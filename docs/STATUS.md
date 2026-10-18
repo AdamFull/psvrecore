@@ -35,6 +35,6 @@ SDK. Those files and the outputs derived from them are not in the repository, so
 | `runtime`: files (mounted devices, descriptors, directories, stat, tty) | Tested (Windows) | Unit tests on a temporary folder: case-insensitive names, `..` kept inside the device, read-only devices |
 | `runtime`: loader and process start-up | Tested (Windows, local, needs the SDK) | Boots SDK-built programs with the SDK's libc and libfios2 (below) |
 | `runtime`: system libraries (thread manager, memory blocks, files, process manager, libc support, sceClib, module loading, RTC, libfios2 overlays) | Tested (Windows) | Unit tests for the calling-convention adapter, formatted output, memory blocks and files; the programs below |
-| Test programs (`scripts/program_check.py`) | Tested (Windows, local, needs the SDK) | Four SDK-built programs (threads and synchronisation, files through libc and the kernel, the libc heap and memory blocks, standard streams) recompiled with libc and libfios2 and booted as a game is: **4 of 4 print exactly what is expected and exit with 0**, 10 runs each |
+| Test programs (`scripts/program_check.py`) | Tested (Windows, local, needs the SDK) | Four SDK-built programs (threads and synchronisation, files through libc and the kernel, the libc heap and memory blocks, standard streams) recompiled with libc and libfios2 and booted as a game is: **4 of 4 print exactly what is expected and exit with 0**: built at -O2 (10 runs each) and at -O0 |
 | `crypto` | Not started | |
 | `gxm`, `vk`, `platform`, `frontend` | Not started | |
