@@ -5,8 +5,8 @@ milestones are in each game's repository.
 
 | # | Milestone | Done when |
 | --- | --- | --- |
-| M0 | Repository, nx-foundation, presets, tests, CI, docs | Windows and Linux build and pass tests; Android preset configures |
-| M1 | `formats`: SFO, SELF→ELF, module info, imports/exports, relocations; NID database; module inspector tool | Unit tests pass on synthetic ELFs; reports match the module's import stubs |
+| M0 ✓ | Repository, nx-foundation, presets, tests, CI, docs | Windows and Linux build and pass tests; Android preset configures (Linux pending CI) |
+| M1 ✓ | `formats`: SFO, SELF→ELF, module info, imports/exports, relocations; NID database; `psvinfo` | Unit tests pass on synthetic ELFs; reports match the module's import stubs |
 | M2 | ARMv7-A / Thumb-2 / VFPv3 / NEON decoder and disassembler | Output matches `llvm-objdump` on an encoding corpus |
 | M3 | Analysis, code generator, test-only interpreter | Same-source differential tests agree (see below) |
 | M4 | Runtime core: memory, loader, threads, synchronisation, files | Multithreaded test programs give the expected results natively on Windows and Linux |

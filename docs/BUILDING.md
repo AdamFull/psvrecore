@@ -8,7 +8,7 @@
 | Build | CMake ≥ 3.25, Ninja (Visual Studio's bundled ones work) | CMake ≥ 3.25, Ninja | CMake ≥ 3.25, Ninja |
 
 Submodules are required: `git submodule update --init --recursive`. That checks out nx-foundation and its own
-third-party code.
+third-party code, and vita-headers (whose NID database the tools read at run time).
 
 ## Presets
 
@@ -45,3 +45,4 @@ ctest --preset linux-x64-release
 | `PSVRECORE_BUILD_TOOLS` | ON (OFF on Android) | Host tools |
 | `PSVRECORE_BUILD_TESTS` | ON (OFF on Android) | Unit tests |
 | `PSVRECORE_PROFILER` | OFF | Builds Tracy into nx-foundation and compiles profiler zones |
+| `PSVRECORE_NID_DB_DIR` | `third_party/vita-headers/db/360` | The NID database the tools load by default |
