@@ -3,13 +3,16 @@
 #   scripts\build.ps1                                  # windows-x64-debug, build + tests
 #   scripts\build.ps1 -Preset windows-x64-release -NoTest
 #   scripts\build.ps1 -Preset android-arm64-release    # ANDROID_NDK_HOME, or the newest NDK in the Android SDK
+#
+# -Root builds another project with the same presets: a game repository calls this script with its own root.
 param(
     [string]$Preset = 'windows-x64-debug',
     [switch]$NoTest,
-    [string[]]$Target
+    [string[]]$Target,
+    [string]$Root = (Split-Path -Parent $PSScriptRoot)
 )
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$root = $Root
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
