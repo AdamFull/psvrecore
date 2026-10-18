@@ -6,9 +6,10 @@ add_executable(psvrecore_tests
     "${_nxtest_dir}/nxtest.cpp"
     core_tests.cpp
     address_space_tests.cpp
+    formats_tests.cpp
 )
 target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")
-target_link_libraries(psvrecore_tests PRIVATE psvrecore::core nx::foundation)
+target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats nx::foundation zlib-ng::zlibstatic)
 psvrecore_target_defaults(psvrecore_tests)
 
 add_test(NAME psvrecore_tests COMMAND psvrecore_tests)

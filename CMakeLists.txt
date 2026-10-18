@@ -45,6 +45,16 @@ if(NOT TARGET nx::foundation)
 endif()
 
 add_subdirectory(libs/core)
+add_subdirectory(libs/formats)
+
+# vita-headers (github.com/vitasdk/vita-headers, MIT, submodule in third_party/vita-headers): its NID database names
+# the system libraries' functions. Tools load it at run time from here unless told otherwise.
+set(PSVRECORE_NID_DB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vita-headers/db/360" CACHE PATH
+    "NID database the tools load by default")
+
+if(PSVRECORE_BUILD_TOOLS)
+    add_subdirectory(tools/psvinfo)
+endif()
 
 if(PSVRECORE_BUILD_TESTS)
     enable_testing()
