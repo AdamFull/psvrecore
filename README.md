@@ -24,12 +24,17 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | `libs/core` | Error handling, log categories, binary readers, file and text helpers shared by every library |
 | `libs/formats` | SELF and ELF, module information, imports/exports, relocations, SFO, NID databases |
 | `libs/arm` | ARMv7-A decoder (ARM, Thumb-2, VFPv3, Advanced SIMD) and disassembler |
+| `libs/analysis` | Code discovery: functions, interworking, IT blocks, jump tables, imported variables |
+| `libs/recomp` | C code generator, the guest ABI header generated code includes, and its support library |
+| `libs/interp` | Reference interpreter, for tests only |
 | `libs/nx-foundation` | [nx-foundation](https://github.com/AdamFull/nx-foundation) (submodule): containers, strings, threads, files, logging, tests |
 | `third_party/vita-headers` | [vita-headers](https://github.com/vitasdk/vita-headers) (submodule, MIT): its NID database names system library functions |
 | `tools/psvinfo` | Inspects SELF/ELF modules and SFO files |
 | `tools/psvdis` | Disassembles raw ARM or Thumb code |
+| `tools/psvrecomp` | Finds a module's code and translates it to C |
 | `scripts/arm_check.py` | Checks psvdis against llvm-objdump over generated instruction corpora or a code file |
-| `tests` | Unit tests (no game data or SDK files needed) |
+| `scripts/probe_check.py` | Same-source differential tests: SDK-built C probes, recompiled, against the host build (needs the SDK) |
+| `tests` | Unit tests and the generator-versus-interpreter test (no game data or SDK files needed); `tests/probes` |
 | `cmake`, `scripts` | Build helpers |
 | `docs` | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Status](docs/STATUS.md) · [Known issues](docs/KNOWN_ISSUES.md) · [Building](docs/BUILDING.md) |
 
@@ -66,6 +71,18 @@ against the module's linked contents.
 psvdis --mode thumb --base 0x81000000 code.bin
 python scripts/arm_check.py --psvdis build/windows-x64-release/tools/psvdis/psvdis.exe   # needs LLVM
 ```
+
+`psvrecomp` finds a module's code and translates it to C:
+
+```
+psvrecomp analyze module.suprx --diagnostics           # functions, jump tables, what discovery could not resolve
+psvrecomp generate module.suprx out/ --name mymodule    # C files: functions, module table, imports
+psvrecomp generate eboot.bin out/ --name game --base 0x81000000,0x81400000
+```
+
+The generated C includes `libs/recomp/include/psvrecore/recomp/guest.h` and must be compiled with the options in
+`psvrecore_generated_code()` (`cmake/PsvrecoreCompilerOptions.cmake`). Generated code is derived from the module, so
+keep it local.
 
 ## License
 

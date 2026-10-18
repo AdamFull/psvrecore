@@ -46,3 +46,19 @@ ctest --preset linux-x64-release
 | `PSVRECORE_BUILD_TESTS` | ON (OFF on Android) | Unit tests |
 | `PSVRECORE_PROFILER` | OFF | Builds Tracy into nx-foundation and compiles profiler zones |
 | `PSVRECORE_NID_DB_DIR` | `third_party/vita-headers/db/360` | The NID database the tools load by default |
+| `PSVRECORE_FUZZ_SEED`, `PSVRECORE_FUZZ_BLOCKS` | `0x9E3779B97F4A7C15`, `2000` | Corpus of the generator-versus-interpreter test. A larger or different corpus, for example `scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000`, is a stress run |
+| `PSVRECORE_PROBES_DIR` | empty | Set by `scripts/probe_check.py` to build the probe runners from the code it generated. Leave it empty otherwise |
+
+## Probes (needs the PS Vita SDK)
+
+`scripts/probe_check.py` runs the same-source differential tests. It needs the SDK, so it runs locally, not in CI:
+
+```
+python scripts/probe_check.py --sdk C:/path/to/sdk               # every probe, -O2
+python scripts/probe_check.py --sdk C:/path/to/sdk --opt=-O0 integer float
+```
+
+It builds each `tests/probes/*.c` with the SDK's compiler, recompiles it and the SDK's libc with psvrecomp, builds a
+runner per probe (with `-Define PSVRECORE_PROBES_DIR=...`, then resets it), and runs them. Each runner compares the
+recompiled probe's output with the same source compiled for the host. Everything it produces goes to `build/probes`
+(`--out`), which is ignored by git. It is derived from the SDK, so never commit it.

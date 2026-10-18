@@ -46,6 +46,32 @@
   console's CPU. ARMv8 instructions are out of scope.
 - **The checker needs LLVM.** It runs llvm-objdump, so CI runs it on Windows only, where the runner image has LLVM.
 
+## Analysis and code generation
+
+- **The console's default FPSCR is unknown.** The SDK material does not say what the floating-point control register
+  holds when a thread starts. Nothing in crt0, libc's startup or a 24 MB SDK-built executable writes it. The runtime
+  starts at 0 (IEEE: no flush-to-zero, no default NaN, round to nearest) until hardware can confirm it.
+- **Floating-point exception flags are not modeled.** The cumulative flags in FPSCR (IOC, DZC and the others) stay
+  clear. Advanced SIMD sets QC on saturation, as the architecture specifies.
+- **Unsupported FPSCR modes trap.** A write that selects directed rounding, a nonzero vector LEN/STRIDE or
+  alternative half precision stops with a diagnostic. No SDK-built code seen does this. The interpreter implements
+  every rounding mode, so the generator can follow if a game needs them.
+- **Exclusive loads and stores are a compare-and-swap.** STREX succeeds if memory still holds the value LDREX read.
+  A store of the same value in between (ABA) therefore goes unnoticed, which real hardware would catch. Lock-free
+  code built from LDREX/STREX does not depend on that difference.
+- **Non-local control flow is not handled yet.** setjmp/longjmp and C++ exception unwinding change the stack and PC
+  in ways the generated functions cannot follow. Those paths trap today; they belong to the runtime (M4).
+- **Some jump tables are sized by inference.** When a TBB/TBH or computed branch has no bounds check that analysis
+  can read, the table is taken to end at the first code after it (79 of 677 tables in a 24 MB executable). A wrong
+  size would show up as a trap on an unknown target, not as a wrong branch.
+- **A few system instructions are not translated.** In the 24 MB executable these are 3 `mcrr` and 3 `mrc p15`
+  (coprocessor registers other than the thread ID registers). Each traps with a diagnostic.
+- **Imported variables need the SDK's reference-table format.** Analysis reads each imported variable's table of uses
+  (MOVW/MOVT pairs and data words). The format was worked out from SDK-built modules, and every one of them decodes.
+  An unknown entry is an error, not a guess.
+- **Probes need the SDK and run locally.** `scripts/probe_check.py` builds C programs with the SDK's compiler, so CI
+  cannot run it. The generator-versus-interpreter test runs in CI without any SDK file.
+
 ## NID databases
 
 - **NID names from different sources can disagree on aliases.** For example, vita-headers names a NID

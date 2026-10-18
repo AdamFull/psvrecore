@@ -1,7 +1,7 @@
 # psvrecore architecture
 
-This document describes the planned design. [STATUS.md](STATUS.md) tracks what exists today; most components below
-are not written yet.
+This document describes the design. [STATUS.md](STATUS.md) tracks what exists today; components from the runtime on
+(M4 and later) are not written yet.
 
 ## Principles
 
@@ -69,14 +69,35 @@ Everything generated stays on the user's machine.
   - A guest address converts to a host pointer as `base + (u32)address`.
   - Only mapped regions are committed. Touching anything else faults, and a fault handler reports the guest address
     and the guest function that touched it.
-- **Generated code.**
-  - Each guest function becomes a C function.
-  - Inside a function, guest registers live in locals so the compiler can allocate them. They are written back at
-    calls and returns.
-  - Condition flags are separate locals.
-  - Indirect branches go through a dense table indexed by guest address. Jump tables become `switch` statements.
-  - Floating point is compiled without contraction (`-ffp-contract=off`). The guest's denormal and NaN modes are
-    handled explicitly.
+- **Analysis.** Function starts come from the module's exports, the exception index table and call targets.
+  - Discovery repeats until the set of functions and the set of functions that never return stop changing. The
+    second set starts from imports known by name never to return (`abort`, `exit`, the C++ throw helpers and
+    others).
+  - Jump tables are read from their bounds checks. When a table has no bounds check, it is taken to end at the
+    first code after it.
+  - Each imported variable's reference table lists the places that need its address. Those places are resolved at
+    load time, never at generation time.
+- **Generated code** (`recomp/guest.h` is the contract between the generator, the runtime and the tests).
+  - Each guest function becomes `void f_<address>(PsvContext*, uint32_t ret)`. `ret` is the guest return address
+    the caller expects.
+  - A call sets LR and calls the C function. A return is an indirect branch whose target equals `ret`. A tail call
+    passes its own `ret` on.
+  - Other indirect branches look the target up among the registered modules' functions. An unknown target stops
+    with a diagnostic. Jump tables become `switch` statements.
+  - Registers and flags live in the context, and the C compiler keeps them in host registers where it can.
+  - IT blocks become per-instruction conditions.
+  - Loads from read-only data are folded into constants, except words the loader patches.
+  - Imports go through a per-module table the loader fills, and so do imported variables' addresses.
+  - Floating point is compiled without contraction (`-ffp-contract=off`, no fast math). Flush-to-zero, default NaN
+    and the ARM NaN rules are implemented explicitly, binary32 by way of binary64 with exact underflow detection.
+  - Advanced SIMD always uses its standard FP mode.
+  - Exclusive loads and stores become a host compare-and-swap.
+- **Reference interpreter** (`interp`, tests only). It is written from the ARM ARM pseudocode, independently of the
+  generator, and shares only the decoder and the context layout. It has its own integer soft float. Two kinds of
+  test compare generated code against it:
+  - random blocks run on both from the same state (in CI);
+  - SDK-built C programs, recompiled and compared with the same source built for the host (`scripts/probe_check.py`,
+    local).
 - **Threads.**
   - Guest threads run in parallel on host threads.
   - The scheduler keeps the guarantees a game can rely on: how many guest threads run at once, priority order, and
