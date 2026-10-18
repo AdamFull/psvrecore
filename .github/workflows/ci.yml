@@ -20,6 +20,10 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/build.ps1 -Preset ${{ matrix.preset }}
+      - name: Disassembler against llvm-objdump
+        if: matrix.preset == 'windows-x64-release'
+        shell: pwsh
+        run: python scripts/arm_check.py --psvdis build/${{ matrix.preset }}/tools/psvdis/psvdis.exe --samples 200000 --show 20
 
   linux:
     runs-on: ubuntu-24.04
