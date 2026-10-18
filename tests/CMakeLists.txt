@@ -45,3 +45,18 @@ set(PSVRECORE_PROBES_DIR "" CACHE PATH "folder of SDK-built probes and their rec
 if(PSVRECORE_PROBES_DIR)
     add_subdirectory(probes)
 endif()
+
+# The runtime: its own executable (it reserves the guest address space, which the generator's tests also use).
+add_library(psvrecore_runtime_test_guest STATIC runtime/runtime_guest.c)
+target_link_libraries(psvrecore_runtime_test_guest PUBLIC psvrecore::recomp_support)
+psvrecore_generated_code(psvrecore_runtime_test_guest)
+
+add_executable(psvrecore_runtime_tests
+    "${_nxtest_dir}/nxtest.cpp"
+    runtime/hle_tests.cpp
+    runtime/kernel_tests.cpp
+)
+target_include_directories(psvrecore_runtime_tests PRIVATE "${_nxtest_dir}" runtime)
+target_link_libraries(psvrecore_runtime_tests PRIVATE psvrecore::runtime psvrecore_runtime_test_guest nx::foundation)
+psvrecore_target_defaults(psvrecore_runtime_tests)
+add_test(NAME psvrecore_runtime_tests COMMAND psvrecore_runtime_tests)
