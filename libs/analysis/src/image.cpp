@@ -4,6 +4,7 @@
 
 #include "psvrecore/formats/self.hpp"
 #include "psvrecore/io/file.hpp"
+#include "core/foundation/core/sha256.h"
 #include "core/foundation/strings/format.h"
 
 namespace psvrecore::analysis {
@@ -42,6 +43,7 @@ Result<Image> Image::from_bytes(std::span<const u8> data, std::span<const u32> b
 
     Image image;
     image.elf_type_ = file->type();
+    image.fingerprint_ = nx::sha256(elf_bytes);
     // Every program header gets a base (the relocations name segments by program-header index); loadable ones are
     // moved where `bases` says.
     nx::vector<u32> all_bases;

@@ -37,12 +37,14 @@ endfunction()
 
 # For targets compiling generated code (psvrecomp's output): integer arithmetic wraps as the guest's does, guest
 # memory is accessed through any type, floating point is exactly as written, and the warnings generated code would
-# raise (unused labels and temporaries) are off.
+# raise (unused labels and temporaries) are off. Unwind tables let the runtime end a guest thread from inside the
+# calls it made (a C++ exception through the generated C frames); Windows x64 code always has them.
 function(psvrecore_generated_code target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /clang:-fwrapv /clang:-fno-strict-aliasing /clang:-ffp-contract=off
                                                  /clang:-fno-fast-math /clang:-w)
     else()
-        target_compile_options(${target} PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off -fno-fast-math -w)
+        target_compile_options(${target} PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off -fno-fast-math -w
+                                                 -funwind-tables)
     endif()
 endfunction()

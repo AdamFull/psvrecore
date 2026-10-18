@@ -7,6 +7,7 @@
 // same address (0x81000000), so several of them can only be loaded together by moving some: `bases` gives a new
 // address for each loadable segment, in program-header order.
 
+#include <array>
 #include <span>
 
 #include "psvrecore/error.hpp"
@@ -65,6 +66,9 @@ public:
     const module::Module& module() const { return module_; }
     const nx::vector<Pointer>& pointers() const { return pointers_; }
     u16 elf_type() const { return elf_type_; }
+    // SHA-256 of the module's ELF (inside its SELF, if it is one): which module this is, whatever its container. A
+    // generated module records it so the runtime runs its code only on the module it was generated from.
+    const std::array<u8, 32>& fingerprint() const { return fingerprint_; }
 
     const Segment* segment_of(u32 address) const;
     bool contains(u32 address, u32 size) const;
@@ -92,6 +96,7 @@ private:
     module::Module module_;
     nx::vector<Pointer> pointers_;
     u16 elf_type_ = 0;
+    std::array<u8, 32> fingerprint_{};
 };
 
 }  // namespace psvrecore::analysis

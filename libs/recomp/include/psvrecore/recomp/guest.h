@@ -108,7 +108,8 @@ typedef struct PsvVariable {
     uint32_t address;
 } PsvVariable;
 
-/* A module's code, as generated: its functions by code address (sorted), and its imports. */
+/* A module's code, as generated: its functions by code address (sorted), its imports, and which module and layout
+ * it is for (the SHA-256 of the module's ELF; each loadable segment's guest address). */
 typedef struct PsvFunctionEntry {
     uint32_t address;
     PsvFunction function;
@@ -123,6 +124,9 @@ typedef struct PsvModuleCode {
     const uint32_t* import_stubs; /* the stub address of each import */
     PsvVariable* variables;
     uint32_t variable_count;
+    uint8_t fingerprint[32];
+    const uint32_t* segment_bases;
+    uint32_t segment_count;
 } PsvModuleCode;
 
 /* ---- Guest memory ---------------------------------------------------------------------------------------------- */
@@ -136,23 +140,32 @@ extern uint8_t* psv_membase;
 #define PSV_HOST(a) (psv_membase + (uint32_t)(a))
 #endif
 
-PSV_INLINE uint32_t psv_ld8(uint32_t a) { return *PSV_HOST(a); }
-PSV_INLINE uint32_t psv_ld16(uint32_t a) { uint16_t v; memcpy(&v, PSV_HOST(a), 2); return v; }
-PSV_INLINE uint32_t psv_ld32(uint32_t a) { uint32_t v; memcpy(&v, PSV_HOST(a), 4); return v; }
+/* Every access is a relaxed atomic one: other guest threads may read or write the same memory at the same time, and
+ * a plain C access would let the compiler keep a value in a register across a loop or merge stores, which the guest
+ * CPU never does (a spin loop on a flag would never see the flag change). Ordering is the guest's business: its
+ * barriers (dmb) become fences, and on a host weaker than x86 relaxed accesses order no more than ARMv7's do.
+ * Unaligned guest accesses stay unaligned host accesses (allowed for ordinary loads and stores on x86-64 and arm64),
+ * and like the guest's they are not single-copy atomic. */
+#define PSV_LOAD(type, a) __atomic_load_n((type*)PSV_HOST(a), __ATOMIC_RELAXED)
+#define PSV_STORE(type, a, v) __atomic_store_n((type*)PSV_HOST(a), (type)(v), __ATOMIC_RELAXED)
+
+PSV_INLINE uint32_t psv_ld8(uint32_t a) { return PSV_LOAD(uint8_t, a); }
+PSV_INLINE uint32_t psv_ld16(uint32_t a) { return PSV_LOAD(uint16_t, a); }
+PSV_INLINE uint32_t psv_ld32(uint32_t a) { return PSV_LOAD(uint32_t, a); }
 #ifdef PSV_ADDRESS_MASK /* (two word accesses, each folded, as the interpreter makes them) */
 PSV_INLINE uint64_t psv_ld64(uint32_t a) { return psv_ld32(a) | ((uint64_t)psv_ld32(a + 4) << 32); }
 #else
-PSV_INLINE uint64_t psv_ld64(uint32_t a) { uint64_t v; memcpy(&v, PSV_HOST(a), 8); return v; }
+PSV_INLINE uint64_t psv_ld64(uint32_t a) { return PSV_LOAD(uint64_t, a); }
 #endif
-PSV_INLINE uint32_t psv_lds8(uint32_t a) { return (uint32_t)(int32_t)(int8_t)*PSV_HOST(a); }
-PSV_INLINE uint32_t psv_lds16(uint32_t a) { int16_t v; memcpy(&v, PSV_HOST(a), 2); return (uint32_t)(int32_t)v; }
-PSV_INLINE void psv_st8(uint32_t a, uint32_t v) { *PSV_HOST(a) = (uint8_t)v; }
-PSV_INLINE void psv_st16(uint32_t a, uint32_t v) { uint16_t h = (uint16_t)v; memcpy(PSV_HOST(a), &h, 2); }
-PSV_INLINE void psv_st32(uint32_t a, uint32_t v) { memcpy(PSV_HOST(a), &v, 4); }
+PSV_INLINE uint32_t psv_lds8(uint32_t a) { return (uint32_t)(int32_t)(int8_t)PSV_LOAD(uint8_t, a); }
+PSV_INLINE uint32_t psv_lds16(uint32_t a) { return (uint32_t)(int32_t)(int16_t)PSV_LOAD(uint16_t, a); }
+PSV_INLINE void psv_st8(uint32_t a, uint32_t v) { PSV_STORE(uint8_t, a, v); }
+PSV_INLINE void psv_st16(uint32_t a, uint32_t v) { PSV_STORE(uint16_t, a, v); }
+PSV_INLINE void psv_st32(uint32_t a, uint32_t v) { PSV_STORE(uint32_t, a, v); }
 #ifdef PSV_ADDRESS_MASK
 PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { psv_st32(a, (uint32_t)v); psv_st32(a + 4, (uint32_t)(v >> 32)); }
 #else
-PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { memcpy(PSV_HOST(a), &v, 8); }
+PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { PSV_STORE(uint64_t, a, v); }
 #endif
 
 /* Exclusive loads and stores. A store succeeds (returns 0) when the monitor holds this address and the memory still
