@@ -1,3 +1,6 @@
 [submodule "libs/nx-foundation"]
 	path = libs/nx-foundation
 	url = https://github.com/AdamFull/nx-foundation
+[submodule "third_party/vita-headers"]
+	path = third_party/vita-headers
+	url = https://github.com/vitasdk/vita-headers
