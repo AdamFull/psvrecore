@@ -49,18 +49,46 @@ bool allowed(Op op) {
         case Op::Stcl: case Op::Stc2: case Op::Stc2l:
             return false;
         default:
-            // (floating point and Advanced SIMD join the corpus once both sides implement them)
-            return op < Op::Vadd;
+            return op <= Op::Vpop;  // (Advanced SIMD joins the corpus once both sides implement it)
     }
+}
+
+// Floating-point forms (S registers or F64), and the loads, stores and moves shared with Advanced SIMD.
+bool vfp_form(const arm::Instruction& in) {
+    switch (in.op) {
+        case Op::Vldr: case Op::Vstr: case Op::Vldmia: case Op::Vldmdb: case Op::Vstmia: case Op::Vstmdb: case Op::Vpush:
+        case Op::Vpop: case Op::Vmrs: case Op::Vmsr:
+            return true;
+        default: break;
+    }
+    if (in.dt == arm::Dt::F64 || in.dt2 == arm::Dt::F64) return true;
+    for (u8 i = 0; i < in.operand_count; ++i) {
+        const auto k = in.operands[i].kind;
+        if (k == arm::OperandKind::SReg || k == arm::OperandKind::SRegList || k == arm::OperandKind::DRegList) return true;
+        if (in.op == Op::Vmov && (k == arm::OperandKind::DScalar || k == arm::OperandKind::Reg || k == arm::OperandKind::FloatImm)) return true;
+    }
+    return false;
 }
 
 bool acceptable(const arm::Instruction& in) {
     if (!in.valid() || (in.flags & arm::kUnpredictable) || (in.flags & arm::kUserRegs)) return false;
     if (!allowed(in.op)) return false;
+    if (in.op >= Op::Vadd && !vfp_form(in)) return false;
+    // (VMRS/VMSR of registers other than FPSCR are not user-accessible)
+    if ((in.op == Op::Vmrs && in.operands[1].imm != 5) || (in.op == Op::Vmsr && in.operands[0].imm != 5)) return false;
     if (in.op == Op::Mrs && in.operands[1].imm != 1) return false;   // (SPSR)
     if (in.op == Op::Msr && (in.operands[0].imm & 0x10)) return false;
     const auto f = analysis::flow_of(in);
     return f.kind == analysis::FlowKind::Next;
+}
+
+// The low 28 bits of an encoding in the floating-point and Advanced SIMD register space (coprocessors 10 and 11):
+// data processing and register transfers (1110), and loads and stores (110x). The same bits follow the condition
+// in ARM and the 1110 prefix in Thumb.
+u32 vfp_space(Rng& rng) {
+    static constexpr u32 kTop[3] = {0xE, 0xD, 0xC};
+    const u32 w = rng.u32v();
+    return (kTop[rng.below(3)] << 24) | (w & 0x00FFF1FFu) | 0xA00u;
 }
 
 struct Block {
@@ -77,9 +105,12 @@ Block make_block(Rng& rng, u32 address, bool thumb) {
     u32 at = address;
     arm::ItState it;
     while (b.code.size() < count || it.active()) {
+        // A third of the instructions come from the floating-point encoding space (rare among random words).
+        const bool focus = rng.below(3) == 0;
         if (!thumb) {
             for (;;) {
-                const auto in = arm::decode_arm(rng.u32v(), at);
+                const u32 word = focus ? (rng.below(15) << 28) | vfp_space(rng) : rng.u32v();
+                const auto in = arm::decode_arm(word, at);
                 if (acceptable(in)) {
                     b.code.push_back(in);
                     at += 4;
@@ -103,9 +134,14 @@ Block make_block(Rng& rng, u32 address, bool thumb) {
         }
         for (;;) {
             arm::ItState trial = it;
-            const bool wide = rng.below(2) == 0;
-            const u16 hw1 = wide ? static_cast<u16>(((0x1D + rng.below(3)) << 11) | (rng.u32v() & 0x7FF)) : static_cast<u16>(rng.u32v() & 0xFFFF);
-            const u16 hw2 = static_cast<u16>(rng.u32v());
+            const bool wide = focus || rng.below(2) == 0;
+            u16 hw1 = wide ? static_cast<u16>(((0x1D + rng.below(3)) << 11) | (rng.u32v() & 0x7FF)) : static_cast<u16>(rng.u32v() & 0xFFFF);
+            u16 hw2 = static_cast<u16>(rng.u32v());
+            if (focus) {
+                const u32 word = 0xE0000000u | vfp_space(rng);
+                hw1 = static_cast<u16>(word >> 16);
+                hw2 = static_cast<u16>(word);
+            }
             if (!wide && arm::thumb_is_32bit(hw1)) continue;
             const auto in = arm::decode_thumb(hw1, hw2, at, trial);
             if (in.op == Op::It || !acceptable(in)) continue;

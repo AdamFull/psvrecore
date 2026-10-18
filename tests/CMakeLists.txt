@@ -30,6 +30,7 @@ add_executable(psvrecore_tests
     arm_tests.cpp
     generator_tests.cpp
     interp_tests.cpp
+    float_tests.cpp
 )
 target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")
 target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::interp psvrecore_fuzz_code

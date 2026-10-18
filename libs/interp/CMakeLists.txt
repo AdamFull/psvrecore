@@ -5,6 +5,7 @@ add_library(psvrecore_interp STATIC
     src/interp_simd.cpp
     src/interp_vfp.cpp
     src/interpreter.cpp
+    src/softfloat.cpp
 )
 add_library(psvrecore::interp ALIAS psvrecore_interp)
 target_include_directories(psvrecore_interp PUBLIC include)

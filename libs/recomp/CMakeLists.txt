@@ -3,6 +3,7 @@
 add_library(psvrecore_recomp STATIC
     src/emit_core.cpp
     src/emit_memory.cpp
+    src/emit_vfp.cpp
     src/generator.cpp
 )
 add_library(psvrecore::recomp ALIAS psvrecore_recomp)

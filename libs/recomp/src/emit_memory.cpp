@@ -243,8 +243,7 @@ bool emit_memory(Emitter& e, const Instruction& in) {
     return single(e, in) || dual(e, in) || multiple(e, in) || exclusive(e, in);
 }
 
-// Placeholders until the floating-point and Advanced SIMD translators exist: those instructions trap.
-bool emit_vfp(Emitter&, const Instruction&) { return false; }
+// A placeholder until the Advanced SIMD translator exists: those instructions trap.
 bool emit_simd(Emitter&, const Instruction&) { return false; }
 
 }  // namespace psvrecore::recomp::detail

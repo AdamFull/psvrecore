@@ -45,6 +45,34 @@ u32 interesting(Rng& rng) {
     return rng.u32v();
 }
 
+// Floating-point values that reach the edge cases: zeros, infinities, quiet and signalling NaNs, denormals, the
+// smallest normal and its neighbours, values whose products and sums land near the flush-to-zero threshold.
+u32 interesting_f32(Rng& rng) {
+    static constexpr u32 kSpecial[] = {
+        0x00000000, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00001, 0x7F800001, 0xFFA00000, 0x00000001,
+        0x807FFFFF, 0x00400000, 0x00800000, 0x80800001, 0x007FFFFF, 0x3F800000, 0xBF800000, 0x7F7FFFFF, 0x20000000,
+        0x1FFFFFFF, 0x20000001, 0x3F000000, 0x4B000000, 0xCF000000, 0x4F800000, 0x47000000, 0x387FC000, 0x33800000,
+    };
+    const u32 pick = rng.u32v() % 4;
+    if (pick == 0) return kSpecial[rng.u32v() % (sizeof kSpecial / sizeof kSpecial[0])];
+    if (pick == 1) return (rng.u32v() & 0x807FFFFFu) | ((0x70 + rng.u32v() % 32) << 23);  // moderate magnitudes
+    return rng.u32v();
+}
+u64 interesting_f64(Rng& rng) {
+    static constexpr u64 kSpecial[] = {
+        0x0000000000000000ull, 0x8000000000000000ull, 0x7FF0000000000000ull, 0xFFF0000000000000ull,
+        0x7FF8000000000000ull, 0xFFF8000000000001ull, 0x7FF0000000000001ull, 0x0000000000000001ull,
+        0x800FFFFFFFFFFFFFull, 0x0010000000000000ull, 0x8010000000000001ull, 0x000FFFFFFFFFFFFFull,
+        0x3FF0000000000000ull, 0xBFF0000000000000ull, 0x7FEFFFFFFFFFFFFFull, 0x2000000000000000ull,
+        0x1FFFFFFFFFFFFFFFull, 0x2000000000000001ull, 0x41E0000000000000ull, 0xC1E0000000000000ull,
+        0x41F0000000000000ull, 0x3810000000000000ull, 0x380FFFFFFFFFFFFFull, 0x36A0000000000000ull,
+    };
+    const u32 pick = rng.u32v() % 4;
+    if (pick == 0) return kSpecial[rng.u32v() % (sizeof kSpecial / sizeof kSpecial[0])];
+    if (pick == 1) return (rng.next() & 0x800FFFFFFFFFFFFFull) | (static_cast<u64>(0x3C0 + rng.u32v() % 128) << 52);
+    return rng.next();
+}
+
 PsvContext random_state(Rng& rng) {
     PsvContext c;
     std::memset(&c, 0, sizeof c);
@@ -56,7 +84,12 @@ PsvContext random_state(Rng& rng) {
     c.v = (flags >> 3) & 1;
     c.q = (flags >> 4) & 1;
     c.ge = (flags >> 5) & 0xF;
-    for (auto& d : c.vfp.d) d = (static_cast<u64>(rng.u32v()) << 32) | rng.u32v();
+    for (int d = 0; d < 32; ++d) {
+        if (rng.u32v() % 2) c.vfp.d[d] = interesting_f64(rng);
+        else c.vfp.d[d] = (static_cast<u64>(interesting_f32(rng)) << 32) | interesting_f32(rng);
+    }
+    // FPSCR: random flags, flush-to-zero and default NaN; round to nearest (the only mode implemented).
+    c.fpscr = (rng.u32v() & 0xF800009Fu) | (rng.u32v() & 0x03000000u);
     c.tpidrurw = rng.u32v();
     c.tpidruro = rng.u32v();
     // Sometimes an exclusive access outstanding (stores after an ldrex in the block itself are covered anyway).
@@ -179,14 +212,18 @@ TEST_CASE("recomp: generated code agrees with the interpreter on random instruct
             }
             ++runs;
             nx::string diff;
-            if (trapped || interp_trapped)
+            if (trapped != interp_trapped || (trapped && g_trap.kind != it.trap_kind))
                 diff = nx::format(" trapped: generated {} ({}), interpreter {} ({})", trapped, trapped ? recomp::describe(g_trap) : "",
                                   interp_trapped, it.trap_kind);
             else
-                diff = differences(g, s, generated, interpreted);
+                diff = differences(g, s, generated, interpreted);  // (both trapped at the same point: the same state too)
             if (!diff.empty()) {
-                if (++failures <= 10)
+                if (++failures <= 10) {
                     std::printf("%s", nx::format("block {} ({}), state {}:{}\n{}", b, block.thumb ? "thumb" : "arm", trial, diff, disassembly(block)).c_str());
+                    nx::string initial = nx::format("    initial: fpscr {:08x}", start.fpscr);
+                    for (int d = 0; d < 32; ++d) initial += nx::format(" d{}={:016x}", d, start.vfp.d[d]);
+                    std::printf("%s\n", initial.c_str());
+                }
             }
         }
     }
