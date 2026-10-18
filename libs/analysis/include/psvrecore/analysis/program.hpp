@@ -87,6 +87,8 @@ struct Program {
         nx::string library;
     };
     nx::vector<ImportRef> imports;  // every imported function, in the module's order
+    nx::vector<ImportRef> variable_imports;  // every imported variable, in the module's order
+    nx::map<u32, VariableUse> variable_uses;  // by the address patched
 
     const Function* function_at(u32 code) const {
         auto it = functions.find(code);

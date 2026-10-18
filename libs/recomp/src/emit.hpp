@@ -64,6 +64,10 @@ public:
     // A memory operand's address. `writeback` receives the statement updating the base register (empty if none).
     nx::string address(const Instruction& in, const Operand& m, nx::string* writeback);
 
+    // Where the module's code builds an imported variable's address (movw/movt patched by the loader): the C
+    // expression of that address, and the patch type; empty elsewhere.
+    nx::string variable_address(u32 site, u8& type) const;
+
     // Literal pools: a load from a read-only segment of the module can be done at generation time.
     bool constant_load(u32 address, u32 size, u32& value) const;
 

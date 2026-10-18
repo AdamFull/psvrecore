@@ -415,6 +415,14 @@ void Analyzer::run() {
             p_.import_stubs[f.address & ~1u] = static_cast<u32>(p_.imports.size());
             p_.imports.push_back(Program::ImportRef{lib.nid, f.nid, lib.name});
         }
+    {
+        nx::vector<Image::ImportedVariable> variables;
+        auto uses = image_.variable_uses(&variables);
+        if (!uses) diag(Severity::Error, 0, 0, uses.error().message);
+        else
+            for (const auto& u : *uses) p_.variable_uses[u.at] = u;
+        for (const auto& v : variables) p_.variable_imports.push_back(Program::ImportRef{v.library_nid, v.nid, v.library});
+    }
     // The module's own export gives module_start/stop/exit as code addresses. (The module information has their
     // offsets too, but without the instruction set.)
     for (const auto& lib : m.exports)

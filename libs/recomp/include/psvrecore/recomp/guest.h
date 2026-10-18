@@ -99,6 +99,15 @@ PSV_INLINE void psv_call_import(PsvContext* PSV_RESTRICT ctx, const PsvImport* i
     import->function(ctx, ret);
 }
 
+/* An imported variable: the loader fills in its guest address. Generated code reads it where the module's code builds
+ * the variable's address (movw/movt); the loader itself writes it into data that refers to the variable. */
+typedef struct PsvVariable {
+    uint32_t library_nid;
+    uint32_t nid;
+    const char* library;
+    uint32_t address;
+} PsvVariable;
+
 /* A module's code, as generated: its functions by code address (sorted), and its imports. */
 typedef struct PsvFunctionEntry {
     uint32_t address;
@@ -112,6 +121,8 @@ typedef struct PsvModuleCode {
     PsvImport* imports;
     uint32_t import_count;
     const uint32_t* import_stubs; /* the stub address of each import */
+    PsvVariable* variables;
+    uint32_t variable_count;
 } PsvModuleCode;
 
 /* ---- Guest memory ---------------------------------------------------------------------------------------------- */

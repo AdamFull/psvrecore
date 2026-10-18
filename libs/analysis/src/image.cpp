@@ -118,6 +118,33 @@ Image Image::from_segments(nx::vector<Segment> segments) {
     return image;
 }
 
+Result<nx::vector<VariableUse>> Image::variable_uses(nx::vector<ImportedVariable>* variables) const {
+    nx::vector<VariableUse> out;
+    if (segments_.empty()) return out;
+    const u32 base = segments_.front().base;
+    u32 index = 0;
+    for (const auto& lib : module_.imports)
+        for (const auto& v : lib.variables) {
+            if (variables) variables->push_back(ImportedVariable{lib.nid, v.nid, lib.name});
+            const u32 table = v.address;
+            const u32 header = u32_at(table);
+            if (!contains(table, 4) || (header & 0x7F) != 0x40)
+                return failure(nx::format("variable 0x{:08x} of {}: reference table at 0x{:08x} has header 0x{:08x}", v.nid, lib.name,
+                                          table, header));
+            const u32 entries = header >> 7;
+            for (u32 i = 0; i < entries; ++i) {
+                const u32 word = u32_at(table + 4 + 8 * i), offset = u32_at(table + 8 + 8 * i);
+                const u8 type = static_cast<u8>(word >> 8);
+                if ((word & 0xFF) != 1 || (type != reloc::kAbs32 && type != reloc::kThmMovwAbsNc && type != reloc::kThmMovtAbs &&
+                                           type != reloc::kMovwAbsNc && type != reloc::kMovtAbs))
+                    return failure(nx::format("variable 0x{:08x} of {}: reference entry 0x{:08x} not supported", v.nid, lib.name, word));
+                out.push_back(VariableUse{index, base + offset, type, word >> 16});
+            }
+            ++index;
+        }
+    return out;
+}
+
 u32 Image::translate(u32 linked) const {
     // (a code address may carry the Thumb bit: translate the address of the byte it names)
     for (const auto& s : segments_)

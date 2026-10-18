@@ -41,6 +41,17 @@ struct Pointer {
     u8 type = 0;     // reloc::Type
 };
 
+// A use of an imported variable, from the module's reference table for it: a MOVW/MOVT pair in code (types 47 and
+// 48, or 43 and 44 in ARM code) or a word in data (type 2) that must hold the variable's address plus the addend.
+// Table format (SDK-built modules): a header (entry count << 7 | 0x40), then per entry a word (addend << 16 | type << 8
+// | 1) and the patched place's offset from the first loadable segment.
+struct VariableUse {
+    u32 variable = 0;  // index among the module's imported variables, in import order
+    u32 at = 0;        // the patched address
+    u8 type = 0;       // reloc::Type
+    u32 addend = 0;
+};
+
 class Image {
 public:
     // Reads a SELF or an ELF file. `bases` is empty to load the module where it was linked.
@@ -67,6 +78,14 @@ public:
 
     // The address in this image of an address as the module was linked (unchanged when no segment holds it).
     u32 translate(u32 linked) const;
+
+    // Every use of every imported variable (and, in `variables`, each variable's library and NID, in import order).
+    struct ImportedVariable {
+        u32 library_nid = 0;
+        u32 nid = 0;
+        nx::string library;
+    };
+    Result<nx::vector<VariableUse>> variable_uses(nx::vector<ImportedVariable>* variables = nullptr) const;
 
 private:
     nx::vector<Segment> segments_;

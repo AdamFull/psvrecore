@@ -291,8 +291,20 @@ bool misc(Emitter& e, const Instruction& in) {
     const auto rr = [&](int i) { return e.read(in, in.operands[i].reg); };
     const u32 rd = in.operands[0].reg;
     switch (in.op) {
-        case Op::Movw: e.write(in, rd, hex(in.operands[1].imm)); return true;
-        case Op::Movt: e.write(in, rd, nx::format("({} & 0xFFFFu) | {}", rr(0), hex(in.operands[1].imm << 16))); return true;
+        case Op::Movw:
+        case Op::Movt: {
+            // (an imported variable's address, filled in by the loader, where the module's reference table says)
+            u8 type = 0;
+            const nx::string variable = e.variable_address(in.address, type);
+            if (!variable.empty()) {
+                if (in.op == Op::Movw) e.write(in, rd, nx::format("{} & 0xFFFFu", variable));
+                else e.write(in, rd, nx::format("({} & 0xFFFFu) | ({} & 0xFFFF0000u)", rr(0), variable));
+                return true;
+            }
+            if (in.op == Op::Movw) e.write(in, rd, hex(in.operands[1].imm));
+            else e.write(in, rd, nx::format("({} & 0xFFFFu) | {}", rr(0), hex(in.operands[1].imm << 16)));
+            return true;
+        }
         case Op::Adr: e.write(in, rd, hex(((analysis::pc_value(in)) & ~3u) + in.operands[1].imm)); return true;
         case Op::Clz: e.write(in, rd, nx::format("psv_clz({})", rr(1))); return true;
         case Op::Rbit: e.write(in, rd, nx::format("psv_rbit({})", rr(1))); return true;
