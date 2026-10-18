@@ -126,6 +126,7 @@ typedef struct PsvModuleCode {
     uint32_t variable_count;
     uint8_t fingerprint[32];
     const uint32_t* segment_bases;
+    const uint32_t* segment_sizes; /* (in memory) */
     uint32_t segment_count;
 } PsvModuleCode;
 

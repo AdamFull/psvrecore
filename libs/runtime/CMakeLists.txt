@@ -3,10 +3,12 @@
 add_library(psvrecore_runtime STATIC
     src/filesystem.cpp
     src/hle.cpp
+    src/hle/fios2.cpp
     src/hle/iofilemgr.cpp
     src/hle/libkernel.cpp
     src/hle/modulemgr.cpp
     src/hle/processmgr.cpp
+    src/hle/rtc.cpp
     src/hle/sysmem.cpp
     src/hle/threadmgr.cpp
     src/kernel/scheduler.cpp

@@ -42,6 +42,8 @@ void Loader::add_code(const PsvModuleCode& code) {
     nx::scoped_lock<nx::mutex> guard(lock_);
     code_.push_back(&code);
     recomp::register_module(code);
+    // Where it will be loaded stays free (memory blocks are not put there meanwhile).
+    for (u32 i = 0; i < code.segment_count; ++i) runtime_.memory().reserve(code.segment_bases[i], code.segment_sizes[i]);
 }
 
 Result<i32> Loader::load(nx::string_view host_path, nx::string_view guest_path) {

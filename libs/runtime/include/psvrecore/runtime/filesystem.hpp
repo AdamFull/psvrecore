@@ -8,7 +8,8 @@
 // the console's file systems (on hosts whose file system is case-sensitive, by looking through the folder).
 //
 // The tty devices (stdin, stdout, stderr of sceKernelGetStd*) are descriptors too: what the guest writes to them goes
-// to a sink (the host's standard output by default).
+// to a sink, by default the host's standard output for both (libc writes its stdout and stderr streams to one tty,
+// as the console's debug console shows them).
 
 #include <memory>
 

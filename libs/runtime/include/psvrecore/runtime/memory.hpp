@@ -75,6 +75,9 @@ public:
     // A block anywhere in `region`, aligned to `alignment` (a power of two, at least a page); 0 if nothing is free.
     u32 map_anywhere(const Region& region, u32 size, u32 alignment, Access access, BlockKind kind, nx::string_view name,
                      i32 uid = 0, u32 type = 0);
+    // Keeps a range for blocks mapped at fixed addresses only (where a module will be loaded): blocks mapped
+    // anywhere stay out of it.
+    void reserve(u32 base, u32 size);
     // Unmaps the block starting at `base`; its pages go back to the host and read as zero when mapped again.
     bool unmap(u32 base);
     bool protect(u32 base, Access access);
@@ -100,6 +103,7 @@ private:
     usize reserved_ = 0;
     mutable nx::mutex lock_;
     nx::map<u32, Block> blocks_;  // by base
+    nx::vector<Region> reserved_ranges_;
 };
 
 // The guest address of a host pointer into guest memory.

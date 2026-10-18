@@ -94,10 +94,11 @@ FileSystem::FileSystem(const Config& config) {
         h->tty = true;
         handles_[fd] = std::move(h);
     }
-    sink_ = Sink([](i32 fd, nx::string_view text) {
-        FILE* f = fd == kStderr ? stderr : stdout;
-        std::fwrite(text.data(), 1, text.size(), f);
-        std::fflush(f);
+    // The console has one tty for both streams (and libc writes both to the same one), so does the host: its
+    // standard output.
+    sink_ = Sink([](i32, nx::string_view text) {
+        std::fwrite(text.data(), 1, text.size(), stdout);
+        std::fflush(stdout);
     });
 }
 

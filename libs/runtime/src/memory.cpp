@@ -1,5 +1,6 @@
 #include "psvrecore/runtime/memory.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 #include "psvrecore/log.hpp"
@@ -111,13 +112,24 @@ u32 GuestMemory::map_anywhere(const Region& region, u32 size, u32 alignment, Acc
     for (;;) {
         if (candidate + size > region.end) return 0;
         while (it != blocks_.end() && u64{it->second.base} + it->second.size <= candidate) ++it;
-        if (it == blocks_.end() || candidate + size <= it->second.base) break;
-        candidate = (u64{it->second.base} + it->second.size + alignment - 1) & ~(u64{alignment} - 1);
+        u64 next = 0;
+        if (it != blocks_.end() && candidate + size > it->second.base) next = u64{it->second.base} + it->second.size;
+        for (const Region& r : reserved_ranges_)
+            if (candidate < r.end && candidate + size > r.begin) next = std::max<u64>(next, r.end);
+        if (!next) break;
+        candidate = (next + alignment - 1) & ~(u64{alignment} - 1);
     }
     const u32 base = static_cast<u32>(candidate);
     if (!commit(base, size, access)) return 0;
     blocks_[base] = Block{base, size, kind, access, nx::string(name), uid, type};
     return base;
+}
+
+void GuestMemory::reserve(u32 base, u32 size) {
+    nx::scoped_lock<nx::mutex> guard(lock_);
+    const u32 begin = base & ~(kPageSize - 1);
+    const u32 end = static_cast<u32>(std::min<u64>((u64{base} + size + kPageSize - 1) & ~u64{kPageSize - 1}, 0xFFFFFFFFu));
+    reserved_ranges_.push_back(Region{begin, end});
 }
 
 bool GuestMemory::unmap(u32 base) {

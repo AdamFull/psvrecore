@@ -256,13 +256,17 @@ nx::string module_source(const analysis::Program& program, const Options& option
     out += nx::format("static const uint32_t {}_segment_bases[{}] = {{", p, std::max<usize>(segments.size(), 1));
     for (const auto& s : segments) out += nx::format(" {},", hex(s.base));
     if (segments.empty()) out += " 0";
+    out += " };\n";
+    out += nx::format("static const uint32_t {}_segment_sizes[{}] = {{", p, std::max<usize>(segments.size(), 1));
+    for (const auto& s : segments) out += nx::format(" {},", hex(s.size()));
+    if (segments.empty()) out += " 0";
     out += " };\n\n";
     nx::string fingerprint;
     for (u8 b : program.image->fingerprint()) fingerprint += nx::format("0x{:02X},", b);
     out += nx::format("const PsvModuleCode {}_module = {{\"{}\", {}_function_table, {}u, {}_imports, {}u, {}_import_stubs, {}_variables, {}u,\n"
-                      "    {{{}}}, {}_segment_bases, {}u}};\n",
+                      "    {{{}}}, {}_segment_bases, {}_segment_sizes, {}u}};\n",
                       p, program.image->module().info.name, p, program.functions.size(), p, program.imports.size(), p, p,
-                      program.variable_imports.size(), fingerprint, p, segments.size());
+                      program.variable_imports.size(), fingerprint, p, p, segments.size());
     return out;
 }
 

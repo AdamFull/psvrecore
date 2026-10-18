@@ -13,7 +13,7 @@ namespace psvrecore::runtime::hle {
 
 namespace {
 
-constexpr u32 kSceLibKernel = 0xCAE9ACE6, kSceProcessmgr = 0x2DD91812;
+constexpr u32 kSceLibKernel = 0xCAE9ACE6, kSceProcessmgr = 0x2DD91812, kSceAppMgr = 0x8AF17416;
 
 struct Timeval {
     i32 sec, usec;
@@ -52,13 +52,18 @@ i32 sceKernelExitProcess(i32 code) {
     kernel().exit_thread(code, false);
 }
 
-i32 sceKernelCallAbortHandler() {
-    nx::loge(logs::kernel, "the guest called abort()");
-    runtime().exit_process(134);  // (the code a host process killed by SIGABRT reports)
-    kernel().exit_thread(134, false);
+// Despite its name, libc calls this at points of a process's life with an event code and carries on (0x102 or 0x103 as
+// exit() begins, for a zero or nonzero status; 0x104/0x105 in _Exit; 0x107 and 0x10B/0x10C elsewhere), so it only
+// notes the event.
+i32 sceKernelCallAbortHandler(u32 event, u32 arg) {
+    nx::logd(logs::kernel, "process event 0x{:x} ({})", event, arg);
+    return err::kOk;
 }
 
 u32 sceKernelGetProcessParam() { return runtime().process_param; }
+
+// Whether the process is a game (libfios2 chooses default file permissions by it): it always is here.
+i32 sceAppMgrIsGameProgram() { return 1; }
 
 i32 sceKernelPowerTick(i32 /*type*/) { return err::kOk; }
 
@@ -130,11 +135,16 @@ const Function kProcessmgr[] = {
     HLE_FUNCTION(0xEB6E50BB, sceKernelCallAbortHandler),
 };
 
+const Function kAppMgr[] = {
+    HLE_FUNCTION(0xFFF8F7F0, sceAppMgrIsGameProgram),
+};
+
 }  // namespace
 
 void register_processmgr() {
     register_library({"SceLibKernel", kSceLibKernel, kLibKernel});
     register_library({"SceProcessmgr", kSceProcessmgr, kProcessmgr});
+    register_library({"SceAppMgr", kSceAppMgr, kAppMgr});
 }
 
 }  // namespace psvrecore::runtime::hle

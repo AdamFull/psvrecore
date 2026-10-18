@@ -302,6 +302,8 @@ void register_system_libraries() {
     register_processmgr();
     register_libkernel();
     register_modulemgr();
+    register_rtc();
+    register_fios2();
 }
 
 }  // namespace psvrecore::runtime::hle
