@@ -129,5 +129,8 @@ enum SysregCode : u32 {
 // Shared between the ARM and Thumb decoders.
 Op parallel_op(bool is_unsigned, u32 prefix, u32 op);  // prefix 1 normal, 2 saturating, 3 halving; op 0..7
 void decode_coprocessor(u32 word, Instruction& in, bool unconditional);
+// Flags kUnpredictable where the PC is the destination of an operation that does not allow it (only data
+// processing, LDR, LDM and POP may write the PC).
+void check_pc_destination(Instruction& in);
 
 }  // namespace psvrecore::arm::detail

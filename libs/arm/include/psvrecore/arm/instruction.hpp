@@ -176,6 +176,8 @@ inline constexpr u16 kUserRegs = 32;        // ldm/stm with ^
 inline constexpr u16 kNarrow = 64;          // a 16-bit Thumb encoding the formatter marks .n (where llvm does)
 inline constexpr u16 kImm12 = 128;          // Thumb add/sub with a plain 12-bit immediate (printed addw/subw)
 inline constexpr u16 kXForm = 256;          // vldm/vstm of doublewords with an odd word count (fldmx/fstmx)
+inline constexpr u16 kImmCarry = 512;       // the modified immediate sets the carry flag (to its bit 31) in flag-setting
+                                            // logical operations; without it they leave the carry unchanged
 
 struct Instruction {
     u32 address = 0;

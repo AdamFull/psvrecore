@@ -10,6 +10,44 @@ using namespace detail;
 
 namespace detail {
 
+void check_pc_destination(Instruction& in) {
+    if (in.operand_count == 0 || (in.flags & kUnpredictable)) return;
+    const auto is_pc = [&](int i) { return in.operand_count > i && in.operands[i].kind == OperandKind::Reg && in.operands[i].reg == kPc; };
+    switch (in.op) {
+        // Destination first.
+        case Op::Movw: case Op::Movt: case Op::Mul: case Op::Mla: case Op::Mls: case Op::Smlabb: case Op::Smlabt:
+        case Op::Smlatb: case Op::Smlatt: case Op::Smlawb: case Op::Smlawt: case Op::Smulbb: case Op::Smulbt: case Op::Smultb:
+        case Op::Smultt: case Op::Smulwb: case Op::Smulwt: case Op::Smuad: case Op::Smuadx: case Op::Smusd: case Op::Smusdx:
+        case Op::Smlad: case Op::Smladx: case Op::Smlsd: case Op::Smlsdx: case Op::Smmul: case Op::Smmulr: case Op::Smmla:
+        case Op::Smmlar: case Op::Smmls: case Op::Smmlsr: case Op::Qadd: case Op::Qsub: case Op::Qdadd: case Op::Qdsub:
+        case Op::Ssat: case Op::Ssat16: case Op::Usat: case Op::Usat16: case Op::Sadd16: case Op::Sasx: case Op::Ssax:
+        case Op::Ssub16: case Op::Sadd8: case Op::Ssub8: case Op::Qadd16: case Op::Qasx: case Op::Qsax: case Op::Qsub16:
+        case Op::Qadd8: case Op::Qsub8: case Op::Shadd16: case Op::Shasx: case Op::Shsax: case Op::Shsub16: case Op::Shadd8:
+        case Op::Shsub8: case Op::Uadd16: case Op::Uasx: case Op::Usax: case Op::Usub16: case Op::Uadd8: case Op::Usub8:
+        case Op::Uqadd16: case Op::Uqasx: case Op::Uqsax: case Op::Uqsub16: case Op::Uqadd8: case Op::Uqsub8: case Op::Uhadd16:
+        case Op::Uhasx: case Op::Uhsax: case Op::Uhsub16: case Op::Uhadd8: case Op::Uhsub8: case Op::Sxtab16: case Op::Sxtb16:
+        case Op::Sxtab: case Op::Sxtb: case Op::Sxtah: case Op::Sxth: case Op::Uxtab16: case Op::Uxtb16: case Op::Uxtab:
+        case Op::Uxtb: case Op::Uxtah: case Op::Uxth: case Op::Clz: case Op::Rbit: case Op::Rev: case Op::Rev16: case Op::Revsh:
+        case Op::Sel: case Op::Usad8: case Op::Usada8: case Op::Pkhbt: case Op::Pkhtb: case Op::Bfc: case Op::Bfi: case Op::Sbfx:
+        case Op::Ubfx: case Op::Ldrb: case Op::Ldrh: case Op::Ldrsb: case Op::Ldrsh: case Op::Ldrt: case Op::Ldrbt:
+        case Op::Ldrht: case Op::Ldrsbt: case Op::Ldrsht: case Op::Ldrex: case Op::Ldrexb: case Op::Ldrexh: case Op::Strex:
+        case Op::Strexb: case Op::Strexh: case Op::Strexd: case Op::Swp: case Op::Swpb: case Op::Mrs: case Op::Strb:
+        case Op::Strh: case Op::Strbt: case Op::Strht:
+            unpredictable(in, is_pc(0));
+            return;
+        // Two destinations.
+        case Op::Umull: case Op::Umlal: case Op::Smull: case Op::Smlal: case Op::Umaal: case Op::Smlalbb: case Op::Smlalbt:
+        case Op::Smlaltb: case Op::Smlaltt: case Op::Smlald: case Op::Smlaldx: case Op::Smlsld: case Op::Smlsldx:
+        case Op::Ldrd: case Op::Strd: case Op::Ldrexd:
+            unpredictable(in, is_pc(0) || is_pc(1));
+            return;
+        case Op::Vmov:  // (to core registers)
+            unpredictable(in, is_pc(0) || (is_pc(1) && in.operand_count > 2 && in.operands[0].kind == OperandKind::Reg));
+            return;
+        default: return;
+    }
+}
+
 Op parallel_op(bool is_unsigned, u32 prefix, u32 op) {
     // op: 0 add16, 1 asx, 2 sax, 3 sub16, 4 add8, 7 sub8 (5 and 6 are undefined)
     static constexpr Op kSigned[3][8] = {
@@ -111,6 +149,7 @@ void data_processing(u32 w, Instruction& in) {
     Operand op2 = immediate ? mod_imm(bits(w, 11, 0)) : by_register ? reg_shifted_reg(rm, type, rs) : shifted_reg(rm, type, imm5);
     const Op op = kDataOps[opc];
     if (s) in.flags |= kSetsFlags;
+    if (immediate && op2.amount != 0) in.flags |= kImmCarry;
     if (by_register) unpredictable(in, rd == kPc || rn == kPc || rm == kPc || rs == kPc);
 
     if (opc >= 8 && opc <= 11) {  // tst, teq, cmp, cmn: no destination (SBZ)
@@ -452,8 +491,14 @@ void media(u32 w, Instruction& in) {
         return set(in, Op::Usada8, {reg(rn), reg(rm), reg(rs), reg(rd)});
     }
     const u32 lsb = bits(w, 11, 7), msb_or_width = bits(w, 20, 16);
-    if ((op1 & 0x1E) == 0x1A && (op2 & 3) == 2) return set(in, Op::Sbfx, {reg(rd), reg(rm), imm(lsb), imm(msb_or_width + 1)});
-    if ((op1 & 0x1E) == 0x1E && (op2 & 3) == 2) return set(in, Op::Ubfx, {reg(rd), reg(rm), imm(lsb), imm(msb_or_width + 1)});
+    if ((op1 & 0x1E) == 0x1A && (op2 & 3) == 2) {  // (a field past bit 31 is unpredictable)
+        set(in, Op::Sbfx, {reg(rd), reg(rm), imm(lsb), imm(msb_or_width + 1)});
+        return unpredictable(in, lsb + msb_or_width > 31);
+    }
+    if ((op1 & 0x1E) == 0x1E && (op2 & 3) == 2) {
+        set(in, Op::Ubfx, {reg(rd), reg(rm), imm(lsb), imm(msb_or_width + 1)});
+        return unpredictable(in, lsb + msb_or_width > 31);
+    }
     if ((op1 & 0x1E) == 0x1C && (op2 & 3) == 0) {
         // msb below lsb is unpredictable; the reference prints it as a 1-bit field at msb.
         const u32 at = msb_or_width >= lsb ? lsb : msb_or_width;
@@ -588,7 +633,19 @@ void unconditional(u32 w, Instruction& in) {
 
 }  // namespace
 
+namespace {
+Instruction decode_arm_fields(u32 w, u32 address);
+}  // namespace
+
 Instruction decode_arm(u32 w, u32 address) {
+    Instruction in = decode_arm_fields(w, address);
+    check_pc_destination(in);
+    return in;
+}
+
+namespace {
+
+Instruction decode_arm_fields(u32 w, u32 address) {
     Instruction in;
     in.address = address;
     in.raw = w;
@@ -652,5 +709,7 @@ Instruction decode_arm(u32 w, u32 address) {
             return in;
     }
 }
+
+}  // namespace
 
 }  // namespace psvrecore::arm

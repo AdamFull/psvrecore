@@ -258,6 +258,7 @@ void data_modified_immediate(u32 hw1, u32 hw2, Instruction& in) {
     const Operand value = imm(thumb_expand_imm(imm12, valid));
     if (!valid) unpredictable(in);
     if (s) in.flags |= kSetsFlags;
+    if ((imm12 >> 10) != 0) in.flags |= kImmCarry;
     const auto compare = [&](Op o) {
         in.flags &= ~kSetsFlags;
         set(in, o, {reg(rn), value});
@@ -301,7 +302,9 @@ void data_plain_immediate(u32 hw1, u32 hw2, Instruction& in) {
         case 0x12:
             if (op == 0x12 && shift == 0) return set(in, Op::Ssat16, {reg(rd), imm(bits(hw2, 3, 0) + 1), reg(rn)});
             return set(in, Op::Ssat, {reg(rd), imm(sat_imm + 1), shifted_reg(rn, bit(hw1, 5) ? 2 : 0, shift)});
-        case 0x14: return set(in, Op::Sbfx, {reg(rd), reg(rn), imm(shift), imm(sat_imm + 1)});
+        case 0x14:
+            set(in, Op::Sbfx, {reg(rd), reg(rn), imm(shift), imm(sat_imm + 1)});
+            return unpredictable(in, shift + sat_imm > 31);  // (a field past bit 31)
         case 0x16: {
             const u32 msb = sat_imm, lsb = shift;
             const u32 at = msb >= lsb ? lsb : msb, width = msb >= lsb ? msb - lsb + 1 : 1;
@@ -314,7 +317,9 @@ void data_plain_immediate(u32 hw1, u32 hw2, Instruction& in) {
         case 0x1A:
             if (op == 0x1A && shift == 0) return set(in, Op::Usat16, {reg(rd), imm(bits(hw2, 3, 0)), reg(rn)});
             return set(in, Op::Usat, {reg(rd), imm(sat_imm), shifted_reg(rn, bit(hw1, 5) ? 2 : 0, shift)});
-        case 0x1C: return set(in, Op::Ubfx, {reg(rd), reg(rn), imm(shift), imm(sat_imm + 1)});
+        case 0x1C:
+            set(in, Op::Ubfx, {reg(rd), reg(rn), imm(shift), imm(sat_imm + 1)});
+            return unpredictable(in, shift + sat_imm > 31);
         default: return undefined(in);
     }
 }
@@ -452,7 +457,7 @@ void load_store_multiple(u32 hw1, u32 hw2, Instruction& in) {
             set(in, load ? Op::Ldmdb : Op::Stmdb, {reg(rn), reg_list(list)});
         }
     }
-    unpredictable(in, count < 2 || (list & (1u << kSp)) || (!load && (list & (1u << kPc))) ||
+    unpredictable(in, count < 2 || rn == kPc || (list & (1u << kSp)) || (!load && (list & (1u << kPc))) ||
                           (load && (list & 0xC000) == 0xC000) || (wb && (list & (1u << rn))));
 }
 
@@ -809,6 +814,7 @@ Instruction decode_thumb(u16 hw1, u16 hw2, u32 address, ItState& it) {
         in.cond = Cond::Al;
         in.flags |= kSetsFlags | kUnpredictable;
     }
+    check_pc_destination(in);
     if (in_block) it.advance();
     if (in.op == Op::It) {
         if (in_block) in.flags |= kUnpredictable;
