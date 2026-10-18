@@ -3,16 +3,20 @@
 #   scripts\build.ps1                                  # windows-x64-debug, build + tests
 #   scripts\build.ps1 -Preset windows-x64-release -NoTest
 #   scripts\build.ps1 -Preset android-arm64-release    # ANDROID_NDK_HOME, or the newest NDK in the Android SDK
+#   scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000  # cache variables for the configure step
 #
 # -Root builds another project with the same presets: a game repository calls this script with its own root.
 param(
     [string]$Preset = 'windows-x64-debug',
     [switch]$NoTest,
     [string[]]$Target,
-    [string]$Root = (Split-Path -Parent $PSScriptRoot)
+    [string]$Root = (Split-Path -Parent $PSScriptRoot),
+    [string[]]$Define
 )
 $ErrorActionPreference = 'Stop'
 $root = $Root
+# (from powershell -File, a list arrives as one comma-separated string)
+$Target = @($Target | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -46,7 +50,8 @@ $env:PATH = ($extra + $env:PATH) -join ';'
 $ErrorActionPreference = 'Continue'
 Push-Location $root
 try {
-    cmake --preset $Preset
+    $defines = @($Define | Where-Object { $_ } | ForEach-Object { "-D$_" })
+    cmake --preset $Preset @defines
     if ($LASTEXITCODE) { throw "configure failed ($LASTEXITCODE)" }
     if ($Target) { cmake --build --preset $Preset --target @Target }
     else { cmake --build --preset $Preset }

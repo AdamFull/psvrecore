@@ -39,3 +39,9 @@ target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm 
 psvrecore_target_defaults(psvrecore_tests)
 
 add_test(NAME psvrecore_tests COMMAND psvrecore_tests)
+
+# Same-source probes, built only by scripts/probe_check.py (they need the SDK and recompiled SDK code: local only).
+set(PSVRECORE_PROBES_DIR "" CACHE PATH "folder of SDK-built probes and their recompiled code (scripts/probe_check.py)")
+if(PSVRECORE_PROBES_DIR)
+    add_subdirectory(probes)
+endif()
