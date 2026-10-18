@@ -27,6 +27,7 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | `libs/analysis` | Code discovery: functions, interworking, IT blocks, jump tables, imported variables |
 | `libs/recomp` | C code generator, the guest ABI header generated code includes, and its support library |
 | `libs/interp` | Reference interpreter, for tests only |
+| `libs/runtime` | What recompiled programs run on: guest memory, the kernel (threads, scheduling, synchronisation), files, the module loader, and the system libraries implemented on the host |
 | `libs/nx-foundation` | [nx-foundation](https://github.com/AdamFull/nx-foundation) (submodule): containers, strings, threads, files, logging, tests |
 | `third_party/vita-headers` | [vita-headers](https://github.com/vitasdk/vita-headers) (submodule, MIT): its NID database names system library functions |
 | `tools/psvinfo` | Inspects SELF/ELF modules and SFO files |
@@ -34,7 +35,8 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | `tools/psvrecomp` | Finds a module's code and translates it to C |
 | `scripts/arm_check.py` | Checks psvdis against llvm-objdump over generated instruction corpora or a code file |
 | `scripts/probe_check.py` | Same-source differential tests: SDK-built C probes, recompiled, against the host build (needs the SDK) |
-| `tests` | Unit tests and the generator-versus-interpreter test (no game data or SDK files needed); `tests/probes` |
+| `scripts/program_check.py` | Whole SDK-built test programs, recompiled with the SDK's libc and libfios2 and booted on the runtime (needs the SDK) |
+| `tests` | Unit tests, the generator-versus-interpreter test and the runtime's tests (no game data or SDK files needed); `tests/probes` and `tests/programs` (sources for the SDK-built checks) |
 | `cmake`, `scripts` | Build helpers |
 | `docs` | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Status](docs/STATUS.md) · [Known issues](docs/KNOWN_ISSUES.md) · [Building](docs/BUILDING.md) |
 

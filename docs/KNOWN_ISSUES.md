@@ -60,7 +60,8 @@
   A store of the same value in between (ABA) therefore goes unnoticed, which real hardware would catch. Lock-free
   code built from LDREX/STREX does not depend on that difference.
 - **Non-local control flow is not handled yet.** setjmp/longjmp and C++ exception unwinding change the stack and PC
-  in ways the generated functions cannot follow. Those paths trap today; they belong to the runtime (M4).
+  in ways the generated functions cannot follow. Those paths trap today. (A thread's own end, sceKernelExitThread
+  from any depth, is handled: the runtime unwinds the host stack.)
 - **Some jump tables are sized by inference.** When a TBB/TBH or computed branch has no bounds check that analysis
   can read, the table is taken to end at the first code after it (79 of 677 tables in a 24 MB executable). A wrong
   size would show up as a trap on an unknown target, not as a wrong branch.
@@ -71,6 +72,44 @@
   An unknown entry is an error, not a guess.
 - **Probes need the SDK and run locally.** `scripts/probe_check.py` builds C programs with the SDK's compiler, so CI
   cannot run it. The generator-versus-interpreter test runs in CI without any SDK file.
+
+## Runtime
+
+- **Preemption takes effect at the preempted thread's next kernel call.** When a higher-priority thread becomes
+  ready and takes the CPU of a running lower-priority one, the kernel cannot stop the host thread between two guest
+  instructions. Until that thread's next system library call, both run, so one CPU is briefly shared by two threads.
+  A thread that never calls the kernel (a pure computation loop) is never stopped. The console would stop it at
+  once.
+- **CPU assignment is simpler than the console's.** There are three CPUs, priorities and affinity masks, but not
+  the console's split into per-CPU queues (priorities 64-127) and a shared queue (128-191). Every ready thread is in
+  one priority-ordered queue that each CPU takes from, as far as its affinity mask allows. For the combinations the
+  SDK recommends (one CPU for 64-127, all CPUs for 128-191), the result is the same.
+- **Not implemented yet:** reader/writer locks, message pipes, timers, simple events, thread events (accepted, never
+  called), mutex priority ceilings, `sceKernelGetModuleInfoByAddr`, `sceKernelLibcMktime`, unloading modules, and
+  libfios2 overlays a game adds (the process has none: a path resolves to itself). A call to anything that is not
+  implemented stops the program with the library and NID.
+- **Not checked against hardware.** Several behaviours follow the SDK's documentation where it is clear and the SDK
+  libraries' own code where it is not. Two examples:
+  - `sceKernelCallAbortHandler`, which libc calls with an event code at exit and elsewhere and then carries on, is
+    implemented as a note.
+  - The main thread gets one argument, the main module's path.
+
+  None of this has been compared with a console.
+- **Unresolved variable imports have address 0.** As on the console for loosely linked imports, an access then
+  faults (and is reported). libc imports one (`SceLibcParam`) that nothing provides; it checks the address first.
+- **The console's stdout and stderr are one stream.** libc writes both to the same tty, and the runtime sends that
+  tty to the host's standard output.
+- **Guest threads that never end keep the process alive.** At shutdown, threads blocked in the kernel end, but one
+  running guest code without kernel calls cannot be stopped. Its host thread is left to the process exit, and the
+  kernel's state stays allocated for it.
+- **Timing on the development machine.** Starting an OS thread there takes 30-100 ms, and while one starts, other
+  threads' timed wake-ups are late by about 10-15 ms. Guest threads start on pooled host threads, so this only
+  happens when the pool grows. Elsewhere, timed waits (delays, timeouts) end within a millisecond of their deadline.
+- **Memory budgets are fixed defaults.** Main memory 256 MiB and CDRAM 128 MiB for memory blocks, set in
+  `Runtime::Config`. The console's figures for a game are not reproduced exactly.
+- **Run on Windows only.** The runtime's POSIX host layer (faults, files, decommit) compiles for Android arm64 with
+  the NDK, without warnings, but has not run there or on Linux (no device test runner, no Linux machine; CI covers
+  Linux once the repository is pushed).
 
 ## NID databases
 

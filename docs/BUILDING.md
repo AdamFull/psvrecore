@@ -48,6 +48,7 @@ ctest --preset linux-x64-release
 | `PSVRECORE_NID_DB_DIR` | `third_party/vita-headers/db/360` | The NID database the tools load by default |
 | `PSVRECORE_FUZZ_SEED`, `PSVRECORE_FUZZ_BLOCKS` | `0x9E3779B97F4A7C15`, `2000` | Corpus of the generator-versus-interpreter test. A larger or different corpus, for example `scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000`, is a stress run |
 | `PSVRECORE_PROBES_DIR` | empty | Set by `scripts/probe_check.py` to build the probe runners from the code it generated. Leave it empty otherwise |
+| `PSVRECORE_PROGRAMS_DIR` | empty | The same for `scripts/program_check.py` and its program runners |
 
 ## Probes (needs the PS Vita SDK)
 
@@ -62,3 +63,19 @@ It builds each `tests/probes/*.c` with the SDK's compiler, recompiles it and the
 runner per probe (with `-Define PSVRECORE_PROBES_DIR=...`, then resets it), and runs them. Each runner compares the
 recompiled probe's output with the same source compiled for the host. Everything it produces goes to `build/probes`
 (`--out`), which is ignored by git. It is derived from the SDK, so never commit it.
+
+## Test programs (needs the PS Vita SDK)
+
+`scripts/program_check.py` runs whole SDK-built programs on the runtime:
+
+```
+python scripts/program_check.py --sdk C:/path/to/sdk                  # every program once
+python scripts/program_check.py --sdk C:/path/to/sdk threads --runs 10
+```
+
+Each `tests/programs/*.c` is built with the SDK's compiler (with the SDK's start-up code), put into an application
+folder with the SDK's `libc.suprx` and `libfios2.suprx` under `sce_module/`, and recompiled with them. A runner boots
+it as a game is booted: `app0:` is the application folder, `ux0:` an empty writable folder. What it prints must
+match `tests/programs/<name>.expected`, and it must exit with 0. The runner logs to stderr; set `PSVRECORE_LOG=debug`
+(or `info`) to see more. Everything goes to `build/programs` (`--out`), which is derived from the SDK: never commit
+it.

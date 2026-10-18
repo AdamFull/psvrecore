@@ -9,7 +9,7 @@ milestones are in each game's repository.
 | M1 ✓ | `formats`: SFO, SELF→ELF, module info, imports/exports, relocations; NID database; `psvinfo` | Unit tests pass on synthetic ELFs; reports match the module's import stubs |
 | M2 ✓ | ARMv7-A / Thumb-2 / VFPv3 / NEON decoder and disassembler | Output matches `llvm-objdump` on an encoding corpus |
 | M3 ✓ | Analysis, code generator, test-only interpreter | Same-source differential tests agree (see below) |
-| M4 | Runtime core: memory, loader, threads, synchronisation, files | Multithreaded test programs give the expected results natively on Windows and Linux |
+| M4 ✓ | Runtime core: memory, loader, threads, synchronisation, files | Multithreaded test programs give the expected results natively on Windows and Linux (Linux pending CI) |
 | M5 | GXM, shader translation, Vulkan backend | Rendering tests, one per feature, match reference images |
 | M6 | Audio, video, input, save data | Sample-accurate audio position tests and input timestamp tests pass |
 

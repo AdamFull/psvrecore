@@ -1,7 +1,7 @@
 # psvrecore architecture
 
-This document describes the design. [STATUS.md](STATUS.md) tracks what exists today; components from the runtime on
-(M4 and later) are not written yet.
+This document describes the design. [STATUS.md](STATUS.md) tracks what exists today; the graphics, audio and platform
+components (M5 and later) are not written yet.
 
 ## Principles
 
@@ -64,11 +64,14 @@ Everything generated stays on the user's machine.
 - **Disassembly** prints llvm-objdump's syntax. That makes the decoder checkable against an independent
   implementation over whole encoding spaces (`scripts/arm_check.py`).
 
-- **Guest memory.**
+- **Guest memory** (`runtime/memory.hpp`).
   - The host reserves the whole 32-bit guest address space plus a guard region.
   - A guest address converts to a host pointer as `base + (u32)address`.
-  - Only mapped regions are committed. Touching anything else faults, and a fault handler reports the guest address
-    and the guest function that touched it.
+  - Only mapped blocks are committed, each with its protection: module segments where their code was generated for,
+    memory blocks, thread stacks and TLS areas, the runtime's own data.
+  - Touching anything else faults. A fault handler reports the guest address and the guest thread that touched it.
+  - Generated code accesses guest memory with relaxed atomic loads and stores. Plain C accesses would let the C
+    compiler keep a value across a guest spin loop. On x86-64 and arm64 they compile to ordinary moves.
 - **Analysis.** Function starts come from the module's exports, the exception index table and call targets.
   - Discovery repeats until the set of functions and the set of functions that never return stop changing. The
     second set starts from imports known by name never to return (`abort`, `exit`, the C++ throw helpers and
@@ -98,14 +101,45 @@ Everything generated stays on the user's machine.
   - random blocks run on both from the same state (in CI);
   - SDK-built C programs, recompiled and compared with the same source built for the host (`scripts/probe_check.py`,
     local).
-- **Threads.**
-  - Guest threads run in parallel on host threads.
-  - The scheduler keeps the guarantees a game can rely on: how many guest threads run at once, priority order, and
-    no time-slicing among threads of equal priority.
+- **Runtime tests.**
+  - Unit tests call the system library functions as recompiled code does, from stand-in guest functions (in CI).
+  - Whole SDK-built programs (start-up code, libc, threads, files, memory) are recompiled and booted from an
+    application folder, and their output is compared with what is expected (`scripts/program_check.py`, local).
+- **Threads** (`runtime/kernel.hpp`).
+  - Each guest thread runs on a host thread of its own, but only while it holds one of the three CPUs a game has.
+  - The kernel hands CPUs out as the console's scheduler does:
+    - fixed priorities, FIFO among equal ones;
+    - no time slicing;
+    - affinity masks;
+    - a thread that becomes ready takes a free CPU, or the CPU of the lowest-priority thread running below it.
+  - A thread that loses its CPU stops at its next kernel call. A host thread cannot be stopped between two guest
+    instructions.
+  - One lock guards the kernel's state. Each thread waits on a parker of its own, which gives microsecond deadlines
+    where a Windows futex timeout rounds to the timer tick.
+  - Guest threads start on pooled host threads, so a start takes microseconds on every host.
+  - Wait queues are FIFO or priority-ordered. Timeouts write back the time left, and objects deleted under a waiter
+    wake it with an error.
+  - `sceKernelExitThread` from any depth ends the thread by unwinding its host stack (a C++ exception through the
+    generated C frames, which have unwind tables).
+  - Host work that blocks, such as file I/O, gives the CPU to other threads meanwhile.
   - Exclusive load/store sequences become host compare-and-swap operations, and barriers become host fences.
-  - Fibers and other guest stack switches use nx-foundation's fibers.
-- **Modules.** Libraries a game ships in its own package are recompiled like its executable. The runtime implements
-  the console firmware's system libraries, looked up by NID.
+- **System libraries** (`runtime/hle.hpp`, `src/hle/`). The firmware's libraries are host functions registered by
+  library and NID. An adapter reads each one's arguments from the guest calling convention: r0-r3, then the stack,
+  with 64-bit values in aligned pairs and variadic arguments read in order. The result goes back in r0 (and r1).
+  Every call ends at a scheduling checkpoint.
+- **Modules** (`runtime/loader.hpp`).
+  - Libraries a game ships in its own package (`sce_module/`) are recompiled like its executable, and all their
+    generated code is linked into the program.
+  - Loading a file finds its code by fingerprint. A module that differs from the one generated from is refused.
+  - The loader maps the segments where the code expects them and links imports: to other modules' exports first,
+    then to the system libraries.
+  - It patches the data that holds imported variables' addresses.
+  - Start-up mirrors the console's: the main module, then the modules the system loads for it, each started with
+    `module_start` on a thread of its own. Then the main thread runs the main module's start entry with the
+    parameters from its process parameter block.
+- **Files** (`runtime/filesystem.hpp`). Device names (`app0:`, `ux0:`, ...) are mounted on host folders, read-only or
+  writable. File names are matched without regard to case, and `..` never leaves a device's folder. The standard
+  streams go to a sink.
 - **Graphics.**
   - GXM scenes map to Vulkan render passes, with load/store operations chosen for tile-based GPUs.
   - Guest surfaces are written back to guest memory only when the game can observe them.
