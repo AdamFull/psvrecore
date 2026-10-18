@@ -675,6 +675,8 @@ PSV_INLINE void psv_write_fpscr(PsvContext* PSV_RESTRICT ctx, uint32_t value, ui
     ctx->fpscr = value & PSV_FPSCR_WRITABLE;
 }
 
+#include "psvrecore/recomp/guest_simd.h"
+
 #ifdef __cplusplus
 }
 #endif

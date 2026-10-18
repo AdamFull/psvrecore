@@ -49,12 +49,12 @@ bool allowed(Op op) {
         case Op::Stcl: case Op::Stc2: case Op::Stc2l:
             return false;
         default:
-            return op <= Op::Vpop;  // (Advanced SIMD joins the corpus once both sides implement it)
+            return true;
     }
 }
 
-// Floating-point forms (S registers or F64), and the loads, stores and moves shared with Advanced SIMD.
-bool vfp_form(const arm::Instruction& in) {
+// (unused: kept for narrowing a corpus to floating point by hand)
+[[maybe_unused]] bool vfp_form(const arm::Instruction& in) {
     switch (in.op) {
         case Op::Vldr: case Op::Vstr: case Op::Vldmia: case Op::Vldmdb: case Op::Vstmia: case Op::Vstmdb: case Op::Vpush:
         case Op::Vpop: case Op::Vmrs: case Op::Vmsr:
@@ -73,7 +73,6 @@ bool vfp_form(const arm::Instruction& in) {
 bool acceptable(const arm::Instruction& in) {
     if (!in.valid() || (in.flags & arm::kUnpredictable) || (in.flags & arm::kUserRegs)) return false;
     if (!allowed(in.op)) return false;
-    if (in.op >= Op::Vadd && !vfp_form(in)) return false;
     // (VMRS/VMSR of registers other than FPSCR are not user-accessible)
     if ((in.op == Op::Vmrs && in.operands[1].imm != 5) || (in.op == Op::Vmsr && in.operands[0].imm != 5)) return false;
     if (in.op == Op::Mrs && in.operands[1].imm != 1) return false;   // (SPSR)
@@ -91,6 +90,22 @@ u32 vfp_space(Rng& rng) {
     return (kTop[rng.below(3)] << 24) | (w & 0x00FFF1FFu) | 0xA00u;
 }
 
+// An Advanced SIMD encoding, as ARM's (unconditional) 1111 001U data processing or 1111 0100 xxx0 loads and stores.
+u32 simd_arm(Rng& rng) {
+    const u32 w = rng.u32v();
+    switch (rng.below(3)) {
+        case 0: return 0xF4000000u | (w & 0x00EFFFFFu);
+        // (the two-register miscellaneous group, a narrow part of the space: 1111 0011 1x11 ... 0xxx xxx0 ...)
+        case 1: return 0xF3B00000u | (w & 0x004FF7EFu);
+        default: return 0xF2000000u | (w & 0x01FFFFFFu);
+    }
+}
+// The same in Thumb: 111U 1111 for data processing (U from ARM's bit 24), 1111 1001 xxx0 for loads and stores.
+u32 simd_thumb(u32 arm) {
+    if ((arm & 0xFF000000u) == 0xF4000000u) return 0xF9000000u | (arm & 0x00FFFFFFu);
+    return 0xEF000000u | ((arm & 0x01000000u) << 4) | (arm & 0x00FFFFFFu);
+}
+
 struct Block {
     u32 address = 0;
     bool thumb = false;
@@ -105,11 +120,15 @@ Block make_block(Rng& rng, u32 address, bool thumb) {
     u32 at = address;
     arm::ItState it;
     while (b.code.size() < count || it.active()) {
-        // A third of the instructions come from the floating-point encoding space (rare among random words).
-        const bool focus = rng.below(3) == 0;
+        // Half of the instructions come from the floating-point and Advanced SIMD encoding spaces (rare among random
+        // words).
+        const u32 focus_kind = rng.below(4);  // 0, 1: none; 2: VFP; 3: Advanced SIMD
+        const bool focus = focus_kind >= 2;
         if (!thumb) {
             for (;;) {
-                const u32 word = focus ? (rng.below(15) << 28) | vfp_space(rng) : rng.u32v();
+                u32 word = rng.u32v();
+                if (focus_kind == 2) word = (rng.below(15) << 28) | vfp_space(rng);
+                if (focus_kind == 3) word = simd_arm(rng);
                 const auto in = arm::decode_arm(word, at);
                 if (acceptable(in)) {
                     b.code.push_back(in);
@@ -138,7 +157,7 @@ Block make_block(Rng& rng, u32 address, bool thumb) {
             u16 hw1 = wide ? static_cast<u16>(((0x1D + rng.below(3)) << 11) | (rng.u32v() & 0x7FF)) : static_cast<u16>(rng.u32v() & 0xFFFF);
             u16 hw2 = static_cast<u16>(rng.u32v());
             if (focus) {
-                const u32 word = 0xE0000000u | vfp_space(rng);
+                const u32 word = focus_kind == 2 ? 0xE0000000u | vfp_space(rng) : simd_thumb(simd_arm(rng));
                 hw1 = static_cast<u16>(word >> 16);
                 hw2 = static_cast<u16>(word);
             }

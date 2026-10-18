@@ -411,4 +411,99 @@ u64 from_fixed(u64 x, int bits, int fraction, bool is_unsigned, int n, bool roun
     return round(r, n, fpscr, round_nearest ? 0 : rounding(fpscr));
 }
 
+namespace {
+
+// recip_estimate and recip_sqrt_estimate (the ARM ARM's C functions), exactly: the result in units of 1/256.
+u32 recip_estimate_units(u32 q /* RoundDown(a * 512), 256..511 */) {
+    // s = RoundDown(256 * 512 / (q + 0.5) + 0.5) = RoundDown((2^19 + 2q + 1) / (4q + 2))
+    return (524288u + 2 * q + 1) / (4 * q + 2);
+}
+u32 recip_sqrt_estimate_units(u32 q, bool below_half /* a in [0.25, 0.5): q = a * 512, else q = a * 256 */) {
+    // s = RoundDown(256 / sqrt(t) + 0.5), t = (q + 0.5) / 512 or (q + 0.5) / 256: the largest s with
+    // (2s - 1)^2 (2q + 1) <= 2^28 (or 2^27).
+    const u64 k = 2 * u64{q} + 1, limit = below_half ? (u64{1} << 28) : (u64{1} << 27);
+    u32 s = 512;
+    while ((2 * u64{s} - 1) * (2 * u64{s} - 1) * k > limit) --s;
+    return s;
+}
+
+}  // namespace
+
+u32 recip_estimate(u32 a) {
+    const Unpacked x = unpack(a, 32, kStandard);
+    if (x.type == Type::QNaN || x.type == Type::SNaN) return static_cast<u32>(process_nan(x.type, a, 32, kStandard));
+    if (x.type == Type::Infinity) return static_cast<u32>(zero(x.value.sign, 32));
+    if (x.type == Type::Zero) return static_cast<u32>(infinity(x.value.sign, 32));
+    const u32 exp = (a >> 23) & 0xFF;
+    if (exp >= 253) return static_cast<u32>(zero(x.value.sign, 32));  // |a| >= 2^126
+    // scaled = 0.1fraction in [0.5, 1): RoundDown(scaled * 512) = 256 + the top eight fraction bits
+    const u32 s = recip_estimate_units(256 + ((a >> 15) & 0xFF));
+    return (a & 0x80000000u) | ((253 - exp) << 23) | ((s - 256) << 15);
+}
+
+u32 rsqrt_estimate(u32 a) {
+    const Unpacked x = unpack(a, 32, kStandard);
+    if (x.type == Type::QNaN || x.type == Type::SNaN) return static_cast<u32>(process_nan(x.type, a, 32, kStandard));
+    if (x.type == Type::Zero) return static_cast<u32>(infinity(x.value.sign, 32));
+    if (x.value.sign) return static_cast<u32>(default_nan(32));
+    if (x.type == Type::Infinity) return 0;
+    const u32 exp = (a >> 23) & 0xFF;
+    // The fraction scaled into [0.5, 1) (exponent even) or [0.25, 0.5) (odd): either way q is 128 plus the top
+    // seven fraction bits.
+    const bool odd = (exp & 1) != 0;
+    const u32 s = recip_sqrt_estimate_units(128 + ((a >> 16) & 0x7F), odd);
+    return (((380 - exp) / 2) << 23) | ((s - 256) << 15);
+}
+
+u32 recip_step(u32 a, u32 b) {
+    const Unpacked x = unpack(a, 32, kStandard), y = unpack(b, 32, kStandard);
+    u64 result;
+    if (process_nans(x.type, y.type, a, b, 32, kStandard, result)) return static_cast<u32>(result);
+    const bool inf_zero = (x.type == Type::Infinity && y.type == Type::Zero) || (x.type == Type::Zero && y.type == Type::Infinity);
+    const u64 product = inf_zero ? 0 : mul(a, b, 32, kStandard);
+    return static_cast<u32>(sub(0x40000000u, product, 32, kStandard));  // 2.0 - product
+}
+
+u32 rsqrt_step(u32 a, u32 b) {
+    const Unpacked x = unpack(a, 32, kStandard), y = unpack(b, 32, kStandard);
+    u64 result;
+    if (process_nans(x.type, y.type, a, b, 32, kStandard, result)) return static_cast<u32>(result);
+    const bool inf_zero = (x.type == Type::Infinity && y.type == Type::Zero) || (x.type == Type::Zero && y.type == Type::Infinity);
+    const u64 product = inf_zero ? 0 : mul(a, b, 32, kStandard);
+    // FPHalvedSub(3.0, product)
+    const Unpacked p = unpack(product, 32, kStandard);
+    if (p.type == Type::QNaN || p.type == Type::SNaN) return static_cast<u32>(default_nan(32));
+    if (p.type == Type::Infinity) return static_cast<u32>(infinity(!p.value.sign, 32));
+    const Real three{false, 3, 0, false};
+    Real neg = p.value;
+    neg.sign = !neg.sign;
+    Real diff = p.type == Type::Zero ? three : real_add(three, neg);
+    if (diff.m == 0 && !diff.sticky) return 0;  // (+0 in round to nearest)
+    diff.e -= 1;  // halved, exactly
+    return static_cast<u32>(round(diff, 32, kStandard, 0));
+}
+
+u32 max(u32 a, u32 b) {
+    const Unpacked x = unpack(a, 32, kStandard), y = unpack(b, 32, kStandard);
+    u64 result;
+    if (process_nans(x.type, y.type, a, b, 32, kStandard, result)) return static_cast<u32>(result);
+    // value1 > value2 picks the first; a zero result takes the AND of the signs ("the most positive").
+    const bool first = compare(a, b, 32, kStandard) == 0b0010;
+    const Unpacked& pick = first ? x : y;
+    if (pick.type == Type::Infinity) return static_cast<u32>(infinity(pick.value.sign, 32));
+    if (pick.type == Type::Zero) return static_cast<u32>(zero(x.value.sign && y.value.sign, 32));
+    return static_cast<u32>(round(pick.value, 32, kStandard, 0));
+}
+
+u32 min(u32 a, u32 b) {
+    const Unpacked x = unpack(a, 32, kStandard), y = unpack(b, 32, kStandard);
+    u64 result;
+    if (process_nans(x.type, y.type, a, b, 32, kStandard, result)) return static_cast<u32>(result);
+    const bool first = compare(a, b, 32, kStandard) == 0b1000;  // value1 < value2
+    const Unpacked& pick = first ? x : y;
+    if (pick.type == Type::Infinity) return static_cast<u32>(infinity(pick.value.sign, 32));
+    if (pick.type == Type::Zero) return static_cast<u32>(zero(x.value.sign || y.value.sign, 32));
+    return static_cast<u32>(round(pick.value, 32, kStandard, 0));
+}
+
 }  // namespace psvrecore::interp::fp

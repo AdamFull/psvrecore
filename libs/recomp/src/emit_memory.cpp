@@ -243,7 +243,5 @@ bool emit_memory(Emitter& e, const Instruction& in) {
     return single(e, in) || dual(e, in) || multiple(e, in) || exclusive(e, in);
 }
 
-// A placeholder until the Advanced SIMD translator exists: those instructions trap.
-bool emit_simd(Emitter&, const Instruction&) { return false; }
 
 }  // namespace psvrecore::recomp::detail
