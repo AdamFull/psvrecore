@@ -1,0 +1,5 @@
+heap: ok
+memory block: done
+formatted: 3.14 1.234500e+03  -2.3
+strtod: 2500.000
+memory: 0 failed

@@ -1,0 +1,5 @@
+printf to stdout
+fprintf to stderr
+fputs to stdout
+fputs to stderr
+puts to stdout

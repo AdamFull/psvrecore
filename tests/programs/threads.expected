@@ -1,0 +1,8 @@
+lw mutex counter: 80000 of 80000
+semaphore ring: sum 500500
+event flag: all three bits 0x7
+priority order: abcd
+condition variable: sum 5050
+atomic adds: 300000
+exit from a nested call: status 77
+threads: 0 failed

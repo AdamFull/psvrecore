@@ -1,0 +1,7 @@
+read: first 1
+read: second line
+size: 20
+after append: 26 bytes
+eboot.bin starts with SCE: yes
+libc.suprx listed: 1
+files: 0 failed

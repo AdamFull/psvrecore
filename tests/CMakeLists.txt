@@ -60,3 +60,9 @@ target_include_directories(psvrecore_runtime_tests PRIVATE "${_nxtest_dir}" runt
 target_link_libraries(psvrecore_runtime_tests PRIVATE psvrecore::runtime psvrecore_runtime_test_guest nx::foundation)
 psvrecore_target_defaults(psvrecore_runtime_tests)
 add_test(NAME psvrecore_runtime_tests COMMAND psvrecore_runtime_tests)
+
+# Test programs on the runtime, built only by scripts/program_check.py (they need the SDK: local only).
+set(PSVRECORE_PROGRAMS_DIR "" CACHE PATH "folder of SDK-built test programs and their recompiled code (scripts/program_check.py)")
+if(PSVRECORE_PROGRAMS_DIR)
+    add_subdirectory(programs)
+endif()
