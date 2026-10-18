@@ -47,6 +47,11 @@ endif()
 add_subdirectory(libs/core)
 add_subdirectory(libs/formats)
 add_subdirectory(libs/arm)
+add_subdirectory(libs/analysis)
+add_subdirectory(libs/recomp)
+if(PSVRECORE_BUILD_TESTS)
+    add_subdirectory(libs/interp)  # (test-only)
+endif()
 
 # vita-headers (github.com/vitasdk/vita-headers, MIT, submodule in third_party/vita-headers): its NID database names
 # the system libraries' functions. Tools load it at run time from here unless told otherwise.
@@ -56,6 +61,7 @@ set(PSVRECORE_NID_DB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vita-headers/d
 if(PSVRECORE_BUILD_TOOLS)
     add_subdirectory(tools/psvinfo)
     add_subdirectory(tools/psvdis)
+    add_subdirectory(tools/psvrecomp)
 endif()
 
 if(PSVRECORE_BUILD_TESTS)

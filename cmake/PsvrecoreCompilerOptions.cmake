@@ -34,3 +34,15 @@ function(psvrecore_full_inlining target)
         target_compile_options(${target} PRIVATE $<$<CONFIG:RelWithDebInfo>:/Ob2>)
     endif()
 endfunction()
+
+# For targets compiling generated code (psvrecomp's output): integer arithmetic wraps as the guest's does, guest
+# memory is accessed through any type, floating point is exactly as written, and the warnings generated code would
+# raise (unused labels and temporaries) are off.
+function(psvrecore_generated_code target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /clang:-fwrapv /clang:-fno-strict-aliasing /clang:-ffp-contract=off
+                                                 /clang:-fno-fast-math /clang:-w)
+    else()
+        target_compile_options(${target} PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off -fno-fast-math -w)
+    endif()
+endfunction()
