@@ -24,6 +24,30 @@
   - ELF type 0xFE00 (fixed-address executables).
 
   All of these are covered by synthetic tests only.
+## Instruction decoder
+
+- **The reference's behaviour on unpredictable encodings is mirrored, not the architecture's.** Where the ARM ARM
+  calls an encoding UNPREDICTABLE, llvm-objdump sometimes rejects it and sometimes decodes it. The decoder follows
+  llvm-objdump's choice so the two can be compared, and flags every decoded case `kUnpredictable` for the
+  recompiler to refuse. Three examples:
+  - nested IT blocks (a pending-condition stack);
+  - LDRD with an odd first register;
+  - VLDM with too many registers (clamped).
+- **Encodings the checker cannot match** (`unmatchable()` in `scripts/arm_check.py`; about 0.01% of random
+  encodings, none in real code):
+  - **Thumb REV/REV16/RBIT/REVSH/CLZ with different Rm fields:** the reference prints a register that is in neither
+    field.
+  - **VTBL/VTBX and VLD1/VLD2 register lists running past d31:** the reference names the registers after d31 as
+    system registers.
+  - **ARM `mov` (register) with a nonzero Rn field:** the reference accepts some and rejects others, with no rule
+    this decoder could find. psvdis rejects all of them.
+  - **CPS (privileged; never in user code):** the reference's exact field checks are not reproduced.
+- **Cortex-A9 instruction set only.** SDIV/UDIV and VFPv4 (VFMA and friends) decode as undefined, as on the
+  console's CPU. ARMv8 instructions are out of scope.
+- **The checker needs LLVM.** It runs llvm-objdump, so CI runs it on Windows only, where the runner image has LLVM.
+
+## NID databases
+
 - **NID names from different sources can disagree on aliases.** For example, vita-headers names a NID
   `sceClibMemcpy_safe` where the SDK's stub calls it `sceClibMemcpy`. When several databases are loaded, the last
   one wins.

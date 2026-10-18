@@ -23,9 +23,12 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | --- | --- |
 | `libs/core` | Error handling, log categories, binary readers, file and text helpers shared by every library |
 | `libs/formats` | SELF and ELF, module information, imports/exports, relocations, SFO, NID databases |
+| `libs/arm` | ARMv7-A decoder (ARM, Thumb-2, VFPv3, Advanced SIMD) and disassembler |
 | `libs/nx-foundation` | [nx-foundation](https://github.com/AdamFull/nx-foundation) (submodule): containers, strings, threads, files, logging, tests |
 | `third_party/vita-headers` | [vita-headers](https://github.com/vitasdk/vita-headers) (submodule, MIT): its NID database names system library functions |
 | `tools/psvinfo` | Inspects SELF/ELF modules and SFO files |
+| `tools/psvdis` | Disassembles raw ARM or Thumb code |
+| `scripts/arm_check.py` | Checks psvdis against llvm-objdump over generated instruction corpora or a code file |
 | `tests` | Unit tests (no game data or SDK files needed) |
 | `cmake`, `scripts` | Build helpers |
 | `docs` | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Status](docs/STATUS.md) · [Known issues](docs/KNOWN_ISSUES.md) · [Building](docs/BUILDING.md) |
@@ -56,6 +59,13 @@ psvinfo stubs <sdk>/target/lib nids.tsv # NID database from SDK stub libraries (
 Names come from vita-headers' database (`third_party/vita-headers/db/360`) unless `--no-default-db` is given;
 `--db` adds more databases (`.yml`, `.tsv`, or folders of them). The `info` command also checks every relocation
 against the module's linked contents.
+
+`psvdis` disassembles raw code in the syntax llvm-objdump prints:
+
+```
+psvdis --mode thumb --base 0x81000000 code.bin
+python scripts/arm_check.py --psvdis build/windows-x64-release/tools/psvdis/psvdis.exe   # needs LLVM
+```
 
 ## License
 

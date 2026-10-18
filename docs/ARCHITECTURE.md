@@ -54,6 +54,16 @@ Everything generated stays on the user's machine.
 
 ## Key design points
 
+- **Instruction model.** The decoder turns ARM and Thumb encodings into one description: an operation, a condition,
+  flags and up to six typed operands. The same operation decodes to the same description whichever instruction set
+  and encoding it comes from, so the code generator implements each operation once.
+  - Encodings the architecture leaves undefined decode to `Op::Undefined`.
+  - UNPREDICTABLE encodings decode with a flag, so analysis can refuse them.
+  - The target is the Cortex-A9's ARMv7-A: VFPv3 with half-precision conversions, and Advanced SIMD. Integer divide
+    and VFPv4 fused multiply-add are not implemented by that core, so they are undefined.
+- **Disassembly** prints llvm-objdump's syntax. That makes the decoder checkable against an independent
+  implementation over whole encoding spaces (`scripts/arm_check.py`).
+
 - **Guest memory.**
   - The host reserves the whole 32-bit guest address space plus a guard region.
   - A guest address converts to a host pointer as `base + (u32)address`.

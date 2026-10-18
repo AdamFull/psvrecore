@@ -21,6 +21,8 @@ SDK. Those files and the outputs derived from them are not in the repository, so
 | `formats`: SFO | Tested | Unit tests. Checked on SDK files: a sample's `param.sfo` |
 | `formats`: NID database (vita-headers YAML, TSV, SDK stub archives) | Tested | Unit tests. Checked on SDK files: names from vita-headers and from the SDK's stub libraries agree on every NID both name, apart from 2 aliases |
 | `psvinfo` tool | Tested | Exercised by the SDK-file checks above |
-| CI workflow | Implemented | Not run yet, because the repository has not been pushed |
-| `crypto`, `arm`, `analysis`, `recomp`, `interp` | Not started | |
+| `arm`: ARM, Thumb-2 (with IT blocks), VFPv3, Advanced SIMD decoder and formatter | Tested | Differential check against llvm-objdump 22.1 (`--mcpu=cortex-a9`), `scripts/arm_check.py`. **0 differences**, apart from the documented unmatchable cases, on random corpora of ~2M ARM words, every 16-bit Thumb encoding, ~2M 32-bit Thumb encodings and ~0.85M IT-block sequences, over several seeds. Checked on SDK files: all 7.1M instructions in the code of libc, libfios2, libult, libsmart, a sample and a 24 MB executable match. Unit tests for the instruction model (ARM and Thumb forms decode alike; conditions, IT, branch targets, memory operands) |
+| `psvdis` tool | Tested | Decodes and formats about 2.5M instructions/s (24 MB of Thumb code in 2.4 s, release build, Core Ultra 7 155H) |
+| CI workflow | Implemented | Includes the disassembler check (Windows, release). Not run yet, because the repository has not been pushed |
+| `crypto`, `analysis`, `recomp`, `interp` | Not started | |
 | `runtime`, `gxm`, `vk`, `platform`, `frontend` | Not started | |
