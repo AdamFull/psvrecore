@@ -1,0 +1,52 @@
+cmake_minimum_required(VERSION 3.25)
+
+# A toolkit for static recompilation of PS Vita software: SELF/ELF analysis, the ARMv7/Thumb-2 recompiler to C, and
+# the runtime the recompiled code runs on (HLE system libraries, GXM on Vulkan, audio, input, files, platform layer).
+# Built on its own (tools and tests) or by a game repository through add_subdirectory.
+project(psvrecore
+    VERSION 0.1.0
+    DESCRIPTION "Static recompilation of PS Vita software to native code"
+    LANGUAGES C CXX)
+
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(PSVRECORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL "psvrecore source directory")
+
+# Host tools and tests are not built for Android.
+if(ANDROID)
+    set(_psvrecore_host_default OFF)
+else()
+    set(_psvrecore_host_default ON)
+endif()
+option(PSVRECORE_BUILD_TOOLS "Build host-side tools" ${_psvrecore_host_default})
+option(PSVRECORE_BUILD_TESTS "Build unit tests (no game data or SDK files required)" ${_psvrecore_host_default})
+option(PSVRECORE_PROFILER "Build Tracy into nx-foundation and compile its profiler zones" OFF)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(PsvrecoreCompilerOptions)
+
+# nx-foundation (github.com/AdamFull/nx-foundation, submodule in libs/nx-foundation), unless the including project
+# provides it. Its own third-party code is in submodules too (git submodule update --init --recursive).
+if(NOT TARGET nx::foundation)
+    set(NX_FOUNDATION_TESTS OFF CACHE BOOL "" FORCE)
+    set(NX_FOUNDATION_TRACY ${PSVRECORE_PROFILER} CACHE BOOL "" FORCE)
+    set(NX_ENABLE_PROFILER ${PSVRECORE_PROFILER} CACHE BOOL "" FORCE)
+    # Games are shared libraries on Android (libmain.so, loaded by the Java activity with dlopen), where mimalloc's
+    # default initial-exec thread-local storage fails to load.
+    if(ANDROID)
+        set(MI_LOCAL_DYNAMIC_TLS ON CACHE BOOL "" FORCE)
+    endif()
+    add_subdirectory(libs/nx-foundation EXCLUDE_FROM_ALL)
+endif()
+
+add_subdirectory(libs/core)
+
+if(PSVRECORE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

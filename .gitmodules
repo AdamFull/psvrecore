@@ -1,0 +1,3 @@
+[submodule "libs/nx-foundation"]
+	path = libs/nx-foundation
+	url = https://github.com/AdamFull/nx-foundation

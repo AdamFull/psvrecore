@@ -1,0 +1,46 @@
+# --- Proprietary inputs and anything derived from them: never commit ---
+# Game packages, licenses and keys, executables and modules, SDK files and SDK-built test material.
+*.pkg
+*.rif
+*.zrif
+work.bin
+*.self
+*.suprx
+*.skprx
+eboot.bin
+EBOOT.BIN
+param.sfo
+PARAM.SFO
+*.sfo
+*.gxp
+*.gxt
+*.at9
+*.psarc
+*.PUP
+/keys/
+/sdk/
+/local/
+/generated/
+
+# --- Build output ---
+/build/
+/out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+
+# --- Tooling / editors ---
+__pycache__/
+*.pyc
+.venv/
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db

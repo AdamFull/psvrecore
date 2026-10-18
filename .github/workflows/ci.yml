@@ -1,0 +1,53 @@
+# Builds the toolkit and runs its unit tests (no game data or SDK files) on Windows and Linux, and checks that the
+# Android preset configures with the NDK.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [windows-x64-debug, windows-x64-release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build and test
+        shell: pwsh
+        run: ./scripts/build.ps1 -Preset ${{ matrix.preset }}
+
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [linux-x64-debug, linux-x64-release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang ninja-build
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  android-configure:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        # The runner image provides the newest NDK in ANDROID_NDK_LATEST_HOME.
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cmake --preset android-arm64-release
