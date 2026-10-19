@@ -74,6 +74,7 @@ i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> regio
     Scene scene;
     scene.target = t->second.get();
     scene.flags = flags;
+    scene.visibility_buffer = c->visibility_buffer;
     scene.region = region ? *region : ValidRegion{scene.target->width - 1, scene.target->height - 1};
     if (color && memory().valid(color, sizeof(ColorSurface))) {
         scene.color = *reinterpret_cast<const ColorSurface*>(memory().host(color));
@@ -206,6 +207,38 @@ void sceGxmSetBackFragmentProgramEnable(u32 context, u32 m) {
 void sceGxmSetFrontLineFillLastPixelEnable(u32, u32) {}
 void sceGxmSetBackLineFillLastPixelEnable(u32, u32) {}
 void sceGxmSetCullMode(u32 context, u32 m) { with(context, [&](Context& c) { c.state.cull = m; }); }
+
+// Visibility testing: the back face's settings follow the front's unless two-sided rendering is enabled (render.cpp
+// reads the front's only: one query per draw).
+void sceGxmSetFrontVisibilityTestEnable(u32 context, u32 m) {
+    with(context, [&](Context& c) { c.state.visibility[0] = m == 0x4000; });
+}
+void sceGxmSetBackVisibilityTestEnable(u32 context, u32 m) {
+    with(context, [&](Context& c) { c.state.visibility[1] = m == 0x4000; });
+}
+void sceGxmSetFrontVisibilityTestIndex(u32 context, u32 index) {
+    with(context, [&](Context& c) { c.state.visibility_index[0] = index & 0x3FFF; });
+}
+void sceGxmSetBackVisibilityTestIndex(u32 context, u32 index) {
+    with(context, [&](Context& c) { c.state.visibility_index[1] = index & 0x3FFF; });
+}
+void sceGxmSetFrontVisibilityTestOp(u32 context, u32 op) {
+    with(context, [&](Context& c) { c.state.visibility_set[0] = op == 0x40000; });
+}
+void sceGxmSetBackVisibilityTestOp(u32 context, u32 op) {
+    with(context, [&](Context& c) { c.state.visibility_set[1] = op == 0x40000; });
+}
+
+i32 sceGxmSetVisibilityBuffer(u32 context, u32 base, u32 stride) {
+    if (!context || !base) return err::kInvalidPointer;
+    if ((base | stride) & 15) return err::kInvalidAlignment;
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    Context* c = context_of(context);
+    if (!c) return err::kInvalidPointer;
+    if (c->in_scene) return err::kWithinScene;
+    c->visibility_buffer = base;
+    return 0;
+}
 void sceGxmSetTwoSidedEnable(u32 context, u32 m) {
     with(context, [&](Context& c) { c.state.two_sided = m == 0x800; });
 }
@@ -235,13 +268,7 @@ void sceGxmSetWClampEnable(u32 context, u32 m) {
 void sceGxmSetWBufferEnable(u32 context, u32 m) {
     with(context, [&](Context& c) { c.state.w_buffer = m == 0x4000; });
 }
-// (visibility tests, YUV profiles, user markers, validation: not modelled yet)
-void sceGxmSetFrontVisibilityTestEnable(u32, u32) {}
-void sceGxmSetBackVisibilityTestEnable(u32, u32) {}
-void sceGxmSetFrontVisibilityTestIndex(u32, u32) {}
-void sceGxmSetBackVisibilityTestIndex(u32, u32) {}
-void sceGxmSetFrontVisibilityTestOp(u32, u32) {}
-void sceGxmSetBackVisibilityTestOp(u32, u32) {}
+// (YUV profiles, user markers, validation: not modelled yet)
 i32 sceGxmSetYuvProfile(u32, u32, u32) { return 0; }
 i32 sceGxmSetUserMarker(u32, u32) { return 0; }
 void sceGxmSetValidationEnable(u32, u32) {}
@@ -357,7 +384,20 @@ nx::vector<u32> copy_words(u32 address, u32 bytes) {
     return words;
 }
 
-i32 draw(u32 context, u32 primitive, u32 index_format, u32 indices, u32 count, u32 instances) {
+// A stage's resources from a precomputed state: its default uniform buffer's words, buffers and textures.
+template <typename StateT>
+bool from_state(u32 address, u32 default_size, u32 textures, nx::vector<u32>& uniforms, u32* buffers, TextureWords* units) {
+    if (!memory().valid(address, sizeof(StateT))) return false;
+    const StateT& s = *reinterpret_cast<const StateT*>(memory().host(address));
+    uniforms = copy_words(s.default_buffer, default_size);
+    if (!memory().valid(s.block, 16 * 4 + textures * 16)) return true;
+    std::memcpy(buffers, memory().host(s.block), 16 * 4);
+    std::memcpy(units, memory().host(s.block + 16 * 4), textures * 16);
+    return true;
+}
+
+// A draw with the context's state (streams: the precomputed draw's, else the context's).
+i32 draw(u32 context, u32 primitive, u32 index_format, u32 indices, u32 count, u32 instances, const u32* streams = nullptr) {
     if (!context || !indices) return err::kInvalidPointer;
     State& st = state();
     nx::scoped_lock<nx::mutex> held(st.lock);
@@ -376,19 +416,40 @@ i32 draw(u32 context, u32 primitive, u32 index_format, u32 indices, u32 count, u
     d.index_address = indices;
     d.index_count = count;
     d.instances = instances;
-    std::memcpy(d.streams, c->streams, sizeof d.streams);
+    std::memcpy(d.streams, streams ? streams : c->streams, sizeof d.streams);
     const u32 vsize = d.vertex->program->gxp.default_uniform_buffer_size;
     const u32 fsize = d.fragment->program->gxp.default_uniform_buffer_size;
-    if (vsize && !c->vertex_default_uniforms) return err::kUniformBufferNotReserved;
-    if (fsize && !c->fragment_default_uniforms) return err::kUniformBufferNotReserved;
-    d.vertex_uniforms = copy_words(c->vertex_default_uniforms, vsize);
-    d.fragment_uniforms = copy_words(c->fragment_default_uniforms, fsize);
-    std::memcpy(d.vertex_buffers, c->vertex_buffers, sizeof d.vertex_buffers);
-    std::memcpy(d.fragment_buffers, c->fragment_buffers, sizeof d.fragment_buffers);
-    std::memcpy(d.fragment_textures, c->fragment_textures, sizeof d.fragment_textures);
-    std::memcpy(d.vertex_textures, c->vertex_textures, sizeof d.vertex_textures);
+    if (vsize && !c->vertex_state && !c->vertex_default_uniforms) return err::kUniformBufferNotReserved;
+    if (fsize && !c->fragment_state && !c->fragment_default_uniforms) return err::kUniformBufferNotReserved;
+    if (!c->vertex_state || !from_state<PrecomputedVertexState>(c->vertex_state, vsize, 4, d.vertex_uniforms,
+                                                                 d.vertex_buffers, d.vertex_textures)) {
+        d.vertex_uniforms = copy_words(c->vertex_default_uniforms, vsize);
+        std::memcpy(d.vertex_buffers, c->vertex_buffers, sizeof d.vertex_buffers);
+        std::memcpy(d.vertex_textures, c->vertex_textures, sizeof d.vertex_textures);
+    }
+    if (!c->fragment_state || !from_state<PrecomputedFragmentState>(c->fragment_state, fsize, 16, d.fragment_uniforms,
+                                                                     d.fragment_buffers, d.fragment_textures)) {
+        d.fragment_uniforms = copy_words(c->fragment_default_uniforms, fsize);
+        std::memcpy(d.fragment_buffers, c->fragment_buffers, sizeof d.fragment_buffers);
+        std::memcpy(d.fragment_textures, c->fragment_textures, sizeof d.fragment_textures);
+    }
     c->scene.draws.push_back(std::move(d));
     return 0;
+}
+
+i32 sceGxmDrawPrecomputed(u32 context, Ptr<const PrecomputedDraw> draw_object) {
+    if (!draw_object) return err::kInvalidPointer;
+    const PrecomputedDraw pd = *draw_object;
+    u32 streams[16] = {};
+    if (pd.block && memory().valid(pd.block, kPrecomputedDrawBlock)) std::memcpy(streams, memory().host(pd.block), sizeof streams);
+    return draw(context, pd.primitive, pd.index_format, pd.index_data, pd.index_count, nx::max(pd.instances, 1u), streams);
+}
+
+void sceGxmSetPrecomputedVertexState(u32 context, u32 precomputed) {
+    with(context, [&](Context& c) { c.vertex_state = precomputed; });
+}
+void sceGxmSetPrecomputedFragmentState(u32 context, u32 precomputed) {
+    with(context, [&](Context& c) { c.fragment_state = precomputed; });
 }
 
 i32 sceGxmDraw(u32 context, u32 primitive, u32 index_format, u32 indices, u32 count) {
@@ -429,6 +490,13 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xC88EB702, sceGxmSetBackLineFillLastPixelEnable),
     HLE_FUNCTION(0xE1CA72AE, sceGxmSetCullMode),
     HLE_FUNCTION(0x0DE9AEB7, sceGxmSetTwoSidedEnable),
+    HLE_FUNCTION(0x30459117, sceGxmSetFrontVisibilityTestEnable),
+    HLE_FUNCTION(0x17CF46B9, sceGxmSetBackVisibilityTestEnable),
+    HLE_FUNCTION(0x12625C34, sceGxmSetFrontVisibilityTestIndex),
+    HLE_FUNCTION(0xAE7886FE, sceGxmSetBackVisibilityTestIndex),
+    HLE_FUNCTION(0xD0E3CD9A, sceGxmSetFrontVisibilityTestOp),
+    HLE_FUNCTION(0xC83F0AB3, sceGxmSetBackVisibilityTestOp),
+    HLE_FUNCTION(0x7767EC49, sceGxmSetVisibilityBuffer),
     HLE_FUNCTION(0x70C86868, sceGxmSetRegionClip),
     HLE_FUNCTION(0x60CF708E, sceGxmSetDefaultRegionClipAndViewport),
     HLE_FUNCTION(0x3EB3380B, sceGxmSetViewport),
@@ -436,12 +504,6 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xD096336E, sceGxmSetWClampValue),
     HLE_FUNCTION(0x1BF8B853, sceGxmSetWClampEnable),
     HLE_FUNCTION(0xEED86975, sceGxmSetWBufferEnable),
-    HLE_FUNCTION(0x30459117, sceGxmSetFrontVisibilityTestEnable),
-    HLE_FUNCTION(0x17CF46B9, sceGxmSetBackVisibilityTestEnable),
-    HLE_FUNCTION(0x12625C34, sceGxmSetFrontVisibilityTestIndex),
-    HLE_FUNCTION(0xAE7886FE, sceGxmSetBackVisibilityTestIndex),
-    HLE_FUNCTION(0xD0E3CD9A, sceGxmSetFrontVisibilityTestOp),
-    HLE_FUNCTION(0xC83F0AB3, sceGxmSetBackVisibilityTestOp),
     HLE_FUNCTION(0xB32917F0, sceGxmSetYuvProfile),
     HLE_FUNCTION(0xC7A8CB77, sceGxmSetUserMarker),
     HLE_FUNCTION(0x8C6A24C9, sceGxmSetValidationEnable),
@@ -456,6 +518,9 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0x16C9D339, sceGxmSetVertexTexture),  // (_sceGxmSetVertexTexture)
     HLE_FUNCTION(0x65DD0C84, sceGxmSetUniformDataF),
     HLE_FUNCTION(0xBC059AFC, sceGxmDraw),
+    HLE_FUNCTION(0xED3F78B8, sceGxmDrawPrecomputed),
+    HLE_FUNCTION(0xB7626A93, sceGxmSetPrecomputedVertexState),
+    HLE_FUNCTION(0xF8952750, sceGxmSetPrecomputedFragmentState),
     HLE_FUNCTION(0x14C4E7D3, sceGxmDrawInstanced),
 };
 

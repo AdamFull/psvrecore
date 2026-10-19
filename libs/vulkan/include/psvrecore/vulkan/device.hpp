@@ -39,6 +39,7 @@ struct Capabilities {
     bool texture_bc = false;
     bool texture_astc = false;
     bool texture_etc2 = false;
+    bool occlusion_query_precise = false;  // (else occlusion queries may count 1 for any number of samples)
     // Reading the destination colour in the fragment shader (GXM's programmable blending): input attachments
     // with rasterization-order access (VK_EXT_ or VK_ARM_rasterization_order_attachment_access).
     bool raster_order_attachment = false;

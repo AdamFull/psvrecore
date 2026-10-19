@@ -17,7 +17,10 @@
 //   every format but the DF32M mask bits, which are not tracked: stored as the background mask).
 // - A scene without a colour surface (depth only) renders at the render target's size.
 //
-// Not yet: tiled and swizzled colour surfaces, multisampling, visibility queries.
+// - Visibility testing: an occlusion query per draw that tests it; when the scene is done, its count is added to
+//   (or, SET, sets to 1) the counter in core 0's visibility buffer (the game sums the cores' buffers).
+//
+// Not yet: tiled and swizzled colour surfaces, multisampling.
 
 #include <bit>
 #include <cmath>
@@ -885,14 +888,33 @@ void render_scene(Context& context, Scene& scene) {
         vkUpdateDescriptorSets(d.device(), writes, w, 0, nullptr);
     }
 
+    // ---- Visibility queries ----------------------------------------------------------------------------------
+    VkQueryPool queries = VK_NULL_HANDLE;
+    nx::vector<u32> query_of(plans.size(), ~0u);
+    u32 query_count = 0;
+    if (scene.visibility_buffer)
+        for (usize i = 0; i < plans.size(); ++i)
+            if (plans[i].draw->state.visibility[0]) query_of[i] = query_count++;
+    if (query_count) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qi.queryCount = query_count;
+        if (vkCreateQueryPool(d.device(), &qi, nullptr, &queries) != VK_SUCCESS) {
+            queries = VK_NULL_HANDLE;
+            query_count = 0;
+        }
+    }
+
     // ---- Commands --------------------------------------------------------------------------------------------
     vk::OneShot shot(d);
     auto cmd = shot.begin();
     if (!cmd) {
+        if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
         vkDestroyDescriptorPool(d.device(), pool, nullptr);
         cleanup();
         return;
     }
+    if (queries) vkCmdResetQueryPool(*cmd, queries, 0, query_count);
     const VkShaderStageFlags push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     bool computed = false;
     for (usize i = 0; i < plans.size(); ++i) {
@@ -974,7 +996,13 @@ void render_scene(Context& context, Scene& scene) {
             vkCmdPushConstants(*cmd, r.layout, push_stages, 0, sizeof p.constants, &p.constants);
             for (const auto& [binding, offset] : p.streams) vkCmdBindVertexBuffers(*cmd, binding, 1, &vb->buffer, &offset);
             vkCmdBindIndexBuffer(*cmd, ib->buffer, p.index_offset, p.index_type);
+            const bool query = queries && query_of[i] != ~0u;
+            // (precise: increments count samples; a set needs only whether any passed)
+            if (query)
+                vkCmdBeginQuery(*cmd, queries, query_of[i],
+                                !st.visibility_set[0] && d.caps().occlusion_query_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
             vkCmdDrawIndexed(*cmd, p.draw->index_count, p.draw->instances, 0, 0, 0);
+            if (query) vkCmdEndQuery(*cmd, queries, query_of[i]);
         }
         r.passes->end(*cmd);
     } else {
@@ -1002,6 +1030,23 @@ void render_scene(Context& context, Scene& scene) {
             for (u32 y = 0; y < height; ++y)
                 std::memcpy(memory().host(cs.data + y * stride * cf.bytes), src + usize{y} * width * cf.bytes, usize{width} * cf.bytes);
         }
+        if (queries) {
+            nx::vector<u64> counts(query_count, 0);
+            if (vkGetQueryPoolResults(d.device(), queries, 0, query_count, query_count * 8, counts.data(), 8,
+                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+                for (usize i = 0; i < plans.size(); ++i) {
+                    if (query_of[i] == ~0u) continue;
+                    const DrawState& st = plans[i].draw->state;
+                    const u32 at = scene.visibility_buffer + st.visibility_index[0] * 4;
+                    if (!memory().valid(at, 4, true)) continue;
+                    u32 v;
+                    std::memcpy(&v, memory().host(at), 4);
+                    const u64 n = counts[query_of[i]];
+                    v = st.visibility_set[0] ? (n ? 1u : v) : v + static_cast<u32>(n);
+                    std::memcpy(memory().host(at), &v, 4);
+                }
+            }
+        }
         if (store_depth && depth.image) {
             vk::invalidate(d, *depth_buf);
             const u8* src = static_cast<const u8*>(depth_buf->mapped);
@@ -1010,6 +1055,7 @@ void render_scene(Context& context, Scene& scene) {
     } else {
         nx::loge(logs::gpu, "scene: {}", done.error().message);
     }
+    if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
     vkDestroyDescriptorPool(d.device(), pool, nullptr);
     cleanup();
     if (d.validation_errors()) nx::logw(logs::gpu, "{} validation errors so far", d.validation_errors());

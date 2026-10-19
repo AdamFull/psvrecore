@@ -226,6 +226,7 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     enabled.textureCompressionBC = supported.textureCompressionBC;
     enabled.textureCompressionASTC_LDR = supported.textureCompressionASTC_LDR;
     enabled.textureCompressionETC2 = supported.textureCompressionETC2;
+    enabled.occlusionQueryPrecise = supported.occlusionQueryPrecise;
     caps.int64 = enabled.shaderInt64;
     caps.logic_op = enabled.logicOp;
     caps.sampler_anisotropy = enabled.samplerAnisotropy;
@@ -235,6 +236,7 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     caps.texture_bc = enabled.textureCompressionBC;
     caps.texture_astc = enabled.textureCompressionASTC_LDR;
     caps.texture_etc2 = enabled.textureCompressionETC2;
+    caps.occlusion_query_precise = enabled.occlusionQueryPrecise;
 
     void* chain = nullptr;
     VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};

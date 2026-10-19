@@ -19,6 +19,7 @@ add_library(psvrecore_gxm_hle STATIC
     src/hle/core.cpp
     src/hle/display.cpp
     src/hle/patcher.cpp
+    src/hle/precomputed.cpp
     src/hle/render.cpp
     src/hle/surfaces.cpp
     src/hle/textures.cpp

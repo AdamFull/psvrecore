@@ -112,6 +112,29 @@ static_assert(sizeof(DepthStencilSurface) == 20);
 // DepthStencilSurface::control bits besides the format.
 inline constexpr u32 kDsTiled = 1u << 28, kDsForceLoad = 1u << 29, kDsForceStore = 1u << 30, kDsEnabled = 1u << 31;
 
+// Precomputed objects: the game allocates these (SCE_GXM_PRECOMPUTED_*_WORD_COUNT words) and a memory block for
+// each (sceGxmGetPrecomputed*Size bytes), which holds their arrays: a draw's 16 stream addresses; a state's 16
+// uniform buffer addresses, then its texture units' control words (4 vertex, 16 fragment).
+struct PrecomputedDraw {
+    u32 vertex;  // the vertex program it was made for
+    u32 block;
+    u32 primitive, index_format, index_data, index_count, instances;
+    u32 reserved[4];
+};
+static_assert(sizeof(PrecomputedDraw) == 11 * 4);
+struct PrecomputedVertexState {
+    u32 program, block, default_buffer;
+    u32 reserved[4];
+};
+static_assert(sizeof(PrecomputedVertexState) == 7 * 4);
+struct PrecomputedFragmentState {
+    u32 program, block, default_buffer;
+    u32 reserved[6];
+};
+static_assert(sizeof(PrecomputedFragmentState) == 9 * 4);
+inline constexpr u32 kPrecomputedDrawBlock = 16 * 4;
+inline constexpr u32 kPrecomputedVertexBlock = 16 * 4 + 4 * 16, kPrecomputedFragmentBlock = 16 * 4 + 16 * 16;
+
 struct Notification {
     u32 address, value;
 };
@@ -204,6 +227,11 @@ struct DrawState {
     bool w_clamp_enabled = true;
     f32 w_clamp = 0.00001f;
     bool w_buffer = false;
+    // Visibility testing (front, back): enabled, the counter's index, set (SCE_GXM_VISIBILITY_TEST_OP_SET) or
+    // increment.
+    bool visibility[2] = {false, false};
+    u32 visibility_index[2] = {0, 0};
+    bool visibility_set[2] = {false, false};
 };
 
 // A draw as recorded in a scene: everything it needs, copied when it was made (uniform data in particular: the
@@ -227,6 +255,7 @@ struct Scene {
     bool has_depth = false;
     ValidRegion region{};
     u32 flags = 0;
+    u32 visibility_buffer = 0;  // (core 0's counters; 0: none)
     nx::vector<Draw> draws;
 };
 
@@ -243,6 +272,10 @@ struct Context {
     u32 vertex_buffers[16] = {}, fragment_buffers[16] = {};
     TextureWords fragment_textures[16] = {}, vertex_textures[4] = {};
     u32 vertex_ring_used = 0, fragment_ring_used = 0;  // (bump offsets, wrapping)
+    // Precomputed states set (guest addresses, 0: none): they replace the context's default uniform buffer,
+    // uniform buffers and textures of their stage.
+    u32 vertex_state = 0, fragment_state = 0;
+    u32 visibility_buffer = 0;  // (for the scenes begun after it is set)
 };
 
 struct DisplayEntry {
@@ -299,6 +332,7 @@ void register_patcher();
 void register_context();
 void register_textures();
 void register_transfer();
+void register_precomputed();
 
 // Writes a notification's value to its address (if any).
 void notify(Ptr<const Notification> n);
