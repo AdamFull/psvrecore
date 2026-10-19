@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,24 +48,65 @@ def libraries(project):
     return libs
 
 
+def project_items(project):
+    """A sample project's Release items: its sources, and its custom build steps (command, outputs) for shaders
+    and textures."""
+    root = ET.parse(project).getroot()
+    ns = {"m": root.tag[1:root.tag.index("}")]} if root.tag.startswith("{") else {}
+    q = (lambda tag: "m:" + tag) if ns else (lambda tag: tag)
+    sources, steps = [], []
+    for item in root.iter():
+        tag = item.tag.split("}")[-1]
+        include = item.get("Include")
+        if not include:
+            continue
+        path = (project.parent / include.replace("\\", "/")).resolve()
+        if tag == "ClCompile":
+            sources.append(path)
+        elif tag == "CustomBuild":
+            command = outputs = None
+            for child in item:
+                cond = child.get("Condition", "")
+                if "Release" not in cond:
+                    continue
+                if child.tag.endswith("Command"):
+                    command = child.text
+                elif child.tag.endswith("Outputs"):
+                    outputs = child.text
+            if command:
+                steps.append((path, command, outputs or ""))
+    return sources, steps
+
+
+def expand(text, source, sdk, work):
+    """MSBuild's item and property macros, as a sample's custom build steps use them."""
+    text = text.replace("%(RootDir)%(Directory)", str(source.parent) + "\\")
+    text = text.replace("%(Filename)", source.stem).replace("%(Extension)", source.suffix)
+    text = text.replace("%(FullPath)", str(source))
+    text = text.replace("$(SCE_PSP2_SDK_DIR)", str(sdk)).replace("$(IntDir)", str(work) + "\\")
+    return text
+
+
 def build_sample(name, sample_dir, work, sdk, env, opt):
     snc = sdk / "host_tools" / "build" / "bin" / "psp2snc.exe"
-    cgc = sdk / "host_tools" / "bin" / "psp2cgc.exe"
-    psp2bin = sdk / "host_tools" / "build" / "bin" / "psp2bin.exe"
-    objects = []
-    for cg in sorted(sample_dir.glob("*.cg")):
-        profile = "sce_vp_psp2" if cg.stem.endswith("_v") else "sce_fp_psp2"
-        gxp = work / f"{cg.stem}.gxp"
-        run([cgc, "--profile", profile, cg, "-o", gxp], env=env)
-        obj = work / f"{cg.stem}_gxp.o"
-        run([psp2bin, gxp, "-b2e", f"PSP2,_binary_{cg.stem}_gxp_start,_binary_{cg.stem}_gxp_size,4", "-o", obj], env=env)
-        objects.append(obj)
-    common = sample_dir.parent / "common"
-    for source in sorted(sample_dir.glob("*.c")) + sorted(sample_dir.glob("*.cpp")):
-        obj = work / f"{source.stem}.o"
-        run([snc, opt, "-c", source, "-o", obj, f"-I{sample_dir.as_posix()}", f"-I{common.as_posix()}"], env=env)
-        objects.append(obj)
     project = next(sample_dir.glob("*.vcxproj"))
+    sources, steps = project_items(project)
+    objects = []
+    for source, command, outputs in steps:
+        result = subprocess.run(expand(command, source, sdk, work).strip(), shell=True, env=env, cwd=work,
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.stdout.write(result.stdout)
+            sys.stderr.write(result.stderr)
+            raise SystemExit(f"failed: the custom build step of {source.name}")
+        for out in expand(outputs, source, sdk, work).split(";"):
+            out = out.strip()
+            if out.lower().endswith(".obj") and Path(out).exists():
+                objects.append(Path(out))
+    for source in sources:
+        obj = work / f"{source.parent.name}_{source.stem}.o"
+        run([snc, opt, "-c", source, "-o", obj, f"-I{sample_dir.as_posix()}"], env=env)
+        objects.append(obj)
     app = work / "app"
     (app / "sce_module").mkdir(parents=True)
     self_file = app / "eboot.bin"
