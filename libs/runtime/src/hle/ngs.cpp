@@ -9,6 +9,7 @@
 // sceNgsVoiceSetParamsBlock) take effect at the next update that does not fall within sceNgsSystemLock and
 // sceNgsSystemUnlock, as do voices started, keyed off, paused and resumed.
 
+#include <atomic>
 #include <algorithm>
 #include <memory>
 
@@ -327,6 +328,10 @@ i32 queue_change(Ngs& n, Voice& v, u32 m) {
         for (u32 ch = 0; ch < probe->param_channels(); ++ch) {
             nx::string message;
             if (!probe->check(probe->params() + ch * stride, &message)) {
+                // (the first 20 are logged; the result tells the game every time)
+                static std::atomic<u32> reported{0};
+                if (reported.fetch_add(1) < 20)
+                    nx::logw(logs::hle, "NGS: voice 0x{:08x} module {}: parameters refused, {}", v.handle, m, message);
                 v.out_of_range[m] = message;
                 return nerr::kParamOutOfRange;
             }

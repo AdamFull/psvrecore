@@ -443,8 +443,8 @@ nx::string Kernel::describe_threads() {
                             : t->state == ThreadState::Waiting ? "waiting"
                             : t->state == ThreadState::Dormant ? "dormant"
                                                                : "deleted";
-        out += nx::format("  0x{:08x} '{}': {}, priority {}, lr {:08x} sp {:08x}", static_cast<u32>(uid), t->name, state,
-                          t->priority, t->ctx.r[14], t->ctx.r[13]);
+        out += nx::format("  0x{:08x} '{}': {}, priority {}, affinity 0x{:x}, cpu {}, lr {:08x} sp {:08x}", static_cast<u32>(uid),
+                          t->name, state, t->priority, static_cast<u32>(t->affinity), t->cpu, t->ctx.r[14], t->ctx.r[13]);
         if (t->state == ThreadState::Waiting) {
             const auto it = impl_->objects.find(t->wait.object);
             out += nx::format(" (wait type 0x{:x} on 0x{:08x} '{}')", static_cast<u32>(t->wait.type),
