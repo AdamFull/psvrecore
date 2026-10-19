@@ -124,7 +124,8 @@ def main():
         if ref is None:
             rejected += 1
             continue
-        mine = [l for l in got.get(f, []) if not l.startswith('input ')]  # (libgxm has no function for these)
+        # (libgxm has no function for input records and output layouts)
+        mine = [l for l in got.get(f, []) if not l.startswith('input ') and not l.startswith('outputs ')]
         if ref == mine:
             same += 1
         elif shown < args.show:

@@ -77,6 +77,31 @@ std::optional<usize> Gxp::find(Semantic wanted, u32 index) const {
     return std::nullopt;
 }
 
+VertexOutputLayout vertex_output_layout(const Gxp& g) {
+    VertexOutputLayout l;
+    i32 at = 0;
+    auto take = [&](u32 bit, u32 count) -> i32 {
+        if (!(g.vertex_outputs & bit)) return -1;
+        const i32 first = at;
+        at += static_cast<i32>(count);
+        return first;
+    };
+    l.position = take(varying::kPosition, 4);
+    l.color[0] = take(varying::kColor0, 4);
+    l.color[1] = take(varying::kColor1, 4);
+    l.fog = take(varying::kFog, 2);
+    for (u32 k = 0; k < 10; ++k) {
+        const u32 size = (g.vertex_texcoord_sizes >> (3 * k)) & 7;
+        const u32 count = size == 7 ? 4 : size == 3 ? 3 : 2;
+        l.texcoord[k] = take(varying::kTexCoord0 << k, count);
+        l.texcoord_registers[k] = l.texcoord[k] >= 0 ? static_cast<u8>(count) : 0;
+    }
+    l.point_size = take(varying::kPointSize, 1);
+    for (u32 k = 0; k < 8; ++k) l.clip[k] = take(varying::kClip0 << k, 1);
+    l.registers = static_cast<u32>(at);
+    return l;
+}
+
 Result<Gxp> parse_gxp(std::span<const u8> data) {
     io::ByteReader r(data);
     if (data.size() < 0x68 || r.le<u32>(0) != kMagic) return failure("not a GXP file");
@@ -118,6 +143,8 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
         for (u32 k = 0; k < 10; ++k)
             if ((coords >> (3 * k)) & 7) out |= varying::kTexCoord0 << k;
         g.vertex_outputs = out;
+        g.vertex_texcoord_sizes = coords & 0x3FFFFFFFu;
+        g.vertex_output_registers = flags4 >> 24;
     } else {
         const u32 format = r.le<u32>(varyings + 0x08);
         g.output_type = static_cast<ParameterType>((format >> 16) & 0xF);

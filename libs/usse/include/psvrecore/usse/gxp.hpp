@@ -111,6 +111,9 @@ struct Gxp {
     bool discard = false, depth_replace = false, sprite_coord = false, native_color = false, frag_color = false;
     u32 default_uniform_buffer_size = 0;  // bytes
     u32 vertex_outputs = 0;  // varying:: mask (vertex programs)
+    // Where a vertex program writes its outputs (vertex_output_layout()).
+    u32 vertex_texcoord_sizes = 0;  // 3 bits per texture coordinate: 1 two registers, 3 three, 7 four
+    u32 vertex_output_registers = 0;  // all the outputs
     u32 fragment_inputs = 0;  // varying:: mask (fragment programs)
     nx::vector<FragmentInput> inputs;  // (fragment programs, in their order in the primary attributes)
     // The fragment program's output register format (fragment programs only).
@@ -129,6 +132,18 @@ struct Gxp {
     std::optional<usize> find(Semantic semantic, u32 index) const;
     const Container* container(u16 index) const;
 };
+
+// A vertex program's outputs in its output registers, in this order (checked with the shader compiler's programs):
+// the position (four), colours 0 and 1 (four each), fog (two), texture coordinates 0-9 (two for one or two
+// components, three, or four), the point size (one), then each clip plane used (one). Every register holds an f32,
+// whatever the output's declared precision. The first register of each output (-1 where it is not written).
+struct VertexOutputLayout {
+    i32 position = -1, color[2] = {-1, -1}, fog = -1, texcoord[10] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    u8 texcoord_registers[10] = {};
+    i32 point_size = -1, clip[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    u32 registers = 0;
+};
+VertexOutputLayout vertex_output_layout(const Gxp& g);
 
 // Whether libgxm accepts the program: "GXP\0" and version 1.4 or 1.5 (sceGxmProgramCheck).
 bool gxp_valid(std::span<const u8> data);
