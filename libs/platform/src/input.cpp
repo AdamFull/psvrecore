@@ -76,9 +76,10 @@ bool InputMapper::to_panel(f32 wx, f32 wy, i16* px, i16* py) const {
 
 runtime::PadState InputMapper::combine() const {
     runtime::PadState s;
-    s.buttons = keys_;
-    // (the stick furthest from rest wins, over all gamepads)
+    s.buttons = keys_ | controls_.buttons();
+    // (the stick furthest from rest wins, over all gamepads and the on-screen ones)
     auto further = [](u8 a, u8 b) { return std::abs(static_cast<i32>(b) - 128) > std::abs(static_cast<i32>(a) - 128) ? b : a; };
+    s.lx = controls_.lx(), s.ly = controls_.ly(), s.rx = controls_.rx(), s.ry = controls_.ry();
     for (const auto& [id, g] : gamepads_) {
         s.buttons |= g.buttons | (g.l_trigger ? kL : 0) | (g.r_trigger ? kR : 0);
         s.lx = further(s.lx, g.lx), s.ly = further(s.ly, g.ly);
@@ -99,6 +100,11 @@ runtime::TouchState InputMapper::touches() const {
 
 bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) {
     bool pad = false, touch = false;
+    switch (e.type) {
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_KEY_DOWN: controls_.other_input(); break;  // (auto: the on-screen controls go)
+        default: break;
+    }
     switch (e.type) {
         case SDL_EVENT_GAMEPAD_ADDED: gamepads_[e.gdevice.which] = Gamepad{}; break;
         case SDL_EVENT_GAMEPAD_REMOVED:
@@ -159,9 +165,21 @@ bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) 
         case SDL_EVENT_FINGER_UP:
         case SDL_EVENT_FINGER_CANCELED: {
             const u64 id = e.tfinger.fingerID;
+            const f32 wx = e.tfinger.x * window_w_, wy = e.tfinger.y * window_h_;
+            // (the on-screen controls first: a finger down on one is that control's until it is lifted)
+            if (e.type == SDL_EVENT_FINGER_DOWN) {
+                controls_.touched();
+                if (controls_.finger_down(id, wx, wy)) {
+                    pad = true;
+                    break;
+                }
+            } else if (e.type == SDL_EVENT_FINGER_MOTION ? controls_.finger_move(id, wx, wy) : controls_.finger_up(id)) {
+                pad = true;
+                break;
+            }
             auto it = std::find_if(fingers_.begin(), fingers_.end(), [&](const Finger& f) { return f.id == id; });
             i16 px, py;
-            const bool inside = to_panel(e.tfinger.x * window_w_, e.tfinger.y * window_h_, &px, &py);
+            const bool inside = to_panel(wx, wy, &px, &py);
             if (e.type == SDL_EVENT_FINGER_UP || e.type == SDL_EVENT_FINGER_CANCELED || !inside) {
                 if (it != fingers_.end()) fingers_.erase(it), touch = true;
             } else if (it != fingers_.end()) {

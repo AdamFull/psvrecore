@@ -21,6 +21,7 @@ add_library(psvrecore_platform STATIC
     src/audio.cpp
     src/input.cpp
     src/quads.cpp
+    src/touch_controls.cpp
     src/window.cpp
 )
 add_library(psvrecore::platform ALIAS psvrecore_platform)

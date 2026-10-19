@@ -42,6 +42,10 @@ public:
         i32 gpu = -1;            // vulkan::DeviceOptions::gpu
         bool validation = false;
         bool hidden = false;     // (tests)
+        // The on-screen controls: shown once the screen is touched (Auto; at once on Android), always or never.
+        TouchControls::Mode controls = TouchControls::Mode::Auto;
+        f32 controls_opacity = 0.5f;
+        f32 controls_scale = 1.0f;
     };
 
     static Result<std::unique_ptr<Window>> open(const Options& options);
@@ -84,6 +88,7 @@ private:
     struct Presenter;
     Window() = default;
     void update_view();
+    void update_overlay();
 
     SDL_Window* window_ = nullptr;
     Options options_;
@@ -92,6 +97,7 @@ private:
     std::unique_ptr<Presenter> presenter_;
     std::atomic<u64> presented_{0};
     bool closed_ = false;
+    u64 overlay_version_ = 0;
 };
 
 }  // namespace psvrecore::platform

@@ -7,10 +7,12 @@
 //   and both sticks.
 // - Keyboard: arrows the d-pad, Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift Select.
 // - The mouse's left button, and fingers on a touch screen, touch the front panel where they are over the picture
-//   (the view: where the frame is drawn in the window).
+//   (the view: where the frame is drawn in the window); a finger that goes down on an on-screen control
+//   (TouchControls, when they are shown) is that control's instead.
 //
 // Every change is stamped with the kernel's clock when the event happened.
 
+#include "psvrecore/platform/touch_controls.hpp"
 #include "psvrecore/runtime/input.hpp"
 #include "core/foundation/containers/hash_map.h"
 #include "core/foundation/core/foundation.h"
@@ -21,8 +23,11 @@ namespace psvrecore::platform {
 
 class InputMapper {
 public:
-    // The window's size and the rectangle the picture fills in it (pixels), for touches.
+    // The window's size and the rectangle the picture fills in it (its coordinates), for touches.
     void set_view(f32 window_w, f32 window_h, f32 x, f32 y, f32 w, f32 h);
+    // The on-screen controls (laid out by the window).
+    TouchControls& controls() { return controls_; }
+    const TouchControls& controls() const { return controls_; }
     // Takes an event (from the thread that pumps them); true if it changed the controls.
     bool handle(const SDL_Event& event, runtime::Input& input, u64 now_ns);
 
@@ -49,6 +54,7 @@ private:
     nx::vector<Finger> fingers_;
     u8 next_report_id_ = 1;
     runtime::TouchState touch_;
+    TouchControls controls_;
     f32 window_w_ = 960, window_h_ = 544, view_x_ = 0, view_y_ = 0, view_w_ = 960, view_h_ = 544;
 
     bool to_panel(f32 wx, f32 wy, i16* px, i16* py) const;

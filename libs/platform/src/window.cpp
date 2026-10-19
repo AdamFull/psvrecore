@@ -566,8 +566,23 @@ Result<std::unique_ptr<Window>> Window::open(const Options& options) {
     w->presenter_->device = std::move(*device);
     w->presenter_->vsync = options.vsync;
     w->presenter_->smooth = options.smooth;
+    // (the on-screen controls: their atlas once, their quads as they change)
+    TouchControls& controls = w->input_.controls();
+    controls.set_mode(options.controls);
+    controls.set_opacity(options.controls_opacity);
+    controls.set_scale(options.controls_scale);
+#if defined(__ANDROID__)
+    controls.touched();  // (a touch screen: shown from the start)
+#endif
     w->update_view();
     if (auto r = w->presenter_->init(); !r) return failure(nx::format("display: {}", r.error().message));
+    {
+        nx::vector<u8> atlas;
+        u32 aw = 0, ah = 0;
+        TouchControls::atlas(&atlas, &aw, &ah);
+        w->set_overlay_atlas(atlas.data(), aw, ah);
+        w->update_overlay();
+    }
     nx::logi(logs::display, "display: window on {}", w->presenter_->device->properties().deviceName);
     return w;
 }
@@ -585,6 +600,12 @@ void Window::update_view() {
     SDL_GetWindowSizeInPixels(window_, &pw, &ph);
     const Rect v = fit(static_cast<f32>(w), static_cast<f32>(h));
     input_.set_view(static_cast<f32>(w), static_cast<f32>(h), v.x, v.y, v.w, v.h);
+    SDL_Rect safe{0, 0, w, h};
+    if (!SDL_GetWindowSafeArea(window_, &safe)) safe = SDL_Rect{0, 0, w, h};
+    input_.controls().layout(static_cast<f32>(w), static_cast<f32>(h), w > 0 ? static_cast<f32>(pw) / w : 1.0f,
+                             static_cast<f32>(safe.x), static_cast<f32>(safe.y), static_cast<f32>(safe.w),
+                             static_cast<f32>(safe.h));
+    update_overlay();
     if (presenter_) {
         presenter_->pixel_w.store(static_cast<u32>(std::max(pw, 0)));
         presenter_->pixel_h.store(static_cast<u32>(std::max(ph, 0)));
@@ -599,7 +620,15 @@ bool Window::pump(runtime::Runtime* rt, u32 wait_ms) {
         handle(e, rt);
         got = SDL_PollEvent(&e);
     }
+    update_overlay();
     return !closed_;
+}
+
+void Window::update_overlay() {
+    const TouchControls& controls = input_.controls();
+    if (!presenter_ || controls.version() == overlay_version_) return;
+    overlay_version_ = controls.version();
+    set_overlay(controls.quads());
 }
 
 void Window::handle(const SDL_Event& e, runtime::Runtime* rt) {

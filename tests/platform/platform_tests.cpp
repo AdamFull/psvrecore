@@ -11,6 +11,7 @@
 #include "nxtest.h"
 #include "psvrecore/platform/audio.hpp"
 #include "psvrecore/platform/input.hpp"
+#include "psvrecore/platform/touch_controls.hpp"
 #include "psvrecore/platform/window.hpp"
 #include "psvrecore/vulkan/device.hpp"
 #include "core/foundation/platform/filesystem.h"
@@ -456,4 +457,94 @@ TEST_CASE("window: overlay quads are blended over the picture, cut from their at
         SDL_Delay(1);
     }
     CHECK(gone);
+}
+
+TEST_CASE("touch controls: buttons, slides, the d-pad's diagonals, sticks, auto showing and hiding") {
+    TouchControls c;
+    // A phone's 2410 x 1080 screen with a notch on the left (the safe area starts at 172).
+    c.layout(2410, 1080, 1.0f, 172, 0, 2238, 1080);
+    const f32 u = 1080 * 0.95f / 7.5f;
+    const f32 face_x = 2410 - 2.1f * u, face_y = 1080 - 2.0f * u, dpad_x = 172 + 2.1f * u, dpad_y = 1080 - 2.0f * u;
+    CHECK_FALSE(c.visible());  // (auto: until the screen is touched)
+    CHECK_FALSE(c.finger_down(1, face_x, face_y + 1.05f * u));
+    c.touched();
+    REQUIRE(c.visible());
+    const u64 v0 = c.version();
+    // Cross, then the same finger slid to Circle.
+    REQUIRE(c.finger_down(1, face_x, face_y + 1.05f * u));
+    CHECK(c.buttons() == kCross);
+    CHECK(c.version() != v0);
+    REQUIRE(c.finger_move(1, face_x + 1.05f * u, face_y));
+    CHECK(c.buttons() == kCircle);
+    // A second finger on the d-pad, up and to the right: both.
+    REQUIRE(c.finger_down(2, dpad_x + 0.8f * u, dpad_y - 0.8f * u));
+    CHECK(c.buttons() == (kCircle | kUp | 1u << 5));
+    REQUIRE(c.finger_move(2, dpad_x - u, dpad_y + 0.05f * u));
+    CHECK(c.buttons() == (kCircle | kLeft));
+    // (a gamepad or a key while fingers are down does not hide them)
+    c.other_input();
+    CHECK(c.visible());
+    CHECK(c.finger_up(1));
+    CHECK(c.finger_up(2));
+    CHECK(c.buttons() == 0);
+    // The left stick, dragged right past its edge: all the way, and back to rest when let go.
+    const f32 stick_y = 1080 - 5.1f * u;
+    REQUIRE(c.finger_down(3, dpad_x, stick_y));
+    CHECK(c.lx() == 128);
+    c.finger_move(3, dpad_x + 3 * u, stick_y);
+    CHECK(c.lx() == 255);
+    CHECK(c.ly() == 128);
+    c.finger_up(3);
+    CHECK(c.lx() == 128);
+    // L at the top left, Start at the bottom middle: their bits.
+    REQUIRE(c.finger_down(4, 172 + 1.6f * u, 0.7f * u));
+    CHECK(c.buttons() == kL);
+    c.finger_up(4);
+    REQUIRE(c.finger_down(5, 172 + 2238 / 2.0f + 1.3f * u, 1080 - 0.6f * u));
+    CHECK(c.buttons() == kStart);
+    c.finger_up(5);
+    // The middle of the screen is no control's.
+    CHECK_FALSE(c.finger_down(6, 1205, 400));
+    // Drawn while shown; nothing once a gamepad is used.
+    CHECK(c.quads().size() > 20);
+    c.other_input();
+    CHECK_FALSE(c.visible());
+    CHECK(c.quads().empty());
+    // Never: not even when touched.
+    c.set_mode(TouchControls::Mode::Never);
+    c.touched();
+    CHECK_FALSE(c.visible());
+    c.set_mode(TouchControls::Mode::Always);
+    CHECK(c.visible());
+    nx::vector<u8> atlas;
+    u32 aw = 0, ah = 0;
+    TouchControls::atlas(&atlas, &aw, &ah);
+    CHECK(aw * ah * 4 == atlas.size());
+    usize opaque = 0;
+    for (usize i = 3; i < atlas.size(); i += 4) opaque += atlas[i] > 200;
+    CHECK(opaque > aw * ah / 20);  // (shapes in it)
+}
+
+TEST_CASE("input: fingers on the on-screen controls press them; others touch the panel") {
+    InputMapper m;
+    runtime::Input input;
+    m.set_view(2410, 1080, 252, 0, 1906, 1080);
+    m.controls().layout(2410, 1080, 1.0f, 172, 0, 2238, 1080);
+    const f32 u = 1080 * 0.95f / 7.5f;
+    const f32 cross_x = 2410 - 2.1f * u, cross_y = 1080 - 2.0f * u + 1.05f * u;
+    // The first touch shows them and, being on Cross, presses it; the panel is not touched.
+    CHECK(m.handle(finger(SDL_EVENT_FINGER_DOWN, 10, cross_x / 2410, cross_y / 1080), input, 100));
+    CHECK(m.controls().visible());
+    CHECK(m.pad().buttons == kCross);
+    CHECK(m.touch().count == 0);
+    // Another finger in the middle of the picture touches the panel.
+    CHECK(m.handle(finger(SDL_EVENT_FINGER_DOWN, 11, 0.5f, 0.5f), input, 110));
+    CHECK(m.touch().count == 1);
+    CHECK(m.pad().buttons == kCross);
+    m.handle(finger(SDL_EVENT_FINGER_UP, 10, cross_x / 2410, cross_y / 1080), input, 120);
+    CHECK(m.pad().buttons == 0);
+    CHECK(input.pad_sample(99, 105).buttons == kCross);
+    // A key press hides them (with no finger on them).
+    m.handle(key(SDLK_Z, true), input, 130);
+    CHECK_FALSE(m.controls().visible());
 }
