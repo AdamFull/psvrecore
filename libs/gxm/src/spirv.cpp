@@ -95,6 +95,11 @@ Id Builder::t_struct(std::initializer_list<Id> members) {
     return id;
 }
 
+Id Builder::t_image(Id sampled_type, u32 dim, u32 depth, u32 arrayed, u32 multisampled, u32 sampled, u32 format) {
+    return type(SpvOpTypeImage, {sampled_type, dim, depth, arrayed, multisampled, sampled, format});
+}
+Id Builder::t_sampled_image(Id image) { return type(SpvOpTypeSampledImage, {image}); }
+
 Id Builder::t_pointer(u32 storage, Id t) { return type(SpvOpTypePointer, {storage, t}); }
 
 Id Builder::t_function(Id result, std::initializer_list<Id> params) {

@@ -40,6 +40,9 @@ public:
     Id t_struct(std::initializer_list<Id> members);  // (not deduplicated: structs carry decorations)
     Id t_pointer(u32 storage, Id type);
     Id t_function(Id result, std::initializer_list<Id> params = {});
+    // OpTypeImage (dim: SpvDim*, sampled: 1 with a sampler, 2 storage or subpass data; format: SpvImageFormat*).
+    Id t_image(Id sampled_type, u32 dim, u32 depth, u32 arrayed, u32 multisampled, u32 sampled, u32 format);
+    Id t_sampled_image(Id image);
 
     // Constants (deduplicated).
     Id c_uint(u32 v);
