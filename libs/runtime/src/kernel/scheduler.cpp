@@ -299,7 +299,8 @@ void Kernel::end_blocking() {
     if (t->terminate) throw ThreadExit{err::kWaitCancel};
 }
 
-u64 Kernel::process_time() const { return (nx::os::ticks_ns() - impl_->start_ns) / 1000; }
+u64 Kernel::process_time() const { return clock_ns() / 1000; }
+u64 Kernel::clock_ns() const { return nx::os::ticks_ns() - impl_->start_ns; }
 
 void Kernel::shutdown() {
     if (!impl_) return;

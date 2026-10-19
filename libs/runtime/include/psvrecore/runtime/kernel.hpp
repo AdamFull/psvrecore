@@ -222,6 +222,9 @@ public:
     void checkpoint();
     // Microseconds since the kernel started (the process time).
     u64 process_time() const;
+    // Nanoseconds since the kernel started: the clock every guest-visible time comes from (process time, the
+    // display's vertical blanks, audio output, input timestamps), so they share one epoch.
+    u64 clock_ns() const;
     // Around host work that blocks (file I/O): the calling thread gives its CPU to others meanwhile, as a thread
     // waiting for a device does on the console, and takes one back after.
     void begin_blocking();

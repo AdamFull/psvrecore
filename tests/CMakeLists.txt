@@ -56,6 +56,7 @@ psvrecore_generated_code(psvrecore_runtime_test_guest)
 
 add_executable(psvrecore_runtime_tests
     "${_nxtest_dir}/nxtest.cpp"
+    runtime/audio_tests.cpp
     runtime/hle_tests.cpp
     runtime/kernel_tests.cpp
 )

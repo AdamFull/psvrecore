@@ -22,10 +22,8 @@ static_assert(sizeof(CtrlData) == 32);
 
 u32 g_sampling_mode = 0;  // SCE_CTRL_MODE_DIGITAL
 
-u64 now_us() {
-    using namespace std::chrono;
-    return static_cast<u64>(duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count());
-}
+// (timestamps: microseconds of the process time, the epoch every guest-visible time shares)
+u64 now_us() { return kernel().process_time(); }
 
 i32 read(i32 port, Ptr<CtrlData> data, i32 count, bool negative) {
     if (port != 0 && port != 1) return kCtrlInvalidArg;

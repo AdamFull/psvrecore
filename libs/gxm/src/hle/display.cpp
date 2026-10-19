@@ -23,7 +23,6 @@ struct Display {
     nx::mutex lock;
     DisplayFrameBuf current{};
     bool shown = false;
-    u64 epoch_ns = 0;  // (the first vertical blank)
 };
 
 Display& display() {
@@ -33,13 +32,8 @@ Display& display() {
 
 f64 period_ns() { return 1e9 / state().options->refresh_hz; }
 
-u64 now_ns() {
-    Display& d = display();
-    const u64 now = nx::os::ticks_ns();
-    nx::scoped_lock<nx::mutex> held(d.lock);
-    if (!d.epoch_ns) d.epoch_ns = now;
-    return now - d.epoch_ns;
-}
+// (the kernel's clock: vertical blanks count from the process's start, the epoch every guest-visible time shares)
+u64 now_ns() { return runtime::runtime().kernel().clock_ns(); }
 
 u64 vcount_at(u64 t) { return static_cast<u64>(static_cast<f64>(t) / period_ns()); }
 

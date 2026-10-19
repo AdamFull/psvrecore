@@ -3,6 +3,7 @@
 // The runtime of one guest process: its memory, kernel, files and modules. There is one per host process (the
 // system library implementations reach it through runtime()); tests create and destroy them one after another.
 
+#include "psvrecore/runtime/audio.hpp"
 #include "psvrecore/runtime/filesystem.hpp"
 #include "psvrecore/runtime/kernel.hpp"
 #include "psvrecore/runtime/loader.hpp"
@@ -26,6 +27,7 @@ public:
         FileSystem::Config files{};
         u64 user_memory_budget = 0x10000000u;  // what memory blocks of main memory may total (256 MiB)
         u64 cdram_budget = 0x08000000u;        // and of CDRAM (128 MiB)
+        AudioSink* audio = nullptr;            // where audio output goes (none: it is paced and dropped)
     };
 
     explicit Runtime(const Config& config);

@@ -38,5 +38,6 @@ void register_modulemgr();
 void register_rtc();
 void register_fios2();
 void register_ctrl();
+void register_audioout();
 
 }  // namespace psvrecore::runtime::hle

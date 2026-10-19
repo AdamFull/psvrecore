@@ -22,15 +22,17 @@ inline constexpr u32 kSceLibKernel = 0xCAE9ACE6, kSceThreadmgr = 0x859A24B1, kSc
 // A runtime, with the calling (test) thread adopted as a guest thread so it can make kernel calls.
 struct TestRuntime {
     Runtime rt;
-    explicit TestRuntime(u32 cpus = kernel::kUserCpuCount, i32 priority = kernel::kGamePriority) : rt(config(cpus)) {
+    explicit TestRuntime(u32 cpus = kernel::kUserCpuCount, i32 priority = kernel::kGamePriority, AudioSink* audio = nullptr)
+        : rt(config(cpus, audio)) {
         if (rt.ok()) rt.kernel().adopt_host_thread("test main", priority);
     }
     ~TestRuntime() {
         if (rt.ok()) rt.kernel().release_host_thread();
     }
-    static Runtime::Config config(u32 cpus) {
+    static Runtime::Config config(u32 cpus, AudioSink* audio) {
         Runtime::Config c;
         c.kernel.cpu_count = cpus;
+        c.audio = audio;
         return c;
     }
     PsvContext* ctx() { return &Kernel::current()->ctx; }
