@@ -12,6 +12,10 @@ target_compile_definitions(psvrecore_volk PUBLIC VK_NO_PROTOTYPES)
 add_library(psvrecore_vulkan STATIC
     src/compute.cpp
     src/device.cpp
+    src/frames.cpp
+    src/pipelines.cpp
+    src/rendering.cpp
+    src/resources.cpp
     src/vma.cpp
 )
 add_library(psvrecore::vulkan ALIAS psvrecore_vulkan)

@@ -116,7 +116,7 @@ Result<void> run_compute(Device& device, std::span<const u32> spirv, std::span<c
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    if (auto r = check("vkQueueSubmit", vkQueueSubmit(device.queue(), 1, &submit, fence)); !r) return r;
+    if (auto r = check("vkQueueSubmit", device.submit(submit, fence)); !r) return r;
     if (auto r = check("vkWaitForFences", vkWaitForFences(dev, 1, &fence, VK_TRUE, 30'000'000'000ull)); !r) return r;
     return {};
 }
