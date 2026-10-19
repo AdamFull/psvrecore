@@ -34,9 +34,10 @@ add_executable(psvrecore_tests
     simd_tests.cpp
     usse_tests.cpp
     usse_interp_tests.cpp
+    gxm_translate_tests.cpp
 )
 target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")
-target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::usse psvrecore::usse_interp psvrecore::interp psvrecore_fuzz_code
+target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code
                                               nx::foundation zlib-ng::zlibstatic)
 psvrecore_target_defaults(psvrecore_tests)
 

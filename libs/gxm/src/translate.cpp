@@ -1,0 +1,1234 @@
+// The USSE to SPIR-V translator. It follows the reference interpreter (libs/usse/src/interp.cpp) operation for
+// operation: the same lanes, conversions and orders of evaluation, so that the interpreter's checked semantics carry
+// over. Where the two differ it says so here:
+// - an instruction under a predicate computes its results and writes them with a select (no branches);
+// - an indexed register outside its bank is clamped to the bank (the interpreter fails);
+// - transcendental functions and division are the GPU's, within Vulkan's precision rather than correctly rounded;
+// - a load outside the memory buffer, or a sample of a missing texture, gives zeros (the interpreter fails).
+
+#include "psvrecore/gxm/translate.hpp"
+
+#include <bit>
+
+#include "core/foundation/strings/format.h"
+#include "psvrecore/gxm/spirv.hpp"
+#include "spirv/unified1/GLSL.std.450.h"
+#include "spirv/unified1/spirv.h"
+
+namespace psvrecore::gxm {
+
+namespace {
+
+using spirv::Id;
+using usse::Bank;
+using usse::Comp;
+using usse::Cond;
+using usse::Decoded;
+using usse::Factor;
+using usse::Instruction;
+using usse::Op;
+using usse::Operand;
+using usse::Part;
+using usse::Pred;
+using usse::SopTerm;
+using usse::TestMode;
+using usse::TexDim;
+using usse::Type;
+
+constexpr u32 kBankSize = 256;
+constexpr u32 kMaxSteps = 1'000'000;  // (blocks run, not instructions)
+
+u32 width_of(Type t) {
+    switch (t) {
+        case Type::F16:
+        case Type::I16:
+        case Type::U16:
+        case Type::S16: return 16;
+        case Type::I8:
+        case Type::U8:
+        case Type::S8:
+        case Type::O8:
+        case Type::Fx8: return 8;
+        case Type::Fx10: return 10;
+        default: return 32;
+    }
+}
+
+bool is_float(Type t) { return t == Type::F32 || t == Type::F16; }
+
+u32 lowest_lane(u8 mask) { return mask ? static_cast<u32>(std::countr_zero(static_cast<u32>(mask))) : 0; }
+
+// A register lane: a pointer to its word and its bit range (see interp.cpp).
+struct Slot {
+    Id ptr = 0;
+    u8 shift = 0;
+    u8 bits = 32;
+    u8 value_bits = 32;
+    bool clear = false;
+};
+
+struct Pending {
+    Slot slot;
+    Id value;
+    Id cond;  // the instruction's predicate (0: none)
+};
+
+// A bank of registers: a function-scope array, sized by the registers the program names (all of the bank when it
+// indexes it).
+struct BankVar {
+    Id var = 0;
+    u32 used = 0;
+    u32 minimum = 0;
+    bool dynamic = false;
+};
+
+class Translator {
+public:
+    Translator(const usse::Gxp& gxp, std::span<const Decoded> program) : gxp_(gxp), program_(program) {}
+
+    Result<nx::vector<u32>> translate();
+
+private:
+    // ---- Helpers -------------------------------------------------------------------------------------------------
+
+    Id u(u32 v) { return b_.c_uint(v); }
+    Id s(i32 v) { return b_.c_int(v); }
+    Id f(f32 v) { return b_.c_float(v); }
+    Id tl() {
+        int64_ = true;
+        return b_.t_int64();
+    }
+    Id l(i64 v) {
+        int64_ = true;
+        return b_.c_int64(v);
+    }
+
+    Id bin(u32 opcode, Id type, Id a, Id c) { return b_.op(opcode, type, {a, c}); }
+    Id un(u32 opcode, Id type, Id a) { return b_.op(opcode, type, {a}); }
+    Id iadd(Id a, Id c) { return bin(SpvOpIAdd, tu_, a, c); }
+    Id isub(Id a, Id c) { return bin(SpvOpISub, tu_, a, c); }
+    Id imul(Id a, Id c) { return bin(SpvOpIMul, tu_, a, c); }
+    Id band(Id a, Id c) { return bin(SpvOpBitwiseAnd, tu_, a, c); }
+    Id bor(Id a, Id c) { return bin(SpvOpBitwiseOr, tu_, a, c); }
+    Id bxor(Id a, Id c) { return bin(SpvOpBitwiseXor, tu_, a, c); }
+    Id shl(Id a, Id c) { return bin(SpvOpShiftLeftLogical, tu_, a, c); }
+    Id shr(Id a, Id c) { return bin(SpvOpShiftRightLogical, tu_, a, c); }
+    Id ieq(Id a, Id c) { return bin(SpvOpIEqual, tb_, a, c); }
+    Id ine(Id a, Id c) { return bin(SpvOpINotEqual, tb_, a, c); }
+    Id cast(Id type, Id v) { return un(SpvOpBitcast, type, v); }
+    Id sel(Id type, Id c, Id a, Id d) { return b_.op(SpvOpSelect, type, {c, a, d}); }
+    Id land(Id a, Id c) { return bin(SpvOpLogicalAnd, tb_, a, c); }
+    Id lor(Id a, Id c) { return bin(SpvOpLogicalOr, tb_, a, c); }
+    Id lnot(Id a) { return un(SpvOpLogicalNot, tb_, a); }
+    // Floating point, each operation rounded on its own.
+    Id exact(Id id) {
+        b_.decorate(id, SpvDecorationNoContraction);
+        return id;
+    }
+    Id fadd(Id a, Id c) { return exact(bin(SpvOpFAdd, tf_, a, c)); }
+    Id fsub(Id a, Id c) { return exact(bin(SpvOpFSub, tf_, a, c)); }
+    Id fmul(Id a, Id c) { return exact(bin(SpvOpFMul, tf_, a, c)); }
+    Id fdiv(Id a, Id c) { return exact(bin(SpvOpFDiv, tf_, a, c)); }
+    Id ext(Id type, u32 instruction, std::initializer_list<Id> operands) {
+        return b_.ext(type, instruction, operands);
+    }
+    Id load(Id type, Id ptr) { return b_.op(SpvOpLoad, type, {ptr}); }
+    void store(Id ptr, Id v) { b_.op0(SpvOpStore, {ptr, v}); }
+    Id chain(Id ptr_type, Id base, std::initializer_list<Id> index) {
+        nx::vector<u32> words{base};
+        words.insert(words.end(), index.begin(), index.end());
+        return b_.op(SpvOpAccessChain, ptr_type, words);
+    }
+    Id buffer_word(Id buffer, Id index) { return chain(tp_su_, buffer, {u(0), index}); }
+
+    // Signed values of the low `bits` of v (as i32).
+    Id sext(Id v, u32 bits) {
+        if (bits == 32) return cast(ti_, v);
+        return b_.op(SpvOpBitFieldSExtract, ti_, {cast(ti_, v), u(0), u(bits)});
+    }
+    Id mask(Id v, u32 bits) { return bits == 32 ? v : band(v, u((1u << bits) - 1)); }
+    // i32 or u32 (as a 32-bit value) to i64.
+    Id to64s(Id v32) { return un(SpvOpSConvert, tl(), v32); }
+    Id to64u(Id v32) {
+        int64_ = true;
+        return cast(tl(), un(SpvOpUConvert, b_.t_uint64(), v32));
+    }
+    Id to32(Id v64) { return un(SpvOpUConvert, tu_, cast(b_.t_uint64(), v64)); }
+
+    // IEEE half conversions: from_half exactly; to_half as the interpreter's (round to nearest even), on the bits.
+    Id from_half(Id h) {
+        const Id pair = ext(b_.t_vector(tf_, 2), GLSLstd450UnpackHalf2x16, {h});
+        return b_.op(SpvOpCompositeExtract, tf_, {pair, 0});
+    }
+    Id to_half(Id x);
+
+    bool fail(nx::string message) {
+        if (error_.empty()) error_ = nx::format("word {}: {}", word_, message);
+        return false;
+    }
+
+    // ---- Registers -----------------------------------------------------------------------------------------------
+
+    Id reg_index(const Operand& o, i64 word, u32 size, BankVar* bank);
+    Id word_ptr(const Operand& o, i64 word, bool write);
+    Slot slot(const Operand& o, u32 c, u32 bits, bool write);
+    Id raw(const Operand& o, u32 lane, Type t);
+    Id fval(const Operand& o, u32 lane, Type t);
+    void put(const Operand& d, u32 lane, Type t, Id value);
+    void putf(const Operand& d, u32 lane, Type t, Id v) { put(d, lane, t, t == Type::F16 ? to_half(cast(tu_, v)) : cast(tu_, v)); }
+    void commit();
+    // A store now (index registers, predicates), under the instruction's predicate.
+    void store_now(Id type, Id ptr, Id v) {
+        if (cond_) v = sel(type, cond_, v, load(type, ptr));
+        store(ptr, v);
+    }
+
+    Id cond_float(Cond c, Id v);
+    Id cond_int(Cond c, Id v, Id type, Id zero);
+    Id predicate(Pred p);
+
+    // ---- Instructions --------------------------------------------------------------------------------------------
+
+    Id alu(Op op, Id a, Id b, Id c);
+    void float_op(const Instruction& in);
+    Id convert(Id v, Type from, Type to, bool scale);
+    void pack_op(const Instruction& in);
+    void move_op(const Instruction& in);
+    Id fx_value(Id raw, Type t) { return t == Type::Fx10 ? sext(raw, 10) : cast(ti_, band(raw, u(0xFF))); }
+    Id fx_raw(Id v, Type t) {
+        if (t == Type::Fx10) return band(cast(tu_, ext(ti_, GLSLstd450SClamp, {v, s(-512), s(511)})), u(0x3FF));
+        return band(cast(tu_, ext(ti_, GLSLstd450SClamp, {v, s(0), s(255)})), u(0xFF));
+    }
+    Id fx_mul(Id a, Id c);
+    void sop_op(const Instruction& in);
+    void fxmad_op(const Instruction& in);
+    Id bitwise(Op op, Id a, Id c, u32 bits);
+    void bitwise_op(const Instruction& in);
+    void test_op(const Instruction& in);
+    Id part_of(Id v, Part p, bool sgn);
+    void imad_op(const Instruction& in);
+    void sample(Id unit, TexDim dim, const Id coord[4], Id rgba[4]);
+    void write_sample(const Id rgba[4], u32 format, Id regs[4]);
+    void tex_op(const Instruction& in);
+    Id memory_read(Id address, u32 size);
+    void memory_op(const Instruction& in);
+    // Translates one instruction; a branch's target block and condition are left to the caller.
+    void emit(usize i);
+
+    [[maybe_unused]] const usse::Gxp& gxp_;  // (the graphics form's inputs and outputs)
+    std::span<const Decoded> program_;
+    spirv::Builder b_;
+    nx::string error_;
+    u32 word_ = 0;
+    bool int64_ = false;
+
+    Id tu_ = 0, ti_ = 0, tf_ = 0, tb_ = 0;
+    Id tp_fu_ = 0, tp_fi_ = 0, tp_fb_ = 0, tp_su_ = 0;
+    Id in_buf_ = 0, sa_buf_ = 0, out_buf_ = 0, tex_buf_ = 0, mem_buf_ = 0;
+    BankVar temp_, out_, pa_;
+    Id internal_ = 0, index_ = 0, pred_ = 0, killed_ = 0, link_ = 0;
+    nx::vector<Pending> writes_;
+    Id cond_ = 0;
+};
+
+Id Translator::to_half(Id x) {
+    const Id sign = band(shr(x, u(16)), u(0x8000));
+    const Id exp = band(shr(x, u(23)), u(0xFF));
+    const Id mant = band(x, u(0x7FFFFF));
+    const Id nan = bor(bor(sign, u(0x7C00)), sel(tu_, ine(mant, u(0)), bor(u(0x200), shr(mant, u(13))), u(0)));
+    const Id e = bin(SpvOpISub, ti_, cast(ti_, exp), s(127 - 15));
+    // Normal results shift the mantissa by 13; subnormal ones (e <= 0) shift it with its leading one by 14 - e,
+    // which at 25 or more leaves zero (the interpreter's "e < -10").
+    const Id small = bin(SpvOpSLessThanEqual, tb_, e, s(0));
+    const Id m = sel(tu_, small, bor(mant, u(0x800000)), mant);
+    const Id shift = sel(tu_, small, cast(tu_, ext(ti_, GLSLstd450SMin, {bin(SpvOpISub, ti_, s(14), e), s(25)})), u(13));
+    const Id base = sel(tu_, small, u(0), shl(cast(tu_, e), u(10)));
+    Id h = bor(base, shr(m, shift));
+    const Id rem = band(m, isub(shl(u(1), shift), u(1)));
+    const Id half = shl(u(1), isub(shift, u(1)));
+    const Id up = lor(bin(SpvOpUGreaterThan, tb_, rem, half), land(ieq(rem, half), ine(band(h, u(1)), u(0))));
+    h = iadd(h, sel(tu_, up, u(1), u(0)));
+    Id r = bor(sign, h);
+    r = sel(tu_, bin(SpvOpSGreaterThanEqual, tb_, e, s(31)), bor(sign, u(0x7C00)), r);
+    return sel(tu_, ieq(exp, u(0xFF)), nan, r);
+}
+
+// ---- Registers -------------------------------------------------------------------------------------------------
+
+Id Translator::reg_index(const Operand& o, i64 word, u32 size, BankVar* bank) {
+    if (!o.indexed) {
+        if (word < 0 || word >= size) {
+            fail(nx::format("register {} of bank {} outside the bank", word, static_cast<u32>(o.bank)));
+            return u(0);
+        }
+        if (bank) bank->used = nx::max(bank->used, static_cast<u32>(word) + 1);
+        return u(static_cast<u32>(word));
+    }
+    Id ix = load(ti_, chain(tp_fi_, index_, {u(o.indexed - 1u)}));
+    if (o.index_scaled) ix = bin(SpvOpIMul, ti_, ix, s(2));
+    ix = bin(SpvOpIAdd, ti_, ix, s(static_cast<i32>(word)));
+    ix = ext(ti_, GLSLstd450SClamp, {ix, s(0), s(static_cast<i32>(size) - 1)});
+    if (bank) bank->dynamic = true;
+    return cast(tu_, ix);
+}
+
+Id Translator::word_ptr(const Operand& o, i64 word, bool write) {
+    BankVar* bank = nullptr;
+    switch (o.bank) {
+        case Bank::Temp: bank = &temp_; break;
+        case Bank::Output: bank = &out_; break;
+        case Bank::Primary: bank = &pa_; break;
+        case Bank::Secondary:
+            if (write) return fail("a write to the secondary attributes"), u(0);
+            return buffer_word(sa_buf_, reg_index(o, word, ComputeLayout::kSecondary, nullptr));
+        default: break;
+    }
+    if (!bank) {
+        fail(nx::format("register {} of bank {} outside the bank", word, static_cast<u32>(o.bank)));
+        return 0;
+    }
+    return chain(tp_fu_, bank->var, {reg_index(o, word, kBankSize, bank)});
+}
+
+Slot Translator::slot(const Operand& o, u32 c, u32 bits, bool write) {
+    if (o.bank == Bank::Internal) {
+        if (o.number < 0 || o.number > 3) return fail("internal register outside 0-3"), Slot{};
+        const u32 base = static_cast<u32>(o.number) * 4;
+        if (bits == 16)
+            return Slot{chain(tp_fu_, internal_, {u(base + ((c >> 1) & 3))}), static_cast<u8>((c & 1) * 16), 16, 16,
+                        (c & 1) == 0};
+        return Slot{chain(tp_fu_, internal_, {u(base + (c & 3))}), 0, 32, static_cast<u8>(bits)};
+    }
+    const i64 n = o.number;
+    if (bits == 10) {
+        const Id w = word_ptr(o, n + (c == 3 ? 1 : 0), write);
+        return w ? Slot{w, static_cast<u8>(c < 3 ? 10 * c : 0), 10} : Slot{};
+    }
+    if (bits == 32) {
+        const Id w = word_ptr(o, n + c, write);
+        return w ? Slot{w, 0, 32} : Slot{};
+    }
+    if (bits == 16) {
+        const i64 h = 2 * n + c;
+        const Id w = word_ptr(o, h >> 1, write);
+        return w ? Slot{w, static_cast<u8>((h & 1) * 16), 16} : Slot{};
+    }
+    const i64 by = 4 * n + c;
+    const Id w = word_ptr(o, by >> 2, write);
+    return w ? Slot{w, static_cast<u8>((by & 3) * 8), 8} : Slot{};
+}
+
+Id Translator::raw(const Operand& o, u32 lane, Type t) {
+    const Comp c = o.lanes ? o.swizzle[lane & 3] : Comp::X;
+    const u32 bits = width_of(t);
+    if (c >= Comp::Zero) {
+        // 0, 1, 2 and 0.5 as f32, f16 and integers
+        static constexpr u32 kF32[4] = {0, 0x3F800000u, 0x40000000u, 0x3F000000u};
+        static constexpr u32 kF16[4] = {0, 0x3C00u, 0x4000u, 0x3800u};
+        static constexpr u32 kInt[4] = {0, 1, 2, 0};
+        const u32 k = static_cast<u32>(c) - static_cast<u32>(Comp::Zero);
+        return u(t == Type::F32 ? kF32[k] : t == Type::F16 ? kF16[k] : kInt[k]);
+    }
+    const u32 comp = static_cast<u32>(c);
+    switch (o.bank) {
+        case Bank::Literal: return u(static_cast<u32>(o.number));
+        case Bank::Constant: {
+            const u32* table = usse::constants();
+            const u32 base = static_cast<u32>(o.number) * 2;
+            if (bits == 32) return u(base + comp < 130 ? table[base + comp] : 0);
+            const u32 word = base + comp / 2;
+            return u(word < 130 ? (table[word] >> ((comp & 1) * 16)) & 0xFFFF : 0);
+        }
+        case Bank::Special: return u(0);
+        case Bank::Internal:
+            if (t == Type::F16) {
+                const Slot sl = slot(o, comp, 32, false);
+                return sl.ptr ? to_half(load(tu_, sl.ptr)) : u(0);
+            }
+            [[fallthrough]];
+        default: {
+            const Slot sl = slot(o, comp, bits, false);
+            if (!sl.ptr) return u(0);
+            const Id w = load(tu_, sl.ptr);
+            if (sl.bits == 32) return sl.value_bits == 32 ? w : mask(w, sl.value_bits);
+            return mask(sl.shift ? shr(w, u(sl.shift)) : w, sl.bits);
+        }
+    }
+}
+
+Id Translator::fval(const Operand& o, u32 lane, Type t) {
+    const Id r = raw(o, lane, t);
+    Id v = t == Type::F16 ? from_half(r) : cast(tf_, r);
+    if (o.absolute) v = ext(tf_, GLSLstd450FAbs, {v});
+    if (o.negate) v = un(SpvOpFNegate, tf_, v);
+    return v;
+}
+
+void Translator::put(const Operand& d, u32 lane, Type t, Id value) {
+    if (d.bank == Bank::Index) {
+        const u32 which = d.number >= 2 ? 1 : 0;
+        store_now(ti_, chain(tp_fi_, index_, {u(which)}), cast(ti_, value));
+        return;
+    }
+    if (d.bank == Bank::Internal && t == Type::F16) {
+        const Slot sl = slot(d, lane, 32, true);
+        if (sl.ptr) writes_.push_back(Pending{sl, cast(tu_, from_half(value)), cond_});
+        return;
+    }
+    const Slot sl = slot(d, lane, width_of(t), true);
+    if (sl.ptr) writes_.push_back(Pending{sl, value, cond_});
+}
+
+void Translator::commit() {
+    for (const Pending& p : writes_) {
+        const Slot& sl = p.slot;
+        Id old = 0;
+        Id v;
+        if (sl.bits == 32) {
+            v = p.value;
+        } else {
+            const u32 m = ((1u << sl.bits) - 1) << sl.shift;
+            const Id part = band(sl.shift ? shl(p.value, u(sl.shift)) : p.value, u(m));
+            if (sl.clear) {
+                v = part;
+            } else {
+                old = load(tu_, sl.ptr);
+                v = bor(band(old, u(~m)), part);
+            }
+        }
+        if (p.cond) v = sel(tu_, p.cond, v, old ? old : load(tu_, sl.ptr));
+        store(sl.ptr, v);
+    }
+    writes_.clear();
+}
+
+Id Translator::cond_float(Cond c, Id v) {
+    const Id zero = f(0.0f);
+    switch (c) {
+        case Cond::Always: return b_.c_bool(true);
+        case Cond::EqZero: return bin(SpvOpFOrdEqual, tb_, v, zero);
+        case Cond::NeZero: return bin(SpvOpFUnordNotEqual, tb_, v, zero);
+        case Cond::PosZero: return ieq(shr(cast(tu_, v), u(31)), u(0));
+        case Cond::LeZero: return bin(SpvOpFOrdLessThanEqual, tb_, v, zero);
+        case Cond::LtZero: return bin(SpvOpFOrdLessThan, tb_, v, zero);
+        case Cond::NegZero: return ine(shr(cast(tu_, v), u(31)), u(0));
+        case Cond::GeZero: return bin(SpvOpFOrdGreaterThanEqual, tb_, v, zero);
+        case Cond::GtZero: return bin(SpvOpFOrdGreaterThan, tb_, v, zero);
+    }
+    return b_.c_bool(false);
+}
+
+Id Translator::cond_int(Cond c, Id v, Id type, Id zero) {
+    (void)type;
+    switch (c) {
+        case Cond::Always: return b_.c_bool(true);
+        case Cond::EqZero: return bin(SpvOpIEqual, tb_, v, zero);
+        case Cond::NeZero: return bin(SpvOpINotEqual, tb_, v, zero);
+        case Cond::PosZero:
+        case Cond::GeZero: return bin(SpvOpSGreaterThanEqual, tb_, v, zero);
+        case Cond::LeZero: return bin(SpvOpSLessThanEqual, tb_, v, zero);
+        case Cond::LtZero:
+        case Cond::NegZero: return bin(SpvOpSLessThan, tb_, v, zero);
+        case Cond::GtZero: return bin(SpvOpSGreaterThan, tb_, v, zero);
+    }
+    return b_.c_bool(false);
+}
+
+Id Translator::predicate(Pred p) {
+    auto get = [&](u32 n) { return load(tb_, chain(tp_fb_, pred_, {u(n)})); };
+    switch (p) {
+        case Pred::None: return 0;
+        case Pred::P0: return get(0);
+        case Pred::P1: return get(1);
+        case Pred::P2: return get(2);
+        case Pred::P3: return get(3);
+        case Pred::NotP0: return lnot(get(0));
+        case Pred::NotP1: return lnot(get(1));
+        case Pred::NotP2: return lnot(get(2));
+        case Pred::Pn: fail("per-instance predicate not implemented"); return 0;
+    }
+    return 0;
+}
+
+// ---- Floating point --------------------------------------------------------------------------------------------
+
+Id Translator::alu(Op op, Id a, Id c, Id d) {
+    switch (op) {
+        case Op::Mad: return fadd(fmul(a, c), d);
+        case Op::Add: return fadd(a, c);
+        case Op::Mul: return fmul(a, c);
+        case Op::Min: return ext(tf_, GLSLstd450NMin, {a, c});
+        case Op::Max: return ext(tf_, GLSLstd450NMax, {a, c});
+        case Op::Frc:
+        case Op::SubFlr: return fsub(a, ext(tf_, GLSLstd450Floor, {c}));
+        case Op::Rcp: return fdiv(f(1.0f), a);
+        case Op::Rsq: return ext(tf_, GLSLstd450InverseSqrt, {a});
+        case Op::Log: return ext(tf_, GLSLstd450Log2, {a});
+        case Op::Exp: return ext(tf_, GLSLstd450Exp2, {a});
+        case Op::Mov: return a;
+        case Op::Cmp: return fsub(a, c);
+        default: return f(0.0f);  // (dsx, dsy: one instance has no neighbours)
+    }
+}
+
+void Translator::float_op(const Instruction& in) {
+    const Type t = in.type;
+    const Type st = in.src_type != Type::None ? in.src_type : t;
+    const Operand& d = in.dest;
+    const bool unary = in.op == Op::Rcp || in.op == Op::Rsq || in.op == Op::Log || in.op == Op::Exp;
+    if (!is_float(t) || !is_float(st)) {
+        fail(nx::format("{} of type {} not implemented", usse::mnemonic(in.op), static_cast<u32>(t)));
+        return;
+    }
+    if (in.op == Op::Dot) {
+        Id sum = f(0.0f);
+        const Operand& a = in.src[0];
+        const Operand& c = in.src[1];
+        const u8 m = a.mask ? a.mask : 15;
+        for (u32 k = 0; k < 4; ++k)
+            if ((m >> k) & 1) sum = fadd(sum, fmul(fval(a, k, st), fval(c, k, st)));
+        for (u32 k = 0; k < 4; ++k)
+            if ((d.mask >> k) & 1) putf(d, k, t, sum);
+        return;
+    }
+    bool scalar = unary;
+    if (!scalar && in.src_count) {
+        scalar = true;
+        for (u8 i = 0; i < in.src_count; ++i) scalar &= in.src[i].lanes == 1;
+    }
+    if (scalar) {
+        Id v[3] = {f(0.0f), f(0.0f), f(0.0f)};
+        for (u8 i = 0; i < in.src_count && i < 3; ++i) v[i] = fval(in.src[i], lowest_lane(in.src[i].mask), st);
+        const Id r = alu(in.op, v[0], v[1], v[2]);
+        for (u32 k = 0; k < 4; ++k)
+            if ((d.mask >> k) & 1) putf(d, k, t, r);
+        return;
+    }
+    for (u32 k = 0; k < 4; ++k) {
+        if (!((d.mask >> k) & 1)) continue;
+        Id v[3] = {f(0.0f), f(0.0f), f(0.0f)};
+        for (u8 i = 0; i < in.src_count && i < 3; ++i) v[i] = fval(in.src[i], k, st);
+        putf(d, k, t, alu(in.op, v[0], v[1], v[2]));
+    }
+}
+
+// ---- Conversions and moves -------------------------------------------------------------------------------------
+
+Id Translator::convert(Id v, Type from, Type to, bool scale) {
+    Id x;
+    switch (from) {
+        case Type::F32: x = cast(tf_, v); break;
+        case Type::F16: x = from_half(mask(v, 16)); break;
+        case Type::U8: x = un(SpvOpConvertUToF, tf_, band(v, u(0xFF))); if (scale) x = fdiv(x, f(255.0f)); break;
+        case Type::S8: x = un(SpvOpConvertSToF, tf_, sext(v, 8)); if (scale) x = fdiv(x, f(127.0f)); break;
+        case Type::U16: x = un(SpvOpConvertUToF, tf_, band(v, u(0xFFFF))); if (scale) x = fdiv(x, f(65535.0f)); break;
+        case Type::S16: x = un(SpvOpConvertSToF, tf_, sext(v, 16)); if (scale) x = fdiv(x, f(32767.0f)); break;
+        case Type::Fx10: x = fdiv(un(SpvOpConvertSToF, tf_, sext(v, 10)), f(255.0f)); break;
+        default: return v;
+    }
+    auto to_int = [&](f32 lo, f32 hi, f32 k) {
+        Id g = scale ? fmul(x, f(k)) : x;
+        g = sel(tf_, un(SpvOpIsNan, tb_, g), f(0.0f), ext(tf_, GLSLstd450NMin, {ext(tf_, GLSLstd450NMax, {g, f(lo)}), f(hi)}));
+        g = ext(tf_, scale ? GLSLstd450RoundEven : GLSLstd450Trunc, {g});
+        return cast(tu_, un(SpvOpConvertFToS, ti_, g));
+    };
+    switch (to) {
+        case Type::F32: return cast(tu_, x);
+        case Type::F16: return to_half(cast(tu_, x));
+        case Type::U8: return band(to_int(0.0f, 255.0f, 255.0f), u(0xFF));
+        case Type::S8: return band(to_int(-128.0f, 127.0f, 127.0f), u(0xFF));
+        case Type::U16: return band(to_int(0.0f, 65535.0f, 65535.0f), u(0xFFFF));
+        case Type::S16: return band(to_int(-32768.0f, 32767.0f, 32767.0f), u(0xFFFF));
+        case Type::Fx10: {
+            Id g = fmul(x, f(255.0f));
+            g = sel(tf_, un(SpvOpIsNan, tb_, x), f(0.0f), ext(tf_, GLSLstd450FClamp, {g, f(-512.0f), f(511.0f)}));
+            return fx_raw(un(SpvOpConvertFToS, ti_, ext(tf_, GLSLstd450RoundEven, {g})), Type::Fx10);
+        }
+        default: return v;
+    }
+}
+
+void Translator::pack_op(const Instruction& in) {
+    const Type dt = in.type, st = in.src_type;
+    const Operand& d = in.dest;
+    const bool scale = (in.flags & usse::kScale) != 0;
+    if (dt == Type::O8 || st == Type::O8) {
+        fail("o8 pack not implemented");
+        return;
+    }
+    for (u32 k = 0; k < 4; ++k) {
+        if (!((d.mask >> k) & 1)) continue;
+        Id v;
+        if (st == Type::F32 && (in.flags & usse::kPairSource)) {
+            const Comp c = in.src[0].swizzle[k];
+            const bool second = c == Comp::Z || c == Comp::W;
+            Operand o = in.src[second ? 1 : 0];
+            o.swizzle[k] = static_cast<Comp>(static_cast<u32>(c) & 1);
+            v = raw(o, k, st);
+        } else {
+            v = raw(in.src[0], k, st);
+        }
+        put(d, k, dt, convert(v, st, dt, scale));
+    }
+}
+
+Id Translator::fx_mul(Id a, Id c) {
+    const Id p = bin(SpvOpIMul, ti_, a, c);
+    const Id pos = bin(SpvOpSDiv, ti_, bin(SpvOpIAdd, ti_, p, s(127)), s(255));
+    const Id neg = un(SpvOpSNegate, ti_,
+                      bin(SpvOpSDiv, ti_, bin(SpvOpIAdd, ti_, un(SpvOpSNegate, ti_, p), s(127)), s(255)));
+    return sel(ti_, bin(SpvOpSGreaterThanEqual, tb_, p, s(0)), pos, neg);
+}
+
+void Translator::move_op(const Instruction& in) {
+    const Type t = in.type;
+    const Operand& d = in.dest;
+    if (t == Type::Fx10) {
+        for (u32 k = 0; k < 4; ++k) {
+            if (!((d.mask >> k) & 1)) continue;
+            Id v = raw(in.src[0], k, t);
+            if (in.op != Op::Mov) {
+                const Id take = cond_int(in.cond, fx_value(raw(in.src[0], k, t), t), ti_, s(0));
+                v = sel(tu_, take, raw(in.src[1], k, t), raw(in.src[2], k, t));
+            }
+            put(d, k, t, band(v, u(0x3FF)));
+        }
+        return;
+    }
+    if (!is_float(t)) {
+        auto byte = [&](const Operand& o, u32 k) -> Id {
+            if (o.bank == Bank::Literal) return u((static_cast<u32>(o.number) >> (8 * k)) & 0xFF);
+            const Comp c = o.lanes ? o.swizzle[k & 3] : static_cast<Comp>(k);
+            if (c >= Comp::Zero) return raw(o, k, Type::U8);
+            Operand word = o;
+            word.lanes = 0;
+            const Id w = raw(word, 0, Type::U32);
+            return band(static_cast<u32>(c) ? shr(w, u(8 * static_cast<u32>(c))) : w, u(0xFF));
+        };
+        Operand dword = d;
+        dword.lanes = 0;
+        Id result = d.bank == Bank::Index ? u(0) : raw(dword, 0, Type::U32);
+        Id whole = 0;
+        if (in.op == Op::Cmov) {
+            const u32 bits = width_of(t);
+            whole = cond_int(in.cond, sext(raw(in.src[0], 0, Type::U32), bits), ti_, s(0));
+        }
+        for (u32 k = 0; k < 4; ++k) {
+            if (!((d.mask >> k) & 1)) continue;
+            Id v;
+            if (in.op == Op::Cmov) {
+                v = sel(tu_, whole, byte(in.src[1], k), byte(in.src[2], k));
+            } else if (in.op == Op::Cmov8) {
+                const Id take = cond_int(in.cond, sext(byte(in.src[0], k), 8), ti_, s(0));
+                v = sel(tu_, take, byte(in.src[1], k), byte(in.src[2], k));
+            } else {
+                v = byte(in.src[0], k);
+            }
+            result = bor(band(result, u(~(0xFFu << (8 * k)))), k ? shl(v, u(8 * k)) : v);
+        }
+        put(dword, 0, Type::U32, result);
+        return;
+    }
+    for (u32 k = 0; k < 4; ++k) {
+        if (!((d.mask >> k) & 1) && d.lanes) continue;
+        if (in.op == Op::Mov) {
+            Id v = raw(in.src[0], k, t);
+            if (in.src[0].negate || in.src[0].absolute) {
+                const Id x = fval(in.src[0], k, t);
+                v = t == Type::F16 ? to_half(cast(tu_, x)) : cast(tu_, x);
+            }
+            put(d, k, t, v);
+        } else {
+            const Id take = cond_float(in.cond, fval(in.src[0], k, t));
+            put(d, k, t, sel(tu_, take, raw(in.src[1], k, t), raw(in.src[2], k, t)));
+        }
+        if (!d.lanes) break;
+    }
+}
+
+// ---- Fixed point -----------------------------------------------------------------------------------------------
+
+void Translator::sop_op(const Instruction& in) {
+    const Type t = in.type;
+    const Operand& d = in.dest;
+    const Id one = s(255);
+    for (u32 k = 0; k < 4; ++k) {
+        if (!((d.mask >> k) & 1)) continue;
+        Id a = fx_value(raw(in.src[0], k, t), t);
+        const Id c = fx_value(raw(in.src[1], k, t), t);
+        if (in.complement_a) a = bin(SpvOpISub, ti_, one, a);
+        Id r;
+        if (in.sop_op == Op::Min || in.sop_op == Op::Max) {
+            r = ext(ti_, in.sop_op == Op::Min ? GLSLstd450SMin : GLSLstd450SMax, {a, c});
+        } else {
+            auto alpha = [&](const Operand& o) { return fx_value(raw(o, 3, t), t); };
+            auto factor = [&](Factor fa) -> Id {
+                switch (fa) {
+                    case Factor::Zero: return s(0);
+                    case Factor::Sat:
+                        return ext(ti_, GLSLstd450SMin, {alpha(in.src[0]), bin(SpvOpISub, ti_, one, alpha(in.src[1]))});
+                    case Factor::A: return a;
+                    case Factor::AAlpha: return alpha(in.src[0]);
+                    case Factor::B: return c;
+                    case Factor::BAlpha: return alpha(in.src[1]);
+                    case Factor::S0: return fx_value(raw(in.src[2], k, t), t);
+                    case Factor::S0Alpha: return alpha(in.src[2]);
+                    default: return s(0);
+                }
+            };
+            auto term = [&](Id v, const SopTerm& st) {
+                const Id fa = factor(st.factor);
+                return fx_mul(st.complement ? bin(SpvOpISub, ti_, one, fa) : fa, v);
+            };
+            const Id t0 = term(a, in.term[0]), t1 = term(c, in.term[1]);
+            r = bin(in.sop_op == Op::Sub ? SpvOpISub : SpvOpIAdd, ti_, t0, t1);
+        }
+        put(d, k, t, fx_raw(r, t));
+    }
+}
+
+void Translator::fxmad_op(const Instruction& in) {
+    const Type t = in.type == Type::Fx10 ? Type::Fx10 : Type::Fx8;
+    const Operand& d = in.dest;
+    for (u32 k = 0; k < 4; ++k) {
+        if (!((d.mask >> k) & 1)) continue;
+        const Id a = fx_value(raw(in.src[0], k, t), t), c = fx_value(raw(in.src[1], k, t), t);
+        Id e = fx_value(raw(in.src[2], k, t), t);
+        if (in.src[2].negate) e = un(SpvOpSNegate, ti_, e);
+        put(d, k, t, fx_raw(bin(SpvOpIAdd, ti_, fx_mul(a, c), e), t));
+    }
+}
+
+// ---- Integers --------------------------------------------------------------------------------------------------
+
+Id Translator::bitwise(Op op, Id a, Id c, u32 bits) {
+    const Id m = u(bits == 32 ? ~0u : (1u << bits) - 1);
+    const Id sh = band(c, u(bits - 1));
+    switch (op) {
+        case Op::And: return band(a, c);
+        case Op::Or: return bor(a, c);
+        case Op::Xor: return bxor(a, c);
+        case Op::Shl: return band(shl(a, sh), m);
+        case Op::Shr: return shr(band(a, m), sh);
+        case Op::Asr: {
+            const Id v = bits == 32 ? cast(ti_, a) : sext(a, 16);
+            return band(cast(tu_, bin(SpvOpShiftRightArithmetic, ti_, v, sh)), m);
+        }
+        case Op::Rol: {
+            // (a shift by the full width is undefined in SPIR-V and selected away)
+            const Id rot = band(bor(shl(a, sh), shr(band(a, m), isub(u(bits), sh))), m);
+            return sel(tu_, ieq(sh, u(0)), band(a, m), rot);
+        }
+        default: return u(0);
+    }
+}
+
+void Translator::bitwise_op(const Instruction& in) {
+    const Type t = in.type;
+    const u32 bits = width_of(t);
+    const Operand& d = in.dest;
+    if (in.op == Op::Rlp) {
+        fail("rlp not implemented");
+        return;
+    }
+    const u32 n = d.bank == Bank::Index ? 1 : (d.lanes ? d.lanes : 1);
+    for (u32 k = 0; k < n; ++k) {
+        if (d.lanes && !((d.mask >> k) & 1)) continue;
+        const Id a = raw(in.src[0], k, t);
+        Id c = raw(in.src[1], k, t);
+        if (in.src[1].bank == Bank::Literal && bits == 16) c = u((static_cast<u32>(in.src[1].number) >> (16 * k)) & 0xFFFF);
+        if (in.flags & usse::kInvertB) c = un(SpvOpNot, tu_, c);
+        put(d, k, t, bitwise(in.op, a, c, bits));
+    }
+}
+
+void Translator::test_op(const Instruction& in) {
+    const Type t = in.type;
+    const bool flt = is_float(t);
+    const Operand& a = in.src[0];
+    const Operand& c = in.src[1];
+    auto lane_result = [&](u32 k) -> Id {
+        if (flt) {
+            if (in.alu == Op::Dot) {
+                Id sum = f(0.0f);
+                for (u32 j = 0; j < 4; ++j)
+                    if ((a.mask >> j) & 1) sum = fadd(sum, fmul(fval(a, j, t), fval(c, j, t)));
+                return cond_float(in.cond, sum);
+            }
+            const Id va = fval(a, k, t), vb = in.src_count > 1 ? fval(c, k, t) : f(0.0f);
+            return cond_float(in.cond, alu(in.alu, va, vb, f(0.0f)));
+        }
+        const u32 bits = width_of(t);
+        const bool sgn = t == Type::I16 || t == Type::I32 || t == Type::S8 || t == Type::S16;
+        auto ext64 = [&](Id r) { return sgn ? to64s(sext(r, bits)) : to64u(mask(r, bits)); };
+        const Id va = ext64(raw(a, k, t)), vb = in.src_count > 1 ? ext64(raw(c, k, t)) : l(0);
+        Id r;
+        switch (in.alu) {
+            case Op::Add: r = bin(SpvOpIAdd, tl(), va, vb); break;
+            case Op::Mul: r = bin(SpvOpIMul, tl(), va, vb); break;
+            case Op::Cmp: r = bin(SpvOpISub, tl(), va, vb); break;
+            case Op::And: r = bin(SpvOpBitwiseAnd, tl(), va, vb); break;
+            case Op::Or: r = bin(SpvOpBitwiseOr, tl(), va, vb); break;
+            case Op::Xor: r = bin(SpvOpBitwiseXor, tl(), va, vb); break;
+            default:
+                fail(nx::format("test of {} not implemented", usse::mnemonic(in.alu)));
+                return b_.c_bool(false);
+        }
+        if (!sgn && in.alu != Op::Cmp) r = bin(SpvOpBitwiseAnd, tl(), r, l((i64{1} << bits) - 1));
+        return cond_int(in.cond, r, tl(), l(0));
+    };
+    if (in.dest.bank == Bank::Predicate) {
+        Id r;
+        const u8 m = a.mask ? a.mask : 1;
+        switch (in.test_mode) {
+            case TestMode::Scalar: r = lane_result(lowest_lane(m)); break;
+            case TestMode::AndAll:
+            case TestMode::OrAll: {
+                const bool all = in.test_mode == TestMode::AndAll;
+                r = b_.c_bool(all);
+                for (u32 k = 0; k < 4; ++k)
+                    if ((m >> k) & 1) r = all ? land(r, lane_result(k)) : lor(r, lane_result(k));
+                break;
+            }
+            default: fail("per-lane test not implemented"); return;
+        }
+        store_now(tb_, chain(tp_fb_, pred_, {u(static_cast<u32>(in.dest.number) & 3)}), r);
+        return;
+    }
+    const Operand& d = in.dest;
+    const u32 n = d.lanes == 4 ? 4 : 1;
+    for (u32 k = 0; k < n; ++k) {
+        if (n == 4 && !((d.mask >> k) & 1)) continue;
+        const Id r = lane_result(k);
+        const u32 bits = width_of(t);
+        put(d, k, t, sel(tu_, r, u(bits == 32 ? ~0u : (1u << bits) - 1), u(0)));
+    }
+}
+
+Id Translator::part_of(Id v, Part p, bool sgn) {
+    switch (p) {
+        case Part::Lo16: return sgn ? to64s(sext(v, 16)) : to64u(band(v, u(0xFFFF)));
+        case Part::Hi16: return sgn ? to64s(sext(shr(v, u(16)), 16)) : to64u(shr(v, u(16)));
+        case Part::Lo8: return sgn ? to64s(sext(v, 8)) : to64u(band(v, u(0xFF)));
+        case Part::Hi8: return sgn ? to64s(sext(shr(v, u(8)), 8)) : to64u(band(shr(v, u(8)), u(0xFF)));
+        case Part::None: return sgn ? to64s(cast(ti_, v)) : to64u(v);
+    }
+    return l(0);
+}
+
+void Translator::imad_op(const Instruction& in) {
+    const bool sgn = in.type == Type::I32 || in.type == Type::I16;
+    const Operand& d = in.dest;
+    auto clamp64 = [&](Id r, i64 lo, i64 hi) { return ext(tl(), GLSLstd450SClamp, {r, l(lo), l(hi)}); };
+    if (in.flags & usse::kScaleVariant) {
+        const Id a = raw(in.src[0], 0, Type::U32);
+        Id c = raw(in.src[1], 0, Type::U32);
+        Id e = raw(in.src[2], 0, Type::U32);
+        if (in.src[1].negate) c = isub(u(0), c);
+        if (in.src[2].negate) e = isub(u(0), e);
+        const Id r = (in.flags & usse::kSignedShift) ? iadd(shl(imul(a, shr(c, u(16))), u(16)), e)
+                                                     : iadd(imul(a, band(c, u(0xFFFF))), e);
+        put(d, 0, Type::U32, r);
+        return;
+    }
+    if (in.type == Type::I16 || in.type == Type::U16) {
+        if (d.absolute) {
+            fail("16-bit multiply-add with an absolute destination not implemented");
+            return;
+        }
+        auto value = [&](const Operand& o, u32 k) -> Id {
+            if (o.part == Part::Lo8 || o.part == Part::Hi8) {
+                const Id w = o.bank == Bank::Literal ? u(static_cast<u32>(o.number)) : raw(o, 0, Type::U32);
+                return part_of(w, o.part, sgn);
+            }
+            const Id h = o.bank == Bank::Literal ? u(static_cast<u32>(o.number) & 0xFFFF) : raw(o, k, Type::U16);
+            return sgn ? to64s(sext(h, 16)) : to64u(band(h, u(0xFFFF)));
+        };
+        const u32 n = d.bank == Bank::Index ? 1 : 2;
+        for (u32 k = 0; k < n; ++k) {
+            const Id a = raw(in.src[0], k, Type::U16);
+            const Id s0 = sgn ? to64s(sext(a, 16)) : to64u(band(a, u(0xFFFF)));
+            Id e = value(in.src[2], k);
+            if (in.src[2].negate) e = un(SpvOpSNegate, tl(), e);
+            Id r = bin(SpvOpIAdd, tl(), bin(SpvOpIMul, tl(), s0, value(in.src[1], k)), e);
+            if (in.flags & usse::kSat) r = sgn ? clamp64(r, INT16_MIN, INT16_MAX) : clamp64(r, 0, UINT16_MAX);
+            put(d, k, Type::U16, band(to32(r), u(0xFFFF)));
+        }
+        return;
+    }
+    const Id a = part_of(raw(in.src[0], 0, Type::U32), in.src[0].part, sgn);
+    const Id c = part_of(raw(in.src[1], 0, Type::U32), in.src[1].part, sgn);
+    const Id e = part_of(raw(in.src[2], 0, Type::U32), in.src[2].part, sgn);
+    Id r = bin(SpvOpIAdd, tl(), bin(SpvOpIMul, tl(), a, c), e);
+    if (in.flags & usse::kSat) r = sgn ? clamp64(r, INT32_MIN, INT32_MAX) : clamp64(r, 0, UINT32_MAX);
+    put(d, 0, Type::U32, to32(r));
+}
+
+// ---- Textures and memory ---------------------------------------------------------------------------------------
+
+// The test model (psvusse --run): the image of the unit the state's first word names, at the nearest texel with
+// wrapping; cube maps pick the face of the largest coordinate and sample it at the others divided by that one.
+void Translator::sample(Id unit, TexDim dim, const Id coord[4], Id rgba[4]) {
+    auto data = [&](Id index) { return load(tu_, buffer_word(tex_buf_, index)); };
+    const Id header = imul(ext(tu_, GLSLstd450UMin, {unit, u(ComputeLayout::kTextures - 1)}), u(4));
+    const Id width = data(header), height = data(iadd(header, u(1))), first = data(iadd(header, u(2)));
+    Id cu = coord[0], cv = dim == TexDim::D1 ? f(0.5f) : coord[1];
+    Id face = u(0), rows = height;
+    if (dim == TexDim::Cube) {
+        const Id ax = ext(tf_, GLSLstd450FAbs, {coord[0]}), ay = ext(tf_, GLSLstd450FAbs, {coord[1]}),
+                 az = ext(tf_, GLSLstd450FAbs, {coord[2]});
+        auto ge = [&](Id p, Id q) { return bin(SpvOpFOrdGreaterThanEqual, tb_, p, q); };
+        const Id on_x = land(ge(ax, ay), ge(ax, az)), on_y = ge(ay, az);
+        auto side = [&](Id c, u32 pos) { return sel(tu_, ge(c, f(0.0f)), u(pos), u(pos + 1)); };
+        face = sel(tu_, on_x, side(coord[0], 0), sel(tu_, on_y, side(coord[1], 2), side(coord[2], 4)));
+        const Id m = sel(tf_, on_x, ax, sel(tf_, on_y, ay, az));
+        const Id su = sel(tf_, on_x, coord[2], coord[0]);
+        const Id sv = sel(tf_, on_x, coord[1], sel(tf_, on_y, coord[2], coord[1]));
+        cu = fmul(fadd(fdiv(su, m), f(1.0f)), f(0.5f));
+        cv = fmul(fadd(fdiv(sv, m), f(1.0f)), f(0.5f));
+        rows = bin(SpvOpUDiv, tu_, height, u(6));
+    }
+    auto wrap = [&](Id c, Id n) {
+        const Id nn = ext(tu_, GLSLstd450UMax, {n, u(1)});
+        Id g = ext(tf_, GLSLstd450Floor, {fmul(c, un(SpvOpConvertUToF, tf_, nn))});
+        g = ext(tf_, GLSLstd450FClamp, {g, f(-1073741824.0f), f(1073741824.0f)});
+        return cast(tu_, bin(SpvOpSMod, ti_, un(SpvOpConvertFToS, ti_, g), cast(ti_, nn)));
+    };
+    const Id texel_index = iadd(first, iadd(imul(iadd(imul(face, rows), wrap(cv, rows)), width), wrap(cu, width)));
+    const Id last = isub(b_.op(SpvOpArrayLength, tu_, {tex_buf_, 0}), u(1));
+    const Id present = ine(width, u(0));
+    const Id texel = sel(tu_, present, data(ext(tu_, GLSLstd450UMin, {texel_index, last})), u(0));
+    for (u32 k = 0; k < 4; ++k)
+        rgba[k] = fdiv(un(SpvOpConvertUToF, tf_, band(k ? shr(texel, u(8 * k)) : texel, u(0xFF))), f(255.0f));
+}
+
+void Translator::write_sample(const Id rgba[4], u32 format, Id regs[4]) {
+    if (format == 0) {
+        Id w = u(0);
+        for (u32 k = 0; k < 4; ++k) {
+            const Id c = sel(tf_, un(SpvOpIsNan, tb_, rgba[k]), f(0.0f), ext(tf_, GLSLstd450FClamp, {rgba[k], f(0.0f), f(1.0f)}));
+            const Id q = cast(tu_, un(SpvOpConvertFToS, ti_, ext(tf_, GLSLstd450RoundEven, {fmul(c, f(255.0f))})));
+            w = bor(w, k ? shl(q, u(8 * k)) : q);
+        }
+        regs[0] = w;
+    } else if (format == 1) {
+        regs[0] = bor(to_half(cast(tu_, rgba[0])), shl(to_half(cast(tu_, rgba[1])), u(16)));
+        regs[1] = bor(to_half(cast(tu_, rgba[2])), shl(to_half(cast(tu_, rgba[3])), u(16)));
+    } else {
+        for (u32 k = 0; k < 4; ++k) regs[k] = cast(tu_, rgba[k]);
+    }
+}
+
+void Translator::tex_op(const Instruction& in) {
+    if (in.flags & (usse::kTexRsd | usse::kTexInfo | usse::kTexMinP)) {
+        fail("texture queries not implemented");
+        return;
+    }
+    Operand state = in.src[1];
+    state.lanes = 0;
+    const Id unit = raw(state, 0, Type::U32);
+    for (u32 k = 1; k < 4; ++k)
+        if (!word_ptr(state, state.number + k, false)) return;
+    Id coord[4] = {f(0.0f), f(0.0f), f(0.0f), f(0.0f)};
+    const u32 n = static_cast<u32>(in.tex_dim) + 1;
+    for (u32 k = 0; k < n; ++k) coord[k] = fval(in.src[0], k, Type::F32);
+    Id rgba[4];
+    sample(unit, in.tex_dim, coord, rgba);
+    const u32 format = in.type == Type::F32 ? 3 : in.type == Type::F16 ? 1 : 0;
+    Id regs[4];
+    write_sample(rgba, format, regs);
+    const u32 count = format == 0 ? 1u : format == 1 ? 2u : 4u;
+    for (u32 k = 0; k < count; ++k) {
+        Operand d = in.dest;
+        d.lanes = 0;
+        if (const Id w = word_ptr(d, d.number + k, true)) writes_.push_back(Pending{Slot{w, 0, 32}, regs[k], cond_});
+    }
+}
+
+// `size` bytes (1-4) at a guest address, little endian; zero outside the memory buffer.
+Id Translator::memory_read(Id address, u32 size) {
+    auto data = [&](Id index) { return load(tu_, buffer_word(mem_buf_, index)); };
+    const Id base = data(u(0)), count = data(u(1));
+    const Id offset = isub(address, base);
+    const Id inside = bin(SpvOpULessThanEqual, tb_, iadd(offset, u(size)), imul(count, u(4)));
+    const Id inside_too = bin(SpvOpULessThan, tb_, offset, imul(count, u(4)));  // (offset + size wrapping)
+    const Id index = ext(tu_, GLSLstd450UMin, {shr(offset, u(2)), count});
+    const Id w0 = data(iadd(index, u(ComputeLayout::kMemoryHeader)));
+    const Id w1 = data(iadd(index, u(ComputeLayout::kMemoryHeader + 1)));
+    const Id sh = shl(band(offset, u(3)), u(3));
+    const Id hi = sel(tu_, ieq(sh, u(0)), u(0), shl(w1, isub(u(32), sh)));
+    const Id v = mask(bor(shr(w0, sh), hi), 8 * size);
+    return sel(tu_, land(inside, inside_too), v, u(0));
+}
+
+void Translator::memory_op(const Instruction& in) {
+    if (in.op == Op::Store) {
+        fail("stores not implemented");
+        return;
+    }
+    if (in.space != usse::Space::Absolute || (in.flags & (usse::kPreIncrement | usse::kPostIncrement))) {
+        fail("load/store addressing mode not implemented");
+        return;
+    }
+    const u32 bytes = in.size / 8u;
+    Operand base_reg = in.src[0];
+    base_reg.lanes = 0;
+    const Id base = raw(base_reg, 0, Type::U32);
+    const Id off = raw(in.src[1], 0, Type::U32);
+    const u32 count = in.fetch ? in.fetch : 1;
+    const Id address = in.src[1].bank == Bank::Literal
+                           ? iadd(base, imul(off, u(bytes)))
+                           : iadd(base, iadd(imul(shr(off, u(16)), u(bytes)), band(off, u(0xFFFF))));
+    const u32 words = in.size == 64 ? 2 : 1;
+    for (u32 i = 0; i < count; ++i) {
+        for (u32 j = 0; j < words; ++j) {
+            const Id at = iadd(address, u(i * bytes + j * 4));
+            const Id v = memory_read(at, nx::min<u32>(bytes, 4));
+            Operand d = in.dest;
+            d.lanes = 0;
+            if (const Id w = word_ptr(d, d.number + i * words + j, true)) writes_.push_back(Pending{Slot{w, 0, 32}, v, cond_});
+        }
+    }
+}
+
+// ---- Programs --------------------------------------------------------------------------------------------------
+
+void Translator::emit(usize i) {
+    const Decoded& dec = program_[i];
+    const Instruction& in = dec.in;
+    word_ = dec.word;
+    if (!dec.executed) return;
+    cond_ = predicate(in.pred);
+    switch (in.op) {
+        case Op::Hidden:
+        case Op::SetIncrements:
+        case Op::Nop:
+        case Op::PCoeff:
+        case Op::Br: break;
+        case Op::Mad:
+        case Op::Add:
+        case Op::Mul:
+        case Op::Min:
+        case Op::Max:
+        case Op::Frc:
+        case Op::Dsx:
+        case Op::Dsy:
+        case Op::Dot:
+        case Op::Rcp:
+        case Op::Rsq:
+        case Op::Log:
+        case Op::Exp:
+        case Op::SubFlr: float_op(in); break;
+        case Op::Mov:
+        case Op::Pack:
+            if (in.family == 8) pack_op(in);
+            else if (in.family == 7) move_op(in);
+            else float_op(in);
+            break;
+        case Op::Cmov:
+        case Op::Cmov8: move_op(in); break;
+        case Op::MovImm: put(in.dest, 0, Type::U32, u(static_cast<u32>(in.src[0].number))); break;
+        case Op::Test: test_op(in); break;
+        case Op::And:
+        case Op::Or:
+        case Op::Xor:
+        case Op::Shl:
+        case Op::Rol:
+        case Op::Shr:
+        case Op::Asr:
+        case Op::Rlp: bitwise_op(in); break;
+        case Op::IMad: imad_op(in); break;
+        case Op::Sop:
+        case Op::Sop2:
+        case Op::Blend: sop_op(in); break;
+        case Op::FxMad: fxmad_op(in); break;
+        case Op::Load:
+        case Op::Store: memory_op(in); break;
+        case Op::Tex: tex_op(in); break;
+        case Op::Kill: store_now(tb_, killed_, b_.c_bool(true)); break;
+        case Op::MovToLink: store_now(tu_, link_, load(tu_, chain(tp_fu_, temp_.var, {u(0)}))), temp_.used = nx::max(temp_.used, 1u); break;
+        case Op::MovFromLink: put(Operand{Bank::Temp, 0, 0, false, 1, 1}, 0, Type::U32, load(tu_, link_)); break;
+        default: fail(nx::format("{} not implemented", usse::mnemonic(in.op))); break;
+    }
+    // The co-issued half of a dual-issue word reads the registers as they were before the word.
+    const bool pair = in.op != Op::Br && i + 1 < program_.size() && (program_[i + 1].in.flags & usse::kCoissued);
+    if (!pair) commit();
+}
+
+Result<nx::vector<u32>> Translator::translate() {
+    b_.capability(SpvCapabilityShader);
+    tu_ = b_.t_uint();
+    ti_ = b_.t_int();
+    tf_ = b_.t_float();
+    tb_ = b_.t_bool();
+    tp_fu_ = b_.t_pointer(SpvStorageClassFunction, tu_);
+    tp_fi_ = b_.t_pointer(SpvStorageClassFunction, ti_);
+    tp_fb_ = b_.t_pointer(SpvStorageClassFunction, tb_);
+    tp_su_ = b_.t_pointer(SpvStorageClassStorageBuffer, tu_);
+
+    // The storage buffers: one struct of a runtime array of words.
+    const Id words = b_.t_runtime_array(tu_);
+    b_.decorate(words, SpvDecorationArrayStride, {4});
+    const Id block = b_.t_struct({words});
+    b_.decorate(block, SpvDecorationBlock);
+    b_.member_decorate(block, 0, SpvDecorationOffset, {0});
+    const Id tp_block = b_.t_pointer(SpvStorageClassStorageBuffer, block);
+    auto buffer = [&](u32 binding, const char* name) {
+        const Id v = b_.variable(tp_block, SpvStorageClassStorageBuffer);
+        b_.decorate(v, SpvDecorationDescriptorSet, {0});
+        b_.decorate(v, SpvDecorationBinding, {binding});
+        b_.name(v, name);
+        return v;
+    };
+    in_buf_ = buffer(kBindingIn, "in");
+    sa_buf_ = buffer(kBindingSecondary, "sa");
+    out_buf_ = buffer(kBindingOut, "out");
+    tex_buf_ = buffer(kBindingTextures, "textures");
+    mem_buf_ = buffer(kBindingMemory, "memory");
+    const Id tv3 = b_.t_vector(tu_, 3);
+    const Id gid_var = b_.variable(b_.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+    b_.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+
+    const Id tvoid = b_.t_void();
+    const Id fn = b_.begin_function(tvoid, b_.t_function(tvoid));
+    b_.name(fn, "main");
+    b_.block(b_.new_label());
+
+    // The registers. Arrays are created at the end, when their sizes are known; the others now.
+    temp_.var = b_.reserve();
+    out_.var = b_.reserve();
+    pa_.var = b_.reserve();
+    out_.minimum = ComputeLayout::kOutput;
+    pa_.minimum = ComputeLayout::kPrimary;
+    b_.name(temp_.var, "r");
+    b_.name(out_.var, "o");
+    b_.name(pa_.var, "pa");
+    auto local = [&](Id type, const char* name) {
+        const Id id = b_.reserve();
+        b_.local(id, b_.t_pointer(SpvStorageClassFunction, type), b_.c_null(type));
+        b_.name(id, name);
+        return id;
+    };
+    internal_ = local(b_.t_array(tu_, 16), "i");
+    index_ = local(b_.t_array(ti_, 2), "index");
+    pred_ = local(b_.t_array(tb_, 4), "p");
+    killed_ = local(tb_, "killed");
+    link_ = local(tu_, "link");
+
+    const Id gid = b_.op(SpvOpCompositeExtract, tu_, {load(tv3, gid_var), 0});
+    const Id in_base = imul(gid, u(ComputeLayout::kIn));
+    for (u32 k = 0; k < ComputeLayout::kPrimary; ++k)
+        store(chain(tp_fu_, pa_.var, {u(k)}), load(tu_, buffer_word(in_buf_, iadd(in_base, u(k)))));
+
+    // Blocks: from the start, each branch target and the instruction after each branch.
+    u32 words_count = 0;
+    for (const Decoded& d : program_) words_count = nx::max(words_count, d.word + 1);
+    const u32 size = static_cast<u32>(program_.size());
+    nx::vector<u32> start(words_count + 1, size);
+    for (u32 i = size; i-- > 0;) start[program_[i].word] = i;
+    for (u32 w = words_count; w-- > 0;)
+        if (start[w] == size) start[w] = start[w + 1];
+    nx::vector<u8> leader(size + 1, 0);
+    leader[0] = 1;
+    bool branches = false;
+    for (u32 i = 0; i < size; ++i) {
+        const Decoded& d = program_[i];
+        if (!d.executed || d.in.op != Op::Br) continue;
+        if (d.in.target < 0 || static_cast<u32>(d.in.target) > words_count) {
+            word_ = d.word;
+            fail("branch outside the program");
+            continue;
+        }
+        branches = true;
+        leader[start[static_cast<u32>(d.in.target)]] = 1;
+        leader[i + 1] = 1;
+    }
+
+    Id stopped = 0;  // (the step limit was reached)
+    if (!branches) {
+        for (usize i = 0; i < size; ++i) emit(i);
+    } else {
+        // A loop around a switch on the block to run next (pc); a block ends by setting pc.
+        nx::vector<u32> block_of(size + 1, 0);
+        nx::vector<u32> firsts;
+        for (u32 i = 0; i <= size; ++i) {
+            if (i < size && leader[i]) firsts.push_back(i);
+            block_of[i] = static_cast<u32>(firsts.size()) - 1;
+        }
+        const u32 end = static_cast<u32>(firsts.size());
+        auto case_of = [&](u32 instruction) { return instruction >= size ? end : block_of[instruction]; };
+        const Id pc = local(tu_, "pc");
+        const Id steps = local(tu_, "steps");
+        const Id header = b_.new_label(), dispatch = b_.new_label(), cont = b_.new_label(), merge = b_.new_label(),
+                 sw_merge = b_.new_label();
+        b_.op0(SpvOpBranch, {header});
+        b_.block(header);
+        b_.op0(SpvOpLoopMerge, {merge, cont, SpvLoopControlMaskNone});
+        b_.op0(SpvOpBranch, {dispatch});
+        b_.block(dispatch);
+        const Id pcv = load(tu_, pc);
+        nx::vector<Id> labels;
+        nx::vector<u32> sw{pcv, sw_merge};  // (the default: no block)
+        for (u32 k = 0; k < end; ++k) {
+            labels.push_back(b_.new_label());
+            sw.push_back(k);
+            sw.push_back(labels.back());
+        }
+        b_.op0(SpvOpSelectionMerge, {sw_merge, SpvSelectionControlMaskNone});
+        b_.op0(SpvOpSwitch, sw);
+        for (u32 k = 0; k < end; ++k) {
+            b_.block(labels[k]);
+            const u32 last = (k + 1 < end ? firsts[k + 1] : size) - 1;
+            for (u32 i = firsts[k]; i <= last; ++i) emit(i);
+            const Decoded& d = program_[last];
+            Id next = u(k + 1);
+            if (d.executed && d.in.op == Op::Br && d.in.target >= 0 && static_cast<u32>(d.in.target) <= words_count) {
+                const Id target = u(case_of(start[static_cast<u32>(d.in.target)]));
+                next = cond_ ? sel(tu_, cond_, target, next) : target;
+            }
+            store(pc, next);
+            b_.op0(SpvOpBranch, {sw_merge});
+        }
+        b_.block(sw_merge);
+        b_.op0(SpvOpBranch, {cont});
+        b_.block(cont);
+        const Id count = iadd(load(tu_, steps), u(1));
+        store(steps, count);
+        const Id more = land(bin(SpvOpULessThan, tb_, load(tu_, pc), u(end)), bin(SpvOpULessThan, tb_, count, u(kMaxSteps)));
+        b_.op0(SpvOpBranchConditional, {more, header, merge});
+        b_.block(merge);
+        stopped = bin(SpvOpUGreaterThanEqual, tb_, count, u(kMaxSteps));
+    }
+
+    // The results.
+    const Id out_base = imul(gid, u(ComputeLayout::kOut));
+    for (u32 k = 0; k < ComputeLayout::kPrimary; ++k)
+        store(buffer_word(out_buf_, iadd(out_base, u(k))), load(tu_, chain(tp_fu_, pa_.var, {u(k)})));
+    for (u32 k = 0; k < ComputeLayout::kOutput; ++k)
+        store(buffer_word(out_buf_, iadd(out_base, u(ComputeLayout::kPrimary + k))),
+              load(tu_, chain(tp_fu_, out_.var, {u(k)})));
+    store(buffer_word(out_buf_, iadd(out_base, u(ComputeLayout::kPrimary + ComputeLayout::kOutput))),
+          bor(sel(tu_, load(tb_, killed_), u(1), u(0)), stopped ? sel(tu_, stopped, u(2), u(0)) : u(0)));
+    b_.op0(SpvOpReturn, {});
+    b_.end_function();
+
+    for (BankVar* bank : {&temp_, &out_, &pa_}) {
+        const u32 n = bank->dynamic ? kBankSize : nx::max(nx::max(bank->used, bank->minimum), 1u);
+        const Id type = b_.t_array(tu_, n);
+        b_.local(bank->var, b_.t_pointer(SpvStorageClassFunction, type), b_.c_null(type));
+    }
+    const Id interface[] = {gid_var};
+    b_.entry_point(SpvExecutionModelGLCompute, fn, "main", interface);
+    b_.execution_mode(fn, SpvExecutionModeLocalSize, {ComputeLayout::kLocalSize, 1, 1});
+    if (int64_) b_.capability(SpvCapabilityInt64);
+    if (!error_.empty()) return failure(error_);
+    return b_.module();
+}
+
+}  // namespace
+
+Result<nx::vector<u32>> translate_compute(const usse::Gxp& gxp, std::span<const usse::Decoded> program) {
+    return Translator(gxp, program).translate();
+}
+
+}  // namespace psvrecore::gxm
