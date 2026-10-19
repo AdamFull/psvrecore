@@ -66,8 +66,26 @@ u32 width_of(Type t) {
         case Type::S8:
         case Type::O8:
         case Type::Fx8: return 8;
+        case Type::Fx10: return 10;
         default: return 32;
     }
+}
+
+// Fixed point: fx8 is a byte with 1.0 = 255; fx10 a signed 10-bit value with 1.0 = 255 (range about [-2, 2]), the
+// lanes x, y, z in bits 0-9, 10-19, 20-29 of a register and w in bits 0-9 of the next (checked: the compiler's fx10
+// literals, e.g. 1.0 = 0x0ff3fcff, 0x000000ff).
+i32 fx_value(u32 raw, Type t) {
+    if (t == Type::Fx10) return static_cast<i32>(raw << 22) >> 22;
+    return static_cast<i32>(raw & 0xFF);
+}
+u32 fx_raw(i32 v, Type t, bool saturate = true) {
+    if (t == Type::Fx10) return static_cast<u32>(saturate ? nx::clamp<i32>(v, -512, 511) : v) & 0x3FF;
+    return static_cast<u32>(saturate ? nx::clamp<i32>(v, 0, 255) : v) & 0xFF;
+}
+// The product of two fixed-point values (1.0 = 255), rounded (assumed).
+i32 fx_mul(i32 a, i32 b) {
+    const i32 p = a * b;
+    return p >= 0 ? (p + 127) / 255 : -((-p + 127) / 255);
 }
 
 bool is_float(Type t) { return t == Type::F32 || t == Type::F16; }
@@ -79,6 +97,7 @@ struct Slot {
     u8 shift = 0;
     u8 bits = 32;
     u8 value_bits = 32;
+    bool clear = false;  // a write clears the rest of the word
 };
 
 struct Pending {
@@ -115,13 +134,20 @@ public:
     // The lane of a register operand reading component c (0-3) as a `bits`-wide value.
     Slot slot(const Operand& o, u32 c, u32 bits) {
         if (o.bank == Bank::Internal) {
-            // An internal register has four 32-bit lanes whatever the type; a narrower integer is zero-extended
-            // (checked: the compiler packs u16 values into one and shifts them as u16 pairs), f16 values are held
-            // as f32 (see raw and put).
+            // An internal register has four 32-bit lanes. f16 values are held as f32 (see raw and put); 16-bit
+            // integer lanes are the halves of the words in order, and a write to the first half of a word clears
+            // the second (checked: the compiler packs a u16 index into lane x, then shifts lanes x and y as a u16
+            // pair and uses the word); other widths take a lane each, zero-extended.
             if (o.number < 0 || o.number > 3) return fail("internal register outside 0-3"), Slot{};
+            if (bits == 16)
+                return Slot{&m_.internal[o.number][(c >> 1) & 3], static_cast<u8>((c & 1) * 16), 16, 16, (c & 1) == 0};
             return Slot{&m_.internal[o.number][c & 3], 0, 32, static_cast<u8>(bits)};
         }
         const i64 n = o.number;
+        if (bits == 10) {  // (fx10)
+            u32* w = reg_word(o, n + (c == 3 ? 1 : 0));
+            return w ? Slot{w, static_cast<u8>(c < 3 ? 10 * c : 0), 10} : Slot{};
+        }
         if (bits == 32) {
             u32* w = reg_word(o, n + c);
             return w ? Slot{w, 0, 32} : Slot{};
@@ -190,7 +216,11 @@ public:
         }
         // An f16 result written to an internal register is widened to f32 (checked: the compiler mixes f16 and f32
         // operations on the internal registers without conversions).
-        if (d.bank == Bank::Internal && t == Type::F16) value = std::bit_cast<u32>(from_half(static_cast<u16>(value)));
+        if (d.bank == Bank::Internal && t == Type::F16) {
+            const Slot s = slot(d, lane, 32);
+            if (s.word) writes.push_back(Pending{s, std::bit_cast<u32>(from_half(static_cast<u16>(value)))});
+            return;
+        }
         const Slot s = slot(d, lane, width_of(t));
         if (s.word) writes.push_back(Pending{s, value});
     }
@@ -203,6 +233,8 @@ public:
         for (const Pending& p : writes) {
             if (p.slot.bits == 32) {
                 *p.slot.word = p.value;
+            } else if (p.slot.clear) {
+                *p.slot.word = (p.value << p.slot.shift) & (((1u << p.slot.bits) - 1) << p.slot.shift);
             } else {
                 const u32 mask = ((1u << p.slot.bits) - 1) << p.slot.shift;
                 *p.slot.word = (*p.slot.word & ~mask) | ((p.value << p.slot.shift) & mask);
@@ -346,6 +378,7 @@ u32 convert(u32 v, Type from, Type to, bool scale) {
         case Type::S8: f = static_cast<f32>(static_cast<i8>(v)) / (scale ? 127.0f : 1.0f); break;
         case Type::U16: f = static_cast<f32>(v & 0xFFFF) / (scale ? 65535.0f : 1.0f); break;
         case Type::S16: f = static_cast<f32>(static_cast<i16>(v)) / (scale ? 32767.0f : 1.0f); break;
+        case Type::Fx10: f = static_cast<f32>(fx_value(v, Type::Fx10)) / 255.0f; break;  // (always scaled: see below)
         default: return v;
     }
     // To integers: truncated (checked: the compiler's float-to-int sequences rely on it), saturated; scaled
@@ -362,6 +395,11 @@ u32 convert(u32 v, Type from, Type to, bool scale) {
         case Type::S8: return to_int(-128.0f, 127.0f, 127.0f) & 0xFF;
         case Type::U16: return to_int(0.0f, 65535.0f, 65535.0f) & 0xFFFF;
         case Type::S16: return to_int(-32768.0f, 32767.0f, 32767.0f) & 0xFFFF;
+        // (fx10 conversions scale whether or not .scl is printed: checked, the compiler converts an f16 dot product
+        // to fx10 without it and back with it)
+        case Type::Fx10:
+            return fx_raw(static_cast<i32>(std::nearbyint(std::isnan(f) ? 0.0f : nx::clamp(f * 255.0f, -512.0f, 511.0f))),
+                          Type::Fx10);
         default: return v;
     }
 }
@@ -370,8 +408,8 @@ void pack_op(Exec& x, const Instruction& in) {
     const Type dt = in.type, st = in.src_type;
     const Operand& d = in.dest;
     const bool scale = (in.flags & kScale) != 0;
-    if (dt == Type::Fx10 || st == Type::Fx10 || dt == Type::O8 || st == Type::O8) {
-        x.fail("fixed-point pack not implemented");
+    if (dt == Type::O8 || st == Type::O8) {
+        x.fail("o8 pack not implemented");
         return;
     }
     for (u32 k = 0; k < 4; ++k) {
@@ -397,7 +435,13 @@ void move_op(Exec& x, const Instruction& in) {
     const Type t = in.type;
     const Operand& d = in.dest;
     if (t == Type::Fx10) {
-        x.fail("fx10 move not implemented");
+        for (u32 k = 0; k < 4; ++k) {
+            if (!((d.mask >> k) & 1)) continue;
+            const Operand* from = &in.src[0];
+            if (in.op != Op::Mov)
+                from = &in.src[cond_holds_int(in.cond, fx_value(x.raw(in.src[0], k, t), t)) ? 1 : 2];
+            x.put(d, k, t, x.raw(*from, k, t) & 0x3FF);
+        }
         return;
     }
     if (!is_float(t)) {
@@ -459,6 +503,61 @@ void move_op(Exec& x, const Instruction& in) {
             x.put(d, k, t, x.raw(in.src[take ? 1 : 2], k, t));
         }
         if (!d.lanes) break;
+    }
+}
+
+// Families 16-18: op(fa * a, fb * b) lane by lane on fixed-point values; a factor is 0, a lane of a, b or (family
+// 17) a third source, the alpha (w) lane of one, or min(a.w, 1 - b.w), and may be complemented (1 - f); family 16
+// may complement a itself. Min and max ignore the factors. Families 16 and 17 give the colour lanes and the alpha
+// lane as two co-issued instructions.
+void sop_op(Exec& x, const Instruction& in) {
+    const Type t = in.type;
+    const Operand& d = in.dest;
+    const i32 one = 255;
+    for (u32 k = 0; k < 4; ++k) {
+        if (!((d.mask >> k) & 1)) continue;
+        i32 a = fx_value(x.raw(in.src[0], k, t), t);
+        const i32 b = fx_value(x.raw(in.src[1], k, t), t);
+        if (in.complement_a) a = one - a;
+        i32 r;
+        if (in.sop_op == Op::Min || in.sop_op == Op::Max) {
+            r = in.sop_op == Op::Min ? nx::min(a, b) : nx::max(a, b);
+        } else {
+            auto alpha = [&](const Operand& o) { return fx_value(x.raw(o, 3, t), t); };
+            auto factor = [&](Factor f) -> i32 {
+                switch (f) {
+                    case Factor::Zero: return 0;
+                    case Factor::Sat: return nx::min(alpha(in.src[0]), one - alpha(in.src[1]));
+                    case Factor::A: return a;
+                    case Factor::AAlpha: return alpha(in.src[0]);
+                    case Factor::B: return b;
+                    case Factor::BAlpha: return alpha(in.src[1]);
+                    case Factor::S0: return fx_value(x.raw(in.src[2], k, t), t);
+                    case Factor::S0Alpha: return alpha(in.src[2]);
+                    default: return 0;
+                }
+            };
+            auto term = [&](i32 v, const SopTerm& st) {
+                const i32 f = factor(st.factor);
+                return fx_mul(st.complement ? one - f : f, v);
+            };
+            const i32 t0 = term(a, in.term[0]), t1 = term(b, in.term[1]);
+            r = in.sop_op == Op::Sub ? t0 - t1 : t0 + t1;
+        }
+        x.put(d, k, t, fx_raw(r, t));
+    }
+}
+
+// Family 25: a * b + c on four fixed-point (fx10) or byte (u8) lanes.
+void fxmad_op(Exec& x, const Instruction& in) {
+    const Type t = in.type == Type::Fx10 ? Type::Fx10 : Type::Fx8;
+    const Operand& d = in.dest;
+    for (u32 k = 0; k < 4; ++k) {
+        if (!((d.mask >> k) & 1)) continue;
+        const i32 a = fx_value(x.raw(in.src[0], k, t), t), b = fx_value(x.raw(in.src[1], k, t), t);
+        i32 c = fx_value(x.raw(in.src[2], k, t), t);
+        if (in.src[2].negate) c = -c;
+        x.put(d, k, t, fx_raw(fx_mul(a, b) + c, t));
     }
 }
 
@@ -744,6 +843,10 @@ Result<void> run(std::span<const Decoded> program, ProgramKind kind, Machine& m,
                 case Op::Asr:
                 case Op::Rlp: bitwise_op(x, in); break;
                 case Op::IMad: imad_op(x, in); break;
+                case Op::Sop:
+                case Op::Sop2:
+                case Op::Blend: sop_op(x, in); break;
+                case Op::FxMad: fxmad_op(x, in); break;
                 case Op::Load:
                 case Op::Store: memory_op(x, in); break;
                 case Op::Br: {

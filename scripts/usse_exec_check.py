@@ -33,6 +33,8 @@ F = np.float32
 SWIZ = 'xyzw'
 SPECIAL = ['mul', 'index', 'half', 'int', 'int', 'sincos', 'pow']  # (--special)
 FLOW = ['branch', 'loop', 'uloop']  # (--flow)
+FRAGMENT = [False]  # (--fragment)
+MAG = [0.0]  # the largest magnitude of the expression being generated (fragment programs compute in f16)
 
 
 def f4(v):
@@ -46,6 +48,17 @@ class Node:
     def __init__(self, text, value, exact, err, const=False, kind=''):
         self.text, self.value, self.exact, self.err = text, f4(value), exact, err
         self.const, self.kind = const, kind
+        with np.errstate(all='ignore'):
+            m = float(np.max(np.abs(self.value)))
+        if np.isfinite(m):
+            MAG[0] = max(MAG[0], m)
+        if FRAGMENT[0] and exact and not f16_exact(self.value):
+            self.exact = False
+
+
+def f16_exact(v):
+    with np.errstate(all='ignore'):
+        return bool(np.all(np.abs(v) < 1024) and np.all(v.astype(np.float16).astype(np.float32) == v))
 
 
 class Gen:
@@ -53,13 +66,15 @@ class Gen:
         self.rnd = rnd
         self.attrs = attrs        # name -> value
         self.uniforms = uniforms  # name -> value
+        self.texts = {}           # name -> the float4 expression reading it (fragment inputs of other types)
+        self.skip = set()         # special operations not to generate
         self.mats = {}            # name -> 4x4 (rows)
         self.arrays = {}          # name -> n x 4
 
     def special(self, depth, a):
         """Matrices, indexed arrays, half precision, integers, trigonometry, powers (or None)."""
         rnd = self.rnd
-        fn = rnd.choice(SPECIAL)
+        fn = rnd.choice([f for f in SPECIAL if f not in self.skip] or ['none'])
         with np.errstate(all='ignore'):
             if fn == 'mul' and self.mats:
                 name = rnd.choice(list(self.mats))
@@ -149,10 +164,12 @@ class Gen:
             val = self.uniforms[name]
         else:
             return self.literal()
-        node = Node(name, val, True, 0.0)
+        text = self.texts.get(name, name)
+        node = Node(text, val, True, 0.0)
         if self.rnd.random() < 0.4:
             sw = ''.join(self.rnd.choice(SWIZ) for _ in range(4))
-            node = Node('%s.%s' % (name, sw), [val[SWIZ.index(c)] for c in sw], True, 0.0)
+            node = Node('(%s).%s' % (text, sw) if text != name else '%s.%s' % (name, sw),
+                        [val[SWIZ.index(c)] for c in sw], True, 0.0)
         return node
 
     def expr(self, depth):
@@ -319,6 +336,114 @@ def program(rnd):
     return source(attrs, uniforms, body, len(outs)), attrs, uniforms, outs, body
 
 
+VARYING_TYPES = {'float4': (4, 'f32'), 'float2': (2, 'f32'), 'float': (1, 'f32'), 'half4': (4, 'f16'),
+                 'half2': (2, 'f16')}
+VARYING_TYPES_FIXED = {'fixed4': (4, 'fx10')}
+SEMANTIC_BITS = dict([('TEXCOORD%d' % k, 16 << k) for k in range(10)] + [('COLOR0', 4), ('COLOR1', 8)])
+
+
+def fragment_program(rnd):
+    """A fragment program: its source, its varyings ({name: (type, semantic, value)}), uniforms and the expected
+    colour (one output, f16x4 in the primary attributes)."""
+    varyings, values, uniforms = {}, {}, {}
+    semantics = rnd.sample(['TEXCOORD%d' % k for k in range(8)] + ['COLOR0', 'COLOR1'], rnd.randint(1, 5))
+    texts = {}
+    for i, sem in enumerate(semantics):
+        t = rnd.choice(list(VARYING_TYPES))
+        n, _ = VARYING_TYPES[t]
+        lo, hi = (0, 8) if sem.startswith('COLOR') else (-32, 32)
+        v = f4([rnd.randint(lo, hi) / 8.0 for _ in range(n)])
+        name = 'i%d' % i
+        varyings[name] = (t, sem, v)
+        rep = {1: 'xxxx', 2: 'xyxy', 4: 'xyzw'}[n]
+        values[name] = f4([v['xyzw'.index(c)] for c in rep])
+        texts[name] = ('(float4)%s' % name if t.startswith('half') else name) + ('.%s' % rep if n < 4 else '')
+    for i in range(rnd.randint(0, 3)):
+        uniforms['u%d' % i] = f4([rnd.randint(-32, 32) / 8.0 for _ in range(4)])
+    if not uniforms:
+        uniforms['u0'] = f4([1, 2, 3, 4])
+    g = Gen(rnd, values, uniforms)
+    g.texts = texts
+    # (psp2cgc converts only one lane of a half vector cast to int, then reads it for every lane: no integer
+    # operations in programs with half inputs)
+    if any(t.startswith('half') for t, _, _ in varyings.values()):
+        g.skip.add('int')
+    MAG[0] = 0.0
+    e = g.expr(rnd.randint(1, 5))
+    e.mag = MAG[0]
+    params = ['%s %s : %s' % (t, name, sem) for name, (t, sem, _) in varyings.items()]
+    src = '\n'.join('uniform float4 %s;' % u for u in uniforms)
+    src += '\nfloat4 main(%s) : COLOR\n{\n    return %s;\n}\n' % (',\n           '.join(params), e.text)
+    return src, varyings, uniforms, [e], []
+
+
+def fixed_program(rnd):
+    """A fragment program computing in fixed point: fixed4 varyings (fx10 in the primary attributes), fixed
+    expressions (sums of products, lerps, clamps), the colour returned as f16x4. Values stay inside fx10's range
+    (about [-2, 2]); each operation may round by 1/255."""
+    varyings = {}
+    semantics = rnd.sample(['COLOR0', 'COLOR1', 'TEXCOORD0', 'TEXCOORD1', 'TEXCOORD2'], rnd.randint(1, 3))
+    for i, sem in enumerate(semantics):
+        varyings['c%d' % i] = ('fixed4', sem, f4([rnd.randint(0, 255) / 255.0 for _ in range(4)]))
+
+    def leaf():
+        k = rnd.random()
+        if k < 0.75:
+            name = rnd.choice(list(varyings))
+            v = varyings[name][2]
+            if rnd.random() < 0.3:
+                c = rnd.choice(SWIZ)
+                return '%s.%s' % (name, c * 4), f4([v[SWIZ.index(c)]] * 4), 0.0, True
+            return name, v, 0.0, False
+        q = rnd.choice([0.25, 0.5, 0.75, 1.0, 2.0])
+        return 'fixed4(%r, %r, %r, %r)' % (q, q, q, q), f4([q] * 4), 0.0, False
+
+    def expr(depth):
+        if depth <= 0 or rnd.random() < 0.25:
+            return leaf()
+        a = expr(depth - 1)
+        op = rnd.choice(['*', '+', '-', 'lerp', 'sat', 'min', 'max', '1-', 'alpha'])
+        # (psp2cgc compiles x - y.wwww, a scalar broadcast subtracted, as a negation followed by a subtraction,
+        # which the hardware cannot both mean: avoid subtracting broadcasts)
+        if op == '1-' and a[3]:
+            op = 'sat'
+        if op == '1-':
+            r = ('(1 - %s)' % a[0], F(1) - a[1], a[2] + 1 / 255, False)
+        elif op == 'sat':
+            r = ('saturate(%s)' % a[0], np.clip(a[1], 0, 1), a[2], a[3])
+        elif op == 'alpha':
+            r = ('%s.wwww' % ('(%s)' % a[0]), f4([a[1][3]] * 4), a[2], True)
+        else:
+            b = expr(depth - 1)
+            if op == '-' and b[3]:
+                op = '+'
+            if op == 'lerp':
+                # (weights in [0, 1]: psp2cgc folds lerp(x, constant, t) with a constant t > 1 with the wrong sign)
+                c = expr(depth - 1)
+                if float(np.max(np.abs(c[1]))) > 1:
+                    c = ('saturate(%s)' % c[0], np.clip(c[1], 0, 1), c[2], c[3])
+                v = a[1] + (b[1] - a[1]) * c[1][3]
+                r = ('lerp(%s, %s, (%s).w)' % (a[0], b[0], c[0]), v,
+                     (a[2] + b[2]) * 2 + c[2] * float(np.max(np.abs(b[1] - a[1]))) + 3 / 255, False)
+            elif op in ('min', 'max'):
+                r = ('%s(%s, %s)' % (op, a[0], b[0]), np.minimum(a[1], b[1]) if op == 'min' else np.maximum(a[1], b[1]),
+                     max(a[2], b[2]), a[3] and b[3])
+            else:
+                v = {'*': a[1] * b[1], '+': a[1] + b[1], '-': a[1] - b[1]}[op]
+                err = a[2] * float(np.max(np.abs(b[1]))) + b[2] * float(np.max(np.abs(a[1]))) if op == '*' else a[2] + b[2]
+                r = ('(%s %s %s)' % (a[0], op, b[0]), v, err + 1 / 255, a[3] and b[3])
+        if float(np.max(np.abs(r[1]))) > 1.9:  # (keep inside fx10's range: saturate instead)
+            r = ('saturate(%s)' % r[0], np.clip(r[1], 0, 1), r[2], r[3])
+        return r
+
+    text, value, err, _ = expr(rnd.randint(1, 5))
+    e = Node(text, value, False, err + 2 / 255)
+    e.mag = float(np.max(np.abs(value)))
+    params = ['fixed4 %s : %s' % (name, sem) for name, (_, sem, _) in varyings.items()]
+    src = 'fixed4 main(%s) : COLOR\n{\n    return %s;\n}\n' % (', '.join(params), text)
+    return src, varyings, {}, [e], []
+
+
 def declaration(name, u):
     if isinstance(u, tuple):
         t = u[0]
@@ -340,6 +465,17 @@ def source(attrs, uniforms, body, outputs):
     return src
 
 
+def varying_words(v, fmt, n):
+    """The primary-attribute words of an interpolated value in the record's format (0 f32, 2 f16)."""
+    if fmt == 0:
+        return words(list(v[:n]) + [0.0] * (n - len(v)))
+    if fmt == 1:  # fx10: x, y, z in bits 0-9, 10-19, 20-29, w in the next register (1.0 = 255)
+        q = [int(round(float(x) * 255)) & 0x3FF for x in list(v[:n]) + [0.0] * (4 - min(n, 4))]
+        return '%08x %08x' % (q[0] | q[1] << 10 | q[2] << 20, q[3])
+    h = np.array(list(v[:n]) + [0.0] * (n - len(v)) + [0.0], np.float32).astype(np.float16).view(np.uint16)
+    return ' '.join('%08x' % (int(h[2 * k]) | int(h[2 * k + 1]) << 16) for k in range((n + 1) // 2))
+
+
 def words(v):
     return ' '.join('%08x' % struct.unpack('<I', struct.pack('<f', float(x)))[0] for x in v)
 
@@ -348,14 +484,46 @@ def from_word(w):
     return struct.unpack('<f', struct.pack('<I', int(w, 16)))[0]
 
 
+def negated_subtrahend(listing):
+    """Whether a fixed-point program negates a value (sub x, 0, y) and later subtracts that value (or a copy of
+    it): psp2cgc compiles subtractions of scalars that way, which only works if the first sub does not negate,
+    while it compiles negations with the same instruction (see KNOWN_ISSUES)."""
+    import re
+
+    def register(text):
+        m = re.match(r'-?[(]?([a-z]+[0-9]+)', text)
+        return m.group(1) if m else None
+
+    negated = set()
+    for line in listing.splitlines():
+        m = re.search(r'(sub|mov)[.]fx(?:10|8) +([a-z]+[0-9]+)[-.xyzw]*, (.*)$', line)
+        if not m:
+            continue
+        op, dest, rest = m.group(1), m.group(2), [x.strip() for x in m.group(3).split(',')]
+        regs = [register(x) for x in rest if register(x)]
+        if op == 'sub' and len(rest) >= 2 and register(rest[1]) in negated:
+            return True
+        if op == 'sub' and rest and rest[0] == '0':
+            negated.add(dest)
+        elif op == 'mov' and regs and regs[0] in negated:
+            negated.add(dest)
+        else:
+            negated.discard(dest)
+    return False
+
+
 def check(job):
     """None if the program agrees; else (kind, index, message). A program that disagrees only while it has
     uniforms (compiled again with them as attributes, it agrees) is reported as 'uniforms': the compiler moves
     uniform-only work into the secondary program, and some of its folds there are wrong (see KNOWN_ISSUES)."""
     i, src, attrs, uniforms, outs, body, cgc, psvusse, folder = job
     r = run_one(os.path.join(folder, 'e%05d' % i), src, attrs, uniforms, outs, cgc, psvusse, i)
+    if r and r[0] == 'value' and FRAGMENT[0]:
+        listing = subprocess.run([psvusse, os.path.join(folder, 'e%05d.gxp' % i)], capture_output=True, text=True).stdout
+        if negated_subtrahend(listing):
+            return ('compiler', i, r[2])
     plain = not any(isinstance(u, tuple) for u in uniforms.values())
-    if r and r[0] == 'value' and uniforms and plain:
+    if r and r[0] == 'value' and uniforms and plain and not FRAGMENT[0]:
         merged = dict(attrs)
         merged.update(uniforms)
         if not run_one(os.path.join(folder, 'e%05d_attr' % i), source(merged, {}, body, len(outs)), merged, {}, outs,
@@ -366,14 +534,21 @@ def check(job):
 
 def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i):
     open(base + '.cg', 'w').write(src)
-    r = subprocess.run([cgc, '-profile', 'sce_vp_psp2', '-o', base + '.gxp', base + '.cg'], capture_output=True,
-                       text=True)
+    profile = 'sce_fp_psp2' if FRAGMENT[0] else 'sce_vp_psp2'
+    r = subprocess.run([cgc, '-profile', profile, '-o', base + '.gxp', base + '.cg'], capture_output=True, text=True)
     if r.returncode:
         return ('compile', i, (r.stderr or r.stdout)[:400])
     # the attributes and uniforms in the order the compiler placed them (psvusse --params)
     p = subprocess.run([psvusse, '--params', base + '.gxp'], capture_output=True, text=True)
     lines = ['# %s' % os.path.basename(base)]
     for line in p.stdout.splitlines():
+        if line.startswith('input '):
+            # a fragment input: the varying it interpolates, at its offset in the primary attributes
+            f = dict(kv.split('=', 1) for kv in line.split()[2:] if '=' in kv)
+            for name, (t, sem, v) in attrs.items():
+                if SEMANTIC_BITS[sem] == int(f['interpolated']):
+                    lines.append('pa %s %s' % (f['offset'], varying_words(v, int(f['format']), int(f['components']))))
+            continue
         if not line.startswith('param '):
             continue
         f = dict(kv.split('=', 1) for kv in line.split()[2:] if '=' in kv)
@@ -387,10 +562,15 @@ def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i):
     if r.returncode or not r.stdout.startswith('out'):
         return ('run', i, (r.stderr or r.stdout)[:400])
     got = [from_word(w) for w in r.stdout.split()[1:65]]
+    if FRAGMENT[0]:  # (the colour: f16x4 in pa0-pa1)
+        hw = [int(w, 16) for w in r.stdout.split()[1:3]]
+        got = [float(np.array([(w >> (16 * h)) & 0xFFFF], np.uint16).view(np.float16)[0]) for w in hw for h in (0, 1)]
     for j, e in enumerate(outs):
         for k in range(4):
             want, have = float(e.value[k]), got[4 * j + k]
             tol = e.err * 4 + 1e-6 * (1 + abs(want))
+            if FRAGMENT[0]:  # (computed in f16, at worst: a few rounding steps of the largest magnitude)
+                tol = e.err * 4 + 4e-3 * (1 + getattr(e, 'mag', abs(want)))
             if not (abs(want - have) <= tol or (np.isnan(want) and np.isnan(have))):
                 return ('value', i, 'o%d.%s: want %r, got %r (tolerance %.3g)' % (j, SWIZ[k], want, have, tol))
     return None
@@ -407,32 +587,39 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--special', help='comma-separated: the special operations to generate (%s; "none")' %
                     ', '.join(sorted(set(SPECIAL))))
+    ap.add_argument('--fragment', action='store_true', help='generate fragment programs instead')
+    ap.add_argument('--fixed', action='store_true', help='generate fixed-point fragment programs instead')
     ap.add_argument('--flow', help='comma-separated: the flow control to generate (%s; "none")' % ', '.join(FLOW))
     args = ap.parse_args()
     if args.special:
         SPECIAL[:] = [] if args.special == 'none' else args.special.split(',')
     if args.flow:
         FLOW[:] = [] if args.flow == 'none' else args.flow.split(',')
+    FRAGMENT[0] = args.fragment or args.fixed
     cgc = os.path.join(args.sdk, 'host_tools', 'bin', 'psp2cgc.exe')
     psvusse = os.path.abspath(args.psvusse)
     folder = args.keep or tempfile.mkdtemp(prefix='usse_exec_')
     os.makedirs(folder, exist_ok=True)
     rnd = random.Random(args.seed)
-    jobs = [(i,) + program(rnd) + (cgc, psvusse, folder) for i in range(args.count)]
+    make = fixed_program if args.fixed else fragment_program if args.fragment else program
+    jobs = [(i,) + make(rnd) + (cgc, psvusse, folder) for i in range(args.count)]
     with ThreadPoolExecutor(args.jobs) as ex:
         results = list(ex.map(check, jobs))
     bad = [r for r in results if r]
-    by = {k: [r for r in bad if r[0] == k] for k in ('compile', 'uniforms')}
+    by = {k: [r for r in bad if r[0] == k] for k in ('compile', 'uniforms', 'compiler')}
     wrong = [r for r in bad if r[0] not in by]
     for r in wrong[:args.show]:
         print('%s e%05d: %s' % r)
     for r in by['uniforms'][:args.show]:
         print('uniforms e%05d: %s (agrees with the uniforms as attributes)' % (r[1], r[2]))
+    for r in by['compiler'][:3]:
+        print('compiler e%05d: %s (it subtracts a value it negated)' % (r[1], r[2]))
     for r in by['compile'][:3]:
         print('compile e%05d: %s' % (r[1], r[2]))
     ran = args.count - len(by['compile'])
-    print('%d of %d programs agree; %d disagree only with uniforms; %d did not compile' % (
-        ran - len(wrong) - len(by['uniforms']), ran, len(by['uniforms']), len(by['compile'])))
+    print('%d of %d programs agree; %d disagree only with uniforms; %d subtract a negated value; %d did not compile'
+          % (ran - len(wrong) - len(by['uniforms']) - len(by['compiler']), ran, len(by['uniforms']), len(by['compiler']),
+             len(by['compile'])))
     if not args.keep:
         shutil.rmtree(folder, ignore_errors=True)
     return 0 if not wrong else 1

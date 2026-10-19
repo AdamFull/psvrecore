@@ -158,3 +158,30 @@ TEST_CASE("usse interp: failures are reported") {
     limits.max_steps = 1000;
     CHECK(!run(decode_program(loop, ProgramKind::Primary), ProgramKind::Primary, m, limits));
 }
+
+TEST_CASE("usse interp: fixed point (fx10)") {
+    // 1 - c in fx10 (x, y, z in bits 0-9, 10-19, 20-29, w in the next register; 1.0 = 255), then to f16
+    const u64 primary[] = {0xFA44070000000000ull, 0x9190FA02E8002040ull, 0x40810F7EA01D8000ull};
+    Machine m;
+    m.secondary[0] = 255 | 255u << 10 | 255u << 20, m.secondary[1] = 255;  // (1, 1, 1, 1)
+    m.primary[0] = 64 | 128u << 10 | 255u << 20, m.primary[1] = 0;         // c = (64, 128, 255, 0) / 255
+    REQUIRE(run(decode_program(primary, ProgramKind::Primary), ProgramKind::Primary, m));
+    CHECK((m.primary[0] & 0xFFFF) == to_half(191.0f / 255.0f));
+    CHECK((m.primary[0] >> 16) == to_half(127.0f / 255.0f));
+    CHECK((m.primary[1] & 0xFFFF) == to_half(0.0f));
+    CHECK((m.primary[1] >> 16) == to_half(1.0f));
+}
+
+TEST_CASE("usse interp: 16-bit integers in internal registers are halves of a word") {
+    // index = (u16)clamp(floor(i1.x), 0, sa32.x), then sa32 = index << 1 as a u16 pair of i2.xy: lane y is the high
+    // half of i2's first word (cleared by the write to lane x), not i2's second word
+    const u64 secondary[] = {0x088208804F80203Dull, 0x08A408A42F845F90ull, 0x08A5088614046F80ull,
+                             0x40C10CC4AFC01000ull, 0x60C1000624003F01ull};
+    Machine m;
+    m.internal[1][0] = bits(2.5f);
+    m.internal[2][0] = 0x3F800000;  // (stale values)
+    m.internal[2][1] = 0x3FF82258;
+    m.secondary[32] = bits(6.0f);
+    REQUIRE(run(decode_program(secondary, ProgramKind::Secondary), ProgramKind::Secondary, m));
+    CHECK(m.secondary[32] == 4u);
+}
