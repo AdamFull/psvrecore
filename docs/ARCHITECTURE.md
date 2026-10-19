@@ -50,7 +50,7 @@ Everything generated stays on the user's machine.
 | `usse` | Shader programs: the GXP container (flags, parameters, vertex outputs, fragment inputs) and the USSE instruction set (decoding into an instruction model, listings in the reference disassembler's syntax) |
 | `gxm` | GXM API, texture formats and layouts, SPIR-V translation of shader programs |
 | `vulkan` | Vulkan backend (volk, VMA): device, memory, buffers, dispatches; knows nothing about GXM |
-| `platform` | SDL3 window, input and events; audio output; Android integration; ImGui overlay; on-screen controls |
+| `platform` | SDL3: a window and its Vulkan swapchain (the frames a game displays, scaled to fit), the audio device (a stream per port), and gamepads, keyboard, mouse and touch for the runtime's input; later Android integration, an ImGui overlay and on-screen controls |
 | `frontend` | Program entry point, command line, settings |
 
 ## Key design points

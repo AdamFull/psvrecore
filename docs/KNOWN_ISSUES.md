@@ -282,8 +282,30 @@
 
 ## Input
 
-- **Nothing feeds input yet.** The platform layer will set the controller's and touch panels' states.
+- **Input comes from the platform layer** (SDL3); its limits are under Platform layer below.
 - **Wireless controllers (ports 1-4) read as idle; touch force reads as 0.**
+
+## Platform layer (SDL3)
+
+- **Not run on Android.** It builds for arm64, but the window needs SDL's Java activity (`SDLActivity`) in the
+  application, which the game's Android app does not have yet. The swapchain is not pre-rotated: the compositor
+  rotates, and `VK_SUBOPTIMAL_KHR` is ignored for that reason.
+- **One Vulkan device a process.** volk's entry points are loaded for the last device made, so a second device breaks
+  the first one's calls (it crashed). With a window, the GXM layer renders with the window's device
+  (`gxm::Options::shared_device`).
+- **Frames are copied:** from guest memory on the game's thread (about 2 MB at 960x544), then uploaded and blitted on
+  the window's thread. Scaling is bilinear (nearest at 1:1); there is no integer scaling. The guest's bytes reach the
+  display as they are (a UNORM swapchain), as on the console.
+- **A frame set for the next vertical blank is shown when the game next waits for a blank or sets a frame** after that
+  blank. A game that sets a frame and then does neither does not get it shown.
+- **Audio:** the device runs at 48 kHz stereo and SDL resamples ports at other rates. A port more than 200 ms behind
+  drops what it holds (logged).
+- **Controls are fixed:** no remapping, no rear touch panel (the mouse and fingers touch the front one), no motion
+  sensors, no rumble. Keyboard: arrows, Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
+  Select; F11 toggles full screen.
+- **Memory block alignment:** an alignment smaller than the type's own is raised to it (the SDK's samples ask CDRAM
+  for 256 bytes and run on the console); one that is not a power of two is refused. Inferred from the samples, not
+  measured.
 
 ## Save data and the application utility
 

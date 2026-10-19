@@ -12,7 +12,8 @@ third-party code, vita-headers (whose NID database the tools read at run time), 
 Vulkan-Headers, SPIRV-Headers, volk and VulkanMemoryAllocator. Nothing links against a Vulkan SDK; the loader is
 opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used by the local checks only. The
 media decoders come the same way: LibAtrac9 (MIT) and openh264 (BSD-2-Clause) as submodules; the PacketVideo AAC
-decoder (Apache-2.0) is vendored in `third_party/pvaacdec` (its README says where from).
+decoder (Apache-2.0) is vendored in `third_party/pvaacdec` (its README says where from). The platform layer's
+SDL3 (zlib) is a submodule as well, built as a static library.
 
 ## Presets
 
@@ -153,6 +154,17 @@ to `build/samples/<sample>/frames`, with what each audio port played as `audio_p
 output to `build/samples/<sample>/run.log`; compare the frames with the screenshot next to each sample's sources.
 `--audio-seconds N` ends a sample once a port has played N seconds. Everything there is derived from the SDK: never
 commit it.
+
+`--window` also shows the sample in a window, plays its sound on the audio device and gives it the host's controls,
+until the window is closed or `--timeout` seconds have passed. `--input` scripts controls, as items
+`<ms> <what> <args>` separated by `;` (the time from the boot): `key <SDL key name> down|up`,
+`pad <SDL gamepad button> down|up`, `axis <SDL gamepad axis> <value>`, `touch <x> <y> down|move|up` (in the
+screen's 960x544) and `shot <name>` (the next frame shown is saved as `<name>.png`):
+
+```
+python scripts/sample_check.py --sdk C:/path/to/sdk input_output_devices/api_ctrl/analog_stick --frames 1 \
+    --timeout 7 --window --input "1500 shot centre; 2000 axis leftx 32767; 3200 shot moved"
+```
 
 ## ATRAC9 check (needs the PS Vita SDK)
 
