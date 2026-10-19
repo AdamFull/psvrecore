@@ -16,6 +16,11 @@ struct Frame {
     u32 pixel_format = 0;  // SCE_DISPLAY_PIXELFORMAT_* (0: A8B8G8R8)
     u32 width = 0, height = 0;
     u64 vcount = 0;        // the vertical blank it was shown at
+    // At an internal resolution above 1 (Options::render_scale): the frame as drawn, scaled_width x scaled_height,
+    // tightly packed in the frame's pixel format; null when the frame was not drawn by a scene, or the CPU wrote to
+    // it since. Readable until show() returns.
+    const u8* scaled = nullptr;
+    u32 scaled_width = 0, scaled_height = 0;
 };
 
 class DisplaySink {
@@ -33,6 +38,10 @@ struct Options {
     // A device to render with instead (the window's: one device a process, as volk's entry points are the last
     // device's); it must outlive the runtime.
     vulkan::Device* shared_device = nullptr;
+    // The internal resolution: colour surfaces drawn at this many times their size (1 to 4; 1 where the device
+    // cannot scale a format), blitted down into guest memory when each scene ends. The frames shown come at the
+    // higher resolution (Frame::scaled); what the game reads back, and samples as textures, is the surface's size.
+    u32 render_scale = 1;
     // Where the shader cache is kept (the SPIR-V translated, the pipelines made, the driver's pipeline cache), from
     // one run to the next: empty, nowhere.
     nx::string cache_folder;

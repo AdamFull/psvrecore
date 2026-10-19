@@ -243,6 +243,7 @@ private:
     Id push_constant(u32 member, Id type);
     Id special(i32 code);
     Id frag_coord();
+    Id surface_position();
 
     Form form_;
     const usse::Gxp& gxp_;
@@ -1513,7 +1514,7 @@ void Translator::vertex_epilogue() {
                          {sel(tf_, enabled, vx, sx), sel(tf_, enabled, vy, sy), sel(tf_, enabled, vz, cz),
                           sel(tf_, enabled, cw, f(1.0f))});
     store(position, pos);
-    store(point_size, l.point_size >= 0 ? o(l.point_size) : f(1.0f));
+    store(point_size, fmul(l.point_size >= 0 ? o(l.point_size) : f(1.0f), push_constant(6, tf_)));
     // The varyings: four components, the missing ones 0, 0, 0, 1.
     auto varying = [&](u32 location, i32 first, u32 count) {
         if (first < 0) return;
@@ -1542,9 +1543,18 @@ Id Translator::frag_coord() {
     return frag_coord_;
 }
 
+// FragCoord in the render target's pixels: x and y over the internal resolution's scale.
+Id Translator::surface_position() {
+    const Id fc = load(tv4_, frag_coord());
+    const Id scale = push_constant(6, tf_);
+    return b_.op(SpvOpCompositeConstruct, tv4_,
+                 {fdiv(b_.op(SpvOpCompositeExtract, tf_, {fc, 0}), scale), fdiv(b_.op(SpvOpCompositeExtract, tf_, {fc, 1}), scale),
+                  b_.op(SpvOpCompositeExtract, tf_, {fc, 2}), b_.op(SpvOpCompositeExtract, tf_, {fc, 3})});
+}
+
 Id Translator::special(i32 code) {
     if (form_ != Form::Fragment || (code != 87 && code != 88 && code != 107)) return u(0);
-    const Id fc = load(tv4_, frag_coord());
+    const Id fc = surface_position();
     auto coord = [&](u32 k) { return un(SpvOpConvertFToU, tu_, b_.op(SpvOpCompositeExtract, tf_, {fc, k})); };
     if (code == 87) return band(coord(0), u(15));
     if (code == 88) return band(coord(1), u(15));
@@ -1612,10 +1622,8 @@ void Translator::fragment_prologue() {
                 var = b_.variable(b_.t_pointer(SpvStorageClassInput, type), SpvStorageClassInput);
                 b_.decorate(var, SpvDecorationBuiltIn, {SpvBuiltInPointCoord});
                 interface_.push_back(var);
-            } else {
-                var = frag_coord();
             }
-            value = load(type, var);
+            value = coord ? load(type, var) : surface_position();
             if (coord) {
                 const Id x = b_.op(SpvOpCompositeExtract, tf_, {value, 0}), y = b_.op(SpvOpCompositeExtract, tf_, {value, 1});
                 value = b_.op(SpvOpCompositeConstruct, tv4_, {x, y, f(0.0f), f(1.0f)});
@@ -1809,10 +1817,10 @@ Result<nx::vector<u32>> Translator::translate() {
         const Id f2 = b_.t_array(tf_, 2), f6 = b_.t_array(tf_, 6);
         b_.decorate(f2, SpvDecorationArrayStride, {4});
         b_.decorate(f6, SpvDecorationArrayStride, {4});
-        const Id pc = b_.t_struct({tu_, tu_, f2, f6, tf_, tu_});
+        const Id pc = b_.t_struct({tu_, tu_, f2, f6, tf_, tu_, tf_});
         b_.decorate(pc, SpvDecorationBlock);
-        const u32 offsets[] = {0, 4, 8, 16, 40, 44};
-        for (u32 m = 0; m < 6; ++m) b_.member_decorate(pc, m, SpvDecorationOffset, {offsets[m]});
+        const u32 offsets[] = {0, 4, 8, 16, 40, 44, 48};
+        for (u32 m = 0; m < 7; ++m) b_.member_decorate(pc, m, SpvDecorationOffset, {offsets[m]});
         push_ = b_.variable(b_.t_pointer(SpvStorageClassPushConstant, pc), SpvStorageClassPushConstant);
         b_.name(push_, "draw");
         tp_push_f_ = b_.t_pointer(SpvStorageClassPushConstant, tf_);

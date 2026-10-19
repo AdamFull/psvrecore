@@ -355,6 +355,9 @@ u32 guest_alloc(u32 size);
 
 // Renders a scene (render.cpp) and writes its colour surface to guest memory.
 void render_scene(Context& context, Scene& scene);
+// At an internal resolution above 1: the frame buffer's pixels as drawn (tightly packed, at the internal
+// resolution), if a scene drew it and guest memory still holds what that scene wrote there.
+bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height);
 
 // The display (display.cpp): what the display queue thread needs.
 void start_display_queue();

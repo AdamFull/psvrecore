@@ -42,7 +42,11 @@ u64 now_ns() { return runtime::runtime().kernel().clock_ns(); }
 u64 vcount_at(u64 t) { return static_cast<u64>(static_cast<f64>(t) / period_ns()); }
 
 void show(DisplaySink* sink, const DisplayFrameBuf& f, u64 vcount) {
-    sink->show(Frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount});
+    Frame frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount};
+    nx::vector<u8> scaled;
+    if (state().options->render_scale > 1 && scaled_frame(f, scaled, &frame.scaled_width, &frame.scaled_height))
+        frame.scaled = scaled.data();
+    sink->show(frame);
 }
 
 // The frame set for a blank that has come, to the sink.
@@ -205,12 +209,12 @@ void display_queue_main() {
         {
             nx::scoped_lock<nx::mutex> held(s.queue_lock);
             s.queue_data_free.push_back(entry.data);
+            if (auto it = s.display_holds.find(entry.old_buffer); it != s.display_holds.end() && it->second)
+                if (--it->second == 0) s.display_holds.erase(it);
             s.queue_busy = 0;
         }
         s.queue_changed.notify_all();
     }
-            if (auto it = s.display_holds.find(entry.old_buffer); it != s.display_holds.end() && it->second)
-                if (--it->second == 0) s.display_holds.erase(it);
     rt.kernel().release_host_thread();
 }
 

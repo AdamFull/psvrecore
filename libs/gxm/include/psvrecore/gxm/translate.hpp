@@ -68,8 +68,11 @@ struct DrawConstants {
     f32 viewport[6] = {};  // x offset, x scale, y offset, y scale, z offset, z scale
     f32 w_clamp = 0.0f;    // (0: no clamp)
     u32 stage = 0;         // secondary dispatches: 0 the vertex program's, 1 the fragment program's
+    // The internal resolution: pixels drawn per pixel of the render target. Positions are mapped through `target`
+    // whatever it is; the fragment form's pixel coordinates are divided by it, and point sizes multiplied.
+    f32 scale = 1.0f;
 };
-static_assert(sizeof(DrawConstants) == 48);
+static_assert(sizeof(DrawConstants) == 52);
 inline constexpr u32 kDrawViewport = 1, kDrawPoints = 2;
 
 // Varying locations between the stages.

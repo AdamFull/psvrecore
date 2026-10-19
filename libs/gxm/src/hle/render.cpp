@@ -220,7 +220,13 @@ void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32
 
 struct Target {
     u32 address = 0, format = 0, width = 0, height = 0;
-    vk::Image image;
+    vk::Image image;  // the surface's size: loaded from guest memory and read back to it
+    // At an internal resolution above 1: the surface as drawn (scale times its size), and its bytes as last written
+    // back. While guest memory still holds those bytes, `scaled` is the surface; once anything else wrote there, the
+    // surface is loaded again from guest memory.
+    vk::Image scaled;
+    u32 scale = 1;
+    nx::vector<u8> written;
 };
 
 struct CachedTexture {
@@ -247,7 +253,9 @@ struct Renderer {
     // Made while the game ran (not by warm_up): what the cache did not have.
     std::atomic<u32> translated{0}, made_pipelines{0};
     std::atomic<bool> pipelines_changed{false};
-    nx::vector<Target> targets;
+    nx::mutex targets_lock;  // (a scene being rendered; the display reading a scaled surface)
+    nx::vector<nx::unique_ptr<Target>> targets;
+    nx::hash_map<u32, bool> scalable;  // (by VkFormat: blits to and from it, and it is drawn into)
     vk::Image white, white_cube;
     VkSampler sampler = VK_NULL_HANDLE;
     nx::hash_map<u64, CachedTexture> textures;
@@ -416,19 +424,112 @@ VkPipeline secondary_pipeline(Renderer& r, const Program& p) {
     return pipeline;
 }
 
-vk::Image* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format, u32 width, u32 height) {
-    for (Target& t : r.targets)
-        if (t.address == address && t.format == format && t.width == width && t.height == height) return &t.image;
+Result<vk::Image> target_image(Renderer& r, VkFormat format, u32 width, u32 height) {
     vk::ImageDesc d;
-    d.format = vk_format;
+    d.format = format;
     d.width = width;
     d.height = height;
     d.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
               VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    auto img = vk::create_image(*r.device, d);
+    return vk::create_image(*r.device, d);
+}
+
+Target* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format, u32 width, u32 height) {
+    for (auto& t : r.targets)
+        if (t->address == address && t->format == format && t->width == width && t->height == height) return t.get();
+    auto img = target_image(r, vk_format, width, height);
     if (!img) return nullptr;
-    r.targets.push_back(Target{address, format, width, height, *img});
-    return &r.targets.back().image;
+    auto t = nx::make_unique<Target>();
+    t->address = address, t->format = format, t->width = width, t->height = height;
+    t->image = *img;
+    r.targets.push_back(std::move(t));
+    return r.targets.back().get();
+}
+
+// The internal resolution a surface of this format is drawn at: the options' (1 to 4), or 1 where the device cannot
+// blit it with filtering (to scale it up and down) or draw into it.
+u32 surface_scale(Renderer& r, VkFormat format) {
+    const u32 wanted = nx::clamp<u32>(state().options->render_scale, 1, 4);
+    if (wanted == 1) return 1;
+    auto it = r.scalable.find(static_cast<u32>(format));
+    if (it == r.scalable.end()) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(r.device->physical(), format, &fp);
+        constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                 VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        const bool ok = (fp.optimalTilingFeatures & kNeeded) == kNeeded;
+        if (!ok)
+            nx::logw(logs::gpu, "surfaces of format {} are drawn at their own size: the device cannot scale them",
+                     static_cast<u32>(format));
+        it = r.scalable.emplace(static_cast<u32>(format), ok).first;
+    }
+    return it->second ? wanted : 1;
+}
+
+// The target's scaled image, at `scale` (made or made again; what it held is forgotten).
+bool ensure_scaled(Renderer& r, Target& t, u32 scale) {
+    if (t.scaled.image && t.scale == scale) return true;
+    if (t.scaled.image) {
+        r.passes->forget(t.scaled.view);
+        vk::destroy_image(*r.device, t.scaled);
+        t.scaled = {};
+    }
+    t.written.clear();
+    auto img = target_image(r, t.image.desc.format, t.width * scale, t.height * scale);
+    if (!img) return false;
+    t.scaled = *img;
+    t.scale = scale;
+    return true;
+}
+
+// The parts of a surface (rows of `stride` pixels in guest memory) that differ from what was last written back:
+// what the CPU drew over it since (text, a cleared area), or all of it when nothing was written back.
+constexpr u32 kTile = 32;
+struct Changes {
+    nx::vector<VkRect2D> tiles;  // kTile x kTile tiles (cut at the edges) with a changed pixel
+    usize pixels = 0;            // changed pixels
+    bool all = false;
+};
+Changes surface_changes(const Target& t, u32 stride, u32 bytes) {
+    Changes c;
+    if (t.written.empty()) {
+        c.all = true;
+        c.pixels = usize{t.width} * t.height;
+        for (u32 y = 0; y < t.height; y += kTile)
+            for (u32 x = 0; x < t.width; x += kTile)
+                c.tiles.push_back({{static_cast<i32>(x), static_cast<i32>(y)}, {nx::min(kTile, t.width - x), nx::min(kTile, t.height - y)}});
+        return c;
+    }
+    const usize row = usize{t.width} * bytes;
+    const u32 tiles_x = (t.width + kTile - 1) / kTile;
+    nx::vector<u8> dirty(usize{tiles_x} * ((t.height + kTile - 1) / kTile), 0);
+    for (u32 y = 0; y < t.height; ++y) {
+        const u8* guest = memory().host(t.address + y * stride * bytes);
+        const u8* had = t.written.data() + y * row;
+        if (std::memcmp(guest, had, row) == 0) continue;
+        for (u32 x = 0; x < t.width; ++x)
+            if (std::memcmp(guest + usize{x} * bytes, had + usize{x} * bytes, bytes) != 0) {
+                ++c.pixels;
+                dirty[usize{y / kTile} * tiles_x + x / kTile] = 1;
+            }
+    }
+    for (usize i = 0; i < dirty.size(); ++i) {
+        if (!dirty[i]) continue;
+        const u32 x = static_cast<u32>(i % tiles_x) * kTile, y = static_cast<u32>(i / tiles_x) * kTile;
+        c.tiles.push_back({{static_cast<i32>(x), static_cast<i32>(y)}, {nx::min(kTile, t.width - x), nx::min(kTile, t.height - y)}});
+    }
+    return c;
+}
+
+// A whole-image blit between two colour images (in TRANSFER_SRC and TRANSFER_DST).
+void blit(VkCommandBuffer cmd, const vk::Image& from, const vk::Image& to, VkFilter filter) {
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = {static_cast<i32>(from.desc.width), static_cast<i32>(from.desc.height), 1};
+    b.dstOffsets[1] = {static_cast<i32>(to.desc.width), static_cast<i32>(to.desc.height), 1};
+    vkCmdBlitImage(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                   filter);
 }
 
 VkSamplerAddressMode address_mode(u32 m) {
@@ -587,6 +688,32 @@ void host_copy(nx::vector<u8>& out, u32 address, u32 bytes) {
     if (address && bytes && memory().valid(address, bytes)) std::memcpy(out.data() + at, memory().host(address), bytes);
 }
 
+// Depth and stencil samples (the depth words, then the stencil bytes) of a w x h surface at the internal
+// resolution: each repeated over a scale x scale block; and back, the middle sample of each block.
+nx::vector<u8> scale_up_samples(const nx::vector<u8>& in, u32 w, u32 h, u32 s) {
+    const usize n = usize{w} * h, sn = n * s * s;
+    nx::vector<u8> out(sn * 5);
+    for (u32 y = 0; y < h * s; ++y)
+        for (u32 x = 0; x < w * s; ++x) {
+            const usize from = usize{y / s} * w + x / s, to = usize{y} * w * s + x;
+            std::memcpy(out.data() + to * 4, in.data() + from * 4, 4);
+            out[sn * 4 + to] = in[n * 4 + from];
+        }
+    return out;
+}
+
+nx::vector<u8> scale_down_samples(const u8* in, u32 w, u32 h, u32 s) {
+    const usize n = usize{w} * h, sn = n * s * s;
+    nx::vector<u8> out(n * 5);
+    for (u32 y = 0; y < h; ++y)
+        for (u32 x = 0; x < w; ++x) {
+            const usize from = usize{y * s + s / 2} * w * s + x * s + s / 2, to = usize{y} * w + x;
+            std::memcpy(out.data() + to * 4, in + from * 4, 4);
+            out[n * 4 + to] = in[sn * 4 + from];
+        }
+    return out;
+}
+
 struct DrawPlan {
     const Draw* draw = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -604,6 +731,7 @@ void render_scene(Context& context, Scene& scene) {
     (void)context;
     Renderer& r = renderer();
     if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return;
+    nx::scoped_lock<nx::mutex> targets_held(r.targets_lock);
     ++r.scenes;
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
@@ -612,6 +740,11 @@ void render_scene(Context& context, Scene& scene) {
     // (without a colour surface, a depth-only scene: the render target's size)
     u32 width = scene.target->width, height = scene.target->height, stride = 0;
     vk::Image* color = nullptr;
+    // The internal resolution: drawn into `color` at `scale` times the surface's size (the target's scaled image),
+    // and blitted down into the surface's image for guest memory. A depth-only scene is drawn at its own size.
+    Target* target = nullptr;
+    u32 scale = 1;
+    Changes changes;  // (at the internal resolution: what the scaled image does not hold yet)
     if (scene.has_color) {
         if (!color_format(cs.format, cf)) {
             nx::logw(logs::gxm, "colour surface format 0x{:08x} not implemented: scene not rendered", cs.format);
@@ -623,19 +756,33 @@ void render_scene(Context& context, Scene& scene) {
         }
         width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
         if (!memory().valid(cs.data, stride * cf.bytes * (height - 1) + width * cf.bytes, true)) return;
-        color = color_target(r, cs.data, cs.format, cf.format, width, height);
-        if (!color) return;
+        target = color_target(r, cs.data, cs.format, cf.format, width, height);
+        if (!target) return;
+        color = &target->image;
+        if (const u32 s = surface_scale(r, cf.format); s > 1 && ensure_scaled(r, *target, s)) {
+            scale = s;
+            color = &target->scaled;
+            changes = surface_changes(*target, stride, cf.bytes);
+        }
 
-        // The colour as it is in guest memory (GXM loads it at the start of every scene).
-        nx::vector<u8> texels(usize{width} * height * cf.bytes);
-        for (u32 y = 0; y < height; ++y)
-            std::memcpy(texels.data() + usize{y} * width * cf.bytes, memory().host(cs.data + y * stride * cf.bytes), usize{width} * cf.bytes);
-        if (auto done = vk::upload_image(d, *color, texels, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); !done) {
-            nx::logw(logs::gpu, "{}", done.error().message);
-            return;
+        // The colour as it is in guest memory (GXM loads it at the start of every scene). At the internal
+        // resolution, the tiles that changed since the last scene wrote it back are scaled up into the scaled image
+        // in the commands below (the CPU's text over a frame, a cleared area); the rest of it is kept.
+        if (scale == 1 || !changes.tiles.empty()) {
+            nx::vector<u8> texels(usize{width} * height * cf.bytes);
+            for (u32 y = 0; y < height; ++y)
+                std::memcpy(texels.data() + usize{y} * width * cf.bytes, memory().host(cs.data + y * stride * cf.bytes),
+                            usize{width} * cf.bytes);
+            const VkImageLayout layout = scale > 1 ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            if (auto done = vk::upload_image(d, target->image, texels, 0, layout); !done) {
+                nx::logw(logs::gpu, "{}", done.error().message);
+                return;
+            }
         }
     }
     const u32 target_w = nx::min(width, scene.target->width), target_h = nx::min(height, scene.target->height);
+    // (what is drawn: the surface's pixels at the internal resolution)
+    const u32 draw_w = width * scale, draw_h = height * scale;
 
     // Depth and stencil: an image of the scene, cleared to the surface's background values, or loaded from the
     // surface (force load) and stored back to it (force store).
@@ -660,8 +807,8 @@ void render_scene(Context& context, Scene& scene) {
     if (has_depth) {
         vk::ImageDesc dd;
         dd.format = d.caps().depth_stencil_format;
-        dd.width = width;
-        dd.height = height;
+        dd.width = draw_w;
+        dd.height = draw_h;
         dd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (auto img = vk::create_image(d, dd)) depth = *img;
     }
@@ -902,6 +1049,7 @@ void render_scene(Context& context, Scene& scene) {
         c.target[1] = static_cast<f32>(target_h);
         std::memcpy(c.viewport, st.viewport, sizeof c.viewport);
         c.w_clamp = st.w_clamp_enabled ? st.w_clamp : 0.0f;
+        c.scale = static_cast<f32>(scale);
         // Region clip (tile-aligned, as the hardware applies it) and the surface's clip, as a scissor.
         i32 x0 = 0, y0 = 0, x1 = static_cast<i32>(width) - 1, y1 = static_cast<i32>(height) - 1;
         if (color) {
@@ -917,7 +1065,8 @@ void render_scene(Context& context, Scene& scene) {
         x1 = nx::min<i32>(x1, static_cast<i32>(target_w) - 1);
         y1 = nx::min<i32>(y1, static_cast<i32>(target_h) - 1);
         if (x1 < x0 || y1 < y0) continue;
-        plan.scissor = {{x0, y0}, {static_cast<u32>(x1 - x0 + 1), static_cast<u32>(y1 - y0 + 1)}};
+        const i32 si = static_cast<i32>(scale);
+        plan.scissor = {{x0 * si, y0 * si}, {static_cast<u32>(x1 - x0 + 1) * scale, static_cast<u32>(y1 - y0 + 1) * scale}};
         plans.push_back(std::move(plan));
     }
 
@@ -943,13 +1092,16 @@ void render_scene(Context& context, Scene& scene) {
     const VkDeviceSize readback_bytes = color ? VkDeviceSize{width} * height * cf.bytes : 0;
     vk::Buffer* readback = make(nullptr, readback_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     // (depth and stencil, to load and store: the depth words, then the stencil bytes)
-    const VkDeviceSize samples = VkDeviceSize{width} * height;
+    // (at the internal resolution: the surface's samples scaled up on loading, down on storing)
+    const VkDeviceSize samples = VkDeviceSize{draw_w} * draw_h;
     vk::Buffer* depth_buf = nullptr;
     if (load_depth || store_depth) {
         nx::vector<u8> init;
         if (load_depth) {
-            init.resize(samples * 5);
-            read_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<u32*>(init.data()), init.data() + samples * 4);
+            const usize n = usize{width} * height;
+            init.resize(n * 5);
+            read_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<u32*>(init.data()), init.data() + n * 4);
+            if (scale > 1) init = scale_up_samples(init, width, height, scale);
         }
         depth_buf = make(load_depth ? init.data() : nullptr, samples * 5,
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -1077,9 +1229,36 @@ void render_scene(Context& context, Scene& scene) {
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &b, 0,
                              nullptr, 0, nullptr);
     }
+    if (scale > 1) {
+        // (the tiles of the surface's colour that changed, scaled up into the scaled image)
+        if (!changes.tiles.empty()) {
+            vk::transition(*cmd, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            vk::transition(*cmd, target->scaled, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            if (changes.all) {
+                blit(*cmd, target->image, target->scaled, VK_FILTER_NEAREST);
+            } else {
+                nx::vector<VkImageBlit> regions;
+                regions.reserve(changes.tiles.size());
+                const i32 s = static_cast<i32>(scale);
+                for (const VkRect2D& t : changes.tiles) {
+                    VkImageBlit b{};
+                    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    const i32 x1 = t.offset.x + static_cast<i32>(t.extent.width), y1 = t.offset.y + static_cast<i32>(t.extent.height);
+                    b.srcOffsets[0] = {t.offset.x, t.offset.y, 0};
+                    b.srcOffsets[1] = {x1, y1, 1};
+                    b.dstOffsets[0] = {t.offset.x * s, t.offset.y * s, 0};
+                    b.dstOffsets[1] = {x1 * s, y1 * s, 1};
+                    regions.push_back(b);
+                }
+                vkCmdBlitImage(*cmd, target->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target->scaled.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<u32>(regions.size()), regions.data(),
+                               VK_FILTER_NEAREST);
+            }
+        }
+    }
     const VkBufferImageCopy depth_regions[2] = {
-        {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}},
-        {samples * 4, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}}};
+        {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {draw_w, draw_h, 1}},
+        {samples * 4, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {draw_w, draw_h, 1}}};
     if (load_depth && depth.image) {
         vk::transition(*cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdCopyBufferToImage(*cmd, depth_buf->buffer, depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, depth_regions);
@@ -1094,9 +1273,9 @@ void render_scene(Context& context, Scene& scene) {
         if (load_depth) pass.depth.load = pass.depth.stencil_load = VK_ATTACHMENT_LOAD_OP_LOAD;
         if (store_depth) pass.depth.store = pass.depth.stencil_store = VK_ATTACHMENT_STORE_OP_STORE;
     }
-    pass.area = {{0, 0}, {target_w, target_h}};
+    pass.area = {{0, 0}, {target_w * scale, target_h * scale}};
     if (auto begun = r.passes->begin(*cmd, pass); begun) {
-        const VkViewport viewport{0, 0, static_cast<f32>(target_w), static_cast<f32>(target_h), 0, 1};
+        const VkViewport viewport{0, 0, static_cast<f32>(target_w * scale), static_cast<f32>(target_h * scale), 0, 1};
         vkCmdSetViewport(*cmd, 0, 1, &viewport);
         const f32 blend[4] = {0, 0, 0, 0};
         for (usize i = 0; i < plans.size(); ++i) {
@@ -1148,11 +1327,17 @@ void render_scene(Context& context, Scene& scene) {
         nx::logw(logs::gpu, "{}", begun.error().message);
     }
     if (color) {
+        // (at the internal resolution, blitted down to the surface's size first: what guest memory gets)
         vk::transition(*cmd, *color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        if (scale > 1) {
+            vk::transition(*cmd, target->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            blit(*cmd, target->scaled, target->image, VK_FILTER_LINEAR);
+            vk::transition(*cmd, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        }
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {width, height, 1};
-        vkCmdCopyImageToBuffer(*cmd, color->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &copy);
+        vkCmdCopyImageToBuffer(*cmd, target->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &copy);
     }
     if (store_depth && depth.image) {
         vk::transition(*cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -1171,6 +1356,8 @@ void render_scene(Context& context, Scene& scene) {
             const u8* src = static_cast<const u8*>(readback->mapped);
             for (u32 y = 0; y < height; ++y)
                 std::memcpy(memory().host(cs.data + y * stride * cf.bytes), src + usize{y} * width * cf.bytes, usize{width} * cf.bytes);
+            // (what guest memory holds now, to know whether the scaled image is still the surface)
+            if (scale > 1) target->written.assign(src, src + usize{width} * height * cf.bytes);
         }
         // (the uniform buffers programs stored to)
         bool invalidated = false;
@@ -1190,7 +1377,8 @@ void render_scene(Context& context, Scene& scene) {
                     if (!memory().valid(at, 4, true)) continue;
                     u32 v;
                     std::memcpy(&v, memory().host(at), 4);
-                    const u64 n = counts[query_of[i]];
+                    // (samples at the internal resolution counted as the surface's: scale squared of them each)
+                    const u64 drawn = counts[query_of[i]], n = drawn ? nx::max<u64>(1, drawn / (u64{scale} * scale)) : 0;
                     v = st.visibility_set[0] ? (n ? 1u : v) : v + static_cast<u32>(n);
                     std::memcpy(memory().host(at), &v, 4);
                 }
@@ -1199,7 +1387,13 @@ void render_scene(Context& context, Scene& scene) {
         if (store_depth && depth.image) {
             vk::invalidate(d, *depth_buf);
             const u8* src = static_cast<const u8*>(depth_buf->mapped);
-            write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src), src + samples * 4);
+            if (scale > 1) {
+                const nx::vector<u8> down = scale_down_samples(src, width, height, scale);
+                write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(down.data()),
+                                    down.data() + usize{width} * height * 4);
+            } else {
+                write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src), src + samples * 4);
+            }
         }
     } else {
         nx::loge(logs::gpu, "scene: {}", done.error().message);
@@ -1208,6 +1402,43 @@ void render_scene(Context& context, Scene& scene) {
     vkDestroyDescriptorPool(d.device(), pool, nullptr);
     cleanup();
     if (d.validation_errors()) nx::logw(logs::gpu, "{} validation errors so far", d.validation_errors());
+}
+
+bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height) {
+    Renderer& r = renderer();
+    if (!r.device) return false;
+    nx::scoped_lock<nx::mutex> held(r.targets_lock);
+    for (auto& t : r.targets) {
+        if (t->address != f.base || t->width != f.width || t->height != f.height || t->scale <= 1) continue;
+        ColorFormat cf;
+        if (!color_format(t->format, cf) || cf.bytes != 4) return false;
+        // (what the CPU drew over the frame since its scene, scaled up over it; the frame as it is in guest memory
+        // when that is most of it)
+        const Changes changes = surface_changes(*t, f.pitch, 4);
+        if (changes.all || changes.pixels * 4 > usize{t->width} * t->height) return false;
+        auto read = vk::read_image(*r.device, t->scaled);
+        if (!read) {
+            nx::logw(logs::gpu, "the scaled frame: {}", read.error().message);
+            return false;
+        }
+        pixels = std::move(*read);
+        const u32 s = t->scale, sw = t->width * s;
+        if (changes.pixels) {
+            for (u32 y = 0; y < t->height; ++y) {
+                const u8* guest = memory().host(t->address + y * f.pitch * 4);
+                const u8* had = t->written.data() + usize{y} * t->width * 4;
+                for (u32 x = 0; x < t->width; ++x) {
+                    if (std::memcmp(guest + x * 4, had + x * 4, 4) == 0) continue;
+                    for (u32 dy = 0; dy < s; ++dy)
+                        for (u32 dx = 0; dx < s; ++dx)
+                            std::memcpy(pixels.data() + (usize{y * s + dy} * sw + x * s + dx) * 4, guest + x * 4, 4);
+                }
+            }
+        }
+        *width = t->scaled.desc.width, *height = t->scaled.desc.height;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace psvrecore::gxm::hle
