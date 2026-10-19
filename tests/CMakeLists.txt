@@ -91,3 +91,14 @@ set(PSVRECORE_SAMPLES_DIR "" CACHE PATH "folder of SDK-built GXM samples and the
 if(PSVRECORE_SAMPLES_DIR)
     add_subdirectory(samples)
 endif()
+
+# The platform layer (SDL3): the controls, the audio device (SDL's disk driver) and the window (skipped without a
+# display or a Vulkan device).
+add_executable(psvrecore_platform_tests
+    "${_nxtest_dir}/nxtest.cpp"
+    platform/platform_tests.cpp
+)
+target_include_directories(psvrecore_platform_tests PRIVATE "${_nxtest_dir}")
+target_link_libraries(psvrecore_platform_tests PRIVATE psvrecore::platform nx::foundation)
+psvrecore_target_defaults(psvrecore_platform_tests)
+add_test(NAME psvrecore_platform_tests COMMAND psvrecore_platform_tests)
