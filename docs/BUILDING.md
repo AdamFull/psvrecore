@@ -93,7 +93,8 @@ with `psvusse --run`, and compares the outputs with the same expressions evaluat
 ```
 python scripts/usse_exec_check.py --psvusse build/windows-x64-release/tools/psvusse/psvusse.exe --sdk C:/path/to/sdk
 python scripts/usse_exec_check.py ... --count 2000 --seed 11 --special int,index --flow none --keep DIR
-python scripts/usse_exec_check.py ... --fragment     # fragment programs (f32 and f16 varyings)
+python scripts/usse_exec_check.py ... --fragment     # fragment programs (f32 and f16 varyings; half sample textures)
+python scripts/usse_exec_check.py ... --fragment --textures 1.0   # every fragment program samples textures
 python scripts/usse_exec_check.py ... --fixed        # fixed-point fragment programs
 ```
 

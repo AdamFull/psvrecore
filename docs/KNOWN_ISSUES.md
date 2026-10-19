@@ -69,7 +69,10 @@
 
 ## Shader interpreter (USSE)
 
-- **Not implemented:** texture sampling, the per-instance predicate, `rlp`, per-lane predicate tests, o8 packs,
+- **Textures are behind an interface** (`ShaderTextures`). The check uses nearest sampling of RGBA8 at texel centres;
+  filtering, mipmaps, bias and level of detail are the texture model's, not the interpreter's. Texture queries (`.rsd`,
+  `.info`, `.minp`) are not implemented.
+- **Not implemented:** the per-instance predicate, `rlp`, per-lane predicate tests, o8 packs,
   loads and stores other than absolute ones, depth output. These fail with "not implemented". Derivatives and the
   special registers read as zero (one instance, no neighbours).
 - **Fixed point is the least certain part.** fx10 is a signed 10-bit value with 1.0 = 255. x, y and z are in bits
