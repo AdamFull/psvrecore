@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -66,6 +67,44 @@ public:
             nx::logi(logs::frontend, "shot: {}", path);
     }
 };
+
+// The application sent to the background and brought back (Android): the game suspended, its sound paused and the
+// window's surface let go, all before the system takes the window. From the activity's pause and resume (on the
+// system's thread, before the surface goes), and from SDL's events as well (which reach SDL's thread only after).
+struct Lifecycle {
+    runtime::Runtime* rt = nullptr;
+    platform::AudioDevice* audio = nullptr;
+    platform::Window* window = nullptr;
+    nx::mutex lock;
+    bool background = false;
+
+    void set_background(bool to) {
+        nx::scoped_lock<nx::mutex> held(lock);
+        if (background == to) return;
+        background = to;
+        if (to) {
+            rt->kernel().suspend();
+            if (audio) audio->set_paused(true);
+            window->set_background(true);
+            nx::logi(logs::frontend, "to the background: suspended");
+        } else {
+            window->set_background(false);
+            if (audio) audio->set_paused(false);
+            rt->kernel().resume();
+            nx::logi(logs::frontend, "back from the background: resumed");
+        }
+    }
+};
+
+std::atomic<Lifecycle*> g_lifecycle{nullptr};
+
+bool on_app_event(void* user, SDL_Event* e) {
+    Lifecycle& l = *static_cast<Lifecycle*>(user);
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) l.set_background(true);
+    else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) l.set_background(false);
+    else if (e->type == SDL_EVENT_TERMINATING) nx::log::flush();
+    return true;
+}
 
 nx::log::Level log_level(nx::string_view name) {
     if (name == "debug") return nx::log::Level::Debug;
@@ -326,6 +365,13 @@ int run(const Game& game, int argc, char** argv) {
     if (!main_thread) return fail(nx::format("The game could not start: {}", main_thread.error().message), cl.hidden);
     nx::logi(logs::frontend, "{} started from {}; data in {}", game.title, s.game_folder, data);
 
+    Lifecycle lifecycle;
+    lifecycle.rt = &rt;
+    lifecycle.audio = speaker.get();
+    lifecycle.window = window->get();
+    SDL_AddEventWatch(on_app_event, &lifecycle);
+    g_lifecycle.store(&lifecycle);
+
     // Until the window is closed, the game exits, the script quits or the time is up.
     Script script(std::move(script_items));
     const u64 booted = nx::os::ticks_ns();
@@ -361,3 +407,13 @@ int run(const Game& game, int argc, char** argv) {
 }
 
 }  // namespace psvrecore::frontend
+
+#if defined(__ANDROID__)
+#include <jni.h>
+
+// PsvrecoreActivity's pause and resume (on the system's thread).
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_adamfull_psvrecore_PsvrecoreActivity_nativeSetBackground(JNIEnv*, jclass, jboolean background) {
+    if (auto* l = psvrecore::frontend::g_lifecycle.load()) l->set_background(background != JNI_FALSE);
+}
+#endif
