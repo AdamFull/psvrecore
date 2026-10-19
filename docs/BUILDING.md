@@ -85,6 +85,20 @@ SDK's host build, `host_tools/lib.x64/gxm_tool.dll`, so it needs a 64-bit Python
 python scripts/gxp_check.py --psvusse build/windows-x64-release/tools/psvusse/psvusse.exe --sdk C:/path/to/sdk shaders/
 ```
 
+## Shader interpreter check (needs the PS Vita SDK)
+
+`scripts/usse_exec_check.py` generates random Cg vertex programs, compiles them with the SDK's compiler, runs them
+with `psvusse --run`, and compares the outputs with the same expressions evaluated by numpy:
+
+```
+python scripts/usse_exec_check.py --psvusse build/windows-x64-release/tools/psvusse/psvusse.exe --sdk C:/path/to/sdk
+python scripts/usse_exec_check.py ... --count 2000 --seed 11 --special int,index --flow none --keep DIR
+```
+
+`--special` and `--flow` limit what is generated. `--keep` keeps the programs, their inputs and their GXPs in a
+folder; they are derived from the SDK, so keep that folder outside the repository. To see a program run, use
+`psvusse --run DIR/eNNNNN.in --trace DIR/eNNNNN.gxp`.
+
 ## Test programs (needs the PS Vita SDK)
 
 `scripts/program_check.py` runs whole SDK-built programs on the runtime:

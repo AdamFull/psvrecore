@@ -53,7 +53,8 @@
   behaviour. The interpreter and rendering tests are what check the semantics.
 - **Every word the compiler emitted in the corpora matches; some random words do not.** On words of random bits, these
   differ from the reference (none was seen in compiled shaders):
-  - repeats of families 9, 14, 15, 18, 25, 26, 28, 29 and 30 decode as one repetition;
+  - repeats of families 9, 14, 18, 25, 28, 29 and 30 decode as one repetition. Families 15 and 26 execute their
+    repetitions and the increments' offsets, which the reference listing does not show (see the interpreter);
   - in repeats, the reference steps immediates, indexed offsets and index-register destinations in printed units, and
     keeps stepped temporaries as temporaries; the decoder does not;
   - small-integer selector layouts of family 8 (pack), u8 variants of family 9 (tests), rare types of family 15;
@@ -65,6 +66,29 @@
   outputs, fragment inputs and output format, all checked against libgxm. Other tables (literals, buffer containers,
   dependent samplers) are not read yet; nothing checks their layout, and the translator will need them.
 - **`sceGxmProgramIsEquivalent` is not modelled.**
+
+## Shader interpreter (USSE)
+
+- **Vertex programs only.** Fragment inputs, the fixed-point families (16, 17, 18, 25), texture sampling, the
+  per-instance predicate, `rlp`, per-lane predicate tests, and loads and stores other than absolute ones fail with
+  "not implemented". Derivatives read as zero (one instance, no neighbours), and so do the special registers.
+- **Semantics marked "(assumed)" in `interp.cpp` are not covered by the same-source check.** These are the
+  index-register destination numbering, the 16-bit integer multiply-add without a byte part, rounding in scaled
+  (normalized) conversions, and unfused multiply-add rounding.
+- **5 of 1949 random programs disagree, unexplained.** They involve integers that go through the compiler's 16-bit
+  conversion shortcuts, or multiplies by selected constants that it turns into shifts. It is not known whether the
+  interpreter or the compiler is wrong there.
+- **The SDK's shader compiler (psp2cgc) miscompiles some expressions.** The check avoids these patterns, or reports
+  them separately, since they say nothing about the interpreter:
+  - `abs(floor(x)) + c` becomes `c - floor(x)`;
+  - `abs(x * y)` is sometimes moved onto one factor;
+  - `frac` of constants folds as `x - trunc(x)`, while `frac` of variables compiles as `x - floor(x)`;
+  - a uniform-only value used both by `clamp`/`min` and directly can lose its register in the secondary program (one
+    case dropped a declared output). Such programs agree once their uniforms are made attributes, and the check
+    reports them as "disagree only with uniforms".
+  - Deep expressions crash the compiler (status 0xC0000409).
+- **The compiler converts float to int by flooring** (`(int)-2.5` is -3). Cg says truncation; the check follows the
+  compiler.
 
 ## Analysis and code generation
 

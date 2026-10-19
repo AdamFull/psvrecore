@@ -151,6 +151,13 @@ Everything generated stays on the user's machine.
   - Words that only set state (the increments, the program prologue) decode to instructions that print nothing.
   - The formatter prints the reference disassembler's syntax, so the decoder can be checked against it word for word
     (`scripts/usse_check.py`).
+- **Shader interpreter** (`usse/interp.hpp`, test and tool use only). It runs decoded programs on one instance.
+  - Lanes are read by data type: words, halves or bytes of the 32-bit registers.
+  - The internal registers hold four 32-bit lanes. f16 values are held there as f32, narrower integers zero-extended.
+  - Before a draw, the secondary attributes are filled as the driver fills them: the default uniform buffer, uniform
+    buffer addresses with their bias, and literals (`load_secondary`). Then the secondary program runs, then the
+    primary one.
+  - It is the oracle for the SPIR-V translator's tests.
 - **Graphics.**
   - GXM scenes map to Vulkan render passes, with load/store operations chosen for tile-based GPUs.
   - Guest surfaces are written back to guest memory only when the game can observe them.
