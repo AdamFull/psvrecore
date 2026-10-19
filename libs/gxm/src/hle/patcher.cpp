@@ -6,6 +6,7 @@
 
 #include "psvrecore/log.hpp"
 #include "state.hpp"
+#include "core/foundation/core/sha256.h"
 #include "core/foundation/strings/format.h"
 
 namespace psvrecore::gxm::hle {
@@ -177,6 +178,7 @@ i32 sceGxmShaderPatcherRegisterProgram(u32 patcher, u32 gxp, Ptr<u32> id) {
     r->guest = guest;
     r->gxp_address = gxp;
     r->gxp = *parsed;
+    r->content = nx::sha256(std::span<const u8>(memory().host(gxp), parsed->size));
     r->primary = usse::decode_program(r->gxp.primary, usse::ProgramKind::Primary);
     r->secondary = usse::decode_program(r->gxp.secondary, usse::ProgramKind::Secondary);
     *reinterpret_cast<u32*>(memory().host(guest)) = gxp;

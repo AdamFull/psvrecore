@@ -22,6 +22,7 @@
 //
 // Not yet: tiled and swizzled colour surfaces, multisampling.
 
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -30,6 +31,8 @@
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/log.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
+#include "shader_cache.hpp"
+#include "core/foundation/platform/os.h"
 #include "state.hpp"
 #include "core/foundation/core/hash.h"
 #include "core/foundation/strings/format.h"
@@ -235,9 +238,15 @@ struct Renderer {
     nx::unique_ptr<vk::Samplers> samplers;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    nx::hash_map<u64, VkShaderModule> modules;      // (by program and variant)
-    nx::hash_map<u64, VkPipeline> compute;          // secondary programs (by program)
+    nx::hash_map<u64, VkShaderModule> modules;      // (by shader key)
+    nx::hash_map<u64, ShaderKey> module_keys;       // (by module: a pipeline's shaders, to record it)
+    nx::hash_map<u64, VkPipeline> compute;          // secondary programs (by shader key)
     nx::hash_map<u64, nx::string> failed_programs;  // (reported once)
+    ShaderCache cache;
+    bool warming = false;
+    // Made while the game ran (not by warm_up): what the cache did not have.
+    std::atomic<u32> translated{0}, made_pipelines{0};
+    std::atomic<bool> pipelines_changed{false};
     nx::vector<Target> targets;
     vk::Image white, white_cube;
     VkSampler sampler = VK_NULL_HANDLE;
@@ -268,6 +277,15 @@ bool ensure(Renderer& r) {
     vk::Device& d = *r.device;
     r.passes = nx::make_unique<vk::RenderPasses>(d);
     r.pipelines = nx::make_unique<vk::Pipelines>(d, *r.passes);
+    // (what an earlier run made, before anything is made now)
+    r.cache.open(state().options->cache_folder);
+    if (!r.cache.folder().empty()) {
+        const nx::string path = r.cache.folder() + "/pipelines.vkcache";
+        if (nx::fs::exists(nx::fs::path_view(path))) {
+            if (auto loaded = r.pipelines->load_cache(nx::fs::path_view(path)); !loaded)
+                nx::logi(logs::gpu, "{}", loaded.error().message);
+        }
+    }
     r.samplers = nx::make_unique<vk::Samplers>(d);
     VkDescriptorSetLayoutBinding bindings[kDrawBindings]{};
     for (u32 i = 0; i < kDrawBindings; ++i) {
@@ -313,47 +331,86 @@ bool ensure(Renderer& r) {
     return true;
 }
 
-VkShaderModule module_for(Renderer& r, u64 key, auto&& translate) {
+// A program's shader module for a variant: made from the cache's SPIR-V, else translated (and kept in the cache).
+// `translate` empty: from the cache only (warm_up).
+VkShaderModule module_for(Renderer& r, const ShaderKey& full, auto&& translate) {
+    const u64 key = short_key(full);
     if (auto it = r.modules.find(key); it != r.modules.end()) return it->second;
     if (r.failed_programs.contains(key)) return VK_NULL_HANDLE;
-    auto spirv = translate();
-    if (!spirv) {
-        nx::logw(logs::gxm, "program not translated: {}", spirv.error().message);
-        r.failed_programs[key] = spirv.error().message;
-        return VK_NULL_HANDLE;
+    nx::vector<u32> words;
+    if (const nx::vector<u32>* cached = r.cache.spirv(full)) {
+        words = *cached;
+    } else {
+        auto spirv = translate();
+        if (!spirv) {
+            nx::logw(logs::gxm, "program not translated: {}", spirv.error().message);
+            r.failed_programs[key] = spirv.error().message;
+            return VK_NULL_HANDLE;
+        }
+        words = std::move(*spirv);
+        r.cache.add_spirv(full, words);
+        if (!r.warming) r.translated.fetch_add(1);
     }
-    auto m = vk::create_shader(*r.device, *spirv);
+    auto m = vk::create_shader(*r.device, words);
     if (!m) {
         r.failed_programs[key] = m.error().message;
         return VK_NULL_HANDLE;
     }
     r.modules[key] = *m;
+    r.module_keys[reinterpret_cast<u64>(*m)] = full;
     return *m;
 }
 
-u64 hash_of(std::initializer_list<u64> parts, const void* bytes = nullptr, usize size = 0) {
-    nx::fnv1a64 h;
-    for (u64 p : parts) h.combine(p);
-    if (bytes) h.combine_bytes(static_cast<const char*>(bytes), size);
-    return h.value();
+// The variants' keys: the program's bytes, and what else its translation reads.
+ShaderKey secondary_key(const Program& p) {
+    const u8 kind = 's';
+    return shader_key({p.content, std::span<const u8>(&kind, 1)});
+}
+
+ShaderKey vertex_key(const Program& p, const VertexShader& vs) {
+    nx::vector<u8> v{'v'};
+    auto put = [&](u32 x) { v.insert(v.end(), reinterpret_cast<const u8*>(&x), reinterpret_cast<const u8*>(&x) + 4); };
+    for (const VertexInput& in : vs.inputs) {
+        put(in.location), put(in.reg);
+        v.push_back(in.format), v.push_back(in.components), v.push_back(in.raw ? 1 : 0);
+    }
+    return shader_key({p.content, v});
+}
+
+ShaderKey fragment_key(const Program& p, const FragmentShader& fs, bool inline_secondary) {
+    nx::vector<u8> v{'f'};
+    v.insert(v.end(), reinterpret_cast<const u8*>(&fs.output_format), reinterpret_cast<const u8*>(&fs.output_format) + 4);
+    v.insert(v.end(), fs.swizzle, fs.swizzle + 4);
+    v.push_back(fs.color_output), v.push_back(fs.fragment_program_enabled), v.push_back(inline_secondary);
+    return shader_key({p.content, v});
+}
+
+// A compute pipeline for a secondary program's module.
+VkPipeline make_compute(Renderer& r, VkShaderModule m) {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = m;
+    ci.stage.pName = "main";
+    ci.layout = r.layout;
+    if (vkCreateComputePipelines(r.device->device(), r.pipelines->cache(), 1, &ci, nullptr, &pipeline) != VK_SUCCESS)
+        pipeline = VK_NULL_HANDLE;
+    return pipeline;
 }
 
 // The compute pipeline of a secondary program (VK_NULL_HANDLE: none to run, or not translated).
 VkPipeline secondary_pipeline(Renderer& r, const Program& p) {
     if (p.secondary.empty()) return VK_NULL_HANDLE;
-    const u64 key = hash_of({reinterpret_cast<u64>(&p), 1});
+    const ShaderKey full = secondary_key(p);
+    const u64 key = short_key(full);
     if (auto it = r.compute.find(key); it != r.compute.end()) return it->second;
-    const VkShaderModule m = module_for(r, key, [&] { return translate_secondary(p.gxp, p.secondary); });
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    if (m) {
-        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = m;
-        ci.stage.pName = "main";
-        ci.layout = r.layout;
-        if (vkCreateComputePipelines(r.device->device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) != VK_SUCCESS)
-            pipeline = VK_NULL_HANDLE;
+    const VkShaderModule m = module_for(r, full, [&] { return translate_secondary(p.gxp, p.secondary); });
+    const VkPipeline pipeline = m ? make_compute(r, m) : VK_NULL_HANDLE;
+    if (pipeline) {
+        r.cache.add_compute(full);
+        if (!r.warming) r.made_pipelines.fetch_add(1);
+        r.pipelines_changed.store(true);
     }
     r.compute[key] = pipeline;
     return pipeline;
@@ -695,14 +752,12 @@ void render_scene(Context& context, Scene& scene) {
                 if (p.category == usse::ParameterCategory::Attribute && p.resource == attr.reg) in.raw = p.reg_format;
             vs.inputs.push_back(in);
         }
-        const u64 vkey = hash_of({reinterpret_cast<u64>(&vp), 2}, vs.inputs.data(), vs.inputs.size() * sizeof(VertexInput));
-        const VkShaderModule vmod = module_for(r, vkey, [&] { return translate_vertex(vp.gxp, vp.primary, vs); });
+        const VkShaderModule vmod = module_for(r, vertex_key(vp, vs), [&] { return translate_vertex(vp.gxp, vp.primary, vs); });
         FragmentShader fs;
         fs.output_format = dr.fragment->output_format;
         std::memcpy(fs.swizzle, cf.swizzle, 4);
         fs.color_output = color != nullptr;
-        const u64 fkey = hash_of({reinterpret_cast<u64>(&fp), 3, fs.output_format, fs.color_output ? 1u : 0u}, fs.swizzle, 4);
-        const VkShaderModule fmod = module_for(r, fkey, [&] {
+        const VkShaderModule fmod = module_for(r, fragment_key(fp, fs, inline_secondary), [&] {
             const std::span<const usse::Decoded> secondary =
                 inline_secondary ? std::span<const usse::Decoded>(fp.secondary) : std::span<const usse::Decoded>{};
             return translate_fragment(fp.gxp, fp.primary, fs, secondary);
@@ -821,10 +876,22 @@ void render_scene(Context& context, Scene& scene) {
         pass_formats.color_input = reads_color;
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
+        const usize before = r.pipelines->count();
         auto pipeline = r.pipelines->graphics(desc);
         if (!pipeline) {
             nx::logw(logs::gpu, "{}", pipeline.error().message);
             continue;
+        }
+        if (r.pipelines->count() != before) {
+            // (a new one: recorded, to be made before the game starts next time)
+            ShaderCache::Graphics g;
+            g.desc = desc;
+            g.desc.vertex = VK_NULL_HANDLE, g.desc.fragment = VK_NULL_HANDLE, g.desc.layout = VK_NULL_HANDLE;
+            g.vertex = r.module_keys[reinterpret_cast<u64>(vmod)];
+            g.fragment = r.module_keys[reinterpret_cast<u64>(fmod)];
+            r.cache.add_graphics(g);
+            r.made_pipelines.fetch_add(1);
+            r.pipelines_changed.store(true);
         }
         plan.pipeline = *pipeline;
 
@@ -1144,3 +1211,54 @@ void render_scene(Context& context, Scene& scene) {
 }
 
 }  // namespace psvrecore::gxm::hle
+
+namespace psvrecore::gxm {
+
+WarmUp warm_up() {
+    using namespace hle;
+    WarmUp w;
+    Renderer& r = renderer();
+    if (!ensure(r)) return w;
+    const u64 start = nx::os::ticks_ns();
+    r.warming = true;
+    auto none = [] { return Result<nx::vector<u32>>(failure("not in the shader cache")); };
+    for (const ShaderKey& key : r.cache.compute()) {
+        if (r.compute.contains(short_key(key))) continue;
+        const VkShaderModule m = module_for(r, key, none);
+        if (!m) continue;
+        r.compute[short_key(key)] = make_compute(r, m);
+        ++w.pipelines;
+    }
+    for (const ShaderCache::Graphics& g : r.cache.graphics()) {
+        vk::GraphicsPipelineDesc desc = g.desc;
+        desc.vertex = module_for(r, g.vertex, none);
+        desc.fragment = module_for(r, g.fragment, none);
+        desc.layout = r.layout;
+        if (!desc.vertex || !desc.fragment) continue;
+        if (r.pipelines->graphics(desc)) ++w.pipelines;
+    }
+    r.warming = false;
+    // (what warm_up could not make is tried again when the game draws with it)
+    r.failed_programs.clear();
+    w.shaders = static_cast<u32>(r.modules.size());
+    w.ms = static_cast<f64>(nx::os::ticks_ns() - start) / 1e6;
+    r.pipelines_changed.store(true);  // (the driver's cache now has them all: saved with the rest)
+    nx::logi(logs::gpu, "warm-up: {} shaders and {} pipelines from the cache in {:.0f} ms", w.shaders, w.pipelines, w.ms);
+    return w;
+}
+
+void save_caches() {
+    using namespace hle;
+    Renderer& r = renderer();
+    if (!r.device || r.cache.folder().empty() || !r.pipelines_changed.exchange(false)) return;
+    const nx::string path = r.cache.folder() + "/pipelines.vkcache";
+    if (auto saved = r.pipelines->save_cache(nx::fs::path_view(path)); !saved)
+        nx::logw(logs::gpu, "pipeline cache: {}", saved.error().message);
+}
+
+PlayStats play_stats() {
+    hle::Renderer& r = hle::renderer();
+    return PlayStats{r.translated.load(), r.made_pipelines.load()};
+}
+
+}  // namespace psvrecore::gxm

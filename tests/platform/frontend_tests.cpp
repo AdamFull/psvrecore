@@ -9,6 +9,7 @@
 #include "nxtest.h"
 #include "psvrecore/frontend/frontend.hpp"
 #include "psvrecore/frontend/script.hpp"
+#include "shader_cache.hpp"
 #include "core/foundation/platform/filesystem.h"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
@@ -278,4 +279,72 @@ TEST_CASE("settings: one value changed in the file, its comments and other lines
     CHECK_FALSE(d.audio);
     CHECK(d.scale == 1);
     std::remove(file.c_str());
+}
+
+TEST_CASE("shader cache: kept from one run to the next; another translator's, or a record cut short, not used") {
+    using namespace psvrecore::gxm::hle;
+    const nx::string folder = temp_file("shader_cache");
+    (void)nx::fs::remove_all(nx::fs::path_view(folder));
+    const u8 program_a[] = {1, 2, 3}, program_b[] = {1, 2, 4};
+    const ShaderKey a = shader_key({program_a}), b = shader_key({program_b});
+    CHECK(a != b);
+    CHECK(shader_key({program_a}) == a);
+    // (the parts' borders count: {1, 2} + {3} is not {1} + {2, 3})
+    const u8 p12[] = {1, 2}, p3[] = {3}, p1[] = {1}, p23[] = {2, 3};
+    CHECK(shader_key({p12, p3}) != shader_key({p1, p23}));
+    const u32 words_a[] = {0x07230203u, 1, 2, 3}, words_b[] = {0x07230203u, 9};
+    {
+        ShaderCache c;
+        c.open(folder);
+        CHECK(c.spirv(a) == nullptr);
+        c.add_spirv(a, words_a);
+        c.add_spirv(b, words_b);
+        c.add_spirv(a, words_b);  // (a key already there: kept as it was)
+        ShaderCache::Graphics g{};
+        g.desc = vulkan::GraphicsPipelineDesc::defaults();
+        g.desc.depth_test = 1;
+        g.vertex = a, g.fragment = b;
+        c.add_graphics(g);
+        c.add_graphics(g);
+        c.add_compute(b);
+    }
+    {
+        ShaderCache c;
+        c.open(folder);
+        REQUIRE(c.spirv(a));
+        CHECK(*c.spirv(a) == nx::vector<u32>(std::begin(words_a), std::end(words_a)));
+        REQUIRE(c.spirv(b));
+        CHECK(c.spirv(b)->size() == 2);
+        REQUIRE(c.graphics().size() == 1);
+        CHECK(c.graphics()[0].desc.depth_test == 1);
+        CHECK(c.graphics()[0].vertex == a);
+        CHECK(c.compute().size() == 1);
+    }
+    // A record cut short (the process ended while writing): what came before it is kept.
+    const nx::string file = folder + "/shaders.bin";
+    {
+        std::FILE* f = std::fopen(file.c_str(), "ab");
+        REQUIRE(f);
+        const u8 partial[] = {1, 200, 0, 0, 0, 7};
+        std::fwrite(partial, 1, sizeof partial, f);
+        std::fclose(f);
+        ShaderCache c;
+        c.open(folder);
+        CHECK(c.spirv(a));
+        CHECK(c.spirv_count() == 2);
+    }
+    // Another translator's file (its header's id differs): dropped, the cache starts again.
+    {
+        std::FILE* f = std::fopen(file.c_str(), "r+b");
+        REQUIRE(f);
+        std::fseek(f, 8, SEEK_SET);
+        std::fputc('#', f);
+        std::fclose(f);
+        ShaderCache c;
+        c.open(folder);
+        CHECK(c.spirv(a) == nullptr);
+        CHECK(c.spirv_count() == 0);
+        CHECK(c.graphics().empty());
+    }
+    (void)nx::fs::remove_all(nx::fs::path_view(folder));
 }

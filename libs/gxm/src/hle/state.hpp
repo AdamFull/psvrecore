@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 // The GXM layer's state: guest structures (laid out as the SDK's headers define them), the host objects behind the
 // handles GXM gives the game (each handle is the guest address of a small block, so the game can keep and compare
 // it), and the global state of the library.
@@ -179,6 +181,7 @@ struct RenderTarget {
 struct Program {
     u32 guest = 0;  // the SceGxmShaderPatcherId
     u32 gxp_address = 0;
+    std::array<u8, 32> content{};  // the GXP's SHA-256 (the shader cache's keys start from it)
     usse::Gxp gxp;
     nx::vector<usse::Decoded> primary, secondary;
     u32 references = 1;

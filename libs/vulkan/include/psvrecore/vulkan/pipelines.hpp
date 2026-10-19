@@ -78,6 +78,7 @@ public:
 
     Result<VkPipeline> graphics(const GraphicsPipelineDesc& desc);
     usize count() const { return count_; }
+    VkPipelineCache cache() const { return cache_; }  // (for the compute pipelines too)
 
     // The driver's pipeline cache, saved for the next run (a file another driver wrote is ignored).
     Result<void> save_cache(nx::fs::path_view path) const;
