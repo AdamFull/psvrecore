@@ -36,7 +36,12 @@ jobs:
         with:
           submodules: recursive
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y clang ninja-build
+        # (SDL needs X11 or Wayland to build its video; Mesa's lavapipe and the validation layers run the GPU tests)
+        run: >
+          sudo apt-get update && sudo apt-get install -y clang ninja-build
+          libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev
+          libwayland-dev wayland-protocols libegl1-mesa-dev libasound2-dev libpulse-dev libudev-dev
+          mesa-vulkan-drivers libvulkan1 vulkan-validationlayers
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
       - name: Build

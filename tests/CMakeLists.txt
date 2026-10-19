@@ -104,3 +104,6 @@ target_include_directories(psvrecore_platform_tests PRIVATE "${_nxtest_dir}" "${
 target_link_libraries(psvrecore_platform_tests PRIVATE psvrecore::platform psvrecore::frontend nx::foundation)
 psvrecore_target_defaults(psvrecore_platform_tests)
 add_test(NAME psvrecore_platform_tests COMMAND psvrecore_platform_tests)
+
+# (nxtest exits with 77 when every case was skipped: no Vulkan device, no window)
+set_tests_properties(psvrecore_tests psvrecore_runtime_tests psvrecore_gpu_tests psvrecore_platform_tests PROPERTIES SKIP_RETURN_CODE 77)
