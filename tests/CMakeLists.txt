@@ -79,3 +79,9 @@ set(PSVRECORE_PROGRAMS_DIR "" CACHE PATH "folder of SDK-built test programs and 
 if(PSVRECORE_PROGRAMS_DIR)
     add_subdirectory(programs)
 endif()
+
+# The SDK's GXM samples, built only by scripts/sample_check.py (they need the SDK: local only).
+set(PSVRECORE_SAMPLES_DIR "" CACHE PATH "folder of SDK-built GXM samples and their recompiled code (scripts/sample_check.py)")
+if(PSVRECORE_SAMPLES_DIR)
+    add_subdirectory(samples)
+endif()
