@@ -772,28 +772,55 @@ TEST_CASE("ngs: ATRAC9 voices play what at9tool decodes, from the start and from
 
 namespace {
 
-// A mono VAG file's blocks played through a player voice: the samples, from the first block on.
-nx::vector<i16> play_vag(const nx::vector<u8>& file, usize frames) {
+// A VAG file's blocks played through a player voice: the samples (`channels` a frame), from the first block on. With
+// `stream` bytes the data goes through two buffers of that size in turn, each refilled with what comes next once the
+// voice has moved on to the other (as the SDK's adpcm_stream sample streams); otherwise it is one buffer.
+nx::vector<i16> play_vag(const nx::vector<u8>& file, usize frames, u32 channels = 1, u32 stream = 0) {
     TestRuntime t;
     PsvContext* ctx = t.ctx();
     Ngs ngs(ctx);
     const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
-    const u32 voice = ngs.rack(kDefTemplate1, 1, 1)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, static_cast<i32>(channels))[0];
     REQUIRE(ngs.patch(voice, master) == 0);
-    const u32 bytes = static_cast<u32>(file.size() - 48);  // (after the 48-byte header)
-    const u32 at = aligned(bytes);
-    std::memcpy(t.rt.memory().host(at), file.data() + 48, bytes);
-    PlayerParams p = player(1);
+    const u8* data = file.data() + 48;  // (after the 48-byte header)
+    const u32 bytes = static_cast<u32>(file.size() - 48);
+    PlayerParams p = player(static_cast<i8>(channels));
     p.type = 1;  // SCE_NGS_PLAYER_TYPE_ADPCM
-    p.buffs[0] = PlayerBuffer{at, static_cast<i32>(bytes), 0, -1};
+    u32 at[2] = {}, sent = 0;
+    const auto fill = [&](u32 b) {
+        const u32 n = nx::min(stream, bytes - sent);
+        std::memcpy(t.rt.memory().host(at[b]), data + sent, n);
+        sent += n;
+        p.buffs[b] = PlayerBuffer{at[b], static_cast<i32>(n), 0, sent < bytes ? static_cast<i16>(1 - b) : i16{-1}};
+    };
+    if (stream == 0) {
+        at[0] = aligned(bytes);
+        std::memcpy(t.rt.memory().host(at[0]), data, bytes);
+        p.buffs[0] = PlayerBuffer{at[0], static_cast<i32>(bytes), 0, -1};
+    } else {
+        at[0] = aligned(stream), at[1] = aligned(stream);
+        fill(0);
+        if (sent < bytes) fill(1);
+    }
     REQUIRE(set_params(ctx, voice, 0, p) == 0);
     REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
     REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
     nx::vector<i16> got;
-    while (got.size() < frames) {
+    u32 playing = 0;
+    const u32 st = scratch(24);
+    while (got.size() < frames * channels) {
         ngs.update();
         const nx::vector<i16> out = ngs.output(master);
-        for (u32 i = 0; i < kG; ++i) got.push_back(out[2 * i]);
+        for (u32 i = 0; i < kG; ++i)
+            for (u32 c = 0; c < channels; ++c) got.push_back(out[2 * i + c]);
+        if (stream == 0) continue;
+        REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
+        const u32 now = psv_ld32(st + 4);
+        if (now != playing && sent < bytes) {
+            fill(playing);
+            REQUIRE(set_params(ctx, voice, 0, p) == 0);
+        }
+        playing = now;
     }
     return got;
 }
@@ -830,6 +857,8 @@ TEST_CASE("ngs: VAG made by vagconv2 plays back its source, HE-VAG at least as w
                 he_blocks += ((vag[at] >> 4) | ((vag[at + 1] >> 4) << 4)) > 4;
             // (vagconv2 starts with a silent block: the source begins at the second)
             const nx::vector<i16> got = play_vag(vag, 28 + n);
+            // (streamed in 4 KB buffers it plays the same: a swap goes on from the samples before)
+            if (mode == 0) CHECK(play_vag(vag, 28 + n, 1, 4096) == got);
             f64 signal = 0, noise = 0;
             for (usize i = 0; i < n; ++i) {
                 i16 want;
@@ -846,6 +875,53 @@ TEST_CASE("ngs: VAG made by vagconv2 plays back its source, HE-VAG at least as w
         CHECK(snr[1] >= 20);
         // (above 60 dB both are within a step of the source: how many samples land one off is the encoder's doing)
         CHECK(snr[0] >= nx::min(snr[1] - 1, 60.0));
+        ++checked;
+    }
+    CHECK(checked > 0);
+}
+
+// Stereo VAG made by vagconv2 from a stereo WAV: scripts/vag_check.py makes it locally as <name>_st.vag next to its
+// source <name>.wav (and copies the SDK's own stereo VAG there the same way). Each channel is measured against the
+// source's, played from one buffer and streamed in 4 KB buffers.
+TEST_CASE("ngs: stereo VAG made by vagconv2 plays back both channels of its source, from one buffer or streamed") {
+    const auto dir = nx::os::environment_variable("PSVRECORE_VAG_DIR");
+    if (!dir) {
+        std::printf("(PSVRECORE_VAG_DIR not set: no VAG data to check)\n");
+        return;
+    }
+    auto entries = nx::fs::directory_entries(nx::fs::path_view(*dir));
+    REQUIRE(entries.has_value());
+    u32 checked = 0;
+    for (const auto& e : *entries) {
+        const nx::string path(e.path);
+        if (path.size() < 7 || path.substr(path.size() - 7) != "_st.vag") continue;
+        const nx::string stem = path.substr(0, path.size() - 7);
+        const nx::vector<u8> source = read_file(stem + ".wav");
+        const auto fmt = riff_chunk(source, "fmt "), ref = riff_chunk(source, "data");
+        REQUIRE(fmt.size() >= 16);
+        REQUIRE(fmt[2] == 2);
+        const usize n = ref.size() / 4;
+        const nx::vector<u8> vag = read_file(path);
+        REQUIRE(vag.size() > 80);
+        REQUIRE(std::memcmp(vag.data(), "VAGp", 4) == 0);
+        CHECK(vag[0x1E] == 2);  // (the header's channel count)
+        // (a silent block of each channel first: the source begins at the second pair)
+        const nx::vector<i16> got = play_vag(vag, 28 + n, 2);
+        CHECK(play_vag(vag, 28 + n, 2, 4096) == got);
+        f64 snr[2] = {};
+        for (u32 c = 0; c < 2; ++c) {
+            f64 signal = 0, noise = 0;
+            for (usize i = 0; i < n; ++i) {
+                i16 want;
+                std::memcpy(&want, ref.data() + 4 * i + 2 * c, 2);
+                signal += static_cast<f64>(want) * want;
+                noise += std::pow(static_cast<f64>(got[2 * (28 + i) + c]) - want, 2);
+            }
+            snr[c] = 10 * std::log10(signal / nx::max(noise, 1.0));
+        }
+        std::printf("%s: left %.2f dB, right %.2f dB\n", stem.c_str(), snr[0], snr[1]);
+        CHECK(snr[0] >= 20);
+        CHECK(snr[1] >= 20);
         ++checked;
     }
     CHECK(checked > 0);
