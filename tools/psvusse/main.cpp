@@ -1,13 +1,17 @@
 // psvusse — disassembles the programs of GXP files (compiled Vita shaders) in the reference disassembler's syntax:
 // "Secondary program:" and "Primary program:" sections of "N: text" lines (scripts/usse_check.py compares them).
 // With --params it prints the program's properties and parameters instead, one "key=value" line each
-// (scripts/gxp_check.py compares them with libgxm's). With --run it runs them in the reference interpreter.
+// (scripts/gxp_check.py compares them with libgxm's). With --run it runs them in the reference interpreter; with
+// --spirv it writes the primary program's translation (the compute form, gxm/translate.hpp); with --run and --gpu
+// the translation runs on a Vulkan device in place of the interpreter's primary program.
 
 #include <bit>
 #include <cmath>
 #include <cstdio>
 
+#include "gpu.hpp"
 #include "psvrecore/cli.hpp"
+#include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/io/file.hpp"
 #include "psvrecore/log.hpp"
 #include "psvrecore/usse/format.hpp"
@@ -146,7 +150,8 @@ void trace(void* user, const usse::Decoded& d, const usse::Machine& m) {
 // runs, then the primary one; the output registers o0-o63 are printed as hex words on one line ("out ..."), and
 // "killed" if the instance was discarded. A fragment program's inputs are "varying <varying:: bit> <4 f32 words>"
 // and its textures "texture <unit> <width> <height> <RGBA8 texels>"; it prints its primary attributes.
-Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tracing) {
+Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tracing,
+                           const psvusse::GpuOptions* gpu) {
     usse::Machine m;
     MapMemory memory;
     Textures textures;
@@ -214,8 +219,25 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
         return failure(nx::format("secondary program: {}", done.error().message));
     state.kind = usse::ProgramKind::Primary;
     const auto primary = usse::decode_program(gxp.primary, usse::ProgramKind::Primary);
-    if (const auto done = usse::run(primary, usse::ProgramKind::Primary, m, limits); !done)
+    if (gpu) {
+        nx::vector<psvusse::GpuTexture> images;
+        for (const auto& [unit, im] : textures.images) images.push_back({unit, im.width, im.height, im.texels});
+        // (the mapped bytes as one block of words, the gaps zero)
+        u32 lo = ~0u, hi = 0;
+        for (const auto& [address, byte] : memory.bytes) lo = nx::min(lo, address), hi = nx::max(hi, address + 1);
+        nx::vector<u32> words;
+        if (lo < hi) {
+            lo &= ~3u;
+            if (hi - lo > (64u << 20)) return failure("guest memory spans more than 64 MiB");
+            words.assign((hi - lo + 3) / 4, 0);
+            for (const auto& [address, byte] : memory.bytes)
+                words[(address - lo) / 4] |= u32{byte} << (8 * ((address - lo) & 3));
+        }
+        if (const auto done = psvusse::run_on_gpu(*gpu, gxp, primary, m, images, lo < hi ? lo : 0, words); !done)
+            return failure(nx::format("primary program (GPU): {}", done.error().message));
+    } else if (const auto done = usse::run(primary, usse::ProgramKind::Primary, m, limits); !done) {
         return failure(nx::format("primary program: {}", done.error().message));
+    }
     // (a vertex program's results are its output registers; a fragment program's, its primary attributes)
     const u32* results = gxp.type == usse::ShaderType::Fragment ? m.primary : m.output;
     nx::string out = "out";
@@ -224,16 +246,30 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
     return out;
 }
 
-Result<void> run(nx::fs::path_view path, bool show_params, const nx::string& run_inputs, bool tracing) {
+Result<void> run(nx::fs::path_view path, bool show_params, const nx::string& run_inputs, bool tracing,
+                 const nx::string& spirv_out, const psvusse::GpuOptions* gpu) {
     const auto data = io::read_file(path);
     if (!data) return nx::err(data.error());
     const auto gxp = usse::parse_gxp(*data);
     if (!gxp) return nx::err(gxp.error());
+    if (!spirv_out.empty()) {
+        const auto primary = usse::decode_program(gxp->primary, usse::ProgramKind::Primary);
+        const auto spirv = gxm::translate_compute(*gxp, primary);
+        if (!spirv) return nx::err(spirv.error());
+        return io::write_file(spirv_out, std::span(reinterpret_cast<const u8*>(spirv->data()), spirv->size() * 4));
+    }
     nx::string out;
     if (!run_inputs.empty()) {
-        const auto inputs = io::read_text_file(run_inputs);
+        // ("@": each file's inputs are next to it, in <name>.in)
+        nx::string input_path = run_inputs;
+        if (run_inputs == "@") {
+            input_path = nx::string(path.native());
+            if (const usize dot = input_path.rfind("."); dot != nx::string::npos) input_path.resize(dot);
+            input_path += ".in";
+        }
+        const auto inputs = io::read_text_file(input_path);
         if (!inputs) return nx::err(inputs.error());
-        auto result = execute(*gxp, *inputs, tracing);
+        auto result = execute(*gxp, *inputs, tracing, gpu);
         if (!result) return nx::err(result.error());
         out = std::move(*result);
     } else if (show_params) {
@@ -257,18 +293,27 @@ int main(int argc, char** argv) {
     bool show_params = false;
     nx::string run_inputs;
     bool tracing = false;
+    nx::string spirv_out;
+    psvusse::GpuOptions gpu;
+    bool use_gpu = false;
     nx::cli::Parser cli("psvusse", "Disassembles the shader programs of GXP files.");
     cli.root()
         .positional_many("files", files, "GXP files")
         .flag("params", show_params, "print the program's properties and parameters instead")
         .option("run", run_inputs, "run the programs with the inputs this file gives (see main.cpp)",
                 {.value_name = "INPUTS"})
-        .flag("trace", tracing, "with --run: print each executed instruction to stderr");
+        .flag("trace", tracing, "with --run: print each executed instruction to stderr")
+        .flag("gpu", use_gpu, "with --run: run the primary program's translation on a Vulkan device")
+        .option("gpu-index", gpu.gpu, "with --gpu: the Vulkan device's index (default: a discrete GPU)",
+                {.value_name = "N"})
+        .flag("validate", gpu.validation, "with --gpu: enable the Vulkan validation layer (its errors fail the run)")
+        .option("spirv", spirv_out, "write the primary program's SPIR-V translation (compute form) to this file",
+                {.value_name = "FILE"});
     if (const int code = parse_command_line(cli, argc, argv); code >= 0) return code;
     int status = 0;
     for (const nx::string& file : files) {
         if (files.size() > 1) std::printf("== %s\n", file.c_str());
-        if (const auto done = run(file, show_params, run_inputs, tracing); !done) {
+        if (const auto done = run(file, show_params, run_inputs, tracing, spirv_out, use_gpu ? &gpu : nullptr); !done) {
             nx::loge(logs::tool, "psvusse: {}: {}", file, done.error().message);
             status = 1;
         }

@@ -13,6 +13,10 @@ approximate operations it uses (division, square roots, exponentials, trigonomet
 continuous (floor, frac, step, comparisons) are only applied to values computed exactly (sums, products and
 moves of short binary fractions), so an approximation cannot move them across a step.
 
+With --gpu each program's primary program also runs translated to SPIR-V on a Vulkan device (psvusse --run --gpu)
+and its results are compared with the interpreter's: the same words, or floating-point values within the GPU's
+precision (its transcendental functions and division are not correctly rounded).
+
 Local only: it needs an SDK (not part of this repository). Everything it writes goes to a temporary folder (or
 --keep): compiled shaders are derived from the SDK, never commit them.
 """
@@ -35,6 +39,7 @@ SPECIAL = ['mul', 'index', 'half', 'int', 'int', 'sincos', 'pow']  # (--special)
 FLOW = ['branch', 'loop', 'uloop']  # (--flow)
 FRAGMENT = [False]  # (--fragment)
 TEXTURE_PROGRAMS = [0.0]  # (--textures: the share of fragment programs that sample textures)
+GPU = [None]  # (--gpu: psvusse's extra arguments)
 MAG = [0.0]  # the largest magnitude of the expression being generated (fragment programs compute in f16)
 
 
@@ -588,6 +593,26 @@ def check(job):
     return r
 
 
+def gpu_mismatch(want, have):
+    """None if the GPU's result words agree with the interpreter's: equal, or as f32 values (or pairs of f16
+    values) within the GPU's precision."""
+    def close(a, b, rel, absolute):
+        return (np.isnan(a) and np.isnan(b)) or abs(a - b) <= absolute + rel * max(abs(a), abs(b))
+    for j, (a, b) in enumerate(zip(want, have)):
+        if a == b:
+            continue
+        wa, wb = int(a, 16), int(b, 16)
+        fa, fb = struct.unpack('<2f', struct.pack('<2I', wa, wb))
+        if close(fa, fb, 2e-5, 1e-6):
+            continue
+        ha = np.array([wa & 0xFFFF, wa >> 16], np.uint16).view(np.float16).astype(np.float64)
+        hb = np.array([wb & 0xFFFF, wb >> 16], np.uint16).view(np.float16).astype(np.float64)
+        if all(close(x, y, 2e-3, 1e-4) for x, y in zip(ha, hb)):
+            continue
+        return 'word %d: interpreter %s, GPU %s' % (j, a, b)
+    return None
+
+
 def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i, textures=None):
     open(base + '.cg', 'w').write(src)
     profile = 'sce_fp_psp2' if FRAGMENT[0] else 'sce_vp_psp2'
@@ -617,6 +642,14 @@ def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i, textures=None):
     r = subprocess.run([psvusse, '--run', base + '.in', base + '.gxp'], capture_output=True, text=True)
     if r.returncode or not r.stdout.startswith('out'):
         return ('run', i, (r.stderr or r.stdout)[:400])
+    if GPU[0] is not None:
+        g = subprocess.run([psvusse, '--run', base + '.in', '--gpu'] + GPU[0] + [base + '.gxp'], capture_output=True,
+                           text=True)
+        if g.returncode or 'out ' not in g.stdout:
+            return ('gpu', i, (g.stderr or g.stdout)[-400:])
+        mismatch = gpu_mismatch(r.stdout.split()[1:65], g.stdout[g.stdout.index('out '):].split()[1:65])
+        if mismatch:
+            return ('gpu', i, mismatch)
     got = [from_word(w) for w in r.stdout.split()[1:65]]
     if FRAGMENT[0]:  # (the colour: f16x4 in pa0-pa1)
         hw = [int(w, 16) for w in r.stdout.split()[1:3]]
@@ -646,6 +679,9 @@ def main():
     ap.add_argument('--fragment', action='store_true', help='generate fragment programs instead')
     ap.add_argument('--fixed', action='store_true', help='generate fixed-point fragment programs instead')
     ap.add_argument('--textures', type=float, default=0.5, help='fragment programs: the share that sample textures')
+    ap.add_argument('--gpu', action='store_true', help='also run the translation on a Vulkan device and compare')
+    ap.add_argument('--gpu-index', type=int, help='with --gpu: the Vulkan device')
+    ap.add_argument('--validate', action='store_true', help='with --gpu: enable the Vulkan validation layer')
     ap.add_argument('--flow', help='comma-separated: the flow control to generate (%s; "none")' % ', '.join(FLOW))
     args = ap.parse_args()
     if args.special:
@@ -653,6 +689,9 @@ def main():
     if args.flow:
         FLOW[:] = [] if args.flow == 'none' else args.flow.split(',')
     FRAGMENT[0] = args.fragment or args.fixed
+    if args.gpu:
+        GPU[0] = (['--gpu-index', str(args.gpu_index)] if args.gpu_index is not None else []) + \
+                 (['--validate'] if args.validate else [])
     TEXTURE_PROGRAMS[0] = args.textures
     cgc = os.path.join(args.sdk, 'host_tools', 'bin', 'psp2cgc.exe')
     psvusse = os.path.abspath(args.psvusse)
@@ -678,6 +717,8 @@ def main():
     print('%d of %d programs agree; %d disagree only with uniforms; %d subtract a negated value; %d did not compile'
           % (ran - len(wrong) - len(by['uniforms']) - len(by['compiler']), ran, len(by['uniforms']), len(by['compiler']),
              len(by['compile'])))
+    if GPU[0] is not None:
+        print('GPU: %d programs differ from the interpreter' % len([r for r in bad if r[0] == 'gpu']))
     if not args.keep:
         shutil.rmtree(folder, ignore_errors=True)
     return 0 if not wrong else 1
