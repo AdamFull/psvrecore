@@ -23,6 +23,10 @@ struct Display {
     nx::mutex lock;
     DisplayFrameBuf current{};
     bool shown = false;
+    // A frame set for the next vertical blank, given to the sink once that blank has come (when the game next waits
+    // for a blank or sets a frame): what is drawn into it meanwhile is shown, as the console scans it out then.
+    bool pending = false;
+    u64 pending_vcount = 0;
 };
 
 Display& display() {
@@ -37,6 +41,27 @@ u64 now_ns() { return runtime::runtime().kernel().clock_ns(); }
 
 u64 vcount_at(u64 t) { return static_cast<u64>(static_cast<f64>(t) / period_ns()); }
 
+void show(DisplaySink* sink, const DisplayFrameBuf& f, u64 vcount) {
+    sink->show(Frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount});
+}
+
+// The frame set for a blank that has come, to the sink.
+void latch() {
+    DisplaySink* sink = state().options ? state().options->display : nullptr;
+    if (!sink) return;
+    Display& d = display();
+    DisplayFrameBuf f;
+    u64 vcount;
+    {
+        nx::scoped_lock<nx::mutex> held(d.lock);
+        if (!d.pending || vcount_at(now_ns()) < d.pending_vcount) return;
+        f = d.current;
+        vcount = d.pending_vcount;
+        d.pending = false;
+    }
+    show(sink, f, vcount);
+}
+
 // Waits (giving up the guest CPU) until `count` more vertical blanks have started.
 void wait_vblanks(u32 count, bool callbacks) {
     const u64 now = now_ns();
@@ -50,15 +75,18 @@ void wait_vblanks(u32 count, bool callbacks) {
             nx::this_thread::sleep_for(std::chrono::nanoseconds(at - t));
         }
     }
+    latch();
     if (callbacks) runtime::runtime().kernel().check_callbacks();
 }
 
 i32 set_frame_buf(Ptr<const DisplayFrameBuf> p, i32 sync) {
     if (sync != 0 && sync != 1) return kErrorInvalidUpdateTiming;  // (immediate, next frame)
     Display& d = display();
+    latch();  // (one set before, whose blank has come)
     if (!p) {  // (no frame buffer: the display shows black)
         nx::scoped_lock<nx::mutex> held(d.lock);
         d.shown = false;
+        d.pending = false;
         return 0;
     }
     const DisplayFrameBuf f = *p;
@@ -68,14 +96,17 @@ i32 set_frame_buf(Ptr<const DisplayFrameBuf> p, i32 sync) {
     if (f.pitch < f.width) return kErrorInvalidPitch;
     if (!f.width || !f.height || f.width > 960 || f.height > 544) return kErrorInvalidResolution;
     if (!runtime::runtime().memory().valid(f.base, f.pitch * f.height * 4)) return kErrorInvalidAddr;
+    const u64 vcount = vcount_at(now_ns());
     {
         nx::scoped_lock<nx::mutex> held(d.lock);
         d.current = f;
         d.shown = true;
+        // (at the next blank; a frame set again before it replaces this one, as the console latches the last)
+        d.pending = sync == 1;
+        d.pending_vcount = vcount + 1;
     }
-    if (DisplaySink* sink = state().options->display) {
-        Frame frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount_at(now_ns())};
-        sink->show(frame);
+    if (sync == 0) {
+        if (DisplaySink* sink = state().options->display) show(sink, f, vcount);
     }
     return 0;
 }
@@ -113,7 +144,7 @@ i32 sceDisplayWaitVblankStartMultiCB(u32 count) {
     wait_vblanks(count ? count : 1, true);
     return 0;
 }
-// (frame buffers take effect at once here: waiting for one to be set is waiting for the next vertical blank)
+// (a frame buffer takes effect at the next vertical blank at the latest: waiting for it is waiting for that blank)
 i32 sceDisplayWaitSetFrameBuf() { return sceDisplayWaitVblankStart(); }
 i32 sceDisplayWaitSetFrameBufCB() { return sceDisplayWaitVblankStartCB(); }
 

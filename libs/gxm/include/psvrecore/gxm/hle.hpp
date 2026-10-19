@@ -21,7 +21,9 @@ struct Frame {
 class DisplaySink {
 public:
     virtual ~DisplaySink() = default;
-    // Called on the thread that set the frame buffer; the frame's memory is readable until the call returns.
+    // Called on a game thread: the one setting the frame buffer for at once, else, once the next vertical blank has
+    // come, the next one to wait for a blank or set a frame buffer. The frame's memory is readable until the call
+    // returns.
     virtual void show(const Frame& frame) = 0;
 };
 
