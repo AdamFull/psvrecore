@@ -180,6 +180,32 @@ unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title I
 Keys while playing: arrows (the d-pad), Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
 Select, F11 full screen. Gamepads work as they are plugged in; the mouse touches the front panel.
 
+## Android applications
+
+`scripts/android_apk.py` packages a `libmain.so` built by an android-arm64 preset as an APK, with the Android SDK's
+own tools (aapt2, javac, d8, zipalign, apksigner) and no Gradle: SDL's Java activity, psvrecore's launcher and
+activity (`android/java`), and the caller's manifest. It is signed with the Android debug key (made in
+`~/.android/debug.keystore` when missing), for development. It needs ANDROID_HOME (or `C:\Android\Sdk`) with
+build-tools and a platform, and a JDK.
+
+```
+python scripts/android_apk.py --manifest <AndroidManifest.xml> --lib build/android-arm64-release/libmain.so \
+    --out game.apk --install
+```
+
+On the device, the launcher asks for the game's application folder the first time (the system's folder picker) and
+copies it into the application's folder, `Android/data/<package>/files/game`; the settings file and the data are
+there too, and standard output goes to `output.txt` there.
+
+`scripts/sample_check.py --android` runs SDK samples on the device adb sees (`--device <serial>` picks one): it builds
+them for arm64, packages and installs them (debuggable), puts their files in the application's internal storage with
+`run-as`, starts them with `--input`'s script for `--timeout` seconds, and brings the shots and the output back:
+
+```
+python scripts/sample_check.py --sdk C:/path/to/sdk input_output_devices/api_touch/trace --android \
+    --device <serial> --frames 1 --timeout 10 --input "3000 touch 480 272 down; 4000 shot touching; 6000 quit"
+```
+
 ## ATRAC9 check (needs the PS Vita SDK)
 
 `scripts/at9_check.py` encodes test signals with the SDK's at9tool (mono, stereo, stereo in superframes), decodes them

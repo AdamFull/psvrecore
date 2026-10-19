@@ -4,9 +4,9 @@
 
 - **Linux has not been built or tested.** The development host has no Linux machine and no WSL. The CI workflow
   covers Linux, but it runs only once the repository is pushed.
-- **Android has nothing in its default build yet.** Tools and tests are host-only, and there is no runtime yet.
-  nx-foundation cross-compiles for arm64. The address-space test has not run on an Android device; it will run once
-  there is a device test runner.
+- **Android: one device so far.** SDK samples run as applications on a Pixel 10 Pro (Android 17); no other device,
+  GPU or Android version has been tried. The unit tests have not run on a device (they are host-only; there is no
+  device test runner).
 
 ## Formats
 
@@ -238,9 +238,9 @@
   happens when the pool grows. Elsewhere, timed waits (delays, timeouts) end within a millisecond of their deadline.
 - **Memory budgets are fixed defaults.** Main memory 256 MiB and CDRAM 128 MiB for memory blocks, set in
   `Runtime::Config`. The console's figures for a game are not reproduced exactly.
-- **Run on Windows only.** The runtime's POSIX host layer (faults, files, decommit) compiles for Android arm64 with
-  the NDK, without warnings, but has not run there or on Linux (no device test runner, no Linux machine; CI covers
-  Linux once the repository is pushed).
+- **Run on Windows and Android.** The POSIX host layer (faults, files, decommit) runs on Android arm64 (the SDK
+  samples on a Pixel 10 Pro: the whole guest address space reserved, guest threads, files); it has not run on Linux
+  (no Linux machine; CI covers Linux once the repository is pushed). A guest memory fault has not been seen on Android.
 
 ## Audio (AudioOut, NGS)
 
@@ -287,9 +287,10 @@
 
 ## Platform layer (SDL3)
 
-- **Not run on Android.** It builds for arm64, but the window needs SDL's Java activity (`SDLActivity`) in the
-  application, which the game's Android app does not have yet. The swapchain is not pre-rotated: the compositor
-  rotates, and `VK_SUBOPTIMAL_KHR` is ignored for that reason.
+- **Android: the application's life is not handled.** Sent to the background, the window's surface goes away; the
+  presenter is not told and does not make it again, and the game keeps running (and playing) meanwhile. Not tried.
+- **Android: the swapchain is not pre-rotated.** The compositor rotates, and `VK_SUBOPTIMAL_KHR` is ignored for that
+  reason. The window is full screen and landscape only.
 - **One Vulkan device a process.** volk's entry points are loaded for the last device made, so a second device breaks
   the first one's calls (it crashed). With a window, the GXM layer renders with the window's device
   (`gxm::Options::shared_device`).
@@ -314,9 +315,13 @@
   is written by the time its calls return, so nothing is lost that the game wrote.
 - **Settings changed while playing are not saved** (F11's full screen lasts for the run). There is no settings
   screen yet; the file is edited by hand.
-- **Not run on Android.** `libmain.so` builds with `SDL_main`, but the application project (SDL's Java activity,
-  the game's files on the device) is not there yet.
-- **The command line is the frontend's** on every platform; Android passes none.
+- **Android: the game's files are copied in.** The application may read only files it made: what adb or a computer
+  puts in its folder (`Android/data/<package>/files`) belongs to someone else and cannot be read (it was refused). So
+  the launcher copies the folder the user picks (the system's folder picker) into `game/` there, which needs the space
+  twice over while it copies. The copy is not checked beyond `eboot.bin` being there.
+- **Android: standard output and error go to `output.txt`** in that folder; the log goes to logcat as well.
+- **The command line is the frontend's** on every platform; on Android it is the intent's `args` array (empty from
+  the home screen).
 - **nx-foundation warns on Android** (`platform/process.cpp`: an unused function `keep`) since the frontend links it
   whole; it is nx-foundation's to fix.
 
