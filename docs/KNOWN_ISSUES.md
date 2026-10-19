@@ -287,9 +287,9 @@
 - **A loop starts VAG decoding again; a buffer swap does not.** A swap goes on from the samples before, so a stream
   split over buffers (as the SDK's adpcm_stream sample streams) decodes as one. Whether the console also clears the
   predictor's history when a buffer loops is unknown (vagconv2 did not make a file that shows it).
-- **A voice cued to play reports itself active and pending** until the next update starts it (the documentation
-  calls an active voice one "cued to play or playing"). CRI's sound engine relies on it: a voice it finds neither
-  active nor finalizing it takes for stopped, and its streams stall.
+- **A voice cued to play reports itself active and pending** until the next update starts it (as we read the
+  documentation, active covers a voice waiting to start as well as one playing). CRI's sound engine relies on it: a
+  voice it finds neither active nor finalizing it takes for stopped, and its streams stall.
 - **Scream's voice definitions are stood in for** by template 1 and the ATRAC9 voice: their layout is not documented.
 - **Callbacks run on the thread that calls `sceNgsSystemUpdate`**, after it processed every voice, as documented.
   Parameter error callbacks are never raised: out-of-range parameters are refused when they are set.
