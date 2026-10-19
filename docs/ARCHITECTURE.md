@@ -47,7 +47,8 @@ Everything generated stays on the user's machine.
 | `recomp` | C code generator, plus the guest ABI header the generated code includes |
 | `interp` | Reference interpreter, used only by differential tests and never linked into a game |
 | `runtime` | Guest memory, module loader, kernel objects and threads, HLE system libraries, files and save data, timing |
-| `gxm` | GXM API, texture formats and layouts, shader-program parser and SPIR-V translator |
+| `usse` | Shader programs: the GXP container and the USSE instruction set (decoding into an instruction model, listings in the reference disassembler's syntax) |
+| `gxm` | GXM API, texture formats and layouts, SPIR-V translation of shader programs |
 | `vk` | Vulkan backend (volk, VMA); knows nothing about GXM |
 | `platform` | SDL3 window, input and events; audio output; Android integration; ImGui overlay; on-screen controls |
 | `frontend` | Program entry point, command line, settings |
@@ -140,6 +141,16 @@ Everything generated stays on the user's machine.
 - **Files** (`runtime/filesystem.hpp`). Device names (`app0:`, `ux0:`, ...) are mounted on host folders, read-only or
   writable. File names are matched without regard to case, and `..` never leaves a device's folder. The standard
   streams go to a sink.
+- **Shader instruction model** (`usse/instruction.hpp`). A GXP file holds a primary program, run per vertex or fragment, and an
+  optional secondary program, run once per draw. Their 64-bit USSE words decode into instructions with an operation, a
+  type, a predicate and typed operands (bank, register number, lanes, swizzle, view, modifiers). The translator works
+  from that model, not from the encodings.
+  - A word that holds two operations decodes to two instructions; the second is marked co-issued.
+  - A repeated instruction decodes to one instruction per repetition, with its registers stepped as the hardware
+    steps them: by the increments the program last set, or by the family's own rule.
+  - Words that only set state (the increments, the program prologue) decode to instructions that print nothing.
+  - The formatter prints the reference disassembler's syntax, so the decoder can be checked against it word for word
+    (`scripts/usse_check.py`).
 - **Graphics.**
   - GXM scenes map to Vulkan render passes, with load/store operations chosen for tile-based GPUs.
   - Guest surfaces are written back to guest memory only when the game can observe them.

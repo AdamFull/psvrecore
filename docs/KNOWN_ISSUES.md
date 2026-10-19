@@ -46,6 +46,23 @@
   console's CPU. ARMv8 instructions are out of scope.
 - **The checker needs LLVM.** It runs llvm-objdump, so CI runs it on Windows only, where the runner image has LLVM.
 
+## Shader decoder (USSE)
+
+- **Checked only against the SDK's disassembler.** Its listings are taken as the reference for what each word means.
+  Where it prints something odd, the decoder prints the same, so a listing match is not proof of the hardware's
+  behaviour. The interpreter and rendering tests are what check the semantics.
+- **Every word the compiler emitted in the corpora matches; some random words do not.** On words of random bits, these
+  differ from the reference (none was seen in compiled shaders):
+  - repeats of families 9, 14, 15, 18, 25, 26, 28, 29 and 30 decode as one repetition;
+  - in repeats, the reference steps immediates, indexed offsets and index-register destinations in printed units, and
+    keeps stepped temporaries as temporaries; the decoder does not;
+  - small-integer selector layouts of family 8 (pack), u8 variants of family 9 (tests), rare types of family 15;
+  - the alpha line of family 16 (blend) when it multiplies, and its stepping;
+  - destination-mask edge cases of family 18 (SOP);
+  - the complement and alpha forms of families 19 and 25;
+  - families 22-24 and 27, for which the reference prints nothing valid.
+- **The GXP parameter tables are not parsed yet.** Only the header and the two programs are read.
+
 ## Analysis and code generation
 
 - **The console's default FPSCR is unknown.** The SDK material does not say what the floating-point control register

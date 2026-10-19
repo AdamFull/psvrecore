@@ -64,6 +64,18 @@ runner per probe (with `-Define PSVRECORE_PROBES_DIR=...`, then resets it), and 
 recompiled probe's output with the same source compiled for the host. Everything it produces goes to `build/probes`
 (`--out`), which is ignored by git. It is derived from the SDK, so never commit it.
 
+## Shader disassembler check (needs the PS Vita SDK)
+
+`scripts/usse_check.py` compares psvusse's listings with the SDK's disassembler, program by program:
+
+```
+python scripts/usse_check.py --psvusse build/windows-x64-release/tools/psvusse/psvusse.exe --sdk C:/path/to/sdk shaders/
+```
+
+The inputs are GXP files, or folders of them: the SDK's sample shaders, or shaders built with its compiler (`psp2cgc
+-profile sce_vp_psp2` or `sce_fp_psp2`). It writes nothing. Shaders built from the SDK are derived from it: keep them
+outside the repository.
+
 ## Test programs (needs the PS Vita SDK)
 
 `scripts/program_check.py` runs whole SDK-built programs on the runtime:
