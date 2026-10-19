@@ -34,6 +34,7 @@ add_executable(psvrecore_tests
     simd_tests.cpp
     usse_tests.cpp
     usse_interp_tests.cpp
+    gxm_texture_tests.cpp
     gxm_translate_tests.cpp
 )
 target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")

@@ -1,5 +1,6 @@
 #include "psvrecore/gxm/texture.hpp"
 
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -349,12 +350,117 @@ u32 texture_size(const TextureInfo& t) {
     return static_cast<u32>(faces > 1 ? face * (faces - 1) + last : last);
 }
 
+namespace {
+
+std::atomic<u32> yuv_profiles[2] = {0, 1};  // (SCE_GXM_YUV_PROFILE_BT601_STANDARD, SCE_GXM_YUV_PROFILE_BT709_STANDARD)
+
+// One pixel of a YUV texture as RGBA: the profile's matrix (BT.601 or BT.709), from standard range (Y 16-235, U and V
+// 16-240) or full range.
+void yuv_to_rgba(u32 profile, u8 y, u8 u, u8 v, f32 out[4]) {
+    const bool full = profile >= 2;
+    const bool bt709 = profile & 1;
+    const f32 yy = full ? y / 255.0f : (static_cast<f32>(y) - 16.0f) / 219.0f;
+    const f32 cb = full ? (static_cast<f32>(u) - 128.0f) / 255.0f : (static_cast<f32>(u) - 128.0f) / 224.0f;
+    const f32 cr = full ? (static_cast<f32>(v) - 128.0f) / 255.0f : (static_cast<f32>(v) - 128.0f) / 224.0f;
+    if (bt709) {
+        out[0] = yy + 1.5748f * cr;
+        out[1] = yy - 0.187324f * cb - 0.468124f * cr;
+        out[2] = yy + 1.8556f * cb;
+    } else {
+        out[0] = yy + 1.402f * cr;
+        out[1] = yy - 0.344136f * cb - 0.714136f * cr;
+        out[2] = yy + 1.772f * cb;
+    }
+    out[3] = 1.0f;
+}
+
+// YUV textures (linear only): YUV420 with two planes (Y, then U and V interleaved) or three (Y, U, V), and YUV422
+// interleaved. The swizzle chooses the order of U and V (or of the four bytes) and the conversion slot. Planes follow
+// each other packed, each row its width rounded up to 8 texels; with mip levels, a plane's offset to the next is that
+// of its power-of-two footprint. The top level only.
+Result<Texels> read_yuv(const TextureInfo& t, u32 code, ReadGuest read) {
+    if (!is_linear(t.type)) return failure("texture: YUV textures are linear");
+    const u32 w = t.width, h = t.height;
+    const u32 cw = (w + 1) / 2, ch = (h + 1) / 2;
+    auto align8 = [](u32 v) { return (v + 7) & ~7u; };
+    const bool padded = t.mipmapped;
+    u32 csc;
+    u32 size;
+    u32 second = 0, third = 0;  // (plane offsets)
+    if (code == kYUV422) {
+        csc = (t.swizzle >> 2) & 1;
+        const u32 pitch = t.type == texture_type::kLinearStrided ? t.stride : align8(w) * 2;
+        size = pitch * h;
+    } else if (code == kYUV420P2) {
+        csc = (t.swizzle >> 1) & 1;
+        second = padded ? pow2_ceil(w) * pow2_ceil(h) : align8(w) * h;
+        size = second + align8(cw) * 2 * ch;
+    } else {
+        csc = (t.swizzle >> 1) & 1;
+        second = padded ? pow2_ceil(w) * pow2_ceil(h) : align8(w) * h;
+        third = second + (padded ? pow2_ceil(cw) * pow2_ceil(ch) : align8(cw) * ch);
+        size = third + align8(cw) * ch;
+    }
+    nx::vector<u8> raw(size);
+    if (!read(t.address, raw.data(), size)) return failure("texture: data outside guest memory");
+    const u32 profile = yuv_profiles[csc].load();
+    Texels out;
+    out.width = w;
+    out.height = h;
+    out.bytes = 4;
+    out.data.resize(usize{w} * h * 4);
+    for (u32 yy = 0; yy < h; ++yy) {
+        for (u32 x = 0; x < w; ++x) {
+            u8 y, u, v;
+            if (code == kYUV422) {
+                // (bytes of a pair of pixels by swizzle: YUYV, YVYU, UYVY, VYUY, most significant first)
+                const u32 pitch = t.type == texture_type::kLinearStrided ? t.stride : align8(w) * 2;
+                const u8* p = raw.data() + usize{yy} * pitch + (x & ~1u) * 2;
+                const bool second_pixel = x & 1;
+                switch (t.swizzle & 3) {
+                    case 0: v = p[0], y = second_pixel ? p[3] : p[1], u = p[2]; break;
+                    case 1: u = p[0], y = second_pixel ? p[3] : p[1], v = p[2]; break;
+                    case 2: y = second_pixel ? p[2] : p[0], v = p[1], u = p[3]; break;
+                    default: y = second_pixel ? p[2] : p[0], u = p[1], v = p[3]; break;
+                }
+            } else {
+                y = raw[usize{yy} * align8(w) + x];
+                const u32 cx = x / 2, cy = yy / 2;
+                const bool swapped = t.swizzle & 1;  // (YVU)
+                if (code == kYUV420P2) {
+                    // (a texel of the chroma plane: U in its high byte for YUV, V for YVU)
+                    const u8* p = raw.data() + second + (usize{cy} * align8(cw) + cx) * 2;
+                    u = swapped ? p[0] : p[1];
+                    v = swapped ? p[1] : p[0];
+                } else {
+                    const usize at = usize{cy} * align8(cw) + cx;
+                    const u8 first = raw[second + at], last = raw[third + at];
+                    u = swapped ? last : first;
+                    v = swapped ? first : last;
+                }
+            }
+            f32 rgba[4];
+            yuv_to_rgba(profile, y, u, v, rgba);
+            u8* dst = out.data.data() + (usize{yy} * w + x) * 4;
+            for (u32 k = 0; k < 4; ++k) dst[k] = static_cast<u8>(std::lround(nx::clamp(rgba[k], 0.0f, 1.0f) * 255.0f));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+void set_yuv_profile(u32 csc, u32 profile) {
+    if (csc < 2 && profile < 4) yuv_profiles[csc].store(profile);
+}
+
 Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
     const u32 code = code_of(t.base_format);
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
     if (code >= kPVRT2 && code <= kPVRTII4) return failure("texture: PVRTC formats not implemented");
-    if ((code >= kUBC4 && code <= kSBC5) || (code >= kYUV420P2 && code <= kYUV422)) return failure("texture: format not implemented");
+    if (code >= kYUV420P2 && code <= kYUV422) return read_yuv(t, code, read);
+    if (code >= kUBC4 && code <= kSBC5) return failure("texture: format not implemented");
     if (code == kX8S8S8U8 || code == kX8U24 || code == kU32 || code == kS32 || code == kSE5M9M9M9 ||
         code == kF11F11F10 || code == kU2F10F10F10 || code == kU32U32)
         return failure(nx::format("texture: format 0x{:08x} not implemented", t.base_format));

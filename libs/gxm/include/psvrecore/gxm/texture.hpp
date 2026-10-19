@@ -66,6 +66,10 @@ using ReadGuest = nx::function_ref<bool(u32 address, void* out, u32 size)>;
 // Reads and decodes a texture's texels. Fails on formats and layouts not implemented yet.
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read);
 
+// The colour space conversion of YUV textures' two slots (CSC0, CSC1): SCE_GXM_YUV_PROFILE_* (BT.601 or BT.709,
+// standard or full range). By default CSC0 is BT.601 and CSC1 BT.709, both of standard range.
+void set_yuv_profile(u32 csc, u32 profile);
+
 // The bytes a texture's data occupies in guest memory (all levels and faces).
 u32 texture_size(const TextureInfo& info);
 

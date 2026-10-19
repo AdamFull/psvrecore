@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/log.hpp"
 #include "state.hpp"
 #include "core/foundation/strings/format.h"
@@ -269,8 +270,13 @@ void sceGxmSetWClampEnable(u32 context, u32 m) {
 void sceGxmSetWBufferEnable(u32 context, u32 m) {
     with(context, [&](Context& c) { c.state.w_buffer = m == 0x4000; });
 }
-// (YUV profiles, user markers, validation: not modelled yet)
-i32 sceGxmSetYuvProfile(u32, u32, u32) { return 0; }
+// The YUV profiles are the device's, not each context's (games set them once). (User markers, validation: not
+// modelled yet.)
+i32 sceGxmSetYuvProfile(u32, u32 csc, u32 profile) {
+    if (csc > 1 || profile > 3) return err::kInvalidValue;
+    gxm::set_yuv_profile(csc, profile);
+    return 0;
+}
 i32 sceGxmSetUserMarker(u32, u32) { return 0; }
 void sceGxmSetValidationEnable(u32, u32) {}
 
