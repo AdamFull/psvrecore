@@ -11,9 +11,11 @@
 //     ...  HLE_FUNCTION(0x4F0EA1B4, sceKernelSignalSema)  ->  {nid, "sceKernelSignalSema", &entry<&sceKernelSignalSema>}
 //
 // Parameter types: 32-bit integers (i32, u32), 64-bit ones (i64, u64; in an even/odd register pair or 8-byte
-// aligned on the stack), Ptr<T> (a guest pointer), and Variadic (the rest of a variadic call's arguments).
-// A PsvContext* parameter receives the calling thread's context. Results: void, 32-bit and 64-bit integers, Ptr<T>.
+// aligned on the stack), f32 and f64 (in VFP registers: the system's ABI is hard-float), Ptr<T> (a guest pointer),
+// and Variadic (the rest of a variadic call's arguments). A PsvContext* parameter receives the calling thread's
+// context. Results: void, 32-bit and 64-bit integers, f32 and f64, Ptr<T>.
 
+#include <bit>
 #include <span>
 #include <tuple>
 #include <type_traits>
@@ -55,11 +57,26 @@ public:
         const u64 lo = word();
         return lo | (u64{word()} << 32);
     }
+    // Floating-point arguments, in s0-s15 / d0-d7 in order (the AAPCS's back-filling of a single after a double is
+    // not needed by any system function).
+    f32 single() {
+        const u32 i = next_vfp_++;
+        if (i < 16) return std::bit_cast<f32>(ctx_->vfp.s[i]);
+        return std::bit_cast<f32>(word());  // (more than sixteen: on the stack)
+    }
+    f64 dbl() {
+        next_vfp_ = (next_vfp_ + 1) & ~1u;
+        const u32 i = next_vfp_;
+        next_vfp_ += 2;
+        if (i < 16) return std::bit_cast<f64>(ctx_->vfp.d[i / 2]);
+        return std::bit_cast<f64>(dword());
+    }
     PsvContext* context() const { return ctx_; }
 
 private:
     PsvContext* ctx_;
     u32 next_ = 0;
+    u32 next_vfp_ = 0;
 };
 
 // The remaining arguments of a variadic call (C's default promotions apply: integers are words, doubles are
@@ -82,6 +99,8 @@ T read(ArgReader& r) {
     if constexpr (std::is_same_v<T, PsvContext*>) return r.context();
     else if constexpr (std::is_same_v<T, Variadic>) return Variadic{&r};
     else if constexpr (is_ptr<T>::value) return T(r.word());
+    else if constexpr (std::is_same_v<T, f32>) return r.single();
+    else if constexpr (std::is_same_v<T, f64>) return r.dbl();
     else if constexpr (std::is_integral_v<T> && sizeof(T) == 8) return static_cast<T>(r.dword());
     else if constexpr (std::is_integral_v<T> && sizeof(T) <= 4) return static_cast<T>(r.word());
     else static_assert(sizeof(T) == 0, "HLE parameter type not supported");
@@ -90,6 +109,8 @@ T read(ArgReader& r) {
 template <class T>
 void write(PsvContext* ctx, T value) {
     if constexpr (is_ptr<T>::value) ctx->r[0] = value.address;
+    else if constexpr (std::is_same_v<T, f32>) ctx->vfp.s[0] = std::bit_cast<u32>(value);
+    else if constexpr (std::is_same_v<T, f64>) ctx->vfp.d[0] = std::bit_cast<u64>(value);
     else if constexpr (std::is_integral_v<T> && sizeof(T) == 8) {
         ctx->r[0] = static_cast<u32>(static_cast<u64>(value));
         ctx->r[1] = static_cast<u32>(static_cast<u64>(value) >> 32);
