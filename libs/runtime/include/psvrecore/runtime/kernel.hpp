@@ -319,6 +319,9 @@ public:
     // next kernel call. Called by the destructor.
     void shutdown();
     bool shutdown_complete() const;
+    // Every thread: its state, priority, what it waits for, and its link register (where its last call returns to),
+    // one line each. For debugging (PSVRECORE_THREADS).
+    nx::string describe_threads();
     // Called on a host thread that runs no guest thread (a test, the process start-up): adopt it as a guest thread
     // with this name, priority and stack, holding a CPU, so it can make kernel calls. Ended by release_host_thread().
     Uid adopt_host_thread(nx::string_view name, i32 priority = kernel::kGamePriority, u32 stack_size = kernel::kMainStackSize);

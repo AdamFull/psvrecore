@@ -174,6 +174,12 @@ void clear_libraries();
 // An implementation for an import, looked up by library NID and then by library name (NIDs of a library can differ
 // between SDK versions); nullptr if the runtime has none.
 const Function* find_function(u32 library_nid, nx::string_view library, u32 nid);
+// What an import is bound to: the function, or, while calls are counted (PSVRECORE_HLE_COUNTS), the function through
+// a counter of its own. And the counts: the functions called since the last time asked, with how often (one line
+// each, the most called first).
+PsvFunction bind(const Function& f);
+bool counting_calls();
+nx::string describe_calls();
 const Variable* find_variable(u32 library_nid, nx::string_view library, u32 nid, u32* guest_address);
 
 // Calls a guest function from host code (a thread's entry, a callback): `args` in r0-r3 and on the stack, LR the

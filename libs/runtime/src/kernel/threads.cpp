@@ -6,6 +6,7 @@
 #include "kernel_impl.hpp"
 #include "psvrecore/recomp/support.hpp"
 #include "psvrecore/runtime/hle.hpp"
+#include "core/foundation/strings/format.h"
 #include "core/foundation/threading/thread.h"
 
 namespace psvrecore::runtime {
@@ -429,6 +430,29 @@ u32 Kernel::tls_address(u32 key) {
     Thread* t = current();
     if (!t || !t->tls || key >= kTlsSize / 4) return 0;
     return t->tls + 4 * key;
+}
+
+nx::string Kernel::describe_threads() {
+    Lock guard(impl_->lock);
+    nx::string out;
+    for (const auto& [uid, object] : impl_->objects) {
+        if (object->cls != ObjectClass::Thread) continue;
+        const auto* t = static_cast<const Thread*>(object.get());
+        const char* state = t->state == ThreadState::Running ? "running"
+                            : t->state == ThreadState::Ready  ? "ready"
+                            : t->state == ThreadState::Waiting ? "waiting"
+                            : t->state == ThreadState::Dormant ? "dormant"
+                                                               : "deleted";
+        out += nx::format("  0x{:08x} '{}': {}, priority {}, lr {:08x} sp {:08x}", static_cast<u32>(uid), t->name, state,
+                          t->priority, t->ctx.r[14], t->ctx.r[13]);
+        if (t->state == ThreadState::Waiting) {
+            const auto it = impl_->objects.find(t->wait.object);
+            out += nx::format(" (wait type 0x{:x} on 0x{:08x} '{}')", static_cast<u32>(t->wait.type),
+                              static_cast<u32>(t->wait.object), it != impl_->objects.end() ? it->second->name.c_str() : "");
+        }
+        out += "\n";
+    }
+    return out;
 }
 
 }  // namespace psvrecore::runtime

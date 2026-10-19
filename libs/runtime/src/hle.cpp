@@ -1,12 +1,17 @@
 #include "psvrecore/runtime/hle.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <utility>
 
 #include "psvrecore/log.hpp"
 #include "psvrecore/recomp/support.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "core/foundation/containers/hash_map.h"
+#include "core/foundation/strings/format.h"
 
 namespace psvrecore::runtime::hle {
 
@@ -36,7 +41,65 @@ Registered* find_library(u32 library_nid, nx::string_view name) {
     return nullptr;
 }
 
+// Counted calls: a trampoline per bound function (up to kCountedSlots), counting its calls.
+constexpr u32 kCountedSlots = 768;
+struct CountedSlot {
+    PsvFunction function = nullptr;
+    const char* name = nullptr;
+    std::atomic<u64> calls{0};
+    u64 reported = 0;
+};
+CountedSlot g_counted[kCountedSlots];
+std::atomic<u32> g_counted_used{0};
+
+template <u32 I>
+void counted_entry(PsvContext* ctx, uint32_t ret) {
+    g_counted[I].calls.fetch_add(1, std::memory_order_relaxed);
+    g_counted[I].function(ctx, ret);
+}
+template <u32... I>
+constexpr std::array<PsvFunction, sizeof...(I)> counted_entries(std::integer_sequence<u32, I...>) {
+    return {&counted_entry<I>...};
+}
+constexpr auto kCountedEntries = counted_entries(std::make_integer_sequence<u32, kCountedSlots>{});
+
 }  // namespace
+
+bool counting_calls() {
+    static const bool on = [] {
+        const char* spec = std::getenv("PSVRECORE_HLE_COUNTS");
+        return spec && *spec;
+    }();
+    return on;
+}
+
+PsvFunction bind(const Function& f) {
+    if (!counting_calls()) return f.function;
+    nx::scoped_lock<nx::mutex> held(g_lock);
+    const u32 used = g_counted_used.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < used; ++i)
+        if (g_counted[i].function == f.function) return kCountedEntries[i];
+    if (used == kCountedSlots) return f.function;
+    g_counted[used].function = f.function;
+    g_counted[used].name = f.name;
+    g_counted_used.store(used + 1, std::memory_order_release);
+    return kCountedEntries[used];
+}
+
+nx::string describe_calls() {
+    nx::scoped_lock<nx::mutex> held(g_lock);
+    nx::vector<std::pair<u64, const char*>> called;
+    const u32 used = g_counted_used.load(std::memory_order_acquire);
+    for (u32 i = 0; i < used; ++i) {
+        const u64 now = g_counted[i].calls.load(std::memory_order_relaxed);
+        if (now != g_counted[i].reported) called.push_back({now - g_counted[i].reported, g_counted[i].name});
+        g_counted[i].reported = now;
+    }
+    std::sort(called.begin(), called.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    nx::string out;
+    for (const auto& [n, name] : called) out += nx::format("  {:>8} {}\n", n, name);
+    return out;
+}
 
 void detail::after_call() {
     if (Runtime* rt = current_runtime()) rt->kernel().checkpoint();

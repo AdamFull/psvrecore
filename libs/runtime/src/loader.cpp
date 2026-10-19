@@ -149,7 +149,7 @@ void Loader::link_module(LoadedModule& m) {
                 nx::logw(logs::loader, "{}: import 0x{:08x} of {} is exported at 0x{:08x}, where no recompiled function starts",
                          m.name, imp.nid, library, at);
         } else if (const hle::Function* f = hle::find_function(imp.library_nid, library, imp.nid)) {
-            imp.function = f->function;
+            imp.function = hle::bind(*f);
         } else {
             imp.function = nullptr;
             ++unresolved;

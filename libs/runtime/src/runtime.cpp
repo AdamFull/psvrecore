@@ -1,6 +1,7 @@
 #include "psvrecore/runtime/runtime.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
@@ -8,6 +9,7 @@
 #include "psvrecore/recomp/support.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "psvrecore/runtime/host.hpp"
+#include "core/foundation/threading/thread.h"
 
 namespace psvrecore::runtime {
 
@@ -54,28 +56,56 @@ u32 g_watched[4];
 u32 g_watched_size[4];  // (0: a function)
 const char* g_watched_name[4];
 
+// The registers that point at text in guest memory: the text (" [r1 \"...\"]").
+void print_texts(const u32* r, u32 count) {
+    Runtime* rt = current_runtime();
+    if (!rt) return;
+    for (u32 k = 0; k < count; ++k) {
+        const u32 at = r[k];
+        if (!rt->memory().valid(at, 4)) continue;
+        char text[121];
+        u32 n = 0;
+        for (; n < 120 && rt->memory().valid(at + n, 1); ++n) {
+            const u8 c = static_cast<u8>(psv_ld8(at + n));
+            if (c < 0x20 || c > 0x7E) break;
+            text[n] = static_cast<char>(c);
+        }
+        text[n] = '\0';
+        if (n >= 4 && rt->memory().valid(at + n, 1) && psv_ld8(at + n) == 0) std::fprintf(stderr, " [r%u \"%s\"]", k, text);
+    }
+}
+
 void on_watched(u32 index, void* host_pc, void* first_argument) {
+    kernel::Thread* t = Kernel::current();
     if (g_watched_size[index] == 0) {
         const auto* ctx = static_cast<const PsvContext*>(first_argument);
-        kernel::Thread* t = Kernel::current();
-        std::fprintf(stderr, "watch: %s in thread '%s' r0 %08x r1 %08x r2 %08x r3 %08x sp %08x lr %08x\n",
+        std::fprintf(stderr, "watch: %s in thread '%s' r0 %08x r1 %08x r2 %08x r3 %08x sp %08x lr %08x",
                      g_watched_name[index], t ? t->name.c_str() : "(host)", ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3],
                      ctx->r[13], ctx->r[14]);
+        print_texts(ctx->r, 4);
+        std::fprintf(stderr, "\n");
         std::fflush(stderr);
         return;
     }
     const u32 at = g_watched[index];
     char where[320];
     host::describe_code(host_pc, where, sizeof where);
-    kernel::Thread* t = Kernel::current();
     std::fprintf(stderr, "watch: write to 0x%08x, now", at);
     for (u32 i = 0; i < g_watched_size[index]; i += 4) std::fprintf(stderr, " %08x", psv_ld32(at + i));
     std::fprintf(stderr, " by %s", where);
-    if (t)
+    if (t) {
         std::fprintf(stderr,
                      " in thread '%s' lr %08x sp %08x r0 %08x r1 %08x r2 %08x r3 %08x r4 %08x r5 %08x r6 %08x r7 %08x r8 %08x",
                      t->name.c_str(), t->ctx.r[14], t->ctx.r[13], t->ctx.r[0], t->ctx.r[1], t->ctx.r[2], t->ctx.r[3],
                      t->ctx.r[4], t->ctx.r[5], t->ctx.r[6], t->ctx.r[7], t->ctx.r[8]);
+        print_texts(t->ctx.r, 13);
+        // (the words at the stack pointer: what the function saved of its caller's registers)
+        if (Runtime* rt = current_runtime(); rt && rt->memory().valid(t->ctx.r[13] & ~3u, 32)) {
+            std::fprintf(stderr, " [sp");
+            for (u32 i = 0; i < 8; ++i) std::fprintf(stderr, " %08x", psv_ld32((t->ctx.r[13] & ~3u) + 4 * i));
+            std::fprintf(stderr, "]");
+        }
+    }
     std::fprintf(stderr, "\n");
     std::fflush(stderr);
 }
@@ -106,6 +136,9 @@ void watch_from_environment(u8* base) {
             }
             g_watched_size[count] = 0;
             g_watched_name[count] = p;
+            char where[320];
+            host::describe_code(addresses[count], where, sizeof where);
+            nx::logi(logs::kernel, "PSVRECORE_WATCH: {} at {} ({})", p, addresses[count], where);
         }
         ++count;
         p = more ? end + 1 : end;
@@ -114,6 +147,54 @@ void watch_from_environment(u8* base) {
         nx::logi(logs::kernel, "{} watchpoint(s) from PSVRECORE_WATCH", count);
     else
         nx::logw(logs::kernel, "PSVRECORE_WATCH: these cannot be watched on this host");
+}
+
+// PSVRECORE_THREADS=<seconds>: every so many seconds, every guest thread's state and what it waits for (to stderr),
+// for finding what a game that stands still waits for. PSVRECORE_HLE_COUNTS=<seconds>: as often, the HLE functions
+// called since the last report and how often.
+void report_threads_from_environment() {
+    const char* spec = std::getenv("PSVRECORE_THREADS");
+    const bool threads = spec && *spec;
+    const char* dump = std::getenv("PSVRECORE_DUMP");
+    if (!threads && !hle::counting_calls() && !(dump && *dump)) return;
+    const u32 seconds =
+        nx::max(1u, static_cast<u32>(std::strtoul(threads ? spec : hle::counting_calls() ? std::getenv("PSVRECORE_HLE_COUNTS") : "10",
+                                                  nullptr, 0)));
+    nx::thread_options options;
+    options.name = "thread report";
+    nx::thread reporter([seconds, threads] {
+        for (u32 n = 1;; ++n) {
+            nx::this_thread::sleep_for(std::chrono::seconds(seconds));
+            Runtime* rt = current_runtime();
+            if (!rt) return;
+            if (threads) {
+                const nx::string list = rt->kernel().describe_threads();
+                std::fprintf(stderr, "threads after %u s:\n%s", n * seconds, list.c_str());
+            }
+            if (hle::counting_calls()) {
+                const nx::string calls = hle::describe_calls();
+                std::fprintf(stderr, "HLE calls in the %u s before %u s:\n%s", seconds, n * seconds, calls.c_str());
+            }
+            // PSVRECORE_DUMP=<address>:<bytes>,...: guest memory, in words, with each report
+            if (const char* dump = std::getenv("PSVRECORE_DUMP")) {
+                for (const char* p = dump; *p;) {
+                    char* end = nullptr;
+                    const u32 at = static_cast<u32>(std::strtoul(p, &end, 0)) & ~3u;
+                    if (end == p) break;
+                    const u32 bytes = *end == ':' ? static_cast<u32>(std::strtoul(end + 1, &end, 0)) : 64;
+                    for (u32 o = 0; o < bytes && rt->memory().valid(at + o, 4); o += 32) {
+                        std::fprintf(stderr, "  [%08x]", at + o);
+                        for (u32 i = 0; i < 32 && o + i < bytes && rt->memory().valid(at + o + i, 4); i += 4)
+                            std::fprintf(stderr, " %08x", psv_ld32(at + o + i));
+                        std::fprintf(stderr, "\n");
+                    }
+                    p = *end == ',' ? end + 1 : end;
+                }
+            }
+            std::fflush(stderr);
+        }
+    }, options);
+    reporter.detach();
 }
 
 }  // namespace
@@ -139,6 +220,7 @@ Runtime::Runtime(const Config& config) : config_(config) {
     g_runtime.store(this, std::memory_order_release);
     hle::register_system_libraries();
     ok_ = true;
+    report_threads_from_environment();
 }
 
 Runtime::~Runtime() {
