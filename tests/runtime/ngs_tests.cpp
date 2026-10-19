@@ -722,3 +722,84 @@ TEST_CASE("ngs: ATRAC9 voices play what at9tool decodes, from the start and from
     }
     CHECK(checked > 0);
 }
+
+namespace {
+
+// A mono VAG file's blocks played through a player voice: the samples, from the first block on.
+nx::vector<i16> play_vag(const nx::vector<u8>& file, usize frames) {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 1)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    const u32 bytes = static_cast<u32>(file.size() - 48);  // (after the 48-byte header)
+    const u32 at = aligned(bytes);
+    std::memcpy(t.rt.memory().host(at), file.data() + 48, bytes);
+    PlayerParams p = player(1);
+    p.type = 1;  // SCE_NGS_PLAYER_TYPE_ADPCM
+    p.buffs[0] = PlayerBuffer{at, static_cast<i32>(bytes), 0, -1};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    nx::vector<i16> got;
+    while (got.size() < frames) {
+        ngs.update();
+        const nx::vector<i16> out = ngs.output(master);
+        for (u32 i = 0; i < kG; ++i) got.push_back(out[2 * i]);
+    }
+    return got;
+}
+
+}  // namespace
+
+// VAG made by the SDK's vagconv2 is SDK output: scripts/vag_check.py makes it locally from test signals, in the
+// default (HE-VAG) mode as <name>_he.vag and the backwards-compatible one as <name>_cb.vag next to the source
+// <name>.wav, and runs this test with PSVRECORE_VAG_DIR naming the folder. Without it there is nothing to check.
+TEST_CASE("ngs: VAG made by vagconv2 plays back its source, HE-VAG at least as well as classic") {
+    const auto dir = nx::os::environment_variable("PSVRECORE_VAG_DIR");
+    if (!dir) {
+        std::printf("(PSVRECORE_VAG_DIR not set: no VAG data to check)\n");
+        return;
+    }
+    auto entries = nx::fs::directory_entries(nx::fs::path_view(*dir));
+    REQUIRE(entries.has_value());
+    u32 checked = 0;
+    for (const auto& e : *entries) {
+        const nx::string path(e.path);
+        if (path.size() < 7 || path.substr(path.size() - 7) != "_he.vag") continue;
+        const nx::string stem = path.substr(0, path.size() - 7);
+        const nx::vector<u8> source = read_file(stem + ".wav");
+        const auto ref = riff_chunk(source, "data");
+        REQUIRE(!ref.empty());
+        const usize n = ref.size() / 2;
+        f64 snr[2] = {};
+        u32 he_blocks = 0;
+        for (u32 mode = 0; mode < 2; ++mode) {
+            const nx::vector<u8> vag = read_file(stem + (mode == 0 ? "_he.vag" : "_cb.vag"));
+            REQUIRE(vag.size() > 64);
+            REQUIRE(std::memcmp(vag.data(), "VAGp", 4) == 0);
+            for (usize at = 48; mode == 0 && at + 16 <= vag.size(); at += 16)
+                he_blocks += ((vag[at] >> 4) | ((vag[at + 1] >> 4) << 4)) > 4;
+            // (vagconv2 starts with a silent block: the source begins at the second)
+            const nx::vector<i16> got = play_vag(vag, 28 + n);
+            f64 signal = 0, noise = 0;
+            for (usize i = 0; i < n; ++i) {
+                i16 want;
+                std::memcpy(&want, ref.data() + 2 * i, 2);
+                signal += static_cast<f64>(want) * want;
+                noise += std::pow(static_cast<f64>(got[28 + i]) - want, 2);
+            }
+            snr[mode] = 10 * std::log10(signal / nx::max(noise, 1.0));
+        }
+        std::printf("%s: HE-VAG %.2f dB (%u blocks with HE filters), classic %.2f dB\n", stem.c_str(), snr[0],
+                    he_blocks, snr[1]);
+        CHECK(he_blocks > 0);
+        CHECK(snr[0] >= 20);
+        CHECK(snr[1] >= 20);
+        // (above 60 dB both are within a step of the source: how many samples land one off is the encoder's doing)
+        CHECK(snr[0] >= nx::min(snr[1] - 1, 60.0));
+        ++checked;
+    }
+    CHECK(checked > 0);
+}

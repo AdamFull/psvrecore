@@ -166,6 +166,18 @@ python scripts/at9_check.py --sdk C:/path/to/sdk
 
 What at9tool makes goes to `build/at9`: never commit it.
 
+## VAG check (needs the PS Vita SDK)
+
+`scripts/vag_check.py` encodes test signals with the SDK's vagconv2, in its default HE-VAG mode and its
+backwards-compatible one, and runs the runtime test that plays each through an NGS player voice and measures it
+against its source:
+
+```
+python scripts/vag_check.py --sdk C:/path/to/sdk
+```
+
+What vagconv2 makes goes to `build/vag`: never commit it.
+
 ## Test programs (needs the PS Vita SDK)
 
 `scripts/program_check.py` runs whole SDK-built programs on the runtime:
