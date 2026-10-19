@@ -81,6 +81,28 @@ def project_items(project):
     return sources, steps
 
 
+def include_dirs(project, sample_dir, sdk):
+    """The include folders a sample's Release configuration adds (beyond the SDK's own, which psp2snc knows)."""
+    root = ET.parse(project).getroot()
+    dirs = []
+    for group in root.iter():
+        if not group.tag.endswith("ItemDefinitionGroup") or "Release" not in group.get("Condition", ""):
+            continue
+        for item in group.iter():
+            if not item.tag.endswith("AdditionalIncludeDirectories") or not item.text:
+                continue
+            for entry in item.text.split(";"):
+                entry = entry.strip()
+                if not entry or entry.startswith("%("):
+                    continue
+                entry = entry.replace("$(SCE_PSP2_SDK_DIR)", str(sdk))
+                entry = entry.replace("$(SCE_PSP2_SAMPLE_DIR)", str(sdk / "target" / "samples"))
+                path = (sample_dir / entry.replace("\\", "/")).resolve()
+                if path.is_dir() and path not in dirs:
+                    dirs.append(path)
+    return dirs
+
+
 def expand(text, source, sdk, work):
     """MSBuild's item and property macros, as a sample's custom build steps use them."""
     text = text.replace("%(RootDir)%(Directory)", str(source.parent) + "\\")
@@ -100,6 +122,17 @@ def target_id(name):
     return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
+def sample_data(sdk, sample_dir, path):
+    """A data file the SDK keeps under target/samples/data (by its name, in the sample's category if several)."""
+    data = sdk / "target" / "samples" / "data"
+    name = Path(path).name
+    found = [f for f in data.rglob(name) if f.is_file() and f.as_posix().endswith(path)] if data.is_dir() else []
+    if len(found) > 1:
+        category = sample_dir.relative_to(sdk / "target" / "samples" / "sample_code").parts[0]
+        found = [f for f in found if category in f.relative_to(data).parts] or found
+    return found[0] if found else None
+
+
 def copy_data(sample_dir, sources, sdk, app):
     """The files the sample's sources name as app0:... (the SDK's samples keep them under target/)."""
     texts = set(sources)
@@ -113,6 +146,8 @@ def copy_data(sample_dir, sources, sdk, app):
             continue
         for path in re.findall(r'"app0:/?([^"%]+)"', text):
             src = sdk / "target" / path
+            if not src.exists():
+                src = sample_data(sdk, sample_dir, path) or src
             dst = app / path
             if src.is_file() and not dst.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -140,9 +175,10 @@ def build_sample(name, sample_dir, work, sdk, env, opt):
             out = out.strip()
             if out.lower().endswith(".obj") and Path(out).exists():
                 objects.append(Path(out))
+    includes = [f"-I{d.as_posix()}" for d in [sample_dir, *include_dirs(project, sample_dir, sdk)]]
     for source in sources:
         obj = work / f"{source.parent.name}_{source.stem}.o"
-        run([snc, opt, "-c", source, "-o", obj, f"-I{sample_dir.as_posix()}"], env=env)
+        run([snc, opt, "-c", source, "-o", obj, *dict.fromkeys(includes)], env=env)
         objects.append(obj)
     app = work / "app"
     (app / "sce_module").mkdir(parents=True)
