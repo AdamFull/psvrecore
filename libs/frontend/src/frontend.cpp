@@ -2,6 +2,10 @@
 
 #include <SDL3/SDL.h>
 
+#if defined(__ANDROID__)
+#include <jni.h>
+#endif
+
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -77,6 +81,7 @@ struct Lifecycle {
     platform::Window* window = nullptr;
     nx::mutex lock;
     bool background = false;
+    std::atomic<bool> sound{true};  // (the settings' audio.enabled: no sound back from the background without it)
 
     void set_background(bool to) {
         nx::scoped_lock<nx::mutex> held(lock);
@@ -89,7 +94,7 @@ struct Lifecycle {
             nx::logi(logs::frontend, "to the background: suspended");
         } else {
             window->set_background(false);
-            if (audio) audio->set_paused(false);
+            if (audio && sound.load()) audio->set_paused(false);
             rt->kernel().resume();
             nx::logi(logs::frontend, "back from the background: resumed");
         }
@@ -97,6 +102,37 @@ struct Lifecycle {
 };
 
 std::atomic<Lifecycle*> g_lifecycle{nullptr};
+// Set when a settings screen has changed the settings file: what applies while the game runs is read again.
+std::atomic<bool> g_settings_changed{false};
+
+nx::log::Level log_level(nx::string_view name);
+
+// The settings that apply while the game runs (SettingInfo::live), from `s`.
+void apply_live(const Settings& s, Lifecycle& l) {
+    platform::TouchControls& controls = l.window->input().controls();
+    controls.set_mode(static_cast<platform::TouchControls::Mode>(s.on_screen));
+    controls.set_opacity(s.controls_opacity);
+    controls.set_scale(s.controls_scale);
+    l.window->set_smooth(s.smooth);
+    l.sound.store(s.audio);
+    if (l.audio) l.audio->set_paused(!s.audio);
+    nx::log::set_level(log_level(s.log_level.view()));
+    l.window->refresh_view();
+}
+
+// The settings screen (Android: SettingsActivity, over the game, which is suspended meanwhile).
+void open_settings() {
+#if defined(__ANDROID__)
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!env || !activity) return;
+    jclass cls = env->GetObjectClass(activity);
+    if (jmethodID open = env->GetMethodID(cls, "openSettings", "()V")) env->CallVoidMethod(activity, open);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(cls);
+    env->DeleteLocalRef(activity);
+#endif
+}
 
 bool on_app_event(void* user, SDL_Event* e) {
     Lifecycle& l = *static_cast<Lifecycle*>(user);
@@ -372,6 +408,7 @@ int run(const Game& game, int argc, char** argv) {
     lifecycle.rt = &rt;
     lifecycle.audio = speaker.get();
     lifecycle.window = window->get();
+    lifecycle.sound.store(s.audio);
     SDL_AddEventWatch(on_app_event, &lifecycle);
     g_lifecycle.store(&lifecycle);
 
@@ -398,6 +435,13 @@ int run(const Game& game, int argc, char** argv) {
             break;
         }
         if (!(*window)->pump(&rt, 5)) break;
+        if ((*window)->input().take_menu_request()) open_settings();
+        if (g_settings_changed.exchange(false)) {
+            // (a settings screen changed the file: what applies while playing, at once)
+            nx::string used;
+            if (auto fresh = resolve_settings(cl, settings_file, &used)) apply_live(*fresh, lifecycle);
+            else nx::logw(logs::frontend, "settings: {}", fresh.error().message);
+        }
     }
     const i32 code = rt.exited() ? rt.exit_code() : 0;
     nx::log::flush();
@@ -413,6 +457,54 @@ int run(const Game& game, int argc, char** argv) {
 
 #if defined(__ANDROID__)
 #include <jni.h>
+
+namespace {
+
+nx::string from_java(JNIEnv* env, jstring s) {
+    if (!s) return {};
+    const char* chars = env->GetStringUTFChars(s, nullptr);
+    nx::string out(chars ? chars : "");
+    if (chars) env->ReleaseStringUTFChars(s, chars);
+    return out;
+}
+
+}  // namespace
+
+// SettingsActivity: the settings file's keys, one a line, tab-separated: section, key, kind, choices (comma-separated)
+// or the range (lo,hi), live (1/0), desktop only (1/0), help, value.
+extern "C" JNIEXPORT jstring JNICALL Java_io_github_adamfull_psvrecore_SettingsActivity_nativeSchema(JNIEnv* env, jclass,
+                                                                                                    jstring file) {
+    using namespace psvrecore::frontend;
+    Settings s;
+    const nx::string path = from_java(env, file);
+    if (auto text = nx::fs::file_read_text(nx::fs::path_view(path))) (void)apply_file_text(&s, text->view());
+    nx::string out;
+    static constexpr const char* kKinds[] = {"bool", "int", "float", "choice", "text", "folder"};
+    for (const SettingInfo& i : describe(s)) {
+        nx::string extra;
+        if (i.kind == SettingInfo::Kind::Choice) {
+            for (usize c = 0; c < i.choices.size(); ++c) extra += (c ? "," : "") + i.choices[c];
+        } else if (i.kind == SettingInfo::Kind::Int || i.kind == SettingInfo::Kind::Float) {
+            extra = nx::format("{},{}", i.lo, i.hi);
+        }
+        out += nx::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", i.section, i.key, kKinds[static_cast<u32>(i.kind)], extra,
+                          i.live ? 1 : 0, i.desktop_only ? 1 : 0, i.help, i.value);
+    }
+    return env->NewStringUTF(out.c_str());
+}
+
+// SettingsActivity: one value changed in the file; null, or why it was refused.
+extern "C" JNIEXPORT jstring JNICALL Java_io_github_adamfull_psvrecore_SettingsActivity_nativeSet(JNIEnv* env, jclass,
+                                                                                                 jstring file,
+                                                                                                 jstring section,
+                                                                                                 jstring key,
+                                                                                                 jstring value) {
+    auto r = psvrecore::frontend::set_in_file(from_java(env, file), from_java(env, section).view(),
+                                              from_java(env, key).view(), from_java(env, value).view());
+    if (!r) return env->NewStringUTF(r.error().message.c_str());
+    psvrecore::frontend::g_settings_changed.store(true);
+    return nullptr;
+}
 
 // PsvrecoreActivity's pause and resume (on the system's thread).
 extern "C" JNIEXPORT void JNICALL
