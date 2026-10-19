@@ -580,7 +580,7 @@ Id Translator::convert(Id v, Type from, Type to, bool scale) {
     auto to_int = [&](f32 lo, f32 hi, f32 k) {
         Id g = scale ? fmul(x, f(k)) : x;
         g = sel(tf_, un(SpvOpIsNan, tb_, g), f(0.0f), ext(tf_, GLSLstd450NMin, {ext(tf_, GLSLstd450NMax, {g, f(lo)}), f(hi)}));
-        g = ext(tf_, scale ? GLSLstd450RoundEven : GLSLstd450Trunc, {g});
+        g = ext(tf_, GLSLstd450Trunc, {g});  // (scaled values too: see interp.cpp)
         return cast(tu_, un(SpvOpConvertFToS, ti_, g));
     };
     switch (to) {

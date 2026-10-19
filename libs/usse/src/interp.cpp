@@ -384,12 +384,12 @@ u32 convert(u32 v, Type from, Type to, bool scale) {
         case Type::Fx10: f = static_cast<f32>(fx_value(v, Type::Fx10)) / 255.0f; break;  // (always scaled: see below)
         default: return v;
     }
-    // To integers: truncated (checked: the compiler's float-to-int sequences rely on it), saturated; scaled
-    // (normalized) values round to nearest (assumed).
+    // To integers: truncated, saturated; scaled (normalized) values too (checked: the compiler's float-to-int
+    // sequences rely on it, and it casts (int)(x * k) as a scaled pack of x * k / 65535).
     auto to_int = [&](f32 lo, f32 hi, f32 k) {
         f32 g = scale ? f * k : f;
         g = std::isnan(g) ? 0.0f : std::fmin(std::fmax(g, lo), hi);
-        return static_cast<u32>(static_cast<i32>(scale ? std::nearbyint(g) : std::trunc(g)));
+        return static_cast<u32>(static_cast<i32>(std::trunc(g)));
     };
     switch (to) {
         case Type::F32: return std::bit_cast<u32>(f);
