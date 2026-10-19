@@ -22,6 +22,7 @@
 //
 // Not yet: tiled and swizzled colour surfaces, multisampling.
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -229,6 +230,17 @@ struct Target {
     nx::vector<u8> written;
 };
 
+// A depth surface a depth-only scene stores (a shadow map), at the internal resolution: its depth image, kept from
+// scene to scene, a view of its depth for textures, and the bytes last stored to guest memory (while they are still
+// there, the image is the surface).
+struct DepthTarget {
+    u32 address = 0, control = 0, stride = 0, width = 0, height = 0;
+    u32 scale = 1;
+    vk::Image image;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    nx::vector<u8> written;
+};
+
 struct CachedTexture {
     vk::Image image;
     VkSampler sampler = VK_NULL_HANDLE;
@@ -255,6 +267,7 @@ struct Renderer {
     std::atomic<bool> pipelines_changed{false};
     nx::mutex targets_lock;  // (a scene being rendered; the display reading a scaled surface)
     nx::vector<nx::unique_ptr<Target>> targets;
+    nx::vector<nx::unique_ptr<DepthTarget>> depth_targets;
     nx::hash_map<u32, bool> scalable;  // (by VkFormat: blits to and from it, and it is drawn into)
     vk::Image white, white_cube;
     VkSampler sampler = VK_NULL_HANDLE;
@@ -578,6 +591,166 @@ Result<void> upload_texels(vk::Device& d, vk::Image& image, const Texels& t) {
     return result;
 }
 
+// The sampler a texture's control words ask for, for an image of this format and levels.
+VkSampler texture_sampler(Renderer& r, const TextureInfo& info, VkFormat format, u32 levels) {
+    vk::SamplerDesc sd;
+    // (32-bit float images are not filterable everywhere: nearest there)
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(r.device->physical(), format, &fp);
+    const bool filterable = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    sd.mag = info.mag_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sd.min = info.min_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sd.mip = info.mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sd.u = address_mode(info.u_address);
+    sd.v = address_mode(info.v_address);
+    sd.w = sd.u;
+    sd.lod_bias = (static_cast<f32>(info.lod_bias) - 31.0f) / 8.0f;  // (assumed: eighths of a level, 31 none)
+    sd.max_lod = static_cast<f32>(levels - 1);
+    auto smp = r.samplers->get(sd);
+    return smp ? *smp : VK_NULL_HANDLE;
+}
+
+// Whether a texture's texels are what sampling an image of this format gives for the same bytes in memory (the
+// texture decoder, on one texel of known bytes): 8-bit RGBA images only.
+bool texels_as_image(const TextureInfo& info, VkFormat format) {
+    u32 order[4];
+    if (format == VK_FORMAT_R8G8B8A8_UNORM) order[0] = 0, order[1] = 1, order[2] = 2, order[3] = 3;
+    else if (format == VK_FORMAT_B8G8R8A8_UNORM) order[0] = 2, order[1] = 1, order[2] = 0, order[3] = 3;
+    else return false;
+    if (texel_bits(info.base_format) != 32 || info.gamma || info.palette) return false;
+    TextureInfo one = info;
+    one.width = one.height = 1;
+    one.levels = 1;
+    one.stride = 4;
+    const u8 probe[4] = {0x11, 0x55, 0x99, 0xDD};
+    auto texels = read_texels(one, [&](u32, void* out, u32 bytes) {
+        if (bytes > 4) return false;
+        std::memcpy(out, probe, bytes);
+        return true;
+    });
+    if (!texels || texels->bytes != 4 || texels->data.size() < 4) return false;
+    for (u32 k = 0; k < 4; ++k)
+        if (texels->data[k] != probe[order[k]]) return false;
+    return true;
+}
+
+// A texture that reads a colour surface drawn at the internal resolution: its scaled image, when the texture is
+// that surface (its address, size and rows, one level, texels as the image holds them), guest memory still holds
+// what its last scene wrote back, and it is not what this scene draws into.
+Target* scaled_texture(Renderer& r, const TextureInfo& info, const Target* drawing) {
+    if (info.type != texture_type::kLinear && info.type != texture_type::kLinearStrided) return nullptr;
+    if (info.levels != 1 || !info.address || info.stride % 4) return nullptr;
+    for (auto& t : r.targets) {
+        if (t->scale <= 1 || t.get() == drawing || t->address != info.address || t->width != info.width ||
+            t->height != info.height)
+            continue;
+        if (!texels_as_image(info, t->image.desc.format)) return nullptr;
+        const Changes changes = surface_changes(*t, info.stride / 4, 4);
+        return changes.all || changes.pixels ? nullptr : t.get();
+    }
+    return nullptr;
+}
+
+// The depth surface's bytes in guest memory (the depth words its samples span).
+std::span<const u8> depth_bytes(const DepthStencilSurface& s, u32 width, u32 height) {
+    return {memory().host(s.depth_data), usize{depth_samples(s, width, height)} * 4};
+}
+
+// The kept depth image of a depth surface a depth-only scene stores, at `scale` (made, or made again at another
+// scale), or none: the device cannot sample its depth format, or the surface is not 4 bytes of depth a sample
+// without stencil (DF32, DF32M).
+DepthTarget* depth_target_for(Renderer& r, const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height,
+                              u32 scale) {
+    if (l.depth_bytes != 4 || l.stencil || l.packed) return nullptr;
+    const VkFormat format = r.device->caps().depth_stencil_format;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(r.device->physical(), format, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return nullptr;
+    const u32 control = s.control & (0x03FFF000u | kDsTiled), stride = s.background_control >> 16;
+    DepthTarget* t = nullptr;
+    for (auto& d : r.depth_targets)
+        if (d->address == s.depth_data && d->control == control && d->stride == stride && d->width == width &&
+            d->height == height)
+            t = d.get();
+    if (t && t->image.image && t->scale == scale) return t;
+    if (!t) {
+        r.depth_targets.push_back(nx::make_unique<DepthTarget>());
+        t = r.depth_targets.back().get();
+        t->address = s.depth_data, t->control = control, t->stride = stride, t->width = width, t->height = height;
+    }
+    if (t->image.image) {
+        vkDestroyImageView(r.device->device(), t->depth_view, nullptr);
+        r.passes->forget(t->image.view);
+        vk::destroy_image(*r.device, t->image);
+        t->image = {}, t->depth_view = VK_NULL_HANDLE;
+    }
+    t->written.clear();
+    vk::ImageDesc dd;
+    dd.format = format;
+    dd.width = width * scale;
+    dd.height = height * scale;
+    dd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT;
+    auto img = vk::create_image(*r.device, dd);
+    if (!img) return nullptr;
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = img->image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(r.device->device(), &vi, nullptr, &t->depth_view) != VK_SUCCESS) {
+        vk::destroy_image(*r.device, *img);
+        return nullptr;
+    }
+    t->image = *img;
+    t->scale = scale;
+    return t;
+}
+
+// Whether a texture reads a depth surface as sampling its depth aspect gives it: one float of the depth, the other
+// components 0, 0, 1 (the texture decoder, on one texel).
+bool texels_as_depth(const TextureInfo& info) {
+    if (texel_bits(info.base_format) != 32 || info.gamma || info.palette) return false;
+    TextureInfo one = info;
+    one.type = texture_type::kLinear;
+    one.width = one.height = 1;
+    one.levels = 1;
+    one.stride = 4;
+    const f32 probe = 0.375f;
+    auto texels = read_texels(one, [&](u32, void* out, u32 bytes) {
+        if (bytes > 4) return false;
+        std::memcpy(out, &probe, bytes);
+        return true;
+    });
+    if (!texels || texels->bytes != 16 || texels->data.size() < 16) return false;
+    f32 c[4];
+    std::memcpy(c, texels->data.data(), 16);
+    return c[0] == probe && c[1] == 0.0f && c[2] == 0.0f && c[3] == 1.0f;
+}
+
+// A texture that reads a depth surface stored at the internal resolution: its kept image's depth, when the texture
+// is that surface (address, size, tiled or rows as it was stored), guest memory still holds what was stored, and it
+// is not this scene's depth.
+DepthTarget* scaled_depth_texture(Renderer& r, const TextureInfo& info, const DepthTarget* drawing) {
+    if (info.levels != 1 || !info.address) return nullptr;
+    for (auto& t : r.depth_targets) {
+        if (t->scale <= 1 || t.get() == drawing || t->address != info.address || t->width != info.width ||
+            t->height != info.height || t->written.empty())
+            continue;
+        const bool tiled = t->control & kDsTiled;
+        if (tiled ? info.type != texture_type::kTiled
+                  : (info.type != texture_type::kLinear && info.type != texture_type::kLinearStrided) ||
+                        info.stride != t->stride * 32 * 4)
+            return nullptr;
+        if (!texels_as_depth(info)) return nullptr;
+        if (!memory().valid(t->address, static_cast<u32>(t->written.size())) ||
+            std::memcmp(memory().host(t->address), t->written.data(), t->written.size()) != 0)
+            return nullptr;
+        return t.get();
+    }
+    return nullptr;
+}
+
 // A texture as the draw's control words describe it (cached), or none if it cannot be read.
 CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
     const TextureInfo info = decode_texture(words.words);
@@ -620,22 +793,9 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
         vk::destroy_image(*r.device, *image);
         return nullptr;
     }
-    vk::SamplerDesc sd;
-    // (32-bit float images are not filterable everywhere: nearest there)
-    VkFormatProperties fp;
-    vkGetPhysicalDeviceFormatProperties(r.device->physical(), d.format, &fp);
-    const bool filterable = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-    sd.mag = info.mag_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    sd.min = info.min_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    sd.mip = info.mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sd.u = address_mode(info.u_address);
-    sd.v = address_mode(info.v_address);
-    sd.w = sd.u;
-    sd.lod_bias = (static_cast<f32>(info.lod_bias) - 31.0f) / 8.0f;  // (assumed: eighths of a level, 31 none)
-    sd.max_lod = static_cast<f32>(texels->levels - 1);
     CachedTexture c;
     c.image = *image;
-    if (auto smp = r.samplers->get(sd)) c.sampler = *smp;
+    c.sampler = texture_sampler(r, info, d.format, texels->levels);
     c.used = r.scenes;
     auto [it, added] = r.textures.emplace(key, c);
     return &it->second;
@@ -781,6 +941,24 @@ void render_scene(Context& context, Scene& scene) {
         }
     }
     const u32 target_w = nx::min(width, scene.target->width), target_h = nx::min(height, scene.target->height);
+    // A depth-only scene whose depth is stored (a shadow map): at the internal resolution too, in a depth image kept
+    // for the surface, which the textures reading that surface then sample.
+    DepthTarget* depth_target = nullptr;
+    bool depth_kept = false;  // (its image still holds the surface: nothing to load)
+    if (!scene.has_color && scene.has_depth && (ds.control & kDsForceStore) &&
+        d.caps().depth_stencil_format != VK_FORMAT_UNDEFINED) {
+        DepthLayout l;
+        const u32 s = nx::clamp<u32>(state().options->render_scale, 1, 4);
+        if (s > 1 && depth_layout(ds.control & 0x03FFF000u, l) && depth_surface_valid(ds, l, width, height)) {
+            depth_target = depth_target_for(r, ds, l, width, height, s);
+            if (depth_target) {
+                scale = s;
+                const auto now = depth_bytes(ds, width, height);
+                depth_kept = depth_target->written.size() == now.size() &&
+                             std::memcmp(now.data(), depth_target->written.data(), now.size()) == 0;
+            }
+        }
+    }
     // (what is drawn: the surface's pixels at the internal resolution)
     const u32 draw_w = width * scale, draw_h = height * scale;
 
@@ -804,7 +982,9 @@ void render_scene(Context& context, Scene& scene) {
         nx::logw(logs::gxm, "depth/stencil surface outside guest memory: not loaded or stored");
         load_depth = store_depth = false;
     }
-    if (has_depth) {
+    if (has_depth && depth_target) {
+        depth = depth_target->image;  // (its layout copied back when the scene is done)
+    } else if (has_depth) {
         vk::ImageDesc dd;
         dd.format = d.caps().depth_stencil_format;
         dd.width = draw_w;
@@ -1097,18 +1277,20 @@ void render_scene(Context& context, Scene& scene) {
     vk::Buffer* depth_buf = nullptr;
     if (load_depth || store_depth) {
         nx::vector<u8> init;
-        if (load_depth) {
+        if (load_depth && !depth_kept) {
             const usize n = usize{width} * height;
             init.resize(n * 5);
             read_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<u32*>(init.data()), init.data() + n * 4);
             if (scale > 1) init = scale_up_samples(init, width, height, scale);
         }
-        depth_buf = make(load_depth ? init.data() : nullptr, samples * 5,
+        depth_buf = make(!init.empty() ? init.data() : nullptr, samples * 5,
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
     auto cleanup = [&] {
         for (vk::Buffer& b : buffers) vk::destroy_buffer(d, b);
-        if (depth.image) {
+        if (depth_target) {
+            depth_target->image.layout = depth.layout;  // (kept)
+        } else if (depth.image) {
             r.passes->forget(depth.view);
             vk::destroy_image(d, depth);
         }
@@ -1130,6 +1312,8 @@ void render_scene(Context& context, Scene& scene) {
     pi.pPoolSizes = sizes;
     vkCreateDescriptorPool(d.device(), &pi, nullptr, &pool);
     nx::vector<VkDescriptorSet> descriptor_sets(plans.size(), VK_NULL_HANDLE);
+    nx::vector<Target*> sampled;  // (surfaces drawn at the internal resolution the draws read as textures)
+    nx::vector<DepthTarget*> sampled_depth;
     for (usize i = 0; i < plans.size(); ++i) {
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         ai.descriptorPool = pool;
@@ -1152,6 +1336,24 @@ void render_scene(Context& context, Scene& scene) {
                 const u32 binding = (stage ? kDrawBindingFragmentTextures : kDrawBindingVertexTextures) + unit;
                 ii[binding].imageView = q.sampler_cube ? r.white_cube.view : r.white.view;
                 const TextureWords& words = stage ? dr.fragment_textures[unit] : dr.vertex_textures[unit];
+                // (a depth surface stored at the internal resolution: its depth read there)
+                if (DepthTarget* dt = q.sampler_cube ? nullptr : scaled_depth_texture(r, decode_texture(words.words), depth_target)) {
+                    const TextureInfo info = decode_texture(words.words);
+                    ii[binding].imageView = dt->depth_view;
+                    const VkSampler smp = texture_sampler(r, info, dt->image.desc.format, 1);
+                    ii[binding].sampler = smp ? smp : r.sampler;
+                    if (std::find(sampled_depth.begin(), sampled_depth.end(), dt) == sampled_depth.end()) sampled_depth.push_back(dt);
+                    continue;
+                }
+                // (a surface drawn at the internal resolution: read there)
+                if (Target* st = q.sampler_cube ? nullptr : scaled_texture(r, decode_texture(words.words), target)) {
+                    const TextureInfo info = decode_texture(words.words);
+                    ii[binding].imageView = st->scaled.view;
+                    const VkSampler smp = texture_sampler(r, info, st->scaled.desc.format, 1);
+                    ii[binding].sampler = smp ? smp : r.sampler;
+                    if (std::find(sampled.begin(), sampled.end(), st) == sampled.end()) sampled.push_back(st);
+                    continue;
+                }
                 if (CachedTexture* t = texture_for(r, words); t && t->image.desc.cube == q.sampler_cube) {
                     ii[binding].imageView = t->image.view;
                     ii[binding].sampler = t->sampler ? t->sampler : r.sampler;
@@ -1229,6 +1431,9 @@ void render_scene(Context& context, Scene& scene) {
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &b, 0,
                              nullptr, 0, nullptr);
     }
+    // (the scaled surfaces the draws read, as textures)
+    for (Target* t : sampled) vk::transition(*cmd, t->scaled, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    for (DepthTarget* t : sampled_depth) vk::transition(*cmd, t->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (scale > 1) {
         // (the tiles of the surface's colour that changed, scaled up into the scaled image)
         if (!changes.tiles.empty()) {
@@ -1259,7 +1464,7 @@ void render_scene(Context& context, Scene& scene) {
     const VkBufferImageCopy depth_regions[2] = {
         {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {draw_w, draw_h, 1}},
         {samples * 4, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {draw_w, draw_h, 1}}};
-    if (load_depth && depth.image) {
+    if (load_depth && !depth_kept && depth.image) {
         vk::transition(*cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdCopyBufferToImage(*cmd, depth_buf->buffer, depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, depth_regions);
     }
@@ -1393,6 +1598,11 @@ void render_scene(Context& context, Scene& scene) {
                                     down.data() + usize{width} * height * 4);
             } else {
                 write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src), src + samples * 4);
+            }
+            // (what guest memory holds now, to know whether the kept depth image is still the surface)
+            if (depth_target) {
+                const auto now = depth_bytes(ds, width, height);
+                depth_target->written.assign(now.begin(), now.end());
             }
         }
     } else {
