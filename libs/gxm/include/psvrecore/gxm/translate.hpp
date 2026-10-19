@@ -105,6 +105,8 @@ struct FragmentShader {
     // attachment's red, green, blue, alpha order.
     u8 swizzle[4] = {0, 1, 2, 3};
     bool fragment_program_enabled = true;
+    // Whether the pass has a colour attachment (depth-only scenes: no colour output).
+    bool color_output = true;
     // Programs that read the colour (FRAGCOLOR, with __nativecolor) find it in their output register before they
     // run: from the colour attachment (input attachment kDrawBindingColor), in the output register's format.
 };

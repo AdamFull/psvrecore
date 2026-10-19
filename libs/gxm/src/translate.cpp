@@ -215,7 +215,9 @@ private:
     void imad_op(const Instruction& in);
     void sample(Id unit, TexDim dim, const Id coord[4], Id rgba[4]);
     // The draw forms: a combined image sampler's sample (explicit level of detail where `lod` is given).
+    Id sampler_variable(u32 binding, bool cube);
     void sample_unit(u32 binding, TexDim dim, const Id coord[4], usse::TexKind kind, const Id extra[4], Id rgba[4]);
+    void gather_unit(u32 binding, const Id coord[4], Id regs[6]);
     Id texture(u32 binding);
     void write_sample(const Id rgba[4], u32 format, Id regs[4]);
     void tex_op(const Instruction& in);
@@ -248,6 +250,7 @@ private:
     nx::string error_;
     u32 word_ = 0;
     bool int64_ = false;
+    bool image_query_ = false;  // (texture size queries: the ImageQuery capability)
 
     Id tu_ = 0, ti_ = 0, tf_ = 0, tb_ = 0;
     Id tp_fu_ = 0, tp_fi_ = 0, tp_fb_ = 0, tp_su_ = 0;
@@ -833,7 +836,8 @@ void Translator::test_op(const Instruction& in) {
         if (n == 4 && !((d.mask >> k) & 1)) continue;
         const Id r = lane_result(k);
         const u32 bits = width_of(t);
-        put(d, k, t, sel(tu_, r, u(bits == 32 ? ~0u : (1u << bits) - 1), u(0)));
+        if (is_float(t)) putf(d, k, t, sel(tf_, r, f(1.0f), f(0.0f)));  // (1.0 or 0.0: see interp.cpp)
+        else put(d, k, t, sel(tu_, r, u(bits == 32 ? ~0u : (1u << bits) - 1), u(0)));
     }
 }
 
@@ -953,9 +957,37 @@ void Translator::write_sample(const Id rgba[4], u32 format, Id regs[4]) {
 
 Id Translator::texture(u32 binding) { return textures_[binding]; }
 
-void Translator::sample_unit(u32 binding, TexDim dim, const Id coord[4], usse::TexKind kind, const Id extra[4],
-                             Id rgba[4]) {
-    const bool cube = dim == TexDim::Cube;
+// The .irsd query of a 2D texture (f32): the bilinear footprint's four texels (their first component) and their
+// weights, as the hardware returns them (inferred from the programs that use it: no oracle has it yet):
+// registers 0-3 the texels (x0, y0), (x1, y0), (x0, y1), (x1, y1) as f32, registers 4-5 four f16 weights with
+// texel k's at index 3 - k.
+void Translator::gather_unit(u32 binding, const Id coord[4], Id regs[6]) {
+    const Id image = b_.t_image(tf_, SpvDim2D, 0, 0, 0, 1, SpvImageFormatUnknown);
+    const Id sampled = b_.t_sampled_image(image);
+    const Id t = load(sampled, sampler_variable(binding, false));
+    image_query_ = true;
+    const Id tc = b_.t_vector(tf_, 2);
+    const Id c = b_.op(SpvOpCompositeConstruct, tc, {coord[0], coord[1]});
+    // (Vulkan's gather order: x (i0, j1), y (i1, j1), z (i1, j0), w (i0, j0))
+    const Id g = b_.op(SpvOpImageGather, tv4_, {t, c, b_.c_int(0)});
+    const Id size = b_.op(SpvOpImageQuerySizeLod, b_.t_vector(ti_, 2), {b_.op(SpvOpImage, image, {t}), b_.c_int(0)});
+    Id frac[2];
+    for (u32 k = 0; k < 2; ++k) {
+        const Id extent = un(SpvOpConvertSToF, tf_, b_.op(SpvOpCompositeExtract, ti_, {size, k}));
+        frac[k] = ext(tf_, GLSLstd450Fract, {fsub(fmul(coord[k], extent), f(0.5f))});
+    }
+    const Id texel[4] = {b_.op(SpvOpCompositeExtract, tf_, {g, 3u}), b_.op(SpvOpCompositeExtract, tf_, {g, 2u}),
+                         b_.op(SpvOpCompositeExtract, tf_, {g, 0u}), b_.op(SpvOpCompositeExtract, tf_, {g, 1u})};
+    const Id fu = frac[0], fv = frac[1], gu = fsub(f(1.0f), fu), gv = fsub(f(1.0f), fv);
+    const Id weight[4] = {fmul(gu, gv), fmul(fu, gv), fmul(gu, fv), fmul(fu, fv)};
+    for (u32 k = 0; k < 4; ++k) regs[k] = cast(tu_, texel[k]);
+    auto h = [&](u32 k) { return to_half(cast(tu_, weight[k])); };
+    regs[4] = bor(h(3), shl(h(2), u(16)));
+    regs[5] = bor(h(1), shl(h(0), u(16)));
+}
+
+// The combined image sampler variable of a draw binding.
+Id Translator::sampler_variable(u32 binding, bool cube) {
     const Id image = b_.t_image(tf_, cube ? SpvDimCube : SpvDim2D, 0, 0, 0, 1, SpvImageFormatUnknown);
     const Id sampled = b_.t_sampled_image(image);
     if (!textures_[binding]) {
@@ -964,7 +996,15 @@ void Translator::sample_unit(u32 binding, TexDim dim, const Id coord[4], usse::T
         b_.decorate(v, SpvDecorationBinding, {binding});
         textures_[binding] = v;
     }
-    const Id t = load(sampled, textures_[binding]);
+    return textures_[binding];
+}
+
+void Translator::sample_unit(u32 binding, TexDim dim, const Id coord[4], usse::TexKind kind, const Id extra[4],
+                             Id rgba[4]) {
+    const bool cube = dim == TexDim::Cube;
+    const Id image = b_.t_image(tf_, cube ? SpvDimCube : SpvDim2D, 0, 0, 0, 1, SpvImageFormatUnknown);
+    const Id sampled = b_.t_sampled_image(image);
+    const Id t = load(sampled, sampler_variable(binding, cube));
     const u32 n = cube ? 3 : 2;
     const Id tc = b_.t_vector(tf_, n);
     const Id c = cube ? b_.op(SpvOpCompositeConstruct, tc, {coord[0], coord[1], coord[2]})
@@ -997,8 +1037,10 @@ void Translator::sample_unit(u32 binding, TexDim dim, const Id coord[4], usse::T
 }
 
 void Translator::tex_op(const Instruction& in) {
-    if (in.flags & (usse::kTexRsd | usse::kTexInfo | usse::kTexMinP)) {
-        fail("texture queries not implemented");
+    const bool query = in.flags & (usse::kTexRsd | usse::kTexInfo | usse::kTexMinP);
+    if (query && (form_ == Form::Compute || (in.flags & usse::kTexMinP) || !(in.flags & usse::kTexRsd) ||
+                  !(in.flags & usse::kTexInfo) || in.tex_dim != TexDim::D2 || in.type != Type::F32)) {
+        fail("texture query not implemented (only .irsd of 2D textures, f32, in the draw forms)");
         return;
     }
     Operand state = in.src[1];
@@ -1039,6 +1081,16 @@ void Translator::tex_op(const Instruction& in) {
             }
         }
         const u32 binding = (vertex ? kDrawBindingVertexTextures : kDrawBindingFragmentTextures) + static_cast<u32>(unit);
+        if (query) {
+            Id regs[6];
+            gather_unit(binding, coord, regs);
+            for (u32 k = 0; k < 6; ++k) {
+                Operand d = in.dest;
+                d.lanes = 0;
+                if (const Id w = word_ptr(d, d.number + k, true)) writes_.push_back(Pending{Slot{w, 0, 32}, regs[k], cond_});
+            }
+            return;
+        }
         sample_unit(binding, in.tex_dim, coord, in.tex_kind, extra, rgba);
     }
     const u32 format = in.type == Type::F32 ? 3 : in.type == Type::F16 ? 1 : 0;
@@ -1371,6 +1423,16 @@ void Translator::vertex_prologue() {
                 break;
         }
     }
+    // The vertex and instance indices (the index buffer's value, the instance number).
+    for (u32 which = 0; which < 2; ++which) {
+        const i32 reg = which ? gxp_.instance_register : gxp_.index_register;
+        if (reg < 0) continue;
+        const Id var = b_.variable(b_.t_pointer(SpvStorageClassInput, ti_), SpvStorageClassInput);
+        b_.decorate(var, SpvDecorationBuiltIn, {which ? static_cast<u32>(SpvBuiltInInstanceIndex) : static_cast<u32>(SpvBuiltInVertexIndex)});
+        interface_.push_back(var);
+        pa_.used = nx::max(pa_.used, static_cast<u32>(reg) + 1);
+        store(pa(static_cast<u32>(reg)), cast(tu_, load(ti_, var)));
+    }
 }
 
 void Translator::vertex_epilogue() {
@@ -1596,12 +1658,14 @@ void Translator::fragment_epilogue() {
             break;
         default: fail(nx::format("output register format {} not implemented", format)); break;
     }
-    const Id color = b_.variable(b_.t_pointer(SpvStorageClassOutput, tv4_), SpvStorageClassOutput);
-    b_.decorate(color, SpvDecorationLocation, {0});
-    interface_.push_back(color);
-    const u8* z = fragment_shader->swizzle;
-    store(color, b_.op(SpvOpCompositeConstruct, tv4_, {lane[nx::min<u8>(z[0], 5)], lane[nx::min<u8>(z[1], 5)],
-                                                      lane[nx::min<u8>(z[2], 5)], lane[nx::min<u8>(z[3], 5)]}));
+    if (fragment_shader->color_output) {
+        const Id color = b_.variable(b_.t_pointer(SpvStorageClassOutput, tv4_), SpvStorageClassOutput);
+        b_.decorate(color, SpvDecorationLocation, {0});
+        interface_.push_back(color);
+        const u8* z = fragment_shader->swizzle;
+        store(color, b_.op(SpvOpCompositeConstruct, tv4_, {lane[nx::min<u8>(z[0], 5)], lane[nx::min<u8>(z[1], 5)],
+                                                          lane[nx::min<u8>(z[2], 5)], lane[nx::min<u8>(z[3], 5)]}));
+    }
     // A discarded instance: no colour, no depth.
     const Id kill = b_.new_label(), merge = b_.new_label();
     const Id killed = load(tb_, killed_);
@@ -1739,6 +1803,7 @@ Result<nx::vector<u32>> Translator::translate() {
             break;
     }
     if (int64_) b_.capability(SpvCapabilityInt64);
+    if (image_query_) b_.capability(SpvCapabilityImageQuery);
     if (!error_.empty()) return failure(error_);
     return b_.module();
 }
