@@ -1,9 +1,12 @@
 #pragma once
 
-// GXP files: compiled shader programs (a vertex or fragment program: a primary program run per vertex or fragment,
-// a secondary one run per draw, and their parameter tables). Only what the decoder needs so far: the header and the
-// two programs' words.
+// GXP files: compiled shader programs. A vertex or fragment program holds a primary program, run per vertex or
+// fragment, a secondary one, run once per draw, and tables describing its interface: the parameters (attributes,
+// uniforms, samplers, uniform buffers), the vertex outputs or fragment inputs, and flags. What is read here is
+// what libgxm's program functions report (sceGxmProgram*), checked against the host build of those functions in
+// the SDK (scripts/gxp_check.py).
 
+#include <optional>
 #include <span>
 
 #include "psvrecore/error.hpp"
@@ -13,14 +16,66 @@ namespace psvrecore::usse {
 
 enum class ShaderType : u8 { Vertex, Fragment };
 
-struct Gxp {
-    ShaderType type = ShaderType::Vertex;
-    u32 size = 0;  // the file's own size field
-    nx::vector<u64> primary;
-    nx::vector<u64> secondary;
+// The values are libgxm's (SceGxmParameterCategory, SceGxmParameterType, SceGxmParameterSemantic).
+enum class ParameterCategory : u8 { Attribute = 0, Uniform = 1, Sampler = 2, UniformBuffer = 4 };
+enum class ParameterType : u8 { F32, F16, C10, U32, S32, U16, S16, U8, S8, Aggregate };
+enum class Semantic : u8 {
+    None, Attr, Bcol, Binormal, BlendIndices, BlendWeight, Color, Diffuse, FogCoord, Normal, PointSize, Position,
+    Specular, Tangent, TexCoord,
 };
 
-// Reads a GXP held in memory (the words are copied out).
+// Vertex outputs and fragment inputs, as libgxm's masks (SceGxmVertexProgramOutput, SceGxmFragmentProgramInput).
+namespace varying {
+inline constexpr u32 kPosition = 1u << 0;  // (fragment inputs: the window position)
+inline constexpr u32 kFog = 1u << 1;
+inline constexpr u32 kColor0 = 1u << 2;
+inline constexpr u32 kColor1 = 1u << 3;
+inline constexpr u32 kTexCoord0 = 1u << 4;  // ... kTexCoord0 << 9
+inline constexpr u32 kPointSize = 1u << 14;  // vertex outputs; for fragment inputs the sprite coordinate
+inline constexpr u32 kSpriteCoord = 1u << 14;
+inline constexpr u32 kClip0 = 1u << 15;  // ... kClip0 << 7 (vertex outputs only)
+}  // namespace varying
+
+struct Parameter {
+    u32 offset = 0;  // of its record in the file
+    nx::string name;  // empty for uniform buffers, which have none
+    bool named = false;
+    ParameterCategory category = ParameterCategory::Uniform;
+    ParameterType type = ParameterType::F32;
+    u8 components = 0;
+    u32 array_size = 0;
+    u32 resource = 0;  // register (attributes), offset in 32-bit words (uniforms), unit (samplers), buffer index
+    u8 container = 0;  // the buffer a uniform is in: 0-13 user buffers, 14 the default uniform buffer
+    Semantic semantic = Semantic::None;  // (attributes only)
+    u8 semantic_index = 0;
+    bool sampler_cube = false;
+    bool reg_format = false;  // an attribute read in its declared format, not converted to f32
+};
+
+struct Gxp {
+    ShaderType type = ShaderType::Vertex;
+    u8 version_major = 0, version_minor = 0;
+    u32 size = 0;  // the file's own size field
+    bool discard = false, depth_replace = false, sprite_coord = false, native_color = false, frag_color = false;
+    u32 default_uniform_buffer_size = 0;  // bytes
+    u32 vertex_outputs = 0;  // varying:: mask (vertex programs)
+    u32 fragment_inputs = 0;  // varying:: mask (fragment programs)
+    // The fragment program's output register format (fragment programs only).
+    ParameterType output_type = ParameterType::F32;
+    u8 output_components = 0;
+    nx::vector<Parameter> parameters;
+    nx::vector<u64> primary;
+    nx::vector<u64> secondary;
+
+    // As sceGxmProgramFindParameterByName / BySemantic (the index in parameters, or none).
+    std::optional<usize> find(nx::string_view name) const;
+    std::optional<usize> find(Semantic semantic, u32 index) const;
+};
+
+// Whether libgxm accepts the program: "GXP\0" and version 1.4 or 1.5 (sceGxmProgramCheck).
+bool gxp_valid(std::span<const u8> data);
+
+// Reads a GXP held in memory (everything is copied out).
 Result<Gxp> parse_gxp(std::span<const u8> data);
 
 }  // namespace psvrecore::usse

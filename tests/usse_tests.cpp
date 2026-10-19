@@ -161,23 +161,84 @@ TEST_CASE("usse: the constant table reads as f32 or f16 lanes") {
 }
 
 TEST_CASE("usse: GXP container") {
-    // A minimal GXP: header, a primary program of two words, no secondary program.
-    u8 data[0x60] = {};
-    std::memcpy(data, "GXP", 4);
+    // A minimal fragment program: header, varyings (an f16x4 output; one input record that samples TEXCOORD0
+    // and interpolates COLOR0), one sampler parameter, a primary program of two words, no secondary program.
+    u8 data[0xB0] = {};
+    std::memcpy(data, "GXP\0\x01\x05", 6);
     auto put32 = [&](u32 at, u32 v) { std::memcpy(data + at, &v, 4); };
     put32(0x08, sizeof data);
-    put32(0x1C, 1);              // fragment
-    put32(0x3C, 2);              // primary: 2 words
-    put32(0x40, 0x50 - 0x40);    // at 0x50
+    put32(0x14, 1 | (1u << 3));     // fragment, discard
+    put32(0x24, 1);                 // one parameter, its record at 0x88
+    put32(0x28, 0x88 - 0x28);
+    put32(0x2C, 0x60 - 0x2C);       // varyings at 0x60
+    put32(0x3C, 2);                 // primary: 2 words at 0xA0
+    put32(0x40, 0xA0 - 0x40);
+    put32(0x64, 4);                 // default uniform buffer: 4 words
+    put32(0x60 + 0x08, 0x04010000); // output: f16, 4 components
+    put32(0x60 + 0x0C, 1);          // one input record
+    put32(0x60 + 0x14, 0x0000A000); // COLOR0 interpolated, TEXCOORD0 sampled
+    put32(0x88, 0x10);              // name at 0x98
+    put32(0x8C, 0x10000402);        // sampler, f32, 4 components, cube
+    put32(0x90, 1);
+    put32(0x94, 3);                 // texture unit 3
+    std::memcpy(data + 0x98, "tex", 4);
     const u64 w0 = 0xFA44070000000000ull, w1 = 0xF800094000000000ull;
-    std::memcpy(data + 0x50, &w0, 8);
-    std::memcpy(data + 0x58, &w1, 8);
+    std::memcpy(data + 0xA0, &w0, 8);
+    std::memcpy(data + 0xA8, &w1, 8);
+    CHECK(gxp_valid(data));
     const auto g = parse_gxp(data);
     REQUIRE(g);
     CHECK(g->type == ShaderType::Fragment);
+    CHECK(g->discard);
+    CHECK(!g->depth_replace);
+    CHECK(g->default_uniform_buffer_size == 16);
+    CHECK(g->output_type == ParameterType::F16);
+    CHECK(g->output_components == 4);
+    CHECK(g->fragment_inputs == (varying::kColor0 | varying::kTexCoord0));
+    REQUIRE(g->parameters.size() == 1);
+    const Parameter& p = g->parameters[0];
+    CHECK(p.name == "tex");
+    CHECK(p.category == ParameterCategory::Sampler);
+    CHECK(p.sampler_cube);
+    CHECK(p.resource == 3);
+    CHECK(p.semantic == Semantic::None);  // (the byte is not a semantic outside attributes)
+    CHECK(g->find("tex") == std::optional<usize>(0));
+    CHECK(!g->find("other"));
     REQUIRE(g->primary.size() == 2);
     CHECK(g->primary[1] == w1);
     CHECK(g->secondary.empty());
+    data[5] = 6;
+    CHECK(!gxp_valid(data));
     data[0] = 'X';
     CHECK(!parse_gxp(data));
+}
+
+TEST_CASE("usse: GXP vertex outputs and attributes") {
+    u8 data[0xA0] = {};
+    std::memcpy(data, "GXP\0\x01\x05", 6);
+    auto put32 = [&](u32 at, u32 v) { std::memcpy(data + at, &v, 4); };
+    put32(0x08, sizeof data);
+    put32(0x24, 2);
+    put32(0x28, 0x80 - 0x28);
+    put32(0x2C, 0x60 - 0x2C);
+    put32(0x60 + 0x08, 0x10);                 // the attribute in register 4 keeps its format
+    put32(0x60 + 0x10, (1u << 12) | (1u << 11) | (1u << 1));  // position, color0, clip plane 1
+    put32(0x60 + 0x14, (3u << 0) | (1u << 27));               // texcoords 0 and 9
+    put32(0x80 + 0x4, 0x020B0400);           // attribute, POSITION2, 4 components
+    put32(0x90 + 0x4, 0x000E0210);           // attribute, TEXCOORD0, f16x2, register 4
+    put32(0x90 + 0xC, 4);
+    const auto g = parse_gxp(data);
+    REQUIRE(g);
+    CHECK(g->type == ShaderType::Vertex);
+    CHECK(g->vertex_outputs == (varying::kPosition | varying::kColor0 | (varying::kClip0 << 1) | varying::kTexCoord0 |
+                                (varying::kTexCoord0 << 9)));
+    REQUIRE(g->parameters.size() == 2);
+    CHECK(!g->parameters[0].named);
+    CHECK(g->parameters[0].semantic == Semantic::Position);
+    CHECK(g->parameters[0].semantic_index == 2);
+    CHECK(!g->parameters[0].reg_format);
+    CHECK(g->parameters[1].type == ParameterType::F16);
+    CHECK(g->parameters[1].reg_format);
+    CHECK(g->find(Semantic::TexCoord, 0) == std::optional<usize>(1));
+    CHECK(!g->find(Semantic::TexCoord, 1));
 }
