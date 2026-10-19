@@ -11,7 +11,7 @@ milestones are in each game's repository.
 | M3 ✓ | Analysis, code generator, test-only interpreter | Same-source differential tests agree (see below) |
 | M4 ✓ | Runtime core: memory, loader, threads, synchronisation, files | Multithreaded test programs give the expected results natively on Windows and Linux (Linux pending CI) |
 | M5 ✓ | GXM, shader translation, Vulkan backend | Rendering tests, one per feature, match reference images |
-| M6 | Audio, video, input, save data | Sample-accurate audio position tests and input timestamp tests pass |
+| M6 ✓ | Audio, video, input, save data | Sample-accurate audio position tests and input timestamp tests pass |
 
 A same-source differential test compiles one source program twice:
 - built for the guest, then recompiled by psvrecore;

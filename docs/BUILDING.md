@@ -10,7 +10,9 @@
 Submodules are required: `git submodule update --init --recursive`. That checks out nx-foundation and its own
 third-party code, vita-headers (whose NID database the tools read at run time), and the Vulkan side:
 Vulkan-Headers, SPIRV-Headers, volk and VulkanMemoryAllocator. Nothing links against a Vulkan SDK; the loader is
-opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used by the local checks only.
+opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used by the local checks only. The
+media decoders come the same way: LibAtrac9 (MIT) and openh264 (BSD-2-Clause) as submodules; the PacketVideo AAC
+decoder (Apache-2.0) is vendored in `third_party/pvaacdec` (its README says where from).
 
 ## Presets
 
@@ -145,8 +147,24 @@ projects included), recompiles them and runs them on the runtime with the GXM la
 python scripts/sample_check.py --sdk C:/path/to/sdk basic shadow_mapping --frames 60
 ```
 
-Name the samples to run. The frames go to `build/samples/<sample>/frames`; compare them with the screenshot next to
-each sample's sources. Everything there is derived from the SDK: never commit it.
+Name the samples to run: a GXM sample by its name, any other as `category/project/sample` (for example
+`audio_video/api_libngs/pcm_player`). The data files a sample names (`app0:...`) are copied from the SDK. The frames go
+to `build/samples/<sample>/frames`, with what each audio port played as `audio_port<N>.wav`, and the runner's whole
+output to `build/samples/<sample>/run.log`; compare the frames with the screenshot next to each sample's sources.
+`--audio-seconds N` ends a sample once a port has played N seconds. Everything there is derived from the SDK: never
+commit it.
+
+## ATRAC9 check (needs the PS Vita SDK)
+
+`scripts/at9_check.py` encodes test signals with the SDK's at9tool (mono, stereo, stereo in superframes), decodes them
+with at9tool as the reference, and runs the runtime test that plays each through an NGS ATRAC9 voice (from the start
+and from a seek) and compares them sample for sample:
+
+```
+python scripts/at9_check.py --sdk C:/path/to/sdk
+```
+
+What at9tool makes goes to `build/at9`: never commit it.
 
 ## Test programs (needs the PS Vita SDK)
 

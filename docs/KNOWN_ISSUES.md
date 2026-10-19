@@ -118,7 +118,10 @@
 - **Uniform buffers** are copied once per scene and shared by the draws that use them; buffers at different
   addresses that overlap get separate copies.
 - **The mask update program** has no `SceGxmProgram`: `sceGxmFragmentProgramGetProgram` returns 0 for it.
-- **Texture formats not done:** PVRTC, BC4/5, YUV, X8U24, F11F11F10. The mirror-clamp addressing modes clamp.
+- **Texture formats not done:** PVRTC, BC4/5, X8U24, F11F11F10. The mirror-clamp addressing modes clamp.
+- **YUV textures are converted to RGBA on the CPU** when they are read, with the colour space profile set then. A
+  profile changed later (`sceGxmSetYuvProfile`) does not reach textures already converted and cached. Only their top
+  level is read.
 
 ## Shader interpreter (USSE)
 
@@ -238,6 +241,50 @@
 - **Run on Windows only.** The runtime's POSIX host layer (faults, files, decommit) compiles for Android arm64 with
   the NDK, without warnings, but has not run there or on Linux (no device test runner, no Linux machine; CI covers
   Linux once the repository is pushed).
+
+## Audio (AudioOut, NGS)
+
+- **The AudioOut timing tests need an idle host.** They check that each block starts exactly a grain after the one
+  before and that calls return within 4 ms. With the host at ~90% CPU from other builds, the test thread wakes late,
+  so the port's timeline restarts after a gap and the checks fail. On an idle host they pass.
+- **HE-VAG is not decoded.** The player decodes classic VAG (filters 0-4). HE-VAG blocks (a 7-bit filter index, the
+  SDK's vagconv2 default "Standard" mode) need a predictor table the documentation does not give. They play as
+  silence, with a warning.
+- **NGS effects are close, not exact.** Filters, the parametric EQ, envelope curves, the compressor, delay, pitch shift
+  and the I3DL2 reverb follow their documented behaviour with the usual designs; the console's arithmetic is unknown.
+  The reverb presets are the I3DL2 environment presets. The player's resampling between rates is linear.
+- **Some NGS defaults are assumptions.** Which modules a template voice starts with bypassed (the player, and in
+  template 1 the mixer, are active; the other effects of source voices bypassed; buss effects active), the modules'
+  default parameters, and the default patch volumes (each channel to the same channel, mono to and from both).
+- **Stereo VAG is assumed interleaved by block** (a block of the left channel, then one of the right).
+- **Scream's voice definitions are stood in for** by template 1 and the ATRAC9 voice: their layout is not documented.
+- **Callbacks run on the thread that calls `sceNgsSystemUpdate`**, after it processed every voice, as documented.
+  Parameter error callbacks are never raised: out-of-range parameters are refused when they are set.
+
+## Video (AvPlayer)
+
+- **Decoding happens in the calls that ask for frames**, on the caller's thread, not on player threads of its own.
+  `sceAvPlayerGetVideoData` decodes as far as the clock needs (at most 16 samples a call).
+- **Events are delivered from the call that causes them** (`sceAvPlayerAddSource`, `Start`, `Pause`, `Resume`,
+  `Stop`, or the frame calls at the end), not from a player thread.
+- **Not modelled:** trick play (only normal speed), timed text streams (listed, never delivered), more than one
+  video or audio stream played at once, and encrypted content.
+- **openh264 is built without its assembly.** Decoding a 960x544 picture takes 2-4 ms on the development machine.
+- **Pictures are rounded up to 16 pixels** with the picture's last column and row repeated; the crop offsets of
+  `sceAvPlayerGetVideoDataEx` say what is the picture.
+
+## Input
+
+- **Nothing feeds input yet.** The platform layer will set the controller's and touch panels' states.
+- **Wireless controllers (ports 1-4) read as idle; touch force reads as 0.**
+
+## Save data and the application utility
+
+- **The save data dialog is not implemented**, so the SDK's save data samples cannot run.
+- **Other titles' save data (`savedata1:`) cannot be mounted.**
+- **The file system's free space is not checked before a save**: a host disk filling up shows as an error while
+  writing.
+- **On case-sensitive hosts, saves write names as given.** Saving `SAVE.DAT` after `save.dat` makes a second file.
 
 ## NID databases
 

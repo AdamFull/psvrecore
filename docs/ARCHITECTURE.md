@@ -46,7 +46,7 @@ Everything generated stays on the user's machine.
 | `analysis` | Function and basic-block recovery, ARM/Thumb interworking, IT blocks, jump tables, call graph |
 | `recomp` | C code generator, plus the guest ABI header the generated code includes |
 | `interp` | Reference interpreter, used only by differential tests and never linked into a game |
-| `runtime` | Guest memory, module loader, kernel objects and threads, HLE system libraries, files and save data, timing |
+| `runtime` | Guest memory, module loader, kernel objects and threads, HLE system libraries, files and save data, timing (one clock), audio output, NGS, the video player (MP4 demuxer and decoders), input sampling |
 | `usse` | Shader programs: the GXP container (flags, parameters, vertex outputs, fragment inputs) and the USSE instruction set (decoding into an instruction model, listings in the reference disassembler's syntax) |
 | `gxm` | GXM API, texture formats and layouts, SPIR-V translation of shader programs |
 | `vulkan` | Vulkan backend (volk, VMA): device, memory, buffers, dispatches; knows nothing about GXM |
