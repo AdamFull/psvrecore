@@ -91,6 +91,7 @@ struct Lifecycle {
             rt->kernel().suspend();
             if (audio) audio->set_paused(true);
             window->set_background(true);
+            gxm::save_caches();  // (the system may end the process in the background)
             nx::logi(logs::frontend, "to the background: suspended");
         } else {
             window->set_background(false);
@@ -392,9 +393,12 @@ int run(const Game& game, int argc, char** argv) {
     gxm_options.display = &display;
     gxm_options.device.validation = s.validation;
     gxm_options.shared_device = (*window)->device();
+    gxm_options.cache_folder = join(data, "cache");
     runtime::Runtime rt(config);
     if (!rt.ok()) return fail("The runtime could not start (see the log).", cl.hidden);
     gxm::register_libraries(gxm_options);
+    // (what earlier runs drew with, made now: nothing of it is translated or compiled while the game plays)
+    const gxm::WarmUp warm = gxm::warm_up();
     for (const PsvModuleCode* code : game.code) rt.loader().add_code(*code);
     runtime::Loader::BootOptions boot;
     boot.main = nx::string(game.main);
@@ -415,6 +419,7 @@ int run(const Game& game, int argc, char** argv) {
     // Until the window is closed, the game exits, the script quits or the time is up.
     Script script(std::move(script_items));
     const u64 booted = nx::os::ticks_ns();
+    u64 saved_at = booted;
     const char* ended = "the window was closed";
     while (true) {
         if (rt.exited()) {
@@ -436,6 +441,10 @@ int run(const Game& game, int argc, char** argv) {
         }
         if (!(*window)->pump(&rt, 5)) break;
         if ((*window)->input().take_menu_request()) open_settings();
+        if (nx::os::ticks_ns() - saved_at > 30'000'000'000ull) {
+            gxm::save_caches();  // (now and then: the pipelines made since)
+            saved_at = nx::os::ticks_ns();
+        }
         if (g_settings_changed.exchange(false)) {
             // (a settings screen changed the file: what applies while playing, at once)
             nx::string used;
@@ -444,9 +453,14 @@ int run(const Game& game, int argc, char** argv) {
         }
     }
     const i32 code = rt.exited() ? rt.exit_code() : 0;
+    gxm::save_caches();
     nx::log::flush();
-    std::fprintf(stderr, "%s: %s; %llu frames presented, exit code %d\n", nx::string(game.name).c_str(), ended,
-                 static_cast<unsigned long long>((*window)->presented()), code);
+    const gxm::PlayStats made = gxm::play_stats();
+    std::fprintf(stderr,
+                 "%s: %s; %llu frames presented, exit code %d; shaders: %u from the cache before the start "
+                 "(%u pipelines, %.0f ms), %u translated and %u pipelines made while playing\n",
+                 nx::string(game.name).c_str(), ended, static_cast<unsigned long long>((*window)->presented()), code,
+                 warm.shaders, warm.pipelines, warm.ms, made.translated, made.pipelines);
     std::fflush(stdout);
     std::fflush(stderr);
     // (guest threads are not waited for: the process ends here)
