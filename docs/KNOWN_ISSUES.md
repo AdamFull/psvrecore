@@ -112,11 +112,13 @@
   tried.
 - **The shader cache only grows.** Nothing is evicted; a translator whose sources changed starts it again (its
   header holds a hash of them, made when CMake runs: it runs again when they change).
-- **The internal resolution (`Options::render_scale`, `[display] internal_resolution`) scales colour surfaces
-  only.** Depth-only scenes (shadow maps) are drawn at their own size, and a surface drawn at a higher resolution is
-  read as a texture at its own size (what guest memory holds, blitted down): shadows and render-to-texture effects
-  keep the console's resolution. The CPU's drawing over a surface (debug text, a cleared area) reaches the scaled
-  picture as the surface's pixels, blown up. Lines are not widened (points are). Surfaces of formats the device
+- **The internal resolution (`Options::render_scale`, `[display] internal_resolution`)** scales colour surfaces,
+  and depth-only scenes whose depth is stored (shadow maps) when the surface is DF32 or DF32M. A texture reads the
+  higher-resolution image only when it is that surface as it was drawn: same address and size, one level, its texels
+  what the image holds (8-bit RGBA colour; one float of depth), not the scene's own target, and guest memory
+  unchanged since. Otherwise (mip levels, other formats, a surface the CPU changed, depth with stencil) it reads what
+  guest memory holds, at the surface's size. The CPU's drawing over a surface (debug text, a cleared area) reaches
+  the scaled picture as the surface's pixels, blown up. Lines are not widened (points are). Surfaces of formats the device
   cannot blit with filtering stay at their own size, as do frames that are not 4 bytes a pixel.
 - **A frame drawn at a higher resolution is read back to the CPU to be shown** (about 8 MB at 2x), then uploaded by
   the window: a copy between the two GPU images would do without it.
