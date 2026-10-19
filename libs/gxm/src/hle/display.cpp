@@ -150,6 +150,8 @@ i32 sceDisplayWaitVblankStartMultiCB(u32 count) {
 }
 // (a frame buffer takes effect at the next vertical blank at the latest: waiting for it is waiting for that blank)
 i32 sceDisplayWaitSetFrameBuf() { return sceDisplayWaitVblankStart(); }
+// (the frame set has been shown for `count` blanks: as many blanks as that)
+i32 sceDisplayWaitSetFrameBufMulti(u32 count) { return sceDisplayWaitVblankStartMulti(count); }
 i32 sceDisplayWaitSetFrameBufCB() { return sceDisplayWaitVblankStartCB(); }
 
 i32 sceDisplayGetVcount() { return static_cast<i32>(vcount_at(now_ns()) & 0xFFFF); }
@@ -172,6 +174,7 @@ const runtime::hle::Function kDisplayFunctions[] = {
     HLE_FUNCTION(0xDD0A13B8, sceDisplayWaitVblankStartMulti),
     HLE_FUNCTION(0x05F27764, sceDisplayWaitVblankStartMultiCB),
     HLE_FUNCTION(0x9423560C, sceDisplayWaitSetFrameBuf),
+    HLE_FUNCTION(0x7D9864A8, sceDisplayWaitSetFrameBufMulti),
     HLE_FUNCTION(0x814C90AF, sceDisplayWaitSetFrameBufCB),
     HLE_FUNCTION(0xB6FDE0BA, sceDisplayGetVcount),
     HLE_FUNCTION(0xA08CA60D, sceDisplayGetRefreshRate),
