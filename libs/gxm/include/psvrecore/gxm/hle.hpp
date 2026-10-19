@@ -30,6 +30,9 @@ public:
 struct Options {
     DisplaySink* display = nullptr;
     vulkan::DeviceOptions device;  // (the device is made at sceGxmInitialize)
+    // A device to render with instead (the window's: one device a process, as volk's entry points are the last
+    // device's); it must outlive the runtime.
+    vulkan::Device* shared_device = nullptr;
 };
 
 // Registers SceGxm and SceDisplay. The options (and the sink) must outlive the runtime.

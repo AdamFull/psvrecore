@@ -228,7 +228,8 @@ struct CachedTexture {
 
 struct Renderer {
     bool tried = false;
-    nx::unique_ptr<vk::Device> device;
+    vk::Device* device = nullptr;
+    nx::unique_ptr<vk::Device> owned;  // (the device, unless the options gave one)
     nx::unique_ptr<vk::RenderPasses> passes;
     nx::unique_ptr<vk::Pipelines> pipelines;
     nx::unique_ptr<vk::Samplers> samplers;
@@ -253,12 +254,17 @@ Renderer& renderer() {
 bool ensure(Renderer& r) {
     if (r.tried) return static_cast<bool>(r.device);
     r.tried = true;
-    auto device = vk::Device::create(state().options->device);
-    if (!device) {
-        nx::loge(logs::gpu, "no Vulkan device: {}; scenes are not rendered", device.error().message);
-        return false;
+    if (state().options->shared_device) {
+        r.device = state().options->shared_device;
+    } else {
+        auto device = vk::Device::create(state().options->device);
+        if (!device) {
+            nx::loge(logs::gpu, "no Vulkan device: {}; scenes are not rendered", device.error().message);
+            return false;
+        }
+        r.owned = std::move(*device);
+        r.device = r.owned.get();
     }
-    r.device = std::move(*device);
     vk::Device& d = *r.device;
     r.passes = nx::make_unique<vk::RenderPasses>(d);
     r.pipelines = nx::make_unique<vk::Pipelines>(d, *r.passes);
