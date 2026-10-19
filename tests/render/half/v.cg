@@ -1,0 +1,6 @@
+// Half-precision varyings.
+void main(float4 aPosition, half4 aColor, out float4 vPosition : POSITION, out half4 vColor : COLOR0)
+{
+    vPosition = aPosition;
+    vColor = aColor;
+}

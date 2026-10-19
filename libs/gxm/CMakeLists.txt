@@ -29,3 +29,10 @@ add_library(psvrecore::gxm_hle ALIAS psvrecore_gxm_hle)
 target_include_directories(psvrecore_gxm_hle PRIVATE "${PSVRECORE_DIR}/third_party/SPIRV-Headers/include")
 target_link_libraries(psvrecore_gxm_hle PUBLIC psvrecore::gxm psvrecore::vulkan psvrecore::runtime)
 psvrecore_target_defaults(psvrecore_gxm_hle)
+
+# The reference renderer (gxm/reference.hpp): the rendering tests' oracle, on the USSE reference interpreter. Tests
+# and tools only: never linked into a game.
+add_library(psvrecore_gxm_reference STATIC src/reference.cpp)
+add_library(psvrecore::gxm_reference ALIAS psvrecore_gxm_reference)
+target_link_libraries(psvrecore_gxm_reference PUBLIC psvrecore::gxm psvrecore::usse_interp)
+psvrecore_target_defaults(psvrecore_gxm_reference)

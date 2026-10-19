@@ -1,0 +1,6 @@
+// Position and texture coordinates through.
+void main(float4 aPosition, float2 aTexCoord, out float4 vPosition : POSITION, out float2 vTexCoord : TEXCOORD0)
+{
+    vPosition = aPosition;
+    vTexCoord = aTexCoord;
+}

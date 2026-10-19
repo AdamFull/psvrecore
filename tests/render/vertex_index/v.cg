@@ -1,0 +1,8 @@
+// Positions and colours from uniform arrays by the vertex index (no attributes).
+uniform float4 positions[4];
+uniform float4 colors[4];
+void main(unsigned int aIndex : INDEX, out float4 vPosition : POSITION, out float4 vColor : COLOR0)
+{
+    vPosition = positions[aIndex];
+    vColor = colors[aIndex];
+}

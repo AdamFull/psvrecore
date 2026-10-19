@@ -1,0 +1,13 @@
+# Source-alpha blending: a triangle with an alpha gradient over an opaque quad.
+target 64 64 ff000000
+vertex v.gxp
+fragment f.gxp
+attribute aPosition 4 -0.9 -0.9 0 1  0.9 -0.9 0 1  -0.9 0.9 0 1  0.9 0.9 0 1
+attribute aColor 4 0.2 0.4 0.8 1  0.2 0.4 0.8 1  0.9 0.9 0.1 1  0.9 0.9 0.1 1
+indices 0 1 2  2 1 3
+draw
+attribute aPosition 4 -0.8 -0.8 0 1  0.8 -0.6 0 1  0 0.8 0 1
+attribute aColor 4 1 0 0 0.1  0 1 0 0.5  1 1 1 0.9
+indices 0 1 2
+blend
+draw

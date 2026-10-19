@@ -67,6 +67,7 @@ if(PSVRECORE_BUILD_TOOLS)
     add_subdirectory(tools/psvdis)
     add_subdirectory(tools/psvrecomp)
     add_subdirectory(tools/psvusse)
+    add_subdirectory(tools/psvrender)
 endif()
 
 if(PSVRECORE_BUILD_TESTS)

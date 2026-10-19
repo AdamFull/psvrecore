@@ -1,0 +1,7 @@
+// Discard in stripes.
+float4 main(float2 vTexCoord : TEXCOORD0) : COLOR
+{
+    if (frac(vTexCoord.x * 6.0) < 0.4)
+        discard;
+    return float4(vTexCoord, 0.5, 1.0);
+}

@@ -1,0 +1,6 @@
+// Position and colour through.
+void main(float4 aPosition, float4 aColor, out float4 vPosition : POSITION, out float4 vColor : COLOR0)
+{
+    vPosition = aPosition;
+    vColor = aColor;
+}

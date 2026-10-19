@@ -1,0 +1,6 @@
+// Half-precision arithmetic on the interpolated colour, a half uniform.
+uniform half4 tint;
+half4 main(half4 vColor : COLOR0) : COLOR
+{
+    return vColor * tint + half4(0.1h, 0.0h, 0.05h, 0.0h);
+}

@@ -1,0 +1,10 @@
+// Integer conversions and bit operations.
+float4 main(float2 vTexCoord : TEXCOORD0) : COLOR
+{
+    int x = (int)(vTexCoord.x * 255.0);
+    int y = (int)(vTexCoord.y * 255.0);
+    int a = (x ^ 0x5A) & 0xF0;
+    int b = (x * 3 + y) & 255;
+    int c = (y >> 2) | ((x & 3) << 6);
+    return float4(a / 255.0, b / 255.0, c / 255.0, 1.0);
+}

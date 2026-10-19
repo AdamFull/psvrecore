@@ -1,0 +1,8 @@
+# A triangle with a colour per vertex, one vertex with w = 2 (perspective-correct interpolation).
+target 64 64 ff000000
+vertex v.gxp
+fragment f.gxp
+attribute aPosition 4 -0.8 -0.8 0 1  0.8 -0.6 0 1  0 1.6 0 2
+attribute aColor 4 1 0 0 1  0 1 0 1  0 0 1 1
+indices 0 1 2
+draw

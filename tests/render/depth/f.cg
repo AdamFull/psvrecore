@@ -1,0 +1,5 @@
+// The interpolated colour.
+float4 main(float4 vColor : COLOR0) : COLOR
+{
+    return vColor;
+}

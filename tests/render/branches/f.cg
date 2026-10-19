@@ -1,0 +1,11 @@
+// A loop whose trip count depends on the pixel, and a branch.
+float4 main(float2 vTexCoord : TEXCOORD0) : COLOR
+{
+    int n = (int)(vTexCoord.x * 9.0);
+    float3 c = float3(0.0, 0.0, 0.0);
+    for (int i = 0; i < n; i++)
+        c += float3(0.11, 0.07 * vTexCoord.y, 0.03);
+    if (vTexCoord.y > 0.5)
+        c = c.zyx;
+    return float4(c, 1.0);
+}
