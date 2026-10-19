@@ -68,6 +68,9 @@ public:
     bool last_image(nx::vector<u8>* rgba, u32* width, u32* height);
 
     SDL_Window* sdl() const { return window_; }
+    // The application to the background (on Android: before its window's surface goes) and back: nothing is drawn
+    // meanwhile. From any thread.
+    void set_background(bool background);
     // The device the window presents with, for the GXM layer to render with too (gxm::Options::shared_device).
     vulkan::Device* device() const;
     InputMapper& input() { return input_; }

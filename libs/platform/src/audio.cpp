@@ -69,6 +69,11 @@ void AudioDevice::port_released(u32 port) {
     ports_.erase(it);
 }
 
+void AudioDevice::set_paused(bool paused) {
+    if (paused) SDL_PauseAudioDevice(device_);
+    else SDL_ResumeAudioDevice(device_);
+}
+
 u32 AudioDevice::queued(u32 port) {
     nx::scoped_lock<nx::mutex> held(lock_);
     auto it = ports_.find(port);

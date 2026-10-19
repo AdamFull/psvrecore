@@ -63,6 +63,9 @@ public:
     VkQueue queue() const { return queue_; }
     u32 queue_family() const { return queue_family_; }
     VkSurfaceKHR surface() const { return surface_; }
+    // Another surface for the same window (the old one destroyed): on Android a window's surface goes when the
+    // application is sent to the background and comes back new. VK_NULL_HANDLE: none for now.
+    void replace_surface(VkSurfaceKHR surface);
     VmaAllocator allocator() const { return allocator_; }
     const VkPhysicalDeviceProperties& properties() const { return properties_; }
     const Capabilities& caps() const { return caps_; }

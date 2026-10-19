@@ -86,6 +86,10 @@ struct Window::Presenter {
     u32 pending_w = 0, pending_h = 0;
     bool has_pending = false, redraw = true, stop = false;
     std::atomic<u32> pixel_w{0}, pixel_h{0};
+    // In the background (set_background): nothing is drawn, and there is no surface until the window is back.
+    nx::mutex draw_lock;  // (held while drawing)
+    std::atomic<bool> background{false};
+    bool need_surface = false;  // (under draw_lock)
     nx::thread thread;
 
     // The presenting thread's.
@@ -189,6 +193,8 @@ struct Window::Presenter {
                 redraw = false;
             }
             if (failed) continue;
+            nx::scoped_lock<nx::mutex> drawing(draw_lock);
+            if (background.load()) continue;
             // (a swapchain out of date: made again and drawn again at once)
             for (u32 attempt = 0; attempt < 3 && !draw(); ++attempt) {
             }
@@ -317,8 +323,32 @@ struct Window::Presenter {
         return true;
     }
 
+    // To the background: the drawing done, the swapchain and the surface gone (the window's goes with it).
+    void enter_background() {
+        background.store(true);
+        nx::scoped_lock<nx::mutex> drawing(draw_lock);
+        device->wait_idle();
+        destroy_swapchain();
+        device->replace_surface(VK_NULL_HANDLE);
+        need_surface = true;
+    }
+
+    void leave_background() {
+        background.store(false);
+        request_redraw();
+    }
+
     // Presents the current frame; false if the swapchain was out of date (to be drawn again).
     bool draw() {
+        if (need_surface) {
+            // (back from the background: a surface for the window as it is now; until it has one, nothing)
+            // (the window may not have its new one yet: tried again at the next frame, without a word)
+            VkSurfaceKHR surface = VK_NULL_HANDLE;
+            if (!SDL_Vulkan_CreateSurface(window.window_, device->instance(), nullptr, &surface)) return true;
+            device->replace_surface(surface);
+            need_surface = false;
+            out_of_date = true;
+        }
         const u32 w = pixel_w.load(), h = pixel_h.load();
         if (!w || !h) return true;  // (minimized)
         if (!swapchain || out_of_date || w != made_w || h != made_h) {
@@ -622,6 +652,12 @@ void Window::show_pixels(const u8* pixels, u32 width, u32 height, u32 pitch, u32
         p.has_pending = true;
     }
     p.wake.notify_one();
+}
+
+void Window::set_background(bool background) {
+    if (!presenter_) return;
+    if (background) presenter_->enter_background();
+    else presenter_->leave_background();
 }
 
 vulkan::Device* Window::device() const { return presenter_ ? presenter_->device.get() : nullptr; }

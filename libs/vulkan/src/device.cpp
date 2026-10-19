@@ -103,6 +103,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL Device::on_message(VkDebugUtilsMessageSeverityFla
     return VK_FALSE;
 }
 
+void Device::replace_surface(VkSurfaceKHR surface) {
+    if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
+    surface_ = surface;
+}
+
 Result<nx::vector<nx::string>> Device::list() {
     bool validation = false;
     auto instance = make_instance({}, validation);

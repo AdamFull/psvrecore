@@ -33,6 +33,8 @@ public:
     void play(const runtime::AudioBlock& block) override;
     void port_released(u32 port) override;
 
+    // Stops playing and goes on (the application in the background).
+    void set_paused(bool paused);
     // Bytes queued in a port's stream and not played yet (for tests).
     u32 queued(u32 port);
 

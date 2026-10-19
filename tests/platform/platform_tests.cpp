@@ -12,6 +12,7 @@
 #include "psvrecore/platform/audio.hpp"
 #include "psvrecore/platform/input.hpp"
 #include "psvrecore/platform/window.hpp"
+#include "psvrecore/vulkan/device.hpp"
 #include "core/foundation/platform/filesystem.h"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
@@ -368,4 +369,38 @@ TEST_CASE("window: a frame shown is presented scaled to fit the window, with bla
     }
     CHECK(magenta);
     std::printf("window: %llu frames presented\n", static_cast<unsigned long long>(w.presented()));
+}
+
+TEST_CASE("window: in the background nothing is presented; back, a new surface and swapchain present again") {
+    Window::Options o;
+    o.title = "psvrecore test";
+    o.hidden = true;
+    auto opened = Window::open(o);
+    if (!opened) SKIP(nx::format("no window: {}", opened.error().message).c_str());
+    Window& w = **opened;
+    w.keep_last(true);
+    const nx::vector<u8> picture = quadrants();
+    w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+    Shot shot;
+    REQUIRE(w.wait_presented(1, 3000));
+    if (!w.last_image(&shot.rgba, &shot.w, &shot.h)) SKIP("the window's images cannot be read back");
+    REQUIRE(presented_fitted(w, &shot));
+    const VkSurfaceKHR before = w.device()->surface();
+    REQUIRE(before != VK_NULL_HANDLE);
+
+    w.set_background(true);
+    CHECK(w.device()->surface() == VK_NULL_HANDLE);
+    const u64 count = w.presented();
+    for (u32 i = 0; i < 20; ++i) {
+        w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+        w.pump(nullptr);
+        SDL_Delay(5);
+    }
+    CHECK(w.presented() == count);
+
+    w.set_background(false);
+    w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+    REQUIRE(w.wait_presented(count + 1, 3000));
+    CHECK(w.device()->surface() != VK_NULL_HANDLE);
+    CHECK(presented_fitted(w, &shot));
 }
