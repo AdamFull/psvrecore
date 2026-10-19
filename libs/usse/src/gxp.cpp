@@ -28,7 +28,9 @@ namespace psvrecore::usse {
 // (bits 12-15: 0-9 a texture coordinate, 0xA color0, 0xB color1, 0xC fog, 0xD window position, 0xF none; bit 30:
 // the sprite coordinate instead) and a texture coordinate sampled without a program instruction (bits 0-3, 0xF
 // none; bit 10: the sprite coordinate instead), the interpolated value's format (bits 28-29: 0 f32, 1 fx10,
-// 2 f16) and component count less one (bits 22-23); bit 25 marks the last record.
+// 2 f16) and component count less one (bits 22-23); bit 25 marks the last record; bits 8-9: 2 for a projected
+// sample. Word 1 is the sample's texture unit; word 2 holds the sizes, bits 6-7 the sample's format (0 u8x4,
+// 1 f16x4, 3 f32x4).
 
 namespace {
 
@@ -133,10 +135,20 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
             in.sampled = sampled(record);
             in.format = static_cast<u8>((record >> 28) & 3);
             in.components = static_cast<u8>(((record >> 22) & 3) + 1);
-            in.offset = static_cast<u16>(offset);
-            // (packed in record order without alignment: f32 a register per component, f16 two components per
-            // register, fx10 always two registers; checked by the interpreter on compiled shaders)
-            offset += in.format == 0 ? in.components : in.format == 1 ? 2u : (in.components + 1u) / 2;
+            // (packed in record order without alignment, a record's interpolated value then its sample: f32 a
+            // register per component, f16 two components per register, fx10 always two registers; the sample
+            // one register (u8x4), two (f16x4) or four (f32x4). Checked by the interpreter on compiled shaders.)
+            if (in.interpolated) {
+                in.offset = static_cast<u16>(offset);
+                offset += in.format == 0 ? in.components : in.format == 1 ? 2u : (in.components + 1u) / 2;
+            }
+            if (in.sampled) {
+                in.sampler = static_cast<u8>(in.raw[1]);
+                in.sample_format = static_cast<u8>((in.raw[2] >> 6) & 3);
+                in.projected = ((record >> 8) & 3) == 2;
+                in.sample_offset = static_cast<u16>(offset);
+                offset += in.sample_format == 0 ? 1u : in.sample_format == 1 ? 2u : 4u;
+            }
             g.inputs.push_back(in);
         }
     }

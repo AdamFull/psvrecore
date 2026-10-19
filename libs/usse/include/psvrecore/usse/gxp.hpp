@@ -93,7 +93,14 @@ struct FragmentInput {
     u32 sampled = 0;       // varying:: bit of the coordinate sampled with, 0 for none
     u8 format = 0;         // 0 f32, 1 fx10, 2 f16 (of the interpolated value)
     u8 components = 0;
-    u16 offset = 0;        // the first primary attribute (32-bit register)
+    u16 offset = 0;        // the interpolated value's first primary attribute (32-bit register)
+    // The sample (when `sampled`): the sampler's texture unit, the result's format (0 u8x4, 1 f16x4, 3 f32x4) and
+    // first primary attribute (after the interpolated value), and whether the coordinate is projected (divided by
+    // its last component).
+    u8 sampler = 0;
+    u8 sample_format = 0;
+    u16 sample_offset = 0;
+    bool projected = false;
     u32 raw[4] = {};
 };
 
