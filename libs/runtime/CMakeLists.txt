@@ -43,4 +43,31 @@ target_include_directories(psvrecore_libatrac9 SYSTEM PUBLIC "${PSVRECORE_DIR}/t
 # (its header declares the functions for a DLL under MSVC-style compilers; as a static library they are defined here)
 target_compile_definitions(psvrecore_libatrac9 PUBLIC COMPILING_DLL)
 target_link_libraries(psvrecore_runtime PRIVATE psvrecore_libatrac9)
+
+# openh264 (github.com/cisco/openh264, BSD-2-Clause, submodule in third_party/openh264): AvPlayer's H.264 decoder,
+# its C++ only (no assembly).
+set(PSVRECORE_OPENH264 "${PSVRECORE_DIR}/third_party/openh264/codec")
+file(GLOB PSVRECORE_OPENH264_SOURCES CONFIGURE_DEPENDS
+    "${PSVRECORE_OPENH264}/common/src/*.cpp"
+    "${PSVRECORE_OPENH264}/decoder/core/src/*.cpp")
+add_library(psvrecore_openh264 STATIC ${PSVRECORE_OPENH264_SOURCES} "${PSVRECORE_OPENH264}/decoder/plus/src/welsDecoderExt.cpp")
+target_include_directories(psvrecore_openh264 SYSTEM PUBLIC "${PSVRECORE_OPENH264}/api/wels")
+target_include_directories(psvrecore_openh264 PRIVATE
+    "${PSVRECORE_OPENH264}/api"
+    "${PSVRECORE_OPENH264}/common/inc"
+    "${PSVRECORE_OPENH264}/decoder/core/inc"
+    "${PSVRECORE_OPENH264}/decoder/plus/inc")
+target_link_libraries(psvrecore_runtime PRIVATE psvrecore_openh264)
+
+# The PacketVideo AAC decoder (Android Open Source Project, Apache-2.0, vendored in third_party/pvaacdec): AvPlayer's
+# AAC decoder.
+file(GLOB PSVRECORE_PVAACDEC_SOURCES CONFIGURE_DEPENDS "${PSVRECORE_DIR}/third_party/pvaacdec/src/*.cpp")
+add_library(psvrecore_pvaacdec STATIC ${PSVRECORE_PVAACDEC_SOURCES})
+target_include_directories(psvrecore_pvaacdec SYSTEM PUBLIC "${PSVRECORE_DIR}/third_party/pvaacdec/src")
+# (its tables narrow constants into Int32 in braces, written before C++11)
+target_compile_options(psvrecore_pvaacdec PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wno-c++11-narrowing -Wno-narrowing>)
+# (what Android's build of it defined: AAC+ with high-quality SBR and parametric stereo, no OSCL linkage macros)
+target_compile_definitions(psvrecore_pvaacdec PRIVATE AAC_PLUS HQ_SBR PARAMETRICSTEREO OSCL_EXPORT_REF= OSCL_UNUSED_ARG=)
+target_compile_definitions(psvrecore_pvaacdec PUBLIC OSCL_IMPORT_REF=)
+target_link_libraries(psvrecore_runtime PRIVATE psvrecore_pvaacdec)
 psvrecore_target_defaults(psvrecore_runtime)
