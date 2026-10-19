@@ -145,6 +145,14 @@ TEST_CASE("sysmem: memory blocks by type, size rules, lookup and freeing") {
     REQUIRE(aligned > 0);
     CHECK(call32(ctx, kSceSysmem, kBase, {u(aligned), base_out}) == 0);
     CHECK(psv_ld32(base_out) % 0x100000 == 0);
+    // One smaller than the type's own (as the SDK's samples ask CDRAM for 256): the type's; not a power of two: refused.
+    psv_st32(opt + 8, 0x100);
+    const i32 small = call32(ctx, kSceSysmem, kAlloc, {name, kCdram, 0x40000, opt});
+    REQUIRE(small > 0);
+    CHECK(call32(ctx, kSceSysmem, kBase, {u(small), base_out}) == 0);
+    CHECK(psv_ld32(base_out) % 0x40000 == 0);
+    psv_st32(opt + 8, 0x3000);
+    CHECK(call32(ctx, kSceSysmem, kAlloc, {name, kUserRw, 0x1000, opt}) == err::kIllegalAlignment);
     // More than the budget.
     CHECK(call32(ctx, kSceSysmem, kAlloc, {name, kUserRw, 0x20000000, 0}) == err::kNoFreePhysicalPage);
     CHECK(call32(ctx, kSceSysmem, kFree, {u(uid)}) == 0);

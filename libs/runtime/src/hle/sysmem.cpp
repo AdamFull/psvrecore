@@ -59,9 +59,10 @@ i32 sceKernelAllocMemBlock(Ptr<const char> name, u32 type, u32 size, Ptr<AllocOp
     u32 alignment = rules.min_alignment;
     if (opt && (opt->attr & kAttrHasAlignment)) {
         if (!rules.alignment_allowed) return err::kInvalidArgument;
-        alignment = opt->alignment;
-        if (alignment < rules.min_alignment || alignment > 16 * kMiB || (alignment & (alignment - 1)))
+        // (a power of two up to 16 MiB; one below the type's own is the type's: the SDK's samples ask CDRAM for 256)
+        if (!opt->alignment || opt->alignment > 16 * kMiB || (opt->alignment & (opt->alignment - 1)))
             return err::kIllegalAlignment;
+        alignment = std::max(opt->alignment, rules.min_alignment);
     }
     Runtime& rt = runtime();
     // Main memory and CDRAM each have a budget, as on the console (the game's share of each).
