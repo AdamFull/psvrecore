@@ -315,8 +315,10 @@
   drops what it holds (logged).
 - **Controls are fixed:** no remapping, no rear touch panel (the mouse and fingers touch the front one), no motion
   sensors, no rumble. The on-screen controls have one layout (size and opacity are settings): no L3/R3, no moving
-  them, no haptic feedback; a finger on a face button presses one button, not two at once. Keyboard: arrows, Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
-  Select; F11 toggles full screen.
+  them, no haptic feedback; a finger on a face button presses one button, not two at once. Keyboard: arrows, Z
+  Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift Select; F11 toggles full screen.
+- **On-screen controls and gamepads coming and going** (auto mode) are unit-tested with SDL's events, not yet with a
+  real controller connected to the phone and taken away.
 - **Memory block alignment:** an alignment smaller than the type's own is raised to it (the SDK's samples ask CDRAM
   for 256 bytes and run on the console); one that is not a power of two is refused. Inferred from the samples, not
   measured.

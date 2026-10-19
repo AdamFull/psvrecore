@@ -98,6 +98,14 @@ runtime::TouchState InputMapper::touches() const {
     return t;
 }
 
+bool InputMapper::has_touch_screen() const {
+    if (touch_screen_ >= 0) return touch_screen_ == 1;
+    int count = 0;
+    SDL_TouchID* devices = SDL_GetTouchDevices(&count);
+    SDL_free(devices);
+    return count > 0;
+}
+
 bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) {
     bool pad = false, touch = false;
     switch (e.type) {
@@ -106,9 +114,13 @@ bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) 
         default: break;
     }
     switch (e.type) {
-        case SDL_EVENT_GAMEPAD_ADDED: gamepads_[e.gdevice.which] = Gamepad{}; break;
+        case SDL_EVENT_GAMEPAD_ADDED:
+            gamepads_[e.gdevice.which] = Gamepad{};
+            controls_.gamepad_connected();  // (auto: the on-screen controls go)
+            break;
         case SDL_EVENT_GAMEPAD_REMOVED:
             gamepads_.erase(e.gdevice.which);
+            if (gamepads_.empty()) controls_.gamepads_gone(has_touch_screen());  // (auto: back where they can be used)
             pad = true;
             break;
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:

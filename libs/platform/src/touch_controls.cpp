@@ -207,7 +207,14 @@ void TouchControls::layout(f32 width, f32 height, f32 pixels_per_unit, f32 sx, f
 }
 
 void TouchControls::touched() {
+    ever_touched_ = true;
     if (mode_ == Mode::Auto && !visible_) visible_ = true, changed();
+}
+
+void TouchControls::gamepad_connected() { other_input(); }
+
+void TouchControls::gamepads_gone(bool touch_screen) {
+    if (mode_ == Mode::Auto && !visible_ && (touch_screen || ever_touched_)) visible_ = true, changed();
 }
 
 void TouchControls::other_input() {

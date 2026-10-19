@@ -555,3 +555,59 @@ TEST_CASE("input: fingers on the on-screen controls press them; others touch the
     m.handle(key(SDLK_Z, true), input, 130);
     CHECK_FALSE(m.controls().visible());
 }
+
+TEST_CASE("input: a gamepad connected hides the on-screen controls; the last one gone shows them again") {
+    const auto device = [](Uint32 type, SDL_JoystickID id) {
+        SDL_Event e{};
+        e.type = type;
+        e.gdevice.which = id;
+        return e;
+    };
+    runtime::Input input;
+    {
+        // A phone: shown by a touch, hidden by a gamepad connected, shown again once both gamepads are gone.
+        InputMapper m;
+        m.set_touch_screen(true);
+        m.controls().touched();
+        REQUIRE(m.controls().visible());
+        m.handle(device(SDL_EVENT_GAMEPAD_ADDED, 1), input, 100);
+        CHECK_FALSE(m.controls().visible());
+        m.handle(device(SDL_EVENT_GAMEPAD_ADDED, 2), input, 110);
+        m.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 1), input, 120);
+        CHECK_FALSE(m.controls().visible());  // (one is left)
+        m.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 2), input, 130);
+        CHECK(m.controls().visible());
+        // Started with a gamepad and never touched: still shown when it goes, on a touch screen.
+        InputMapper n;
+        n.set_touch_screen(true);
+        n.handle(device(SDL_EVENT_GAMEPAD_ADDED, 3), input, 100);
+        CHECK_FALSE(n.controls().visible());
+        n.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 3), input, 110);
+        CHECK(n.controls().visible());
+    }
+    {
+        // A computer without a touch screen: never shown by a gamepad going, unless the screen was touched (a mouse
+        // does not count).
+        InputMapper m;
+        m.set_touch_screen(false);
+        m.handle(device(SDL_EVENT_GAMEPAD_ADDED, 1), input, 100);
+        m.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 1), input, 110);
+        CHECK_FALSE(m.controls().visible());
+        m.controls().touched();
+        m.handle(device(SDL_EVENT_GAMEPAD_ADDED, 1), input, 120);
+        CHECK_FALSE(m.controls().visible());
+        m.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 1), input, 130);
+        CHECK(m.controls().visible());
+    }
+    {
+        // Always and never: a gamepad changes nothing.
+        InputMapper m;
+        m.set_touch_screen(true);
+        m.controls().set_mode(TouchControls::Mode::Always);
+        m.handle(device(SDL_EVENT_GAMEPAD_ADDED, 1), input, 100);
+        CHECK(m.controls().visible());
+        m.controls().set_mode(TouchControls::Mode::Never);
+        m.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 1), input, 110);
+        CHECK_FALSE(m.controls().visible());
+    }
+}

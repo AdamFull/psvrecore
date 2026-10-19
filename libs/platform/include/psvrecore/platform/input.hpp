@@ -28,6 +28,9 @@ public:
     // The on-screen controls (laid out by the window).
     TouchControls& controls() { return controls_; }
     const TouchControls& controls() const { return controls_; }
+    // Whether the device has a touch screen (for the on-screen controls when the last gamepad goes): SDL's touch
+    // devices unless set (tests).
+    void set_touch_screen(bool touch_screen) { touch_screen_ = touch_screen ? 1 : 0; }
     // Takes an event (from the thread that pumps them); true if it changed the controls.
     bool handle(const SDL_Event& event, runtime::Input& input, u64 now_ns);
 
@@ -63,6 +66,8 @@ private:
     runtime::TouchState touch_;
     TouchControls controls_;
     bool menu_requested_ = false;
+    i8 touch_screen_ = -1;  // (-1: ask SDL)
+    bool has_touch_screen() const;
     f32 window_w_ = 960, window_h_ = 544, view_x_ = 0, view_y_ = 0, view_w_ = 960, view_h_ = 544;
 
     bool to_panel(f32 wx, f32 wy, i16* px, i16* py) const;
