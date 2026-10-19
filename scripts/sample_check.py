@@ -269,6 +269,7 @@ def main():
             print(f"{name}: did not end")
             failed.append(name)
             continue
+        (work / "run.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         shown = sorted(frames.glob("*.png"))
         tracks = sorted(frames.glob("*.wav"))
         good = result.returncode == 0 and len(shown) >= wanted
@@ -277,6 +278,7 @@ def main():
         if not good or args.log:
             sys.stdout.write(result.stdout[-4000:])
             sys.stdout.write(result.stderr[-8000:])
+            print(f"(the whole output: {work / 'run.log'})")
         if not good:
             failed.append(name)
     print(f"{len(names) - len(failed)} of {len(names)} samples ran" + (f"; failed: {', '.join(failed)}" if failed else ""))
