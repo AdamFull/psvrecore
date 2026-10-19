@@ -1,0 +1,530 @@
+// NGS (SceNgs): voices played through patches into the master buss, sample for sample; the player's counters,
+// buffers, loops, lead-in and limit; callbacks; voice states; envelopes; VAG decoding; a filter.
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+
+#include "nxtest.h"
+#include "runtime_support.hpp"
+
+using namespace psvrecore;
+using namespace psvrecore::runtime;
+using namespace psvrecore::runtime::test;
+
+namespace {
+
+constexpr u32 kSceNgs = 0xB01598D9;
+constexpr u32 kSysSize = 0x6CE8B36F, kSysInit = 0xED14CF4A, kUpdate = 0x684F080C, kSysRelease = 0x4A25BEBC,
+              kRackSize = 0x477318C0, kRackInit = 0x0A92E4EC, kVoiceHandle = 0xFE1A98E9, kVoiceInit = 0x1DDBEBEB,
+              kPlay = 0xFA0A0F34, kKeyOff = 0xBB13373D, kKill = 0x0E291AAD, kPause = 0xD7786E99, kResume = 0x54CFB981,
+              kLock = 0xAB6BEF8F, kUnlock = 0x3D46D8A7, kParamsBlock = 0xFB8174B1, kBypass = 0x9AB87E71,
+              kModuleCallback = 0x24E909A8, kFinishedCallback = 0x17A6F564, kStateData = 0xC9B8C0B4, kInfo = 0x5551410D,
+              kOutOfRange = 0x4CBE08F3, kPatchCreate = 0xD668B49C, kPatchInfo = 0x98703DBC, kVolumesMatrix = 0xA0F5402D,
+              kDefMaster = 0x79A121D1, kDefMixer = 0xE0AC8776, kDefTemplate1 = 0xE9B572B7;
+constexpr i32 kResourceLocked = static_cast<i32>(0x804A0008u), kParamOutOfRange = static_cast<i32>(0x804A0009u),
+              kParamTypeMismatch = static_cast<i32>(0x804A000Fu), kDependency = static_cast<i32>(0x804A0005u);
+constexpr u32 kPlayerParamsId = 0x01015CE6, kEnvelopeParamsId = 0x01015CE3, kEqParamsId = 0x01015CEC,
+              kGeneratorParamsId = 0x01015CE8;
+constexpr u32 kG = 256;
+
+u32 u(i32 v) { return static_cast<u32>(v); }
+
+u32 aligned(u32 size) { return (scratch(size + 16) + 15) & ~15u; }
+
+struct PlayerBuffer {
+    u32 buffer;
+    i32 bytes;
+    i16 loop_count, next;
+};
+struct PlayerParams {
+    u32 id, size;
+    PlayerBuffer buffs[4];
+    f32 frequency, scalar;
+    i32 lead_in, limit, start_byte;
+    i8 channels;
+    i8 map[2];
+    i8 type, reserved, start_buffer;
+    i8 pad[2];
+};
+static_assert(sizeof(PlayerParams) == 84);
+
+PlayerParams player(i8 channels) {
+    PlayerParams p{};
+    p.id = kPlayerParamsId;
+    p.size = sizeof p;
+    for (auto& b : p.buffs) b = PlayerBuffer{0, 0, 0, -1};
+    p.frequency = 48000.0f;
+    p.scalar = 1.0f;
+    p.channels = channels;
+    p.map[0] = 0;
+    p.map[1] = channels == 2 ? 1 : 0;
+    return p;
+}
+
+// A block of parameters (module, all channels) for sceNgsVoiceSetParamsBlock.
+template <typename T>
+i32 set_params(PsvContext* ctx, u32 voice, u32 module, const T& params) {
+    const u32 at = scratch(8 + sizeof(T));
+    const i32 header[2] = {static_cast<i32>(module), -1};
+    std::memcpy(current_runtime()->memory().host(at), header, 8);
+    std::memcpy(current_runtime()->memory().host(at + 8), &params, sizeof(T));
+    const u32 errors = scratch(4);
+    return call32(ctx, kSceNgs, kParamsBlock, {voice, at, static_cast<u32>(8 + sizeof(T)), errors});
+}
+
+struct Ngs {
+    PsvContext* ctx;
+    u32 system = 0;
+
+    explicit Ngs(PsvContext* c) : ctx(c) {
+        const u32 params = scratch(20);
+        const i32 p[5] = {8, 16, static_cast<i32>(kG), 48000, 0};
+        std::memcpy(current_runtime()->memory().host(params), p, sizeof p);
+        const u32 size = scratch(4);
+        REQUIRE(call32(ctx, kSceNgs, kSysSize, {params, size}) == 0);
+        const u32 mem = aligned(psv_ld32(size));
+        const u32 handle = scratch(4);
+        REQUIRE(call32(ctx, kSceNgs, kSysInit, {mem, psv_ld32(size), params, handle}) == 0);
+        system = psv_ld32(handle);
+    }
+    ~Ngs() { call32(ctx, kSceNgs, kSysRelease, {system}); }
+
+    // A rack of a voice definition; returns its voices' handles.
+    nx::vector<u32> rack(u32 definition_nid, i32 voices, i32 channels, i32 max_in = 4, i32 per_out = 2) {
+        const u32 def = static_cast<u32>(call32(ctx, kSceNgs, definition_nid, {}));
+        const u32 desc = scratch(24);
+        const i32 d[6] = {static_cast<i32>(def), voices, channels, max_in, per_out, 0};
+        std::memcpy(current_runtime()->memory().host(desc), d, sizeof d);
+        const u32 size = scratch(4);
+        REQUIRE(call32(ctx, kSceNgs, kRackSize, {system, desc, size}) == 0);
+        const u32 buffer = scratch(8);
+        psv_st32(buffer, aligned(psv_ld32(size)));
+        psv_st32(buffer + 4, psv_ld32(size));
+        const u32 handle = scratch(4);
+        REQUIRE(call32(ctx, kSceNgs, kRackInit, {system, buffer, desc, handle}) == 0);
+        nx::vector<u32> out;
+        for (i32 i = 0; i < voices; ++i) {
+            const u32 v = scratch(4);
+            REQUIRE(call32(ctx, kSceNgs, kVoiceHandle, {psv_ld32(handle), u(i), v}) == 0);
+            out.push_back(psv_ld32(v));
+        }
+        return out;
+    }
+    i32 patch(u32 from, u32 to, u32* handle = nullptr) {
+        const u32 setup = scratch(20);
+        const i32 s[5] = {static_cast<i32>(from), 0, -1, static_cast<i32>(to), 0};
+        std::memcpy(current_runtime()->memory().host(setup), s, sizeof s);
+        const u32 h = scratch(4);
+        const i32 r = call32(ctx, kSceNgs, kPatchCreate, {setup, h});
+        if (handle) *handle = psv_ld32(h);
+        return r;
+    }
+    void update() { REQUIRE(call32(ctx, kSceNgs, kUpdate, {system}) == 0); }
+    // The master's packet (interleaved stereo).
+    nx::vector<i16> output(u32 master) {
+        const u32 at = scratch(kG * 4);
+        REQUIRE(call32(ctx, kSceNgs, kStateData, {master, 1, at, kG * 4}) == 0);
+        nx::vector<i16> out(kG * 2);
+        std::memcpy(out.data(), current_runtime()->memory().host(at), kG * 4);
+        return out;
+    }
+    u32 state(u32 voice) {
+        const u32 info = scratch(24);
+        REQUIRE(call32(ctx, kSceNgs, kInfo, {voice, info}) == 0);
+        return psv_ld32(info);
+    }
+};
+
+u32 pcm(const nx::vector<i16>& samples) {
+    const u32 at = aligned(static_cast<u32>(samples.size() * 2));
+    std::memcpy(current_runtime()->memory().host(at), samples.data(), samples.size() * 2);
+    return at;
+}
+
+struct Call {
+    u32 voice, module;
+    i32 data, data2;
+    u32 ptr, user;
+};
+nx::vector<Call> calls;
+
+void record(PsvContext* ctx, uint32_t) {
+    const u32 info = ctx->r[0];
+    calls.push_back(Call{psv_ld32(info), psv_ld32(info + 8), static_cast<i32>(psv_ld32(info + 12)),
+                         static_cast<i32>(psv_ld32(info + 16)), psv_ld32(info + 20), psv_ld32(info + 24)});
+}
+
+}  // namespace
+
+TEST_CASE("ngs: PCM played through the master buss comes out sample for sample; the counters count exactly") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    GuestCode code;
+    const u32 callback = code.add(record);
+    code.install();
+    calls.clear();
+    Ngs ngs(ctx);
+    // (the master's rack made first: the patch decides the order, not the creation)
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 2)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    nx::vector<i16> data(2000);
+    for (u32 i = 0; i < 1000; ++i) {
+        data[2 * i] = static_cast<i16>(static_cast<i32>(i * 37 % 20000) - 10000);
+        data[2 * i + 1] = static_cast<i16>(-data[2 * i]);
+    }
+    PlayerParams p = player(2);
+    p.buffs[0] = PlayerBuffer{pcm(data), 4000, 0, -1};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kModuleCallback, {voice, 0, callback, 0x111}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kFinishedCallback, {voice, callback, 0x222}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    CHECK(ngs.state(voice) == 16);  // (pending until the next update)
+
+    u32 frame = 0;
+    bool exact = true;
+    for (u32 update = 0; update < 4; ++update) {
+        ngs.update();
+        const nx::vector<i16> out = ngs.output(master);
+        for (u32 i = 0; i < kG; ++i, ++frame) {
+            const i16 l = frame < 1000 ? data[2 * frame] : 0, r = frame < 1000 ? data[2 * frame + 1] : 0;
+            exact &= out[2 * i] == l && out[2 * i + 1] == r;
+        }
+        if (update == 0) {
+            CHECK(ngs.state(voice) == 1);
+            const u32 st = scratch(24);
+            REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
+            CHECK(psv_ld32(st) == 1024);       // position in the buffer
+            CHECK(psv_ld32(st + 4) == 0);      // buffer
+            CHECK(psv_ld32(st + 8) == 256);    // samples since key on
+            CHECK(psv_ld32(st + 12) == 1024);  // bytes since key on
+            CHECK(calls.empty());
+        }
+    }
+    CHECK(exact);
+    // It ended in the fourth update: the player said so, then the voice finished.
+    CHECK(ngs.state(voice) == 0);
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[0].module == 0);
+    CHECK(calls[0].data == 0);  // SCE_NGS_PLAYER_END_OF_DATA
+    CHECK(calls[0].user == 0x111);
+    CHECK(calls[1].voice == voice);
+    CHECK(calls[1].user == 0x222);
+    const u32 st = scratch(24);
+    REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
+    CHECK(psv_ld32(st + 8) == 1000);
+    CHECK(psv_ld32(st + 12) == 4000);
+}
+
+TEST_CASE("ngs: streaming swaps buffers with a callback; loops, lead-in and the sample limit are exact") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    GuestCode code;
+    const u32 callback = code.add(record);
+    code.install();
+    calls.clear();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 1)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    nx::vector<i16> a(256), b(256);
+    for (u32 i = 0; i < 256; ++i) a[i] = static_cast<i16>(1000 + i), b[i] = static_cast<i16>(-1000 - static_cast<i32>(i));
+    const u32 ba = pcm(a), bb = pcm(b);
+    PlayerParams p = player(1);
+    p.buffs[0] = PlayerBuffer{ba, 512, 0, 1};
+    p.buffs[1] = PlayerBuffer{bb, 512, 0, 0};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kModuleCallback, {voice, 0, callback, 0}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    for (u32 k = 0; k < 3; ++k) {
+        ngs.update();
+        const nx::vector<i16> out = ngs.output(master);
+        const nx::vector<i16>& want = k == 1 ? b : a;
+        bool same = true;
+        for (u32 i = 0; i < kG; ++i) same &= out[2 * i] == want[i] && out[2 * i + 1] == want[i];
+        CHECK(same);
+        REQUIRE(calls.size() == k + 1);
+        CHECK(calls[k].data == 1);                                  // SCE_NGS_PLAYER_SWAPPED_BUFFER
+        CHECK(calls[k].data2 == static_cast<i32>(k == 1 ? 1 : 0));  // (the buffer finished)
+        CHECK(calls[k].ptr == (k == 1 ? ba : bb));                  // (the buffer now playing)
+    }
+
+    // 100 samples of lead-in, buffer 0 looped without end, 300 samples at most.
+    REQUIRE(call32(ctx, kSceNgs, kKill, {voice}) == 0);
+    p.buffs[0] = PlayerBuffer{ba, 512, -1, -1};
+    p.lead_in = 100;
+    p.limit = 300;
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    calls.clear();
+    nx::vector<i16> got;
+    for (u32 k = 0; k < 2; ++k) {
+        ngs.update();
+        const nx::vector<i16> out = ngs.output(master);
+        for (u32 i = 0; i < kG; ++i) got.push_back(out[2 * i]);
+    }
+    bool same = true;
+    for (u32 i = 0; i < 512; ++i) {
+        const i16 want = i < 100 ? 0 : i < 400 ? a[(i - 100) % 256] : 0;
+        same &= got[i] == want;
+    }
+    CHECK(same);
+    REQUIRE(calls.size() == 1);  // (one per update at most: the first had none, the second ended)
+    CHECK(calls[0].data == 0);
+    CHECK(ngs.state(voice) == 0);
+
+    // Buffer 0 played three times (two loops): 300 samples, then the end.
+    p.buffs[0] = PlayerBuffer{ba, 200, 2, -1};
+    p.lead_in = 0;
+    p.limit = 0;
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    calls.clear();
+    got.clear();
+    for (u32 k = 0; k < 2; ++k) {
+        ngs.update();
+        const nx::vector<i16> out = ngs.output(master);
+        for (u32 i = 0; i < kG; ++i) got.push_back(out[2 * i]);
+    }
+    same = true;
+    for (u32 i = 0; i < 512; ++i) same &= got[i] == (i < 300 ? a[i % 100] : 0);
+    CHECK(same);
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[0].data == 2);  // SCE_NGS_PLAYER_LOOPED_BUFFER
+    CHECK(calls[0].data2 == 2);
+    CHECK(calls[1].data == 0);
+}
+
+TEST_CASE("ngs: patches mix with their volumes through a mixer buss; pausing, killing; parameter locks and checks") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 buss = ngs.rack(kDefMixer, 1, 1)[0];
+    const nx::vector<u32> voices = ngs.rack(kDefTemplate1, 2, 1);
+    nx::vector<i16> a(4096), b(4096);
+    for (u32 i = 0; i < 4096; ++i) a[i] = static_cast<i16>(4 * (i % 2000)), b[i] = static_cast<i16>(-8 * (i % 1000));
+    const u32 ba = pcm(a), bb = pcm(b);
+    u32 pa, pb;
+    REQUIRE(ngs.patch(voices[0], buss, &pa) == 0);
+    REQUIRE(ngs.patch(voices[1], buss, &pb) == 0);
+    REQUIRE(ngs.patch(buss, master) == 0);
+    CHECK(ngs.patch(master, voices[0]) != 0);    // (the master has no output)
+    CHECK(ngs.patch(buss, buss) == kDependency);  // (a voice of the same rack)
+    // (0.5 of the first, 0.25 of the second)
+    const u32 m = scratch(16);
+    const f32 half[4] = {0.5f, 0, 0, 0}, quarter[4] = {0.25f, 0, 0, 0};
+    std::memcpy(t.rt.memory().host(m), half, 16);
+    REQUIRE(call32(ctx, kSceNgs, kVolumesMatrix, {pa, m}) == 0);
+    const u32 m2 = scratch(16);
+    std::memcpy(t.rt.memory().host(m2), quarter, 16);
+    REQUIRE(call32(ctx, kSceNgs, kVolumesMatrix, {pb, m2}) == 0);
+    const u32 route = scratch(24);
+    REQUIRE(call32(ctx, kSceNgs, kPatchInfo, {pa, route, 0}) == 0);
+    CHECK(psv_ld32(route) == 1);
+    CHECK(psv_ld32(route + 4) == 1);
+
+    PlayerParams p = player(1);
+    p.buffs[0] = PlayerBuffer{ba, 8192, 0, -1};
+    REQUIRE(set_params(ctx, voices[0], 0, p) == 0);
+    p.buffs[0] = PlayerBuffer{bb, 8192, 0, -1};
+    REQUIRE(set_params(ctx, voices[1], 0, p) == 0);
+    for (u32 v : {voices[0], voices[1], buss, master}) REQUIRE(call32(ctx, kSceNgs, kPlay, {v}) == 0);
+    ngs.update();
+    nx::vector<i16> out = ngs.output(master);
+    bool mixed = true;
+    for (u32 i = 0; i < kG; ++i) {
+        const i16 want = static_cast<i16>(a[i] / 2 + b[i] / 4);
+        mixed &= out[2 * i] == want && out[2 * i + 1] == want;
+    }
+    CHECK(mixed);
+
+    // Paused (no fade: the mixer's lead-out is 0), the first voice is silent; resumed, it goes on where it was.
+    REQUIRE(call32(ctx, kSceNgs, kPause, {voices[0]}) == 0);
+    CHECK((ngs.state(voices[0]) & 32) != 0);
+    ngs.update();
+    out = ngs.output(master);
+    bool paused = true;
+    for (u32 i = 0; i < kG; ++i) paused &= out[2 * i] == static_cast<i16>(b[kG + i] / 4);
+    CHECK(paused);
+    REQUIRE(call32(ctx, kSceNgs, kResume, {voices[0]}) == 0);
+    ngs.update();
+    out = ngs.output(master);
+    bool resumed = true;
+    for (u32 i = 0; i < kG; ++i) resumed &= out[2 * i] == static_cast<i16>(a[kG + i] / 2 + b[2 * kG + i] / 4);
+    CHECK(resumed);
+    REQUIRE(call32(ctx, kSceNgs, kKill, {voices[1]}) == 0);
+    CHECK(ngs.state(voices[1]) == 0);
+
+    // Locks: one at a time, of the module's own interface; what is unlocked is checked.
+    const u32 info = scratch(8);
+    REQUIRE(call32(ctx, kSceNgs, kLock, {voices[0], 0, kPlayerParamsId, info}) == 0);
+    CHECK(psv_ld32(info + 4) == sizeof(PlayerParams));
+    CHECK(call32(ctx, kSceNgs, kLock, {voices[0], 0, kPlayerParamsId, info}) == kResourceLocked);
+    CHECK(call32(ctx, kSceNgs, kLock, {voices[0], 2, kPlayerParamsId, scratch(8)}) == kParamTypeMismatch);
+    t.rt.memory().host(psv_ld32(info))[offsetof(PlayerParams, channels)] = 3;
+    CHECK(call32(ctx, kSceNgs, kUnlock, {voices[0], 0}) == kParamOutOfRange);
+    const u32 message = scratch(128);
+    REQUIRE(call32(ctx, kSceNgs, kOutOfRange, {voices[0], 0, message}) == 0);
+    CHECK(nx::string(reinterpret_cast<const char*>(t.rt.memory().host(message))).find("nChannels") != nx::string::npos);
+}
+
+TEST_CASE("ngs: a keyed-off envelope releases over its time, then the voice finishes") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    GuestCode code;
+    const u32 callback = code.add(record);
+    code.install();
+    calls.clear();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 1)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    const nx::vector<i16> level(256, 16384);
+    PlayerParams p = player(1);
+    p.buffs[0] = PlayerBuffer{pcm(level), 512, -1, -1};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    struct Envelope {
+        u32 id, size;
+        struct {
+            u32 msecs;
+            f32 amplitude;
+            u32 curve;
+        } points[4];
+        u32 release_msecs, num_points, loop_start;
+        i32 loop_end;
+    } e{};
+    e.id = kEnvelopeParamsId;
+    e.size = sizeof e;
+    e.points[0] = {0, 1.0f, 0};
+    e.num_points = 1;
+    e.release_msecs = 10;  // (480 samples)
+    e.loop_end = -1;
+    REQUIRE(set_params(ctx, voice, 4, e) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kBypass, {voice, 4, 0}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kFinishedCallback, {voice, callback, 7}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    ngs.update();
+    CHECK(ngs.output(master)[2 * 100] == 16384);
+    REQUIRE(call32(ctx, kSceNgs, kKeyOff, {voice}) == 0);
+    CHECK((ngs.state(voice) & 64) != 0);
+    ngs.update();
+    CHECK(ngs.state(voice) == 4);  // finalizing
+    nx::vector<i16> out = ngs.output(master);
+    CHECK(out[0] == 16384);
+    CHECK(std::abs(out[2 * 255] - static_cast<i32>(16384 * (1 - 255.0 / 480))) <= 2);
+    bool falling = true;
+    for (u32 i = 1; i < kG; ++i) falling &= out[2 * i] <= out[2 * (i - 1)];
+    CHECK(falling);
+    CHECK(calls.empty());
+    ngs.update();
+    out = ngs.output(master);
+    CHECK(out[2 * 200] > 0);
+    CHECK(out[2 * 224] == 0);  // (480 samples after the key off)
+    CHECK(out[2 * 255] == 0);
+    CHECK(ngs.state(voice) == 0);
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].user == 7);
+}
+
+TEST_CASE("ngs: VAG blocks decode as the ADPCM filters say; the bytes count per block") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 1)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    // Two blocks: filter 0 shift 4, then filter 3 shift 9.
+    u8 vag[32] = {};
+    vag[0] = 0x04;
+    vag[16] = 0x39;
+    for (u32 i = 0; i < 14; ++i) {
+        vag[2 + i] = static_cast<u8>((i * 0x37 + 0x12) & 0xFF);
+        vag[18 + i] = static_cast<u8>((i * 0x5B + 0x8E) & 0xFF);
+    }
+    const u32 at = aligned(32);
+    std::memcpy(t.rt.memory().host(at), vag, 32);
+    // (the reference: the PlayStation ADPCM formula)
+    nx::vector<i16> want;
+    i32 h1 = 0, h2 = 0;
+    const i32 coef[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
+    for (u32 blk = 0; blk < 2; ++blk) {
+        const u8* bp = vag + 16 * blk;
+        const i32 shift = bp[0] & 15, filter = bp[0] >> 4;
+        for (u32 i = 0; i < 28; ++i) {
+            i32 nib = (i & 1) ? bp[2 + i / 2] >> 4 : bp[2 + i / 2] & 15;
+            if (nib >= 8) nib -= 16;
+            i32 s = ((nib * 4096) >> shift) + ((h1 * coef[filter][0] + h2 * coef[filter][1] + 32) >> 6);
+            s = std::clamp(s, -32768, 32767);
+            h2 = h1, h1 = s;
+            want.push_back(static_cast<i16>(s));
+        }
+    }
+    PlayerParams p = player(1);
+    p.type = 1;  // SCE_NGS_PLAYER_TYPE_ADPCM
+    p.buffs[0] = PlayerBuffer{at, 32, 0, -1};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    ngs.update();
+    const nx::vector<i16> out = ngs.output(master);
+    bool same = true;
+    for (u32 i = 0; i < 56; ++i) same &= out[2 * i] == want[i];
+    CHECK(same);
+    CHECK(out[2 * 56] == 0);
+    const u32 st = scratch(24);
+    REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
+    CHECK(psv_ld32(st + 8) == 56);
+    CHECK(psv_ld32(st + 12) == 32);
+}
+
+TEST_CASE("ngs: a generated tone, and a low-pass EQ on the send taking it away") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 1)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    struct Generator {
+        u32 id, size, mode;
+        i32 frequency;
+        f32 amplitude, pulse_width;
+        u32 sample_offset, phase_angle;
+    } g{kGeneratorParamsId, 32, 0, 8000, 0.5f, 0.5f, 0, 0};
+    REQUIRE(set_params(ctx, voice, 1, g) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kBypass, {voice, 0, 2}) == 0);  // (no player)
+    REQUIRE(call32(ctx, kSceNgs, kBypass, {voice, 1, 0}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    auto rms = [&] {
+        f64 sum = 0;
+        for (u32 k = 0; k < 4; ++k) {
+            ngs.update();
+            const nx::vector<i16> out = ngs.output(master);
+            if (k < 2) continue;  // (the filter settles)
+            for (u32 i = 0; i < kG; ++i) sum += static_cast<f64>(out[2 * i]) * out[2 * i];
+        }
+        return std::sqrt(sum / (2 * kG));
+    };
+    const f64 open = rms();
+    CHECK(std::fabs(open - 0.5 * 32768 / std::sqrt(2.0)) < 0.01 * open);
+    struct Eq {
+        u32 id, size;
+        struct {
+            u32 mode;
+            f32 frequency, resonance, gain;
+        } f[4];
+    } eq{};
+    eq.id = kEqParamsId;
+    eq.size = sizeof eq;
+    for (auto& f : eq.f) f = {0, 1000.0f, 0.707f, 0.0f};
+    eq.f[0] = {1, 500.0f, 0.707f, 0.0f};  // (low pass, resonant)
+    REQUIRE(set_params(ctx, voice, 6, eq) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kBypass, {voice, 6, 0}) == 0);
+    const f64 filtered = rms();
+    CHECK(filtered < open / 100);
+}

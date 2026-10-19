@@ -308,6 +308,7 @@ void register_system_libraries() {
     register_audioout();
     register_touch();
     register_apputil();
+    register_ngs();
 }
 
 }  // namespace psvrecore::runtime::hle

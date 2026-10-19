@@ -11,6 +11,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/iofilemgr.cpp
     src/hle/libkernel.cpp
     src/hle/modulemgr.cpp
+    src/hle/ngs.cpp
     src/hle/processmgr.cpp
     src/hle/rtc.cpp
     src/hle/sysmem.cpp
@@ -21,6 +22,7 @@ add_library(psvrecore_runtime STATIC
     src/kernel/threads.cpp
     src/loader.cpp
     src/memory.cpp
+    src/ngs/modules.cpp
     src/runtime.cpp
     src/savedata.cpp
 )

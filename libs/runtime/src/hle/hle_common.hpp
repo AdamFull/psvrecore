@@ -41,5 +41,6 @@ void register_ctrl();
 void register_audioout();
 void register_touch();
 void register_apputil();
+void register_ngs();
 
 }  // namespace psvrecore::runtime::hle
