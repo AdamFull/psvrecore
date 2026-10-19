@@ -524,7 +524,8 @@ struct Streamer : Module {
     }
 };
 
-// The player: 16-bit PCM, or VAG ADPCM (16-byte blocks of 28 samples, a block per channel in turn).
+// The player: 16-bit PCM, or VAG ADPCM (16-byte blocks of 28 samples; stereo takes a block of each channel in turn,
+// the left first, as vagconv2 makes it from a stereo WAV).
 struct Player : Streamer {
     using Streamer::Streamer;
 
@@ -573,9 +574,13 @@ struct Player : Streamer {
         return Settings{q.frequency, q.scalar, q.lead_in, q.limit, q.start_byte, q.channels, {q.map[0], q.map[1]}, q.start_buffer};
     }
     i32 looped_code() const override { return 2; }  // SCE_NGS_PLAYER_LOOPED_BUFFER
-    void buffer_started(bool) override {
+    void started() override {
         for (auto& h : hist)
             for (f64& v : h) v = 0;
+    }
+    // A swap carries on with the samples before (a stream split over buffers decodes as one); a loop starts again.
+    void buffer_started(bool looped) override {
+        if (looped) started();
         decoded_index = 28;
         block_bytes = 0;
     }

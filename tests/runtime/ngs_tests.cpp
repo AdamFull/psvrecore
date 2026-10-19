@@ -459,9 +459,9 @@ nx::vector<f64> vag_reference(const u8* vag, u32 blocks, Coef coef) {
 }
 
 // Whether the master's output is the formula's rounded, sample for sample (give or take the f32 in between).
-bool decodes_as(const nx::vector<i16>& out, const nx::vector<f64>& want) {
+bool decodes_as(const nx::vector<i16>& out, const nx::vector<f64>& want, u32 channel = 0) {
     bool same = true;
-    for (usize i = 0; i < want.size(); ++i) same &= std::fabs(out[2 * i] - want[i]) <= 0.51;
+    for (usize i = 0; i < want.size(); ++i) same &= std::fabs(out[2 * i + channel] - want[i]) <= 0.51;
     return same;
 }
 
@@ -545,6 +545,53 @@ TEST_CASE("ngs: HE-VAG blocks take a 7-bit filter and up to 4 taps") {
     for (u32 i = 28; i < 140; ++i) loudest = std::max(loudest, std::abs(static_cast<i32>(out[2 * i])));
     CHECK(loudest > 1000);
     CHECK(out[2 * 140] == 0);
+}
+
+TEST_CASE("ngs: stereo VAG takes a block of each channel in turn, the left first; a swap keeps the samples before") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 2)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    // Left: filter 0 shift 2, then classic filter 1 shift 6. Right: filter 0 shift 5, then HE filter 45 shift 9.
+    // Their second blocks predict from the first, and each pair is a buffer of its own (0, then 1).
+    u8 left[32] = {}, right[32] = {};
+    left[0] = 0x02, left[16] = 0x16;
+    right[0] = 0x05, right[16] = 0xD9, right[17] = 0x20;
+    for (u32 i = 0; i < 14; ++i) {
+        left[2 + i] = static_cast<u8>((i * 0x37 + 0x12) & 0xFF), left[18 + i] = static_cast<u8>((i * 0x5B + 0x8E) & 0xFF);
+        right[2 + i] = static_cast<u8>((i * 0x29 + 0xC4) & 0xFF), right[18 + i] = static_cast<u8>((i * 0x71 + 0x3D) & 0xFF);
+    }
+    const u32 at = aligned(64);
+    for (u32 b = 0; b < 2; ++b) {
+        std::memcpy(t.rt.memory().host(at + 32 * b), left + 16 * b, 16);
+        std::memcpy(t.rt.memory().host(at + 32 * b + 16), right + 16 * b, 16);
+    }
+    const auto coef = [](u32 f) {
+        switch (f) {
+            case 1: return std::array<i32, 4>{60 * 128, 0, 0, 0};
+            case 45: return std::array<i32, 4>{-4745, -4122, -5486, -1493};
+            default: return std::array<i32, 4>{};
+        }
+    };
+    PlayerParams p = player(2);
+    p.type = 1;  // SCE_NGS_PLAYER_TYPE_ADPCM
+    p.buffs[0] = PlayerBuffer{at, 32, 0, 1};
+    p.buffs[1] = PlayerBuffer{at + 32, 32, 0, -1};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    ngs.update();
+    const nx::vector<i16> out = ngs.output(master);
+    CHECK(decodes_as(out, vag_reference(left, 2, coef), 0));
+    CHECK(decodes_as(out, vag_reference(right, 2, coef), 1));
+    CHECK(out[2 * 56] == 0);
+    CHECK(out[2 * 56 + 1] == 0);
+    const u32 st = scratch(24);
+    REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
+    CHECK(psv_ld32(st + 8) == 56);
+    CHECK(psv_ld32(st + 12) == 64);
 }
 
 TEST_CASE("ngs: a generated tone, and a low-pass EQ on the send taking it away") {
