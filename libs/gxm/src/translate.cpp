@@ -836,7 +836,7 @@ void Translator::test_op(const Instruction& in) {
         if (n == 4 && !((d.mask >> k) & 1)) continue;
         const Id r = lane_result(k);
         const u32 bits = width_of(t);
-        if (is_float(t)) putf(d, k, t, sel(tf_, r, f(1.0f), f(0.0f)));  // (1.0 or 0.0: see interp.cpp)
+        if (is_float(t) && n == 4) putf(d, k, t, sel(tf_, r, f(1.0f), f(0.0f)));  // (1.0 or 0.0: see interp.cpp)
         else put(d, k, t, sel(tu_, r, u(bits == 32 ? ~0u : (1u << bits) - 1), u(0)));
     }
 }
@@ -1135,9 +1135,9 @@ void Translator::memory_op(const Instruction& in) {
     const Id base = raw(base_reg, 0, Type::U32);
     const Id off = raw(in.src[1], 0, Type::U32);
     const u32 count = in.fetch ? in.fetch : 1;
-    const Id address = in.src[1].bank == Bank::Literal
-                           ? iadd(base, imul(off, u(bytes)))
-                           : iadd(base, iadd(imul(shr(off, u(16)), u(bytes)), band(off, u(0xFFFF))));
+    // (as the interpreter: a register offset's low half in bytes; a burst starts one element further)
+    Id address = in.src[1].bank == Bank::Literal ? iadd(base, imul(off, u(bytes))) : iadd(base, band(off, u(0xFFFF)));
+    if (in.fetch) address = iadd(address, u(bytes));
     const u32 words = in.size == 64 ? 2 : 1;
     for (u32 i = 0; i < count; ++i) {
         for (u32 j = 0; j < words; ++j) {

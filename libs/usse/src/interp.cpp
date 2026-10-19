@@ -658,17 +658,17 @@ void test_op(Exec& x, const Instruction& in) {
         x.m_.pred[in.dest.number & 3] = r;
         return;
     }
-    // Family 15: the result is all ones or zero for integer types (checked: integer conversions select with cmov8
-    // on it), 1.0 or 0.0 for float types (checked: the compiler weighs the results of a four-lane comparison with a
-    // dot product, as in percentage-closer shadow filtering); from lane x, or lane by lane for a four-lane
-    // destination.
+    // Family 15: the result is all ones or zero, from lane x (checked: the compiler's conversions and selects use it
+    // as a byte mask, with cmov8); lane by lane for a four-lane destination, where a float test writes 1.0 or 0.0
+    // instead (checked: the compiler weighs four-lane comparison results with a dot product, as in percentage-closer
+    // shadow filtering). (Surveyed over the corpora: every single-lane float test result goes to a cmov8.)
     const Operand& d = in.dest;
     const u32 n = d.lanes == 4 ? 4 : 1;
     for (u32 k = 0; k < n; ++k) {
         if (n == 4 && !((d.mask >> k) & 1)) continue;
         const bool r = lane_result(k);
         const u32 bits = width_of(t);
-        if (flt) x.putf(d, k, t, r ? 1.0f : 0.0f);
+        if (flt && n == 4) x.putf(d, k, t, r ? 1.0f : 0.0f);
         else x.put(d, k, t, r ? (bits == 32 ? ~0u : (1u << bits) - 1) : 0u);
     }
 }
@@ -808,12 +808,15 @@ void memory_op(Exec& x, const Instruction& in) {
     const u32 bytes = in.size / 8u;
     u32* base = x.reg_word(in.src[0], in.src[0].number);
     if (!base) return;
-    // An immediate offset counts elements; a register offset is a byte offset (low half) plus a count of
-    // elements (high half). (Checked for the default uniform buffer's arrays.)
+    // An immediate offset counts elements; a register offset's low half is a byte offset (its high half, which the
+    // compiler sets to 1, does not move the address). A burst (.fetchN) starts one element further. (Checked with
+    // the shader compiler's reads of uniform buffer arrays, at constant and computed indices, with and without
+    // bursts: with the buffers' -4 bias every read lands on its element; the compiler adds the element itself for
+    // single loads, as offset + 1 or an adjusted base.)
     const u32 off = x.raw(in.src[1], 0, Type::U32);
     const u32 count = in.fetch ? in.fetch : 1;
-    const u32 address = in.src[1].bank == Bank::Literal ? *base + off * bytes
-                                                        : *base + (off >> 16) * bytes + (off & 0xFFFF);
+    const u32 address = (in.src[1].bank == Bank::Literal ? *base + off * bytes : *base + (off & 0xFFFF)) +
+                        (in.fetch ? bytes : 0);
     const u32 words = in.size == 64 ? 2 : 1;
     for (u32 i = 0; i < count; ++i) {
         for (u32 j = 0; j < words; ++j) {

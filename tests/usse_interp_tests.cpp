@@ -149,6 +149,63 @@ TEST_CASE("usse interp: the default uniform buffer read from memory") {
     CHECK(value(m.output[3]) == 34.0f);
 }
 
+TEST_CASE("usse interp: user uniform buffer arrays (single, burst and computed loads)") {
+    // BUFFER[0] holds words 0, 1, 2, ... (as floats); its address goes to sa0 with the buffer's -4 bias. The
+    // shader compiler's reads of: float arr[3] (lda32 at immediate 4: a single load counts from the address),
+    // float2 arr[3] (lda32.fetch2 at immediate 6: a burst starts one element further) and float arr[(int)i]
+    // (lda32 at a register offset, 0x10000 in its high half, from sa0 + 4).
+    const u64 scalar_s[] = {0xE8A30084A0200200ull, 0xF920000000000000ull, 0xF804014000000000ull};
+    const u64 scalar_p[] = {0xFA44070000000000ull, 0x08A41185B0040000ull, 0x08C01189B0440040ull, 0xFB275000A0200000ull};
+    const u64 pair_s[] = {0xE8831084A0400300ull, 0xF920000000000000ull, 0xF804014000000000ull};
+    const u64 pair_p[] = {0xFA44070000000000ull, 0x08A44185B0040001ull, 0x08C04189B0440041ull, 0xFB275000A0200000ull};
+    const u64 index_s[] = {0xA8860086A0604080ull};
+    const u64 index_p[] = {0xFA44070000000000ull, 0x40810CC6A0800200ull, 0xA8820886B0810202ull, 0xE8A50084A080C200ull,
+                           0xF920000000000000ull, 0x08A40185A0040002ull, 0x08C00189A0440042ull, 0xFB275000A0200000ull};
+    TestMemory memory;
+    memory.base = 0x10000;
+    for (u32 i = 0; i < 16; ++i) memory.words[i] = bits(static_cast<f32>(i));
+    u32 buffers[15] = {};
+    buffers[0] = memory.base;
+    auto setup = [&](Gxp& gxp, Machine& m) {
+        m.memory = &memory;
+        REQUIRE(load_secondary(gxp, {}, buffers, m));
+        CHECK(m.secondary[0] == memory.base - 4);
+        set4(m.primary, 0, 1, 1, 1, 1);
+    };
+    {
+        Gxp gxp;
+        gxp.containers = {Container{kConstantsContainer, 0, 1}};
+        gxp.buffer_slots = {BufferSlot{0, 0, -4}};
+        Machine m;
+        setup(gxp, m);
+        REQUIRE(run_both(scalar_s, scalar_p, m));
+        CHECK(value(m.output[0]) == 3.0f);
+        CHECK(value(m.output[1]) == 3.0f);
+    }
+    {
+        Gxp gxp;
+        gxp.containers = {Container{kConstantsContainer, 0, 1}};
+        gxp.buffer_slots = {BufferSlot{0, 0, -4}};
+        Machine m;
+        setup(gxp, m);
+        REQUIRE(run_both(pair_s, pair_p, m));
+        CHECK(value(m.output[0]) == 6.0f);
+        CHECK(value(m.output[1]) == 7.0f);
+    }
+    {
+        Gxp gxp;
+        gxp.containers = {Container{kConstantsContainer, 0, 3}};
+        gxp.buffer_slots = {BufferSlot{0, 0, -4}};
+        gxp.literals = {Literal{1, 4}, Literal{2, 0x10000}};
+        Machine m;
+        setup(gxp, m);
+        m.primary[4] = bits(5.0f);  // i
+        REQUIRE(run_both(index_s, index_p, m));
+        CHECK(value(m.output[0]) == 5.0f);
+        CHECK(value(m.output[1]) == 5.0f);
+    }
+}
+
 TEST_CASE("usse interp: failures are reported") {
     Machine m;
     const u64 texture[] = {0xE001C408E2C00080ull};  // (texture sampling is not implemented yet)

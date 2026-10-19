@@ -72,8 +72,8 @@ struct Literal {
 
 // A uniform buffer's address goes to a register of the constants block, plus a bias in bytes: -4 for a user
 // buffer; for the default uniform buffer (kDefaultUniformContainer), whose first words are in secondary attributes
-// and the rest read from memory, 4 * (the first word not in a register) - 4. (Loads count their offsets from one
-// element past that address.)
+// and the rest read from memory, 4 * (the first word not in a register) - 4. (A burst load, .fetchN, starts one
+// element past its address; the compiler adds that element itself for single loads: see the interpreter.)
 struct BufferSlot {
     u16 buffer = 0;  // the BUFFER[n] index, or kDefaultUniformContainer
     u16 offset = 0;
