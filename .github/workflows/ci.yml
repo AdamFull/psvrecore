@@ -20,10 +20,17 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/build.ps1 -Preset ${{ matrix.preset }}
+      - name: LLVM for the disassembler check
+        # (the reference is llvm-objdump 22: older ones print some operands wrongly and track IT blocks otherwise)
+        if: matrix.preset == 'windows-x64-release'
+        shell: pwsh
+        run: |
+          choco upgrade llvm -y --no-progress
+          & "C:\Program Files\LLVMin\llvm-objdump.exe" --version
       - name: Disassembler against llvm-objdump
         if: matrix.preset == 'windows-x64-release'
         shell: pwsh
-        run: python scripts/arm_check.py --psvdis build/${{ matrix.preset }}/tools/psvdis/psvdis.exe --samples 200000 --show 20
+        run: python scripts/arm_check.py --objdump "C:\Program Files\LLVMin\llvm-objdump.exe" --psvdis build/${{ matrix.preset }}/tools/psvdis/psvdis.exe --samples 200000 --show 20
 
   linux:
     runs-on: ubuntu-24.04

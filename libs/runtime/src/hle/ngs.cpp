@@ -9,8 +9,9 @@
 // sceNgsVoiceSetParamsBlock) take effect at the next update that does not fall within sceNgsSystemLock and
 // sceNgsSystemUnlock, as do voices started, keyed off, paused and resumed.
 
-#include <atomic>
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <memory>
 
 #include "../ngs/modules.hpp"
