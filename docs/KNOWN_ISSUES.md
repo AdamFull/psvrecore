@@ -103,6 +103,15 @@
 
 ## GXM layer (HLE)
 
+- **A program and state seen for the first time is still translated (and its pipeline compiled) when it is first
+  drawn.** The shader cache makes everything an earlier run drew with before the game starts, but nothing can be
+  made ahead of that: the programs are in the user's game files (not there when the program is built, and never in
+  the repository), and what a translation depends on (the vertex formats, the output format, blending, depth) is
+  known only when the game draws. The first run of each scene pays once, on each device. The cache's SPIR-V would do
+  for another device (the driver's pipeline cache would not, and is dropped there), but copying it has not been
+  tried.
+- **The shader cache only grows.** Nothing is evicted; a translator whose sources changed starts it again (its
+  header holds a hash of them, made when CMake runs: it runs again when they change).
 - **Scenes render synchronously** when they end (one submission and wait each): simple and ordered with transfers and
   the CPU, but slow (multithreaded_rendering: about 40 ms a frame).
 - **Not implemented:** tiled and swizzled colour surfaces (the scene is not rendered), multisampling, the DF32M_S8

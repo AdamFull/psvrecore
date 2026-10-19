@@ -175,7 +175,9 @@ from `settings.ini` in the user's data folder (`%APPDATA%\psvrecore\<program>\` 
 `~/.local/share/psvrecore/<program>/` on Linux), written with the defaults and a comment on every key the first time;
 the command line goes over them (`--set section.key=value`, or the options that stand for one). The game's
 application folder is `--game <folder>` or `[game] folder`; ux0: and save data are in `data/` beside the settings
-unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title ID>`.
+unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title ID>`. The shader cache is `data/cache`
+(the game's programs translated, the pipelines made, the driver's pipeline cache): what a run drew with is made before
+the next one starts. Deleting it only costs that again.
 
 Keys while playing: arrows (the d-pad), Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
 Select, F11 full screen. Gamepads work as they are plugged in; the mouse touches the front panel. On a touch screen the
