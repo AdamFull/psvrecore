@@ -30,9 +30,10 @@ function(psvrecore_add_sample)
     target_link_libraries(psvrecore_sample_${P_NAME}_code PUBLIC psvrecore::recomp_support)
     psvrecore_generated_code(psvrecore_sample_${P_NAME}_code)
 
-    add_executable(sample_${P_NAME} "${_sample_src}/runner.cpp" "${_sample_src}/png.cpp")
-    target_compile_definitions(sample_${P_NAME} PRIVATE PSVRECORE_SAMPLE_MODULE=sample_${P_NAME}_module)
-    target_link_libraries(sample_${P_NAME} PRIVATE psvrecore::runtime psvrecore::gxm_hle psvrecore::platform psvrecore_sample_${P_NAME}_code
+    add_executable(sample_${P_NAME} "${_sample_src}/runner.cpp")
+    target_compile_definitions(sample_${P_NAME} PRIVATE PSVRECORE_SAMPLE_MODULE=sample_${P_NAME}_module
+                                                    PSVRECORE_SAMPLE_NAME="${P_NAME}")
+    target_link_libraries(sample_${P_NAME} PRIVATE psvrecore::runtime psvrecore::gxm_hle psvrecore::frontend psvrecore_sample_${P_NAME}_code
                                                   psvrecore_sample_libc psvrecore_sample_libfios2 nx::foundation)
     psvrecore_target_defaults(sample_${P_NAME})
 endfunction()
