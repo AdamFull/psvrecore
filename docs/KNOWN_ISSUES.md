@@ -346,7 +346,11 @@
 ## Save data and the application utility
 
 - **The save data dialog is not implemented**, so the SDK's save data samples cannot run.
-- **Other titles' save data (`savedata1:`) cannot be mounted.**
+- **Other titles' save data (`savedata1:`) cannot be mounted**, nor other titles' add-ons (`addcont1:`,
+  `sceAppUtilAddcontMount`).
+- **Add-ons are always owned and installed.** Every folder in `addcont0:` opens; there are no entitlement checks,
+  downloads or store. A file in an add-on folder that is not open is reported missing (`ENOENT`): what the console
+  answers there is not documented.
 - **The file system's free space is not checked before a save**: a host disk filling up shows as an error while
   writing.
 - **On case-sensitive hosts, saves write names as given.** Saving `SAVE.DAT` after `save.dat` makes a second file.

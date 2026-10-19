@@ -173,8 +173,13 @@ python scripts/sample_check.py --sdk C:/path/to/sdk input_output_devices/api_ctr
 A game's program is psvrecore's frontend with the game's recompiled code. `--help` lists its options. Settings come
 from `settings.ini` in the user's data folder (`%APPDATA%\psvrecore\<program>\` on Windows,
 `~/.local/share/psvrecore/<program>/` on Linux), written with the defaults and a comment on every key the first time;
-the command line goes over them (`--set section.key=value`, or the options that stand for one). The game's
-application folder is `--game <folder>` or `[game] folder`; ux0: and save data are in `data/` beside the settings
+the command line goes over them (`--set section.key=value`, or the options that stand for one). The game's folder
+is `--game <folder>` or `[game] folder`: either its application folder (`eboot.bin` at the top), or a copy of the
+console's folders for the title, `app/<title ID>`, `patch/<title ID>` (an update) and `addcont/<title ID>` (add-ons),
+as they are under `ux0:`. From a copy, `app0:` shows the update's files over the game's (its `eboot.bin` is the one
+that runs and is checked), and `addcont0:` holds the add-ons, each readable once the game opens it
+(`sceAppUtilDrmOpen`). Without an update or add-ons those parts are simply missing. ux0: and save data are in
+`data/` beside the settings
 unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title ID>`. The shader cache is `data/cache`
 (the game's programs translated, the pipelines made, the driver's pipeline cache): what a run drew with is made before
 the next one starts. Deleting it only costs that again.
