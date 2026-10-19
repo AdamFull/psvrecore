@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <optional>
 
 #include "nxtest.h"
 #include "psvrecore/frontend/frontend.hpp"
@@ -219,7 +220,51 @@ TEST_CASE("script: items by time, comments, and what each takes") {
     }
     auto r = parse_script("100 key z down; 200 jump");
     REQUIRE_FALSE(r);
-    CHECK(r.error().message == "input '200 jump': expected key, pad, axis, touch, shot or quit");
+    CHECK(r.error().message == "input '200 jump': expected key, pad, axis, touch, shot, wait or quit");
+}
+
+TEST_CASE("script: a wait holds what follows until a frame shows its colour; their times count from then") {
+    // (written out of order: each stretch is sorted, and a wait ends its own)
+    auto items = parse_script("200 shot b; 100 shot a; 300 wait 480 272 ff8000 10; 50 shot d; 20 shot c; 0 wait 1 2 000000");
+    if (!items) std::printf("%s\n", items.error().message.c_str());
+    REQUIRE(items);
+    REQUIRE(items->size() == 6);
+    const auto& v = *items;
+    CHECK(v[0].name == "a");
+    CHECK(v[1].name == "b");
+    CHECK(v[2].what == ScriptItem::What::Wait);
+    CHECK(v[2].x == 480.0f);
+    CHECK(v[2].rgb == 0xFF8000u);
+    CHECK(v[2].tolerance == 10);
+    CHECK(v[3].name == "c");
+    CHECK(v[5].tolerance == 24);
+    for (const char* bad : {"1 wait 1 2", "1 wait 1 2 ff80", "1 wait 1 2 gg8000", "1 wait 1 2 ff8000 300"})
+        CHECK_FALSE(parse_script(bad));
+
+    Script script(*items);
+    REQUIRE(script.probes().size() == 2);
+    nx::vector<nx::string> shots;
+    std::optional<u32> colour;  // (the probed pixel: none until a frame is shown)
+    auto shot = [&](const nx::string& name) { shots.push_back(name); };
+    auto pixel = [&](f32, f32) { return colour; };
+    CHECK(script.play(250, nullptr, shot, pixel));
+    CHECK(shots.size() == 2);  // a, b
+    CHECK(script.play(1000, nullptr, shot, pixel));  // (no frame yet: held)
+    colour = 0xF08A05u;  // (not within 10 of ff8000)
+    CHECK(script.play(2000, nullptr, shot, pixel));
+    CHECK(shots.size() == 2);
+    colour = 0xFA7F08u;
+    CHECK(script.play(3000, nullptr, shot, pixel));  // met at 3000: c is due at 3020, d at 3050
+    CHECK(shots.size() == 2);
+    CHECK(script.play(3030, nullptr, shot, pixel));
+    REQUIRE(shots.size() == 3);
+    CHECK(shots[2] == "c");
+    CHECK(script.play(3060, nullptr, shot, pixel));
+    CHECK(shots.size() == 4);
+    CHECK_FALSE(script.finished());  // (the last wait: 000000 not shown)
+    colour = 0x101010u;
+    CHECK(script.play(3070, nullptr, shot, pixel));
+    CHECK(script.finished());
 }
 
 TEST_CASE("settings: described for a settings screen, every key with what it takes") {

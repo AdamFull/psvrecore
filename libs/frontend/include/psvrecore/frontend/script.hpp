@@ -10,7 +10,13 @@
 //     axis <SDL gamepad axis> <-32768..32767> a gamepad axis (leftx, lefty, rightx, righty, lefttrigger, ...)
 //     touch <x> <y> down|move|up             the mouse at a point of the screen (960 x 544) where it is drawn
 //     shot <name>                            the next frame shown, saved as <name>.png
+//     wait <x> <y> <rrggbb> [<tolerance>]    from then on, holds the script until a frame shown has that colour (each
+//                                            component within the tolerance, 24 by default) at that point of the
+//                                            screen; the items after a wait count their times from when it was met
 //     quit                                   ends the program
+
+#include <optional>
+#include <utility>
 
 #include "psvrecore/error.hpp"
 #include "psvrecore/platform/window.hpp"
@@ -20,18 +26,20 @@
 namespace psvrecore::frontend {
 
 struct ScriptItem {
-    enum class What : u8 { Key, Pad, Axis, Touch, Shot, Quit };
+    enum class What : u8 { Key, Pad, Axis, Touch, Shot, Wait, Quit };
     u64 at_ms = 0;
     What what = What::Key;
     i32 code = 0;       // the key, button or axis (SDL's)
     i32 value = 0;      // an axis's value
     bool down = false;  // a key's or button's
     u8 phase = 0;       // a touch's: 0 down, 1 move, 2 up
-    f32 x = 0, y = 0;   // a touch's point on the screen
+    f32 x = 0, y = 0;   // a touch's or a wait's point on the screen
+    u32 rgb = 0;        // a wait's colour (0xRRGGBB)
+    i32 tolerance = 24; // a wait's: per component
     nx::string name;    // a shot's
 };
 
-// The items in time order; an error names the item that is wrong.
+// The items in time order (within the stretches a wait ends); an error names the item that is wrong.
 Result<nx::vector<ScriptItem>> parse_script(nx::string_view text);
 
 class Script {
@@ -39,14 +47,20 @@ public:
     Script() = default;
     explicit Script(nx::vector<ScriptItem> items) : items_(std::move(items)) {}
 
-    // Plays the items due by `ms` (from the boot): controls into the window's event queue, shots to `shot`. False
-    // once a `quit` has been played.
-    bool play(u64 ms, platform::Window& window, nx::function_ref<void(const nx::string&)> shot);
+    // The colour of the last frame shown at a point of the screen (0xRRGGBB), or none yet.
+    using Pixel = nx::function_ref<std::optional<u32>(f32 x, f32 y)>;
+
+    // Plays the items due by `ms` (from the boot): controls into the window's event queue (touches need the window
+    // to place them), shots to `shot`, waits against `pixel`. False once a `quit` has been played.
+    bool play(u64 ms, platform::Window* window, nx::function_ref<void(const nx::string&)> shot, Pixel pixel);
     bool finished() const { return next_ >= items_.size(); }
+    // The points the waits look at (for the display to keep their colours).
+    nx::vector<std::pair<f32, f32>> probes() const;
 
 private:
     nx::vector<ScriptItem> items_;
     usize next_ = 0;
+    u64 since_ms_ = 0;  // (when the last wait was met: the items after it count from then)
 };
 
 }  // namespace psvrecore::frontend

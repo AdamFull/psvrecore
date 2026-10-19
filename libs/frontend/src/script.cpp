@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <optional>
 
 #include "core/foundation/strings/format.h"
 
@@ -88,11 +89,20 @@ Result<ScriptItem> parse_item(const nx::vector<nx::string_view>& w, nx::string_v
         item.name = a;
         if (w.size() != 3 || a.view().find_first_of("/\\:") != nx::string_view::npos)
             return bad("expected shot <name> (no folders)");
+    } else if (what == "wait") {
+        item.what = ScriptItem::What::Wait;
+        u32 rgb = 0;
+        const auto hex = w.size() > 4 ? std::from_chars(w[4].data(), w[4].data() + w[4].size(), rgb, 16) : std::from_chars_result{};
+        if ((w.size() != 5 && w.size() != 6) || !number(w[2], &item.x) || !number(w[3], &item.y) || w[4].size() != 6 ||
+            hex.ec != std::errc{} || hex.ptr != w[4].data() + w[4].size() ||
+            (w.size() == 6 && (!number(w[5], &item.tolerance) || item.tolerance < 0 || item.tolerance > 255)))
+            return bad("expected wait <x> <y> <rrggbb> [<tolerance 0-255>]");
+        item.rgb = rgb;
     } else if (what == "quit") {
         item.what = ScriptItem::What::Quit;
         if (w.size() != 2) return bad("expected quit");
     } else {
-        return bad("expected key, pad, axis, touch, shot or quit");
+        return bad("expected key, pad, axis, touch, shot, wait or quit");
     }
     return item;
 }
@@ -125,13 +135,37 @@ Result<nx::vector<ScriptItem>> parse_script(nx::string_view text) {
         }
         line_start = line_end + 1;
     }
-    std::stable_sort(items.begin(), items.end(), [](const ScriptItem& a, const ScriptItem& b) { return a.at_ms < b.at_ms; });
+    // (in time order within each stretch; a wait ends its stretch, whatever its time)
+    auto by_time = [](const ScriptItem& a, const ScriptItem& b) { return a.at_ms < b.at_ms; };
+    usize from = 0;
+    for (usize i = 0; i <= items.size(); ++i) {
+        if (i < items.size() && items[i].what != ScriptItem::What::Wait) continue;
+        std::stable_sort(items.begin() + static_cast<std::ptrdiff_t>(from), items.begin() + static_cast<std::ptrdiff_t>(i), by_time);
+        from = i + 1;
+    }
     return items;
 }
 
-bool Script::play(u64 ms, platform::Window& window, nx::function_ref<void(const nx::string&)> shot) {
-    for (; next_ < items_.size() && items_[next_].at_ms <= ms; ++next_) {
+nx::vector<std::pair<f32, f32>> Script::probes() const {
+    nx::vector<std::pair<f32, f32>> out;
+    for (const ScriptItem& s : items_)
+        if (s.what == ScriptItem::What::Wait) out.push_back({s.x, s.y});
+    return out;
+}
+
+bool Script::play(u64 ms, platform::Window* window, nx::function_ref<void(const nx::string&)> shot, Pixel pixel) {
+    for (; next_ < items_.size() && since_ms_ + items_[next_].at_ms <= ms; ++next_) {
         const ScriptItem& s = items_[next_];
+        if (s.what == ScriptItem::What::Wait) {
+            const std::optional<u32> c = pixel(s.x, s.y);
+            auto near = [&](u32 shift) {
+                const i32 d = static_cast<i32>((*c >> shift) & 0xFF) - static_cast<i32>((s.rgb >> shift) & 0xFF);
+                return d >= -s.tolerance && d <= s.tolerance;
+            };
+            if (!c || !near(16) || !near(8) || !near(0)) return true;  // (held until a frame shows it)
+            since_ms_ = ms;
+            continue;
+        }
         SDL_Event e{};
         switch (s.what) {
             case ScriptItem::What::Key:
@@ -153,8 +187,9 @@ bool Script::play(u64 ms, platform::Window& window, nx::function_ref<void(const 
                 break;
             case ScriptItem::What::Touch: {
                 // (the screen's point in the window: where the picture is drawn)
+                if (!window) continue;
                 int w = 0, h = 0;
-                SDL_GetWindowSize(window.sdl(), &w, &h);
+                SDL_GetWindowSize(window->sdl(), &w, &h);
                 const f32 scale = std::min(static_cast<f32>(w) / platform::kScreenWidth,
                                            static_cast<f32>(h) / platform::kScreenHeight);
                 const f32 x = (static_cast<f32>(w) - platform::kScreenWidth * scale) / 2 + s.x * scale;
@@ -173,6 +208,7 @@ bool Script::play(u64 ms, platform::Window& window, nx::function_ref<void(const 
                 break;
             }
             case ScriptItem::What::Shot: shot(s.name); continue;
+            case ScriptItem::What::Wait: continue;  // (met above)
             case ScriptItem::What::Quit: ++next_; return false;
         }
         e.common.timestamp = SDL_GetTicksNS();

@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "psvrecore/io/png.hpp"
 #include "psvrecore/frontend/script.hpp"
@@ -37,9 +38,28 @@ public:
     nx::string out;
     nx::mutex lock;
     nx::vector<nx::string> shots;
+    // The points of the screen the script's waits look at, and their colours in the last frame shown.
+    nx::vector<std::pair<f32, f32>> probes;
+    nx::vector<std::optional<u32>> probed;
 
     void show(const gxm::Frame& f) override {
         if (window) window->show(f);
+        if (!probes.empty()) {
+            // (from the frame in guest memory, at its own size)
+            const u8* base = runtime::runtime().memory().host(f.address);
+            nx::scoped_lock<nx::mutex> held(lock);
+            probed.resize(probes.size());
+            for (usize i = 0; i < probes.size(); ++i) {
+                const u32 x = static_cast<u32>(probes[i].first * f.width / platform::kScreenWidth);
+                const u32 y = static_cast<u32>(probes[i].second * f.height / platform::kScreenHeight);
+                if (x >= f.width || y >= f.height) continue;
+                u32 v;
+                std::memcpy(&v, base + (usize{y} * f.pitch + x) * 4, 4);
+                probed[i] = f.pixel_format == 0x50000000u  // (A2B10G10R10; else ABGR8888)
+                                ? ((v >> 2) & 0xFF) << 16 | ((v >> 12) & 0xFF) << 8 | ((v >> 22) & 0xFF)
+                                : (v & 0xFF) << 16 | ((v >> 8) & 0xFF) << 8 | ((v >> 16) & 0xFF);
+            }
+        }
         nx::string name;
         {
             nx::scoped_lock<nx::mutex> held(lock);
@@ -419,6 +439,10 @@ int run(const Game& game, int argc, char** argv) {
 
     // Until the window is closed, the game exits, the script quits or the time is up.
     Script script(std::move(script_items));
+    {
+        nx::scoped_lock<nx::mutex> held(display.lock);
+        display.probes = script.probes();
+    }
     const u64 booted = nx::os::ticks_ns();
     u64 saved_at = booted;
     const char* ended = "the window was closed";
@@ -432,10 +456,18 @@ int run(const Game& game, int argc, char** argv) {
             ended = "the time was up";
             break;
         }
-        const bool go_on = script.play(ms, **window, [&](const nx::string& name) {
-            nx::scoped_lock<nx::mutex> held(display.lock);
-            display.shots.push_back(name);
-        });
+        const bool go_on = script.play(
+            ms, window->get(),
+            [&](const nx::string& name) {
+                nx::scoped_lock<nx::mutex> held(display.lock);
+                display.shots.push_back(name);
+            },
+            [&](f32 x, f32 y) -> std::optional<u32> {
+                nx::scoped_lock<nx::mutex> held(display.lock);
+                for (usize i = 0; i < display.probes.size() && i < display.probed.size(); ++i)
+                    if (display.probes[i].first == x && display.probes[i].second == y) return display.probed[i];
+                return std::nullopt;
+            });
         if (!go_on) {
             ended = "the script quit";
             break;
