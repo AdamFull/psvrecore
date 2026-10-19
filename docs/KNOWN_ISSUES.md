@@ -247,9 +247,14 @@
 - **The AudioOut timing tests need an idle host.** They check that each block starts exactly a grain after the one
   before and that calls return within 4 ms. With the host at ~90% CPU from other builds, the test thread wakes late,
   so the port's timeline restarts after a gap and the checks fail. On an idle host they pass.
-- **HE-VAG is not decoded.** The player decodes classic VAG (filters 0-4). HE-VAG blocks (a 7-bit filter index, the
-  SDK's vagconv2 default "Standard" mode) need a predictor table the documentation does not give. They play as
-  silence, with a warning.
+- **HE-VAG's predictors are measured, not documented.** The 128 filters of HE-VAG (a 7-bit filter index, the SDK's
+  vagconv2 default "Standard" mode) are not in the documentation: they were measured against vagconv2, as the
+  coefficients that make its output decode closest to its input. The 2-tap filters (5-28) land exactly on a grid of
+  1/8192ths. The 4-tap ones (29-127) are the grid points nearest the fit and may be a step off, which changes nothing
+  measurable: the test files' SNR is the same to 0.01 dB with the unrounded fit.
+- **VAG prediction is not rounded.** vagconv2 encodes for a decoder that keeps the fraction of the prediction (the
+  PlayStation ADPCM decoders round it to an integer, which drifts a few steps from what vagconv2 meant). Whether the
+  console rounds is unknown.
 - **NGS effects are close, not exact.** Filters, the parametric EQ, envelope curves, the compressor, delay, pitch shift
   and the I3DL2 reverb follow their documented behaviour with the usual designs; the console's arithmetic is unknown.
   The reverb presets are the I3DL2 environment presets. The player's resampling between rates is linear.
