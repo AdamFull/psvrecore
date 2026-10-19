@@ -256,7 +256,14 @@ bool decode_fam8(const Word& w, nx::vector<Instruction>& out) {
         // Two 64-bit halves: a (window words 0, 1) and b (words 2, 3); the lanes select window words.
         const Kind bkind = src_kind(w.field(28, 2), w.bit(48));
         const i32 a = w.field(8, 6), b = w.field(1, 6);
-        const i32 l[4] = {static_cast<i32>(w.bit(0) | (w.bit(7) << 1)), w.field(16, 2), w.field(14, 2), w.field(19, 2)};
+        const i32 sel[4] = {static_cast<i32>(w.bit(0) | (w.bit(7) << 1)), w.field(16, 2), w.field(14, 2),
+                            w.field(19, 2)};
+        i32 l[4] = {sel[0], sel[1], sel[2], sel[3]};
+        if (dt != Type::F32 && dt != Type::F16 && dt != Type::Fx10) {
+            // (packing to integers: the selects go to the used lanes in order)
+            int k = 0;
+            for (int i = 0; i < 4; ++i) l[i] = ((on >> i) & 1) ? sel[k++] : 0;
+        }
         bool uses_b = false;
         for (int i = 0; i < 4; ++i) uses_b |= ((on >> i) & 1) && l[i] >= 2;
         const bool gpi = skind == Kind::Temp && a >= 60;

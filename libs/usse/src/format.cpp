@@ -365,7 +365,7 @@ nx::string format(const Instruction& in, ProgramKind kind, i32 target_line) {
         case Op::Nop: return p + "nop";
         case Op::Kill: return p + "kill";
         case Op::PCoeff: return "pcoeff";
-        case Op::DepthF: return line("depthf", {format_operand(in.dest, kind)});
+        case Op::DepthF: return p + line("depthf", {format_operand(in.dest, kind)});
         case Op::MovImm: return p + line_n("mov.u32", ops(true));
         default: {
             nx::string m = nx::format("{}.{}", mnemonic(in.op), type_name(in.type));

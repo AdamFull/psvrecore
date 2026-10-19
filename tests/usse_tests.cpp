@@ -65,6 +65,9 @@ TEST_CASE("usse: moves, packs and tests") {
     CHECK(one(0x40C30D9C5FC18002ull) == "mov.f32 i2.xyz, ({0}, {1})");
     CHECK(one(0x40810FC4A0800001ull) == "mov.fx10 r4.x, pa0.y");
     CHECK(one(0x40810B7EE0198001ull) == "mov.f16 pa0.xyzw, sa0.yyzw");
+    // packing f32 to integers: the lane selects go to the written lanes in order
+    CHECK(one(0x40810C7120033C80ull) == "pack.s8.f32 o0.--zw, i0.--zw");
+    CHECK(one(0x40810C3120010000ull) == "pack.u8.f32 o0.--zw, r0.--xy");
     CHECK(one(0x4809C91110038080ull) == "cmp.ge.f32 p0, r2.y, {0}");
     CHECK(one(0x488C0A81000A2240ull) == "cmp.gt.u8 p0, r4.x, r0.x");
     CHECK(one(0x78408A80C0338080ull) == "cmp.gt.f32 r2.x, sa2.xyzw, r0.xyzw");
@@ -109,6 +112,8 @@ TEST_CASE("usse: texture, memory, control") {
     CHECK(one(0xEE16737A7ED4D57Bull, ProgramKind::Secondary) == "!p1 lda64.fetch8 r118, [o83, 67110912]");
     CHECK(one(0xFC63003000503127ull) == "mov.u32 r2.x, 0xc0703127");
     CHECK(one(0xF9300406F0000000ull) == "!p1 kill");
+    CHECK(one(0xFB300400F000060Cull) == "p1 depthf r0");  // (its own predicate table)
+    CHECK(one(0xFB380000F0005830ull) == "depthf o1");
     CHECK(one(0xF800094000000000ull) == "nop");
     CHECK(lines(0xFA44070000000000ull).empty());  // (the program prologue prints nothing)
 }

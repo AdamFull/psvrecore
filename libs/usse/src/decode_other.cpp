@@ -151,8 +151,10 @@ bool decode_control(const Word& w, nx::vector<Instruction>& out) {
             return true;
         }
         if (s == 3) {
-            Instruction in = control(Op::DepthF);
-            in.dest.bank = w.bit(34) ? Bank::Primary : Bank::Temp;
+            static constexpr Pred depth_pred[4] = {Pred::None, Pred::P0, Pred::P1, Pred::NotP0};
+            static constexpr Bank depth_bank[4] = {Bank::Temp, Bank::Primary, Bank::Output, Bank::Secondary};
+            Instruction in = control(Op::DepthF, depth_pred[w.field(41, 2)]);
+            in.dest.bank = depth_bank[w.bit(34) | (w.bit(51) << 1)];
             in.dest.number = w.field(14, 7);
             out.push_back(in);
             return true;
