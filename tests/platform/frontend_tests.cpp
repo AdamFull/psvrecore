@@ -3,6 +3,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <cstdio>
 
 #include "nxtest.h"
@@ -217,4 +218,64 @@ TEST_CASE("script: items by time, comments, and what each takes") {
     auto r = parse_script("100 key z down; 200 jump");
     REQUIRE_FALSE(r);
     CHECK(r.error().message == "input '200 jump': expected key, pad, axis, touch, shot or quit");
+}
+
+TEST_CASE("settings: described for a settings screen, every key with what it takes") {
+    Settings s;
+    s.language = 18;
+    const auto all = describe(s);
+    REQUIRE(all.size() >= 20);
+    usize live = 0, phone = 0;
+    for (const SettingInfo& i : all) {
+        CHECK_FALSE(i.help.empty());
+        if (i.kind == SettingInfo::Kind::Choice) {
+            CHECK_FALSE(i.choices.empty());
+            CHECK(std::find(i.choices.begin(), i.choices.end(), i.value) != i.choices.end());
+        }
+        if (i.kind == SettingInfo::Kind::Int || i.kind == SettingInfo::Kind::Float) CHECK(i.hi > i.lo);
+        // (each value is one the key takes)
+        Settings t;
+        CHECK(set(&t, i.section.view(), i.key.view(), i.value.view()));
+        live += i.live;
+        phone += !i.desktop_only;
+    }
+    CHECK(live >= 5);
+    CHECK(phone >= 12);
+    auto language = std::find_if(all.begin(), all.end(), [](const SettingInfo& i) { return i.key == "language"; });
+    REQUIRE(language != all.end());
+    CHECK(language->value == "english_gb");
+}
+
+TEST_CASE("settings: one value changed in the file, its comments and other lines kept") {
+    const nx::string file = temp_file("edit.ini");
+    const nx::string text = "; mine\n[display]\nsmooth = true ; keep this\nvsync = false\n\n[system]\nlanguage = french\n";
+    REQUIRE(nx::fs::file_write_text_atomic(nx::fs::path_view(file), text));
+    REQUIRE(set_in_file(file, "display", "smooth", "false"));
+    REQUIRE(set_in_file(file, "controls", "opacity", "0.25"));  // (a section not there yet)
+    REQUIRE(set_in_file(file, "system", "user_name", "Rise; #1"));
+    auto now = nx::fs::file_read_text(nx::fs::path_view(file));
+    REQUIRE(now);
+    CHECK(now->view().find("; mine") != nx::string_view::npos);
+    CHECK(now->view().find("keep this") != nx::string_view::npos);
+    CHECK(now->view().find("vsync = false") != nx::string_view::npos);
+    Settings s;
+    REQUIRE(apply_file_text(&s, now->view()));
+    CHECK_FALSE(s.smooth);
+    CHECK_FALSE(s.vsync);
+    CHECK(s.language == 2);
+    CHECK(s.controls_opacity == 0.25f);
+    CHECK(s.user_name == "Rise; #1");
+    // Refused: nothing written.
+    auto bad = set_in_file(file, "display", "scale", "9");
+    REQUIRE_FALSE(bad);
+    CHECK(bad.error().message == "display.scale = 9: expected 1 to 8");
+    CHECK(*nx::fs::file_read_text(nx::fs::path_view(file)) == *now);
+    std::remove(file.c_str());
+    // A missing file: made with the defaults, then changed.
+    REQUIRE(set_in_file(file, "audio", "enabled", "false"));
+    Settings d;
+    REQUIRE(apply_file_text(&d, nx::fs::file_read_text(nx::fs::path_view(file))->view()));
+    CHECK_FALSE(d.audio);
+    CHECK(d.scale == 1);
+    std::remove(file.c_str());
 }

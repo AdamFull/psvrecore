@@ -3,6 +3,7 @@
 #include <charconv>
 #include <ctime>
 
+#include "core/foundation/platform/filesystem.h"
 #include "core/foundation/serialization/ini.h"
 #include "core/foundation/strings/format.h"
 
@@ -166,6 +167,53 @@ const Key kKeys[] = {
      [](const Settings& s) { return s.log_file; }, "a file"},
 };
 
+// What each key takes, for settings screens: its kind, choices or range, whether it applies while the game runs, and
+// whether it means anything on a phone.
+struct Schema {
+    const char* section;
+    const char* key;
+    SettingInfo::Kind kind;
+    f32 lo, hi;
+    bool live, desktop_only;
+};
+
+using K = SettingInfo::Kind;
+const Schema kSchema[] = {
+    {"game", "folder", K::Folder, 0, 0, false, true},       {"game", "data", K::Folder, 0, 0, false, true},
+    {"display", "fullscreen", K::Bool, 0, 0, false, true},  {"display", "scale", K::Int, 1, 8, false, true},
+    {"display", "vsync", K::Bool, 0, 0, false, false},      {"display", "smooth", K::Bool, 0, 0, true, false},
+    {"display", "gpu", K::Int, -1, 8, false, true},         {"display", "validation", K::Bool, 0, 0, false, true},
+    {"audio", "enabled", K::Bool, 0, 0, true, false},       {"audio", "latency_ms", K::Int, 20, 2000, false, false},
+    {"controls", "on_screen", K::Choice, 0, 0, true, false}, {"controls", "opacity", K::Float, 0, 1, true, false},
+    {"controls", "scale", K::Float, 0.5f, 2, true, false},  {"system", "language", K::Choice, 0, 0, false, false},
+    {"system", "user_name", K::Text, 0, 0, false, false},   {"system", "date_format", K::Choice, 0, 0, false, false},
+    {"system", "time_format", K::Choice, 0, 0, false, false}, {"system", "time_zone", K::Text, 0, 0, false, false},
+    {"system", "summer_time", K::Bool, 0, 0, false, false}, {"log", "level", K::Choice, 0, 0, true, false},
+    {"log", "file", K::Text, 0, 0, false, true},
+};
+
+template <usize N>
+nx::vector<nx::string> list(const char* const (&names)[N]) {
+    nx::vector<nx::string> out;
+    for (const char* n : names) out.push_back(n);
+    return out;
+}
+
+// A value as the file must spell it: quoted when it has what the grammar would read otherwise (a path with ';' or
+// '#', spaces at the ends).
+nx::string file_value(const nx::string& value) {
+    const bool quote = value.view().find_first_of(";#\"\\") != nx::string_view::npos ||
+                       (!value.empty() && (value.front() == ' ' || value.back() == ' '));
+    if (!quote) return value;
+    nx::string escaped = "\"";
+    for (char c : value) {
+        if (c == '"' || c == '\\') escaped.push_back('\\');
+        escaped.push_back(c);
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
 const Key* find_key(nx::string_view section, nx::string_view key) {
     for (const Key& k : kKeys)
         if (section == k.section && key == k.key) return &k;
@@ -223,22 +271,49 @@ nx::string file_text(const Settings& settings) {
         nx::string_view help(k.help);
         if (!help.empty() && help.back() == '.') help = help.substr(0, help.size() - 1);
         text += nx::format("; {}: {}.\n", help, expected(k));
-        const nx::string value = k.get(settings);
-        // (quoted when it has what the grammar would read otherwise: a path with ';' or '#', spaces at the ends)
-        const bool quote = value.view().find_first_of(";#\"\\") != nx::string_view::npos ||
-                           (!value.empty() && (value.front() == ' ' || value.back() == ' '));
-        if (quote) {
-            nx::string escaped;
-            for (char c : value) {
-                if (c == '"' || c == '\\') escaped.push_back('\\');
-                escaped.push_back(c);
-            }
-            text += nx::format("{} = \"{}\"\n", k.key, escaped);
-        } else {
-            text += nx::format("{} = {}\n", k.key, value);
-        }
+        text += nx::format("{} = {}\n", k.key, file_value(k.get(settings)));
     }
     return text;
+}
+
+nx::vector<SettingInfo> describe(const Settings& settings) {
+    nx::vector<SettingInfo> out;
+    for (const Key& k : kKeys) {
+        SettingInfo info;
+        info.section = k.section, info.key = k.key, info.help = k.help;
+        info.value = k.get(settings);
+        for (const Schema& s : kSchema) {
+            if (nx::string_view(s.section) != k.section || nx::string_view(s.key) != k.key) continue;
+            info.kind = s.kind, info.lo = s.lo, info.hi = s.hi, info.live = s.live, info.desktop_only = s.desktop_only;
+        }
+        const nx::string_view key(k.key);
+        if (key == "language") info.choices = list(kLanguages);
+        else if (key == "date_format") info.choices = list(kDateFormats);
+        else if (key == "time_format") info.choices = list(kTimeFormats);
+        else if (key == "on_screen") info.choices = list(kOnScreen);
+        else if (key == "level") info.choices = list(kLogLevels);
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+Result<void> set_in_file(const nx::string& path, nx::string_view section, nx::string_view key, nx::string_view value) {
+    const nx::fs::path_view file(path);
+    nx::string text;
+    if (nx::fs::exists(file)) {
+        auto read = nx::fs::file_read_text(file);
+        if (!read) return failure(nx::format("{}: cannot be read", path));
+        text = std::move(*read);
+    } else {
+        text = file_text(Settings{});
+    }
+    Settings settings;
+    if (auto r = apply_file_text(&settings, text.view()); !r) return failure(nx::format("{}: {}", path, r.error().message));
+    if (auto r = set(&settings, section, key, value); !r) return r;
+    auto changed = nx::ini::assign(text.view(), section, key, value);  // (it quotes what needs it)
+    if (!changed) return failure(nx::format("{}: {}", path, changed.error().message()));
+    if (!nx::fs::file_write_text_atomic(file, changed->view())) return failure(nx::format("{}: cannot be written", path));
+    return {};
 }
 
 nx::string get(const Settings& settings, nx::string_view section, nx::string_view key) {

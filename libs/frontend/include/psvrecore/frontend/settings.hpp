@@ -51,6 +51,23 @@ nx::string file_text(const Settings& settings);
 // One value as the settings file spells it.
 nx::string get(const Settings& settings, nx::string_view section, nx::string_view key);
 
+// What a settings screen needs to know of each setting, in the file's order.
+struct SettingInfo {
+    enum class Kind : u8 { Bool, Int, Float, Choice, Text, Folder };
+    nx::string section, key, help;
+    Kind kind = Kind::Text;
+    nx::vector<nx::string> choices;  // (Choice)
+    f32 lo = 0, hi = 0;              // (Int, Float)
+    bool live = false;               // applies while the game runs (else at its next start)
+    bool desktop_only = false;       // means nothing on a phone (the window's size, the GPU, the log file, ...)
+    nx::string value;                // as the file spells it
+};
+nx::vector<SettingInfo> describe(const Settings& settings);
+
+// One value changed in a settings file, every other line kept as it was (comments included); a missing file is made
+// with the defaults first. A refused value, or a file that does not read, is an error and changes nothing.
+Result<void> set_in_file(const nx::string& path, nx::string_view section, nx::string_view key, nx::string_view value);
+
 // The host's time zone, in minutes ahead of GMT (without summer time), and whether summer time is on now.
 i32 host_time_zone_minutes();
 bool host_summer_time();
