@@ -26,11 +26,11 @@ jobs:
         shell: pwsh
         run: |
           choco upgrade llvm -y --no-progress
-          & "C:\Program Files\LLVMin\llvm-objdump.exe" --version
+          & "C:/Program Files/LLVM/bin/llvm-objdump.exe" --version
       - name: Disassembler against llvm-objdump
         if: matrix.preset == 'windows-x64-release'
         shell: pwsh
-        run: python scripts/arm_check.py --objdump "C:\Program Files\LLVMin\llvm-objdump.exe" --psvdis build/${{ matrix.preset }}/tools/psvdis/psvdis.exe --samples 200000 --show 20
+        run: python scripts/arm_check.py --objdump "C:/Program Files/LLVM/bin/llvm-objdump.exe" --psvdis build/${{ matrix.preset }}/tools/psvdis/psvdis.exe --samples 200000 --show 20
 
   linux:
     runs-on: ubuntu-24.04
