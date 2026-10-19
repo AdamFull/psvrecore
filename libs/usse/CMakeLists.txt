@@ -14,3 +14,10 @@ add_library(psvrecore::usse ALIAS psvrecore_usse)
 target_include_directories(psvrecore_usse PUBLIC include)
 target_link_libraries(psvrecore_usse PUBLIC psvrecore::core)
 psvrecore_target_defaults(psvrecore_usse)
+
+# The reference interpreter of USSE programs: the oracle of the shader translator's tests (and psvusse --run).
+# Never linked into a game.
+add_library(psvrecore_usse_interp STATIC src/interp.cpp)
+add_library(psvrecore::usse_interp ALIAS psvrecore_usse_interp)
+target_link_libraries(psvrecore_usse_interp PUBLIC psvrecore::usse)
+psvrecore_target_defaults(psvrecore_usse_interp)
