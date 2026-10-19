@@ -16,10 +16,13 @@ SDK (programs, recompiled code, frames) goes to --out, by default build/samples:
 """
 
 import argparse
+import io
 import os
 import re
 import shutil
 import subprocess
+import tarfile
+import time
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -188,6 +191,91 @@ def build_sample(name, sample_dir, work, sdk, env, opt):
     return app, self_file
 
 
+ANDROID_PRESET = "android-arm64-release"
+ANDROID_PACKAGE = "io.github.adamfull.psvrecore.sample"
+
+
+def adb(*cmd, check=True):
+    result = subprocess.run(["adb", *[str(c) for c in cmd]], capture_output=True, text=True, encoding="utf-8",
+                            errors="replace")
+    if check and result.returncode != 0:
+        sys.stdout.write(result.stdout + result.stderr)
+        raise SystemExit(f"adb {' '.join(str(c) for c in cmd)} failed ({result.returncode})")
+    return result.stdout
+
+
+def run_android(args, names, out):
+    """Each sample on the device in turn: packaged (debuggable), installed, its files put in the application's own
+    storage, run, its shots and output brought back.
+
+    Files adb pushes into the application's shared folder (Android/data/<package>) are the shell's, and the
+    application may not read them; so they go through run-as into its internal storage instead.
+    """
+    shared = f"/sdcard/Android/data/{ANDROID_PACKAGE}/files"
+    internal = f"/data/user/0/{ANDROID_PACKAGE}/files"
+    staging = "/data/local/tmp/psvrecore_sample.tar"
+    failed = []
+    for name in names:
+        tid = target_id(name)
+        work = out / tid
+        lib = ROOT / "build" / ANDROID_PRESET / "tests" / "samples" / tid / "libmain.so"
+        apk = work / "sample.apk"
+        run([sys.executable, ROOT / "scripts" / "android_apk.py", "--manifest",
+             ROOT / "tests" / "samples" / "android" / "AndroidManifest.xml", "--lib", lib, "--out", apk, "--debuggable"])
+        adb("install", "-r", apk)
+        adb("shell", "am", "force-stop", ANDROID_PACKAGE)
+        # (the application folder and the script, as one tar unpacked by the application's user)
+        bundle = work / "device.tar"
+        script = (args.input or "").replace(";", "\n") + "\n"
+        with tarfile.open(bundle, "w") as t:
+            t.add(work / "app", arcname="game")
+            info = tarfile.TarInfo("script.txt")
+            info.size = len(script.encode("utf-8"))
+            t.addfile(info, io.BytesIO(script.encode("utf-8")))
+        adb("push", bundle, staging)
+        adb("shell", f"run-as {ANDROID_PACKAGE} sh -c 'rm -rf files/game files/shots files/script.txt && "
+                     f"mkdir -p files/shots && tar xf - -C files' < {staging}")
+        adb("shell", "rm", "-f", staging)
+        launch = ["--game", f"{internal}/game", "--input", f"@{internal}/script.txt", "--out", f"{internal}/shots",
+                  "--timeout", str(args.timeout), "--log", args.log or "info"]
+        adb("logcat", "-c")
+        adb("shell", "am", "start", "-W", "-n", f"{ANDROID_PACKAGE}/io.github.adamfull.psvrecore.PsvrecoreActivity",
+            "--esa", "args", ",".join(launch))
+        # (until the process has gone: the timeout, a script's quit, or a crash)
+        started = time.time()
+        while time.time() - started < args.timeout + 30:
+            time.sleep(1)
+            if not adb("shell", "pidof", ANDROID_PACKAGE, check=False).strip():
+                break
+        else:
+            adb("shell", "am", "force-stop", ANDROID_PACKAGE)
+            print(f"{name}: did not end on the device")
+        frames = work / "frames"
+        shutil.rmtree(frames, ignore_errors=True)
+        frames.mkdir()
+        shots = subprocess.run(["adb", "exec-out", "run-as", ANDROID_PACKAGE, "tar", "cf", "-", "-C", "files/shots",
+                                "."], capture_output=True)
+        if shots.returncode == 0 and shots.stdout:
+            with tarfile.open(fileobj=io.BytesIO(shots.stdout)) as t:
+                t.extractall(frames, filter="data")
+        output = adb("shell", "cat", f"{shared}/output.txt", check=False)
+        log = adb("logcat", "-d", check=False)
+        (work / "run.log").write_text(output + "\n---- logcat ----\n" + log, encoding="utf-8")
+        shown = sorted(frames.glob("*.png"))
+        wanted = args.frames or 0
+        ended = next((l for l in output.splitlines() if "frames presented" in l), "")
+        good = len(shown) >= wanted and "exit code 0" in ended
+        print(f"{name}: {'ran' if good else 'FAILED'} on the device: {ended or 'no end line'}; {len(shown)} shot(s)"
+              + "".join(f"; {s}" for s in shown))
+        if not good:
+            sys.stdout.write(output[-4000:])
+            print(f"(the whole output and logcat: {work / 'run.log'})")
+            failed.append(name)
+    print(f"{len(names) - len(failed)} of {len(names)} samples ran on the device"
+          + (f"; failed: {', '.join(failed)}" if failed else ""))
+    return 1 if failed else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("samples", nargs="*", help="sample names (default: basic)")
@@ -206,7 +294,14 @@ def main():
                         help="run the sample as a game (psvrecore::frontend): in a window with sound and the host's "
                              "controls, until the window is closed or the timeout; --frames counts the script's shots")
     parser.add_argument("--input", help="scripted controls with --window (see libs/frontend/.../script.hpp)")
+    parser.add_argument("--android", action="store_true",
+                        help="run the sample as a game on the Android device adb sees: built for arm64, packaged "
+                             "(scripts/android_apk.py), installed, its files pushed, run for --timeout seconds with "
+                             "--input; the shots and its output come back")
+    parser.add_argument("--device", help="the Android device's serial number (ANDROID_SERIAL; adb devices lists them)")
     args = parser.parse_args()
+    if args.device:
+        os.environ["ANDROID_SERIAL"] = args.device  # (adb's, for every call)
     if not args.sdk:
         raise SystemExit("give --sdk (or set SCE_PSP2_SDK_DIR)")
     sdk = Path(args.sdk).resolve()
@@ -243,12 +338,26 @@ def main():
         (out / "samples.cmake").write_text("\n".join(lines) + "\n")
         build = ROOT / "scripts" / "build.ps1"
         targets = ",".join(f"sample_{target_id(n)}" for n in names)
-        try:
-            run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", build, "-Preset", args.preset,
-                 "-Target", targets, "-Define", f"PSVRECORE_SAMPLES_DIR={out.as_posix()}"])
-        finally:
-            run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", build, "-Preset", args.preset,
-                 "-Target", "psvrecomp", "-Define", "PSVRECORE_SAMPLES_DIR="])
+        if args.android:
+            # (tests are off in the Android presets: on for this build only, which builds the samples alone)
+            try:
+                run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", build, "-Preset",
+                     ANDROID_PRESET, "-NoTest", "-Target", targets, "-Define",
+                     f"PSVRECORE_SAMPLES_DIR={out.as_posix()},PSVRECORE_BUILD_TESTS=ON"])
+            finally:
+                run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", build, "-Preset",
+                     ANDROID_PRESET, "-NoTest", "-Target", "psvrecore_frontend", "-Define",
+                     "PSVRECORE_SAMPLES_DIR=,PSVRECORE_BUILD_TESTS=OFF"])
+        else:
+            try:
+                run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", build, "-Preset", args.preset,
+                     "-Target", targets, "-Define", f"PSVRECORE_SAMPLES_DIR={out.as_posix()}"])
+            finally:
+                run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", build, "-Preset", args.preset,
+                     "-Target", "psvrecomp", "-Define", "PSVRECORE_SAMPLES_DIR="])
+
+    if args.android:
+        return run_android(args, names, out)
 
     failed = []
     for name in names:

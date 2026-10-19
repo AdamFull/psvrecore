@@ -17,6 +17,7 @@ $ErrorActionPreference = 'Stop'
 $root = $Root
 # (from powershell -File, a list arrives as one comma-separated string)
 $Target = @($Target | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$Define = @($Define | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath

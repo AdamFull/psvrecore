@@ -7,8 +7,8 @@
 //
 //     sample_<name> <application folder> <data folder> <output folder> <frames> [timeout seconds] [audio seconds]
 //
-// Given options instead (the first argument starting with --), it is the sample as a game: psvrecore::frontend's
-// program, in a window with sound and the host's controls (--help lists the options).
+// Given options instead (the first argument starting with --), or none (as on Android), it is the sample as a game:
+// psvrecore::frontend's program, in a window with sound and the host's controls (--help lists the options).
 //
 // Built by tests/samples/CMakeLists.txt with the sample's and libc's generated code.
 
@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include <SDL3/SDL_main.h>
 
 #include "psvrecore/frontend/frontend.hpp"
 #include "psvrecore/gxm/hle.hpp"
@@ -118,7 +120,7 @@ const char* const kModules[] = {"app0:sce_module/libc.suprx", "app0:sce_module/l
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 1 && std::strncmp(argv[1], "--", 2) == 0) {
+    if (argc == 1 || std::strncmp(argv[1], "--", 2) == 0) {  // (none: as launched on Android)
         frontend::Game game;
         game.name = "sample_" PSVRECORE_SAMPLE_NAME;
         game.title = PSVRECORE_SAMPLE_NAME;

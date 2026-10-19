@@ -30,7 +30,14 @@ function(psvrecore_add_sample)
     target_link_libraries(psvrecore_sample_${P_NAME}_code PUBLIC psvrecore::recomp_support)
     psvrecore_generated_code(psvrecore_sample_${P_NAME}_code)
 
-    add_executable(sample_${P_NAME} "${_sample_src}/runner.cpp")
+    # (on Android the shared library SDL's activity loads: libmain.so)
+    if(ANDROID)
+        add_library(sample_${P_NAME} SHARED "${_sample_src}/runner.cpp")
+        set_target_properties(sample_${P_NAME} PROPERTIES OUTPUT_NAME main
+                              LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${P_NAME}")
+    else()
+        add_executable(sample_${P_NAME} "${_sample_src}/runner.cpp")
+    endif()
     target_compile_definitions(sample_${P_NAME} PRIVATE PSVRECORE_SAMPLE_MODULE=sample_${P_NAME}_module
                                                     PSVRECORE_SAMPLE_NAME="${P_NAME}")
     target_link_libraries(sample_${P_NAME} PRIVATE psvrecore::runtime psvrecore::gxm_hle psvrecore::frontend psvrecore_sample_${P_NAME}_code
