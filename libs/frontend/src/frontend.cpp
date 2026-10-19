@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -80,8 +81,14 @@ nx::string join(nx::string_view folder, nx::string_view name) {
     return path;
 }
 
-// The user's data folder for the program (made if missing; empty if there is none).
+// The user's data folder for the program (made if missing; empty if there is none). On Android, the application's
+// own folder in shared storage (Android/data/<package>/files), which adb and a computer over USB reach.
 nx::string user_folder(const Game& game) {
+#if defined(__ANDROID__)
+    (void)game;
+    const char* external = SDL_GetAndroidExternalStoragePath();
+    return external ? nx::string(external) : nx::string();
+#else
     const nx::string app(game.name);
     char* pref = SDL_GetPrefPath("psvrecore", app.c_str());
     if (!pref) return {};
@@ -89,6 +96,7 @@ nx::string user_folder(const Game& game) {
     SDL_free(pref);
     while (!path.empty() && (path.back() == '/' || path.back() == '\\')) path.pop_back();
     return path;
+#endif
 }
 
 }  // namespace
@@ -199,9 +207,26 @@ int run(const Game& game, int argc, char** argv) {
 
     SDL_SetAppMetadata(title.c_str(), nullptr, nx::string(game.name).c_str());
     const nx::string user = user_folder(game);
+#if defined(__ANDROID__)
+    // (standard output and error reach nothing there: they go to output.txt in the user's folder)
+    if (!user.empty()) {
+        const nx::string output = join(user, "output.txt");
+        if (std::freopen(output.c_str(), "w", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, 0);
+        if (std::freopen(output.c_str(), "a", stderr)) std::setvbuf(stderr, nullptr, _IONBF, 0);
+    }
+#endif
     nx::string settings_file;
     auto settings = resolve_settings(cl, user.empty() ? nx::string() : join(user, "settings.ini"), &settings_file);
     if (!settings) return fail(settings.error().message, cl.hidden);
+#if defined(__ANDROID__)
+    // (no command line there: the game's folder is game/ in the user's folder unless the settings say otherwise)
+    // (made when missing, to show where the game's files go: a folder adb or a computer makes the application may
+    // not be allowed to read)
+    if (settings->game_folder.empty() && !user.empty()) {
+        settings->game_folder = join(user, "game");
+        (void)nx::fs::create_directories(nx::fs::path_view(settings->game_folder));
+    }
+#endif
     const Settings& s = *settings;
 
     nx::log::Config log_config;
@@ -216,8 +241,16 @@ int run(const Game& game, int argc, char** argv) {
                                settings_file.empty() ? "the settings" : settings_file.c_str()),
                     cl.hidden);
     const nx::string eboot = join(s.game_folder, "eboot.bin");
-    if (!nx::fs::exists(nx::fs::path_view(eboot)))
-        return fail(nx::format("{} has no eboot.bin: it is not a game's application folder.", s.game_folder), cl.hidden);
+    if (!nx::fs::exists(nx::fs::path_view(eboot))) {
+        // (what the system says: a file there that cannot be read is not the same as none)
+        errno = 0;
+        std::FILE* f = std::fopen(eboot.c_str(), "rb");
+        const int error = errno;
+        if (f) std::fclose(f);
+        return fail(nx::format("{} has no eboot.bin ({}): it is not a game's application folder.", s.game_folder,
+                               f ? "it opens, but is not found" : std::strerror(error)),
+                    cl.hidden);
+    }
     if (game.check) {
         if (auto r = game.check(s.game_folder); !r) return fail(r.error().message, cl.hidden);
     }

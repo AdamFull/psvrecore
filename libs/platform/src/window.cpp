@@ -490,6 +490,11 @@ Result<std::unique_ptr<Window>> Window::open(const Options& options) {
     w->options_ = options;
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (options.fullscreen) flags |= SDL_WINDOW_FULLSCREEN;
+#if defined(__ANDROID__)
+    // (the whole screen, held sideways as the console is: SDL lets a resizable window turn any way otherwise)
+    flags |= SDL_WINDOW_FULLSCREEN;
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
     if (options.hidden) flags |= SDL_WINDOW_HIDDEN;
     const u32 scale = std::max(options.scale, 1u);
     w->window_ = SDL_CreateWindow(options.title.c_str(), static_cast<int>(kScreenWidth * scale),
