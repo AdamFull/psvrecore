@@ -19,7 +19,7 @@ namespace {
 
 constexpr u32 kSceNgs = 0xB01598D9;
 constexpr u32 kSysSize = 0x6CE8B36F, kSysInit = 0xED14CF4A, kUpdate = 0x684F080C, kSysRelease = 0x4A25BEBC,
-              kRackSize = 0x477318C0, kRackInit = 0x0A92E4EC, kVoiceHandle = 0xFE1A98E9, kVoiceInit = 0x1DDBEBEB,
+              kRackSize = 0x477318C0, kRackInit = 0x0A92E4EC, kVoiceHandle = 0xFE1A98E9,
               kPlay = 0xFA0A0F34, kKeyOff = 0xBB13373D, kKill = 0x0E291AAD, kPause = 0xD7786E99, kResume = 0x54CFB981,
               kLock = 0xAB6BEF8F, kUnlock = 0x3D46D8A7, kParamsBlock = 0xFB8174B1, kBypass = 0x9AB87E71,
               kModuleCallback = 0x24E909A8, kFinishedCallback = 0x17A6F564, kStateData = 0xC9B8C0B4, kInfo = 0x5551410D,
