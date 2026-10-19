@@ -136,6 +136,10 @@ bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) 
         }
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP: {
+            if (e.key.key == SDLK_AC_BACK) {  // (Android's Back: the settings)
+                if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) menu_requested_ = true;
+                break;
+            }
             const u32 bit = key_bit(e.key.key);
             if (!bit || e.key.repeat) break;
             keys_ = e.key.down ? keys_ | bit : keys_ & ~bit;

@@ -62,7 +62,8 @@ const char* mode_name(VkPresentModeKHR m) {
 struct Window::Presenter {
     Window& window;
     nx::unique_ptr<vulkan::Device> device;
-    bool vsync = true, smooth = true;
+    bool vsync = true;
+    std::atomic<bool> smooth{true};
 
     // The frame waiting to be presented (the game's thread to this one), and the window's size in pixels (from the
     // thread pumping events).
@@ -544,6 +545,7 @@ Result<std::unique_ptr<Window>> Window::open(const Options& options) {
     // (the whole screen, held sideways as the console is: SDL lets a resizable window turn any way otherwise)
     flags |= SDL_WINDOW_FULLSCREEN;
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");  // (Back is a key: the settings, not leaving the game)
 #endif
     if (options.hidden) flags |= SDL_WINDOW_HIDDEN;
     const u32 scale = std::max(options.scale, 1u);
@@ -723,6 +725,12 @@ void Window::set_overlay_atlas(const u8* rgba, u32 width, u32 height) {
         presenter_->redraw = true;
     }
     presenter_->wake.notify_one();
+}
+
+void Window::set_smooth(bool smooth) {
+    if (!presenter_) return;
+    presenter_->smooth.store(smooth);
+    presenter_->request_redraw();
 }
 
 void Window::set_background(bool background) {

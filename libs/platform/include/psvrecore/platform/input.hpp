@@ -31,6 +31,13 @@ public:
     // Takes an event (from the thread that pumps them); true if it changed the controls.
     bool handle(const SDL_Event& event, runtime::Input& input, u64 now_ns);
 
+    // The settings asked for (the on-screen menu button, Android's Back), once.
+    bool take_menu_request() {
+        const bool r = controls_.take_menu_request() || menu_requested_;
+        menu_requested_ = false;
+        return r;
+    }
+
     const runtime::PadState& pad() const { return pad_; }
     const runtime::TouchState& touch() const { return touch_; }
 
@@ -55,6 +62,7 @@ private:
     u8 next_report_id_ = 1;
     runtime::TouchState touch_;
     TouchControls controls_;
+    bool menu_requested_ = false;
     f32 window_w_ = 960, window_h_ = 544, view_x_ = 0, view_y_ = 0, view_w_ = 960, view_h_ = 544;
 
     bool to_panel(f32 wx, f32 wy, i16* px, i16* py) const;

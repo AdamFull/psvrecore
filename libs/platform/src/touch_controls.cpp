@@ -15,13 +15,14 @@ constexpr u32 kSelect = 1u << 0, kStart = 1u << 3, kUp = 1u << 4, kRight = 1u <<
 
 // ---- The atlas: white shapes on clear, anti-aliased, in cells of kCell pixels ----------------------------------
 
-constexpr u32 kCell = 128, kColumns = 7, kRows = 2;
+constexpr u32 kCell = 128, kColumns = 7, kRows = 3;
 constexpr u32 kAtlasW = kCell * kColumns, kAtlasH = kCell * kRows;
 
 // The sprites by cell (the pill is two cells wide).
 enum Sprite : u8 {
     kDisc, kRing, kTriangleGlyph, kCircleGlyph, kCrossGlyph, kSquareGlyph, kArrowUp,  // row 0
     kArrowRight, kTextL, kTextR, kPill, kPillEnd, kTextStart, kTextSelect,              // row 1
+    kMenuIcon,                                                                          // row 2
 };
 
 struct Vec {
@@ -155,6 +156,13 @@ void TouchControls::atlas(nx::vector<u8>* rgba, u32* width, u32* height) {
         const Vec q{std::max(std::fabs(p.x) - hw + round, 0.0f), std::max(std::fabs(p.y) - hh + round, 0.0f)};
         return length(q) - round;
     }, 2);
+    a.shape(kMenuIcon, [&](Vec p) {
+        // (three bars)
+        const f32 w = kCell * 0.26f, gap = kCell * 0.15f;
+        f32 d = 1e9f;
+        for (i32 i = -1; i <= 1; ++i) d = std::min(d, segment(p, {-w, gap * i}, {w, gap * i}));
+        return d - line * 0.55f;
+    });
     a.text(kTextStart, "START", 4);
     a.text(kTextSelect, "SELECT", 3);
     *rgba = std::move(a.pixels);
@@ -189,10 +197,11 @@ void TouchControls::layout(f32 width, f32 height, f32 pixels_per_unit, f32 sx, f
     face_x_ = right - 2.1f * u, face_y_ = bottom - 2.0f * u;
     stick_x_[0] = left + 2.1f * u, stick_y_[0] = bottom - 5.1f * u;
     stick_x_[1] = right - 2.1f * u, stick_y_[1] = bottom - 5.1f * u;
-    const f32 rects[4][4] = {{left + 0.4f * u, top + 0.3f * u, left + 2.9f * u, top + 1.1f * u},
+    const f32 rects[5][4] = {{left + 0.4f * u, top + 0.3f * u, left + 2.9f * u, top + 1.1f * u},
                              {right - 2.9f * u, top + 0.3f * u, right - 0.4f * u, top + 1.1f * u},
                              {middle - 2.3f * u, bottom - 0.95f * u, middle - 0.3f * u, bottom - 0.3f * u},
-                             {middle + 0.3f * u, bottom - 0.95f * u, middle + 2.3f * u, bottom - 0.3f * u}};
+                             {middle + 0.3f * u, bottom - 0.95f * u, middle + 2.3f * u, bottom - 0.3f * u},
+                             {middle - 0.6f * u, top + 0.3f * u, middle + 0.6f * u, top + 1.1f * u}};
     std::memcpy(rect_, rects, sizeof rect_);
     changed();
 }
@@ -218,7 +227,7 @@ TouchControls::Control TouchControls::hit(f32 x, f32 y) const {
     round(Control::LeftStick, stick_x_[0], stick_y_[0], 1.5f * unit_);
     round(Control::RightStick, stick_x_[1], stick_y_[1], 1.5f * unit_);
     const f32 m = 0.25f * unit_;
-    for (u32 i = 0; i < 4; ++i) {
+    for (u32 i = 0; i < 5; ++i) {
         if (x >= rect_[i][0] - m && x < rect_[i][2] + m && y >= rect_[i][1] - m && y < rect_[i][3] + m)
             return static_cast<Control>(static_cast<u32>(Control::L) + i);
     }
@@ -267,6 +276,10 @@ void TouchControls::press(Finger& f, f32 x, f32 y) {
             break;
         }
         default: {
+            if (f.control == Control::Menu) {
+                f.bits = 0;
+                break;
+            }
             const u32 i = static_cast<u32>(f.control) - static_cast<u32>(Control::L);
             const f32 m = 0.4f * u;  // (a little off it still presses)
             const bool on = x >= rect_[i][0] - m && x < rect_[i][2] + m && y >= rect_[i][1] - m && y < rect_[i][3] + m;
@@ -283,6 +296,7 @@ bool TouchControls::finger_down(u64 id, f32 x, f32 y) {
     if (c == Control::None) return false;
     fingers_.push_back(Finger{id, c, 0});
     press(fingers_.back(), x, y);
+    if (c == Control::Menu) menu_requested_ = true;
     changed();
     return true;
 }
@@ -379,6 +393,15 @@ nx::vector<Quad> TouchControls::quads() const {
         const f32 hw = (rect_[i][2] - rect_[i][0]) * 0.5f, hh = (rect_[i][3] - rect_[i][1]) * 0.5f;
         add(kPill, cx, cy, hw, hh, (pressed & kBits[i]) ? lit : body);
         add(kLabels[i], cx, cy, hh * (i < 2 ? 1.2f : 1.6f), hh * (i < 2 ? 1.2f : 1.6f), label);
+    }
+    // The menu.
+    {
+        const f32 cx = (rect_[4][0] + rect_[4][2]) * 0.5f, cy = (rect_[4][1] + rect_[4][3]) * 0.5f;
+        const f32 hw = (rect_[4][2] - rect_[4][0]) * 0.5f, hh = (rect_[4][3] - rect_[4][1]) * 0.5f;
+        const bool held = std::any_of(fingers_.begin(), fingers_.end(),
+                                      [](const Finger& f) { return f.control == Control::Menu; });
+        add(kPill, cx, cy, hw, hh, held ? lit : body);
+        add(kMenuIcon, cx, cy, hh * 1.3f, hh * 1.3f, label);
     }
     return out;
 }

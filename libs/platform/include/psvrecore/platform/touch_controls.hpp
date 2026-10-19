@@ -1,7 +1,8 @@
 #pragma once
 
 // The console's controls drawn on a touch screen, over the picture: the d-pad and the left stick on the left, the
-// face buttons and the right stick on the right, L and R at the top corners, Select and Start at the bottom. A finger
+// face buttons and the right stick on the right, L and R at the top corners, Select and Start at the bottom, and a
+// menu button (the settings) at the top in the middle. A finger
 // that goes down on a control is that control's until it is lifted (sliding between the face buttons, or around the
 // d-pad, moves the press; a stick follows it); other fingers touch the front panel as before.
 //
@@ -41,6 +42,13 @@ public:
     u8 rx() const { return stick_[1][0]; }
     u8 ry() const { return stick_[1][1]; }
 
+    // The menu button was touched (once).
+    bool take_menu_request() {
+        const bool r = menu_requested_;
+        menu_requested_ = false;
+        return r;
+    }
+
     // Changes whenever what is drawn does.
     u64 version() const { return version_; }
     // The quads to draw, in the window's pixels (none when hidden).
@@ -49,8 +57,8 @@ public:
     static void atlas(nx::vector<u8>* rgba, u32* width, u32* height);
 
 private:
-    // (L, R, Select and Start in that order: rect_ follows it)
-    enum class Control : u8 { None, Dpad, Face, LeftStick, RightStick, L, R, Select, Start };
+    // (L, R, Select, Start and Menu in that order: rect_ follows it)
+    enum class Control : u8 { None, Dpad, Face, LeftStick, RightStick, L, R, Select, Start, Menu };
     struct Finger {
         u64 id;
         Control control;
@@ -68,7 +76,8 @@ private:
     f32 width_ = 0, height_ = 0, ppu_ = 1, unit_ = 1;
     f32 dpad_x_ = 0, dpad_y_ = 0, face_x_ = 0, face_y_ = 0;
     f32 stick_x_[2] = {}, stick_y_[2] = {};
-    f32 rect_[4][4] = {};  // L, R, Select, Start: x0, y0, x1, y1
+    f32 rect_[5][4] = {};  // L, R, Select, Start, Menu: x0, y0, x1, y1
+    bool menu_requested_ = false;
     nx::vector<Finger> fingers_;
     u8 stick_[2][2] = {{0x80, 0x80}, {0x80, 0x80}};
     u64 version_ = 1;

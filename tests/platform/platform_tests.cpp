@@ -505,6 +505,13 @@ TEST_CASE("touch controls: buttons, slides, the d-pad's diagonals, sticks, auto 
     c.finger_up(5);
     // The middle of the screen is no control's.
     CHECK_FALSE(c.finger_down(6, 1205, 400));
+    // The menu button, at the top in the middle: no button, a request for the settings (once).
+    CHECK_FALSE(c.take_menu_request());
+    REQUIRE(c.finger_down(7, 172 + 2238 / 2.0f, 0.7f * u));
+    CHECK(c.buttons() == 0);
+    CHECK(c.take_menu_request());
+    CHECK_FALSE(c.take_menu_request());
+    c.finger_up(7);
     // Drawn while shown; nothing once a gamepad is used.
     CHECK(c.quads().size() > 20);
     c.other_input();

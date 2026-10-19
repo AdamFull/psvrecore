@@ -77,6 +77,10 @@ public:
     // alpha). From any thread; the quads are in the window's pixels.
     void set_overlay(nx::vector<Quad> quads);
     void set_overlay_atlas(const u8* rgba, u32 width, u32 height);
+    // Filtering the picture when it is scaled, changed while running.
+    void set_smooth(bool smooth);
+    // The view and the on-screen controls laid out again (after their settings changed).
+    void refresh_view() { update_view(); }
     // The application to the background (on Android: before its window's surface goes) and back: nothing is drawn
     // meanwhile. From any thread.
     void set_background(bool background);
