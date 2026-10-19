@@ -21,9 +21,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 
 /**
- * Where a game built on psvrecore starts on Android. With the game's files in place (game/eboot.bin in the
- * application's own folder) it goes straight on to the game (PsvrecoreActivity); without them it asks for the
- * game's application folder with the system's folder picker and copies it there first.
+ * Where a game built on psvrecore starts on Android: Play (the game, PsvrecoreActivity), Settings
+ * (SettingsActivity), and the game's application folder chosen with the system's folder picker and copied into the
+ * application's own folder (game/), which Play needs. With an "args" extra (a test's command line) it goes straight on
+ * to the game.
  *
  * The files are copied, not read where they are: the application may read only files it made itself (the ones adb
  * or a computer puts in its folder belong to someone else).
@@ -32,7 +33,7 @@ public class LauncherActivity extends Activity {
     private static final int PICK_FOLDER = 1;
 
     private TextView message;
-    private Button choose;
+    private Button play, settings, choose;
     private volatile boolean copying;
 
     private File gameFolder() {
@@ -42,7 +43,7 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        if (new File(gameFolder(), "eboot.bin").isFile() || getIntent().hasExtra("args")) {
+        if (getIntent().hasExtra("args")) {
             startGame();
             return;
         }
@@ -51,23 +52,66 @@ public class LauncherActivity extends Activity {
         layout.setGravity(Gravity.CENTER);
         layout.setBackgroundColor(Color.BLACK);
         layout.setPadding(64, 64, 64, 64);
+        TextView name = new TextView(this);
+        name.setTextColor(Color.WHITE);
+        name.setTextSize(28);
+        name.setGravity(Gravity.CENTER);
+        name.setText(getApplicationInfo().loadLabel(getPackageManager()));
         message = new TextView(this);
         message.setTextColor(Color.WHITE);
-        message.setTextSize(18);
+        message.setTextSize(16);
         message.setGravity(Gravity.CENTER);
-        message.setText("The game's files are not here yet.\n\nChoose the game's application folder: the one that "
-                        + "holds eboot.bin and sce_module. It is copied into this app's storage.");
-        choose = new Button(this);
-        choose.setText("Choose the game's folder");
-        choose.setOnClickListener(new View.OnClickListener() {
+        message.setPadding(0, 24, 0, 24);
+        play = button("Play", new Runnable() {
             @Override
-            public void onClick(View v) {
+            public void run() {
+                startGame();
+            }
+        });
+        settings = button("Settings", new Runnable() {
+            @Override
+            public void run() {
+                startActivity(new Intent(LauncherActivity.this, SettingsActivity.class));
+            }
+        });
+        choose = button("Choose the game's folder", new Runnable() {
+            @Override
+            public void run() {
                 pick();
             }
         });
+        layout.addView(name);
         layout.addView(message);
+        layout.addView(play);
+        layout.addView(settings);
         layout.addView(choose);
         setContentView(layout);
+        update();
+    }
+
+    private Button button(String text, final Runnable action) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setMinWidth(560);
+        b.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                action.run();
+            }
+        });
+        return b;
+    }
+
+    // What the menu says and offers, as the game's files are there or not.
+    private void update() {
+        boolean present = new File(gameFolder(), "eboot.bin").isFile();
+        play.setEnabled(present && !copying);
+        settings.setEnabled(!copying);
+        choose.setEnabled(!copying);
+        choose.setText(present ? "Choose the game's folder again" : "Choose the game's folder");
+        message.setText(present ? "The game's files are in place."
+                                : "The game's files are not here yet: choose the game's application folder (the one "
+                                  + "that holds eboot.bin and sce_module). It is copied into this app's storage.");
     }
 
     private void pick() {
@@ -81,8 +125,8 @@ public class LauncherActivity extends Activity {
         super.onActivityResult(request, result, data);
         if (request != PICK_FOLDER || result != RESULT_OK || data == null || data.getData() == null) return;
         final Uri tree = data.getData();
-        choose.setEnabled(false);
         copying = true;
+        update();
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -117,12 +161,9 @@ public class LauncherActivity extends Activity {
             @Override
             public void run() {
                 copying = false;
-                if (shown == null) {
-                    startGame();
-                } else {
-                    message.setText(shown);
-                    choose.setEnabled(true);
-                }
+                update();
+                if (shown == null) startGame();
+                else message.setText(shown);
             }
         });
     }
@@ -177,6 +218,12 @@ public class LauncherActivity extends Activity {
         if (getIntent().getExtras() != null) intent.putExtras(getIntent().getExtras());
         startActivity(intent);
         finish();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (play != null) update();
     }
 
     @Override

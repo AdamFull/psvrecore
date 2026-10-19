@@ -13,6 +13,7 @@
     <application
         android:label="psvrecore sample"
         android:extractNativeLibs="false"
+        android:enableOnBackInvokedCallback="false"
         android:appCategory="game"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
         <!-- (the game's files first: imported with the system's folder picker when they are not there) -->
@@ -28,9 +29,15 @@
         <activity
             android:name="io.github.adamfull.psvrecore.PsvrecoreActivity"
             android:exported="true"
-            android:launchMode="singleInstance"
+            android:launchMode="singleTask"
             android:screenOrientation="sensorLandscape"
             android:preferMinimalPostProcessing="true"
             android:configChanges="layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation" />
+        <!-- (the settings: from the launcher, or over the game) -->
+        <activity
+            android:name="io.github.adamfull.psvrecore.SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
     </application>
 </manifest>
