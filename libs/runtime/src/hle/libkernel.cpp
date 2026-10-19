@@ -309,6 +309,7 @@ void register_system_libraries() {
     register_touch();
     register_apputil();
     register_ngs();
+    register_avplayer();
 }
 
 }  // namespace psvrecore::runtime::hle

@@ -60,6 +60,7 @@ add_executable(psvrecore_runtime_tests
     runtime/audio_tests.cpp
     runtime/hle_tests.cpp
     runtime/input_tests.cpp
+    runtime/media_tests.cpp
     runtime/ngs_tests.cpp
     runtime/savedata_tests.cpp
     runtime/kernel_tests.cpp

@@ -5,6 +5,7 @@ add_library(psvrecore_runtime STATIC
     src/hle.cpp
     src/input.cpp
     src/hle/apputil.cpp
+    src/hle/avplayer.cpp
     src/hle/audioout.cpp
     src/hle/ctrl.cpp
     src/hle/fios2.cpp
@@ -22,6 +23,8 @@ add_library(psvrecore_runtime STATIC
     src/kernel/threads.cpp
     src/loader.cpp
     src/memory.cpp
+    src/media/decoders.cpp
+    src/media/mp4.cpp
     src/ngs/modules.cpp
     src/runtime.cpp
     src/savedata.cpp
