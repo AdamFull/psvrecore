@@ -698,10 +698,17 @@ i32 update(PsvContext* ctx, Ngs& n) {
 
 // ---- system functions
 
+// The system's memory: its state is the host's, the guest's memory only names it, so it asks for little. (Games
+// size it for the console's: CRI's sound engine initializes the system in a static 8 KiB buffer and gives up when
+// more is asked for; 43 racks and some hundred voices fit there.)
+u32 system_size(const InitParams& p) {
+    return 512 + 8 * static_cast<u32>(nx::max(p.max_racks, 0)) + 8 * static_cast<u32>(nx::max(p.max_voices, 0));
+}
+
 i32 sceNgsSystemGetRequiredMemorySize(Ptr<const InitParams> params, Ptr<u32> size) {
     if (!params || !memory().valid(params.address, sizeof(InitParams)) || !writable(size.address, 4))
         return nerr::kInvalidParam;
-    *size = 4096 + 64 * static_cast<u32>(nx::max(params->max_racks, 0)) + 64 * static_cast<u32>(nx::max(params->max_voices, 0));
+    *size = system_size(*params);
     return 0;
 }
 
@@ -713,7 +720,7 @@ i32 sceNgsSystemInit(Ptr<u8> mem, u32 size, Ptr<const InitParams> params, Ptr<u3
     const i32 g = p.granularity;
     if (p.max_racks < 1 || p.max_voices < 1 || p.sample_rate <= 0 || (g != 64 && g != 128 && g != 256 && g != 512))
         return nerr::kInvalidParam;
-    const u32 need = 4096 + 64 * static_cast<u32>(p.max_racks) + 64 * static_cast<u32>(p.max_voices);
+    const u32 need = system_size(p);
     if (size < need || !writable(mem.address, need)) return nerr::kSizeMismatch;
     Ngs& n = ngs_state();
     nx::scoped_lock<nx::mutex> held(n.lock);
