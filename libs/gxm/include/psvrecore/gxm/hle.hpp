@@ -28,7 +28,6 @@ public:
 struct Options {
     DisplaySink* display = nullptr;
     vulkan::DeviceOptions device;  // (the device is made at sceGxmInitialize)
-    f64 refresh_hz = 59.94005994;  // the display's vertical blanks
 };
 
 // Registers SceGxm and SceDisplay. The options (and the sink) must outlive the runtime.

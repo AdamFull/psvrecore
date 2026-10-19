@@ -3,6 +3,7 @@
 add_library(psvrecore_runtime STATIC
     src/filesystem.cpp
     src/hle.cpp
+    src/input.cpp
     src/hle/audioout.cpp
     src/hle/ctrl.cpp
     src/hle/fios2.cpp
@@ -13,6 +14,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/rtc.cpp
     src/hle/sysmem.cpp
     src/hle/threadmgr.cpp
+    src/hle/touch.cpp
     src/kernel/scheduler.cpp
     src/kernel/sync.cpp
     src/kernel/threads.cpp

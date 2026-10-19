@@ -5,6 +5,7 @@
 
 #include "psvrecore/runtime/audio.hpp"
 #include "psvrecore/runtime/filesystem.hpp"
+#include "psvrecore/runtime/input.hpp"
 #include "psvrecore/runtime/kernel.hpp"
 #include "psvrecore/runtime/loader.hpp"
 #include "psvrecore/runtime/memory.hpp"
@@ -28,6 +29,7 @@ public:
         u64 user_memory_budget = 0x10000000u;  // what memory blocks of main memory may total (256 MiB)
         u64 cdram_budget = 0x08000000u;        // and of CDRAM (128 MiB)
         AudioSink* audio = nullptr;            // where audio output goes (none: it is paced and dropped)
+        f64 refresh_hz = 59.94005994;          // the display's vertical blanks (input is sampled at them too)
     };
 
     explicit Runtime(const Config& config);
@@ -41,6 +43,12 @@ public:
     Kernel& kernel() { return *kernel_; }
     FileSystem& files() { return *files_; }
     Loader& loader() { return *loader_; }
+    // What the platform layer feeds (the controller, the touch panels).
+    Input& input() { return input_; }
+    // The vertical blanks, counted from the kernel's start: when the n-th one happens (Kernel::clock_ns), and how
+    // many have happened by a time.
+    u64 vblank_ns(u64 n) const { return static_cast<u64>(static_cast<f64>(n) * 1e9 / config_.refresh_hz + 0.5); }
+    u64 vblanks_at(u64 t_ns) const { return static_cast<u64>(static_cast<f64>(t_ns) * config_.refresh_hz / 1e9); }
 
     // Guest memory for the runtime's own use (exported variables, strings), never freed.
     u32 allocate_system(u32 size, nx::string_view name);
@@ -60,6 +68,7 @@ private:
     nx::unique_ptr<Kernel> kernel_;
     nx::unique_ptr<FileSystem> files_;
     nx::unique_ptr<Loader> loader_;
+    Input input_;
     bool ok_ = false;
 
     mutable nx::mutex exit_lock_;

@@ -30,7 +30,7 @@ Display& display() {
     return d;
 }
 
-f64 period_ns() { return 1e9 / state().options->refresh_hz; }
+f64 period_ns() { return 1e9 / runtime::runtime().config().refresh_hz; }
 
 // (the kernel's clock: vertical blanks count from the process's start, the epoch every guest-visible time shares)
 u64 now_ns() { return runtime::runtime().kernel().clock_ns(); }
@@ -121,7 +121,7 @@ i32 sceDisplayGetVcount() { return static_cast<i32>(vcount_at(now_ns()) & 0xFFFF
 
 i32 sceDisplayGetRefreshRate(Ptr<f32> hz) {
     if (!hz) return kErrorInvalidValue;
-    *hz = static_cast<f32>(state().options->refresh_hz);
+    *hz = static_cast<f32>(runtime::runtime().config().refresh_hz);
     return 0;
 }
 
