@@ -61,7 +61,10 @@
   - destination-mask edge cases of family 18 (SOP);
   - the complement and alpha forms of families 19 and 25;
   - families 22-24 and 27, for which the reference prints nothing valid.
-- **The GXP parameter tables are not parsed yet.** Only the header and the two programs are read.
+- **Only what libgxm's program functions report is read from GXP files.** That is the flags, parameters, vertex
+  outputs, fragment inputs and output format, all checked against libgxm. Other tables (literals, buffer containers,
+  dependent samplers) are not read yet; nothing checks their layout, and the translator will need them.
+- **`sceGxmProgramIsEquivalent` is not modelled.**
 
 ## Analysis and code generation
 

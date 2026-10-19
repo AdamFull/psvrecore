@@ -76,6 +76,15 @@ The inputs are GXP files, or folders of them: the SDK's sample shaders, or shade
 -profile sce_vp_psp2` or `sce_fp_psp2`). It writes nothing. Shaders built from the SDK are derived from it: keep them
 outside the repository.
 
+## GXP reader check (needs the PS Vita SDK, Windows)
+
+`scripts/gxp_check.py` compares `psvusse --params` with what libgxm's program functions report. It calls them in the
+SDK's host build, `host_tools/lib.x64/gxm_tool.dll`, so it needs a 64-bit Python on Windows:
+
+```
+python scripts/gxp_check.py --psvusse build/windows-x64-release/tools/psvusse/psvusse.exe --sdk C:/path/to/sdk shaders/
+```
+
 ## Test programs (needs the PS Vita SDK)
 
 `scripts/program_check.py` runs whole SDK-built programs on the runtime:
