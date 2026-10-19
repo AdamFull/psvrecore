@@ -93,12 +93,13 @@ if(PSVRECORE_SAMPLES_DIR)
 endif()
 
 # The platform layer (SDL3): the controls, the audio device (SDL's disk driver) and the window (skipped without a
-# display or a Vulkan device).
+# display or a Vulkan device); the frontend's settings, command line and scripts.
 add_executable(psvrecore_platform_tests
     "${_nxtest_dir}/nxtest.cpp"
     platform/platform_tests.cpp
+    platform/frontend_tests.cpp
 )
 target_include_directories(psvrecore_platform_tests PRIVATE "${_nxtest_dir}")
-target_link_libraries(psvrecore_platform_tests PRIVATE psvrecore::platform nx::foundation)
+target_link_libraries(psvrecore_platform_tests PRIVATE psvrecore::platform psvrecore::frontend nx::foundation)
 psvrecore_target_defaults(psvrecore_platform_tests)
 add_test(NAME psvrecore_platform_tests COMMAND psvrecore_platform_tests)

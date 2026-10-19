@@ -1,0 +1,184 @@
+#include "psvrecore/frontend/script.hpp"
+
+#include <SDL3/SDL.h>
+
+#include <algorithm>
+#include <charconv>
+
+#include "core/foundation/strings/format.h"
+
+namespace psvrecore::frontend {
+
+namespace {
+
+// The words of an item.
+nx::vector<nx::string_view> words(nx::string_view item) {
+    nx::vector<nx::string_view> out;
+    usize i = 0;
+    while (i < item.size()) {
+        while (i < item.size() && (item[i] == ' ' || item[i] == '\t' || item[i] == '\r')) ++i;
+        const usize start = i;
+        while (i < item.size() && item[i] != ' ' && item[i] != '\t' && item[i] != '\r') ++i;
+        if (i > start) out.push_back(item.substr(start, i - start));
+    }
+    return out;
+}
+
+template <typename T>
+bool number(nx::string_view v, T* out) {
+    const auto [end, error] = std::from_chars(v.data(), v.data() + v.size(), *out);
+    return error == std::errc{} && end == v.data() + v.size();
+}
+
+// A gamepad button by the console's name for it, else by SDL's.
+i32 pad_button(const nx::string& name) {
+    static constexpr struct {
+        const char* name;
+        SDL_GamepadButton button;
+    } kNames[] = {{"cross", SDL_GAMEPAD_BUTTON_SOUTH},        {"circle", SDL_GAMEPAD_BUTTON_EAST},
+                  {"square", SDL_GAMEPAD_BUTTON_WEST},        {"triangle", SDL_GAMEPAD_BUTTON_NORTH},
+                  {"up", SDL_GAMEPAD_BUTTON_DPAD_UP},         {"down", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+                  {"left", SDL_GAMEPAD_BUTTON_DPAD_LEFT},     {"right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+                  {"l", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},    {"r", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+                  {"start", SDL_GAMEPAD_BUTTON_START},        {"select", SDL_GAMEPAD_BUTTON_BACK},
+                  {"l3", SDL_GAMEPAD_BUTTON_LEFT_STICK},      {"r3", SDL_GAMEPAD_BUTTON_RIGHT_STICK}};
+    for (const auto& n : kNames)
+        if (name == n.name) return n.button;
+    return SDL_GetGamepadButtonFromString(name.c_str());
+}
+
+bool up_down(nx::string_view v, bool* down) {
+    if (v == "down") return *down = true, true;
+    if (v == "up") return *down = false, true;
+    return false;
+}
+
+Result<ScriptItem> parse_item(const nx::vector<nx::string_view>& w, nx::string_view text) {
+    auto bad = [&](const char* why) { return failure(nx::format("input '{}': {}", text, why)); };
+    ScriptItem item;
+    if (w.size() < 2 || !number(w[0], &item.at_ms)) return bad("expected <ms> <what> ...");
+    const nx::string_view what = w[1];
+    const nx::string a = w.size() > 2 ? nx::string(w[2]) : nx::string();
+    if (what == "key") {
+        item.what = ScriptItem::What::Key;
+        item.code = static_cast<i32>(SDL_GetKeyFromName(a.c_str()));
+        if (w.size() != 4 || item.code == SDLK_UNKNOWN || !up_down(w[3], &item.down))
+            return bad("expected key <SDL key name> down|up");
+    } else if (what == "pad") {
+        item.what = ScriptItem::What::Pad;
+        item.code = pad_button(a);
+        if (w.size() != 4 || item.code == SDL_GAMEPAD_BUTTON_INVALID || !up_down(w[3], &item.down))
+            return bad("expected pad <button> down|up (cross, circle, ..., or SDL's name)");
+    } else if (what == "axis") {
+        item.what = ScriptItem::What::Axis;
+        item.code = SDL_GetGamepadAxisFromString(a.c_str());
+        if (w.size() != 4 || item.code == SDL_GAMEPAD_AXIS_INVALID || !number(w[3], &item.value) ||
+            item.value < -32768 || item.value > 32767)
+            return bad("expected axis <SDL gamepad axis> <-32768 to 32767>");
+    } else if (what == "touch") {
+        item.what = ScriptItem::What::Touch;
+        if (w.size() != 5 || !number(w[2], &item.x) || !number(w[3], &item.y))
+            return bad("expected touch <x> <y> down|move|up");
+        if (w[4] == "down") item.phase = 0;
+        else if (w[4] == "move") item.phase = 1;
+        else if (w[4] == "up") item.phase = 2;
+        else return bad("expected touch <x> <y> down|move|up");
+    } else if (what == "shot") {
+        item.what = ScriptItem::What::Shot;
+        item.name = a;
+        if (w.size() != 3 || a.view().find_first_of("/\\:") != nx::string_view::npos)
+            return bad("expected shot <name> (no folders)");
+    } else if (what == "quit") {
+        item.what = ScriptItem::What::Quit;
+        if (w.size() != 2) return bad("expected quit");
+    } else {
+        return bad("expected key, pad, axis, touch, shot or quit");
+    }
+    return item;
+}
+
+}  // namespace
+
+Result<nx::vector<ScriptItem>> parse_script(nx::string_view text) {
+    nx::vector<ScriptItem> items;
+    // Line by line, without comments, then item by item.
+    usize line_start = 0;
+    while (line_start <= text.size()) {
+        usize line_end = text.find('\n', line_start);
+        if (line_end == nx::string_view::npos) line_end = text.size();
+        nx::string_view line = text.substr(line_start, line_end - line_start);
+        if (const usize hash = line.find('#'); hash != nx::string_view::npos) line = line.substr(0, hash);
+        usize start = 0;
+        while (start <= line.size()) {
+            usize end = line.find(';', start);
+            if (end == nx::string_view::npos) end = line.size();
+            nx::string_view item = line.substr(start, end - start);
+            while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item = item.substr(1);
+            while (!item.empty() && (item.back() == ' ' || item.back() == '\t' || item.back() == '\r'))
+                item = item.substr(0, item.size() - 1);
+            if (auto w = words(item); !w.empty()) {
+                auto parsed = parse_item(w, item);
+                if (!parsed) return nx::err(parsed.error());
+                items.push_back(*parsed);
+            }
+            start = end + 1;
+        }
+        line_start = line_end + 1;
+    }
+    std::stable_sort(items.begin(), items.end(), [](const ScriptItem& a, const ScriptItem& b) { return a.at_ms < b.at_ms; });
+    return items;
+}
+
+bool Script::play(u64 ms, platform::Window& window, nx::function_ref<void(const nx::string&)> shot) {
+    for (; next_ < items_.size() && items_[next_].at_ms <= ms; ++next_) {
+        const ScriptItem& s = items_[next_];
+        SDL_Event e{};
+        switch (s.what) {
+            case ScriptItem::What::Key:
+                e.type = s.down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+                e.key.key = static_cast<SDL_Keycode>(s.code);
+                e.key.down = s.down;
+                break;
+            case ScriptItem::What::Pad:
+                e.type = s.down ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+                e.gbutton.which = 0x7FFFFFFF;  // (a gamepad of the script's own)
+                e.gbutton.button = static_cast<u8>(s.code);
+                e.gbutton.down = s.down;
+                break;
+            case ScriptItem::What::Axis:
+                e.type = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+                e.gaxis.which = 0x7FFFFFFF;
+                e.gaxis.axis = static_cast<u8>(s.code);
+                e.gaxis.value = static_cast<i16>(s.value);
+                break;
+            case ScriptItem::What::Touch: {
+                // (the screen's point in the window: where the picture is drawn)
+                int w = 0, h = 0;
+                SDL_GetWindowSize(window.sdl(), &w, &h);
+                const f32 scale = std::min(static_cast<f32>(w) / platform::kScreenWidth,
+                                           static_cast<f32>(h) / platform::kScreenHeight);
+                const f32 x = (static_cast<f32>(w) - platform::kScreenWidth * scale) / 2 + s.x * scale;
+                const f32 y = (static_cast<f32>(h) - platform::kScreenHeight * scale) / 2 + s.y * scale;
+                if (s.phase == 1) {
+                    e.type = SDL_EVENT_MOUSE_MOTION;
+                    e.motion.which = 1;
+                    e.motion.x = x, e.motion.y = y;
+                } else {
+                    e.type = s.phase == 2 ? SDL_EVENT_MOUSE_BUTTON_UP : SDL_EVENT_MOUSE_BUTTON_DOWN;
+                    e.button.which = 1;
+                    e.button.button = SDL_BUTTON_LEFT;
+                    e.button.down = s.phase == 0;
+                    e.button.x = x, e.button.y = y;
+                }
+                break;
+            }
+            case ScriptItem::What::Shot: shot(s.name); continue;
+            case ScriptItem::What::Quit: ++next_; return false;
+        }
+        e.common.timestamp = SDL_GetTicksNS();
+        SDL_PushEvent(&e);
+    }
+    return true;
+}
+
+}  // namespace psvrecore::frontend
