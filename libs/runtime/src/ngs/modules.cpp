@@ -1,11 +1,9 @@
 #include "modules.hpp"
 
-#include <atomic>
 #include <cmath>
 #include <cstring>
 
 #include "libatrac9.h"
-#include "psvrecore/log.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "core/foundation/strings/format.h"
 
@@ -224,10 +222,6 @@ bool fail(nx::string* message, std::format_string<T...> f, T&&... args) {
     return false;
 }
 
-void warn_once(std::atomic<bool>& flag, const char* what) {
-    if (!flag.exchange(true)) nx::logw(logs::audio, "ngs: {}", what);
-}
-
 // ---- biquads
 
 struct Biquad {
@@ -314,7 +308,46 @@ struct Biquad {
 
 // ---- player (PCM and VAG ADPCM)
 
-std::atomic<bool> warned_hevag{false};
+// The VAG predictors: 128 filters of up to 4 taps on the samples before, in 1/8192ths. The first five are the
+// PlayStation ADPCM filters (in 1/64ths there). The HE-VAG ones were measured against the SDK's vagconv2: the
+// coefficients that make its output decode closest to its input. Every 2-tap filter (5-28) lands on this grid exactly;
+// the 4-tap ones are the nearest grid points, within a step.
+// clang-format off
+constexpr i16 kVagCoef[128][4] = {
+    {     0,      0,      0,      0}, {  7680,      0,      0,      0}, { 14720,  -6656,      0,      0}, { 12544,  -7040,      0,      0},
+    { 15616,  -7680,      0,      0}, { 14731,  -7059,      0,      0}, { 14507,  -7366,      0,      0}, { 13920,  -7522,      0,      0},
+    { 13133,  -7680,      0,      0}, { 12028,  -7680,      0,      0}, { 10764,  -7680,      0,      0}, {  9359,  -7680,      0,      0},
+    {  7832,  -7680,      0,      0}, {  6201,  -7680,      0,      0}, {  4488,  -7680,      0,      0}, {  2717,  -7680,      0,      0},
+    {   910,  -7680,      0,      0}, {  -910,  -7680,      0,      0}, { -2717,  -7680,      0,      0}, { -4488,  -7680,      0,      0},
+    { -6201,  -7680,      0,      0}, { -7832,  -7680,      0,      0}, { -9359,  -7680,      0,      0}, {-10764,  -7680,      0,      0},
+    {-12028,  -7680,      0,      0}, {-13133,  -7680,      0,      0}, {-13920,  -7522,      0,      0}, {-14507,  -7366,      0,      0},
+    {-14731,  -7059,      0,      0}, {  5376,  -9216,   3328,  -3072}, { -6400,  -7168,  -3328,  -2304}, {-10496,  -7424,  -3584,  -1024},
+    {  -167,  -2722,   -494,   -541}, { -7430,  -2221,  -2298,    424}, { -8000,  -3165,  -2814,    289}, {  6018,  -4750,   2649,  -1298},
+    {  3798,  -6946,   3875,  -1216}, { -8237,  -2596,  -2071,    227}, {  9199,   1982,  -1382,  -2316}, { 13021,  -3044,  -3792,   1267},
+    { 13112,  -4487,  -2250,   1665}, { -1668,  -3744,  -6456,    840}, {  7819,  -4328,   2111,   -506}, {  9571,  -1336,   -757,    487},
+    { 10032,  -2562,    300,    199}, { -4745,  -4122,  -5486,  -1493}, { -5896,   2378,  -4787,  -6947}, { -1193,  -9117,  -1237,  -3114},
+    {  2783,  -7108,  -1575,  -1447}, { -7334,  -2062,  -2212,    446}, {  6127,  -2577,   -315,    -18}, {  9457,  -1858,    102,    258},
+    {  7876,  -4483,   2126,   -538}, { -7172,  -1795,  -2069,    482}, { -7358,  -2102,  -2233,    440}, { -9170,  -3509,  -2674,   -391},
+    { -2638,  -2647,  -1929,  -1637}, {  1873,   9183,   1860,  -5746}, {  9214,   1859,  -1124,  -2427}, { 13204,  -3012,  -4139,   1370},
+    { 12437,  -4792,   -256,    622}, { -2653,  -1144,  -3182,  -6878}, {  9331,  -1048,   -828,    507}, {  1642,   -620,   -946,  -4229},
+    {  4246,  -7585,   -533,  -2259}, { -8988,  -3891,  -2807,     44}, { -2562,  -2735,  -1730,  -1899}, {  3182,   -483,   -714,  -1421},
+    {  7936,  -3842,   2820,  -1019}, { 10069,  -2609,    314,    195}, {  8400,  -3297,   1551,   -155}, { -8529,  -2775,  -2432,   -336},
+    {  9477,  -1882,    108,    256}, {    75,  -2241,   -298,  -6937}, { -9143,  -4160,  -2963,      5}, { -7270,  -1958,  -2156,    460},
+    { -2740,   3745,   5936,  -1089}, {  8993,   1948,   -683,  -2704}, { 13101,  -2835,  -3854,   1055}, {  9543,  -1961,    130,    250},
+    {  5272,  -4270,   3124,  -3157}, { -7696,  -3383,  -2907,   -456}, {  7309,   2523,    434,  -2461}, { 10275,  -2867,    391,    172},
+    { 10940,  -3721,    665,     97}, {    24,   -310,  -1261,    320}, { -8122,  -2411,  -2311,   -271}, { -8511,  -3067,  -2337,    163},
+    {   326,  -3846,    419,   -933}, {  8895,   2194,   -541,  -2880}, { 12073,  -1876,  -2017,   -601}, {  8729,  -3423,   1674,   -169},
+    { 12950,  -3847,  -3007,   1946}, { 10038,  -2570,    302,    198}, {  9385,  -2757,   1008,     41}, { -4720,  -5006,  -2852,  -1161},
+    {  7869,  -4326,   2135,   -501}, {  2450,  -8597,   1299,  -2780}, { 10192,  -2763,    360,    181}, { 11313,  -4213,    833,     53},
+    { 10154,  -2716,    345,    185}, {  9638,  -1417,   -737,    482}, {  3854,  -4554,   2843,  -3397}, {  6699,  -5659,   2249,  -1074},
+    { 11082,  -3908,    728,     80}, { -1026,  -9810,   -805,  -3462}, { 10396,  -3746,   1367,    -96}, { 10287,    988,  -1915,  -1437},
+    {  7953,   3878,   -764,  -3263}, { 12689,  -3375,  -3354,   2079}, {  6641,   3166,    231,  -2089}, { -2348,  -7354,  -1944,  -4122},
+    {  9290,  -4039,   1885,   -246}, {  4633,  -6403,   1748,  -1619}, { 11247,  -4125,    802,     61}, {  9807,  -2284,    219,    222},
+    {  9736,  -1536,   -706,    473}, {  8440,  -3436,   1562,   -176}, {  9307,  -1021,   -835,    509}, {  1698,  -9025,    688,  -3037},
+    { 10214,  -2791,    368,    179}, {  8390,   3248,   -758,  -2989}, {  7201,   3316,     46,  -2614}, {   -88,  -7809,   -538,  -4571},
+    {  6193,  -5189,   2760,  -1245}, { 12325,  -1290,  -3284,    253}, { 13064,  -4075,  -2824,   1877}, {  5333,   2999,    775,  -1132},
+};
+// clang-format on
 
 // What both players do: up to four buffers (loops, swaps, the end), lead-in, the sample limit, resampling to the
 // system's rate, and the counters. Reading frames out of a buffer is the format's (PCM and VAG, or ATRAC9).
@@ -495,8 +528,8 @@ struct Streamer : Module {
 struct Player : Streamer {
     using Streamer::Streamer;
 
-    i32 hist1[2] = {}, hist2[2] = {};
-    i16 decoded[2][28] = {};
+    f64 hist[2][4] = {};  // (the samples before, the last first)
+    f32 decoded[2][28] = {};
     u32 decoded_index = 28;
     u32 block_bytes = 0;  // (owed to the block's first sample)
 
@@ -541,30 +574,28 @@ struct Player : Streamer {
     }
     i32 looped_code() const override { return 2; }  // SCE_NGS_PLAYER_LOOPED_BUFFER
     void buffer_started(bool) override {
-        hist1[0] = hist1[1] = hist2[0] = hist2[1] = 0;
+        for (auto& h : hist)
+            for (f64& v : h) v = 0;
         decoded_index = 28;
         block_bytes = 0;
     }
 
+    // The prediction is not rounded: the encoder tracks a decoder that keeps the fraction, and an integer one drifts
+    // a few steps away from what it meant.
     void decode_block(const u8* block, u32 ch) {
-        static constexpr i32 kCoef[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
         const u32 shift = block[0] & 0x0F;
         // (HE-VAG takes 3 more bits of the filter from byte 1)
-        const u32 filter = (block[0] >> 4) | ((block[1] >> 4) << 4);
-        if (filter > 4) {
-            warn_once(warned_hevag, "HE-VAG blocks (filters above 4) are not decoded yet: played as silence");
-            for (i16& s : decoded[ch]) s = 0;
-            return;
-        }
+        const u32 filter = ((block[0] >> 4) | ((block[1] >> 4) << 4)) & 0x7F;
+        const i16* c = kVagCoef[filter];
+        f64* h = hist[ch];
         for (u32 i = 0; i < 28; ++i) {
             const u8 byte = block[2 + i / 2];
             const i32 nibble = (i & 1) ? (byte >> 4) : (byte & 0x0F);
             const i32 d = static_cast<i32>(static_cast<i16>(static_cast<u16>(nibble << 12))) >> (shift > 12 ? 12 : shift);
-            i32 s = d + ((hist1[ch] * kCoef[filter][0] + hist2[ch] * kCoef[filter][1] + 32) >> 6);
-            s = s < -32768 ? -32768 : s > 32767 ? 32767 : s;
-            hist2[ch] = hist1[ch];
-            hist1[ch] = s;
-            decoded[ch][i] = static_cast<i16>(s);
+            f64 s = d + (c[0] * h[0] + c[1] * h[1] + c[2] * h[2] + c[3] * h[3]) / 8192.0;
+            s = s < -32768.0 ? -32768.0 : s > 32767.0 ? 32767.0 : s;
+            h[3] = h[2], h[2] = h[1], h[1] = h[0], h[0] = s;
+            decoded[ch][i] = static_cast<f32>(s);
         }
     }
 
@@ -593,7 +624,7 @@ struct Player : Streamer {
             block_bytes = block;
             decoded_index = 0;
         }
-        for (u32 c = 0; c < nch; ++c) f.s[c] = static_cast<f32>(decoded[c][decoded_index]) / 32768.0f;
+        for (u32 c = 0; c < nch; ++c) f.s[c] = decoded[c][decoded_index] / 32768.0f;
         ++decoded_index;
         f.bytes = block_bytes;
         block_bytes = 0;

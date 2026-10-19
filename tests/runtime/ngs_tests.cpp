@@ -2,6 +2,7 @@
 // buffers, loops, lead-in and limit; callbacks; voice states; envelopes; VAG decoding; a filter.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 
@@ -433,7 +434,40 @@ TEST_CASE("ngs: a keyed-off envelope releases over its time, then the voice fini
     CHECK(calls[0].user == 7);
 }
 
-TEST_CASE("ngs: VAG blocks decode as the ADPCM filters say; the bytes count per block") {
+namespace {
+
+// The VAG formula: each sample is its 4-bit residual scaled by the block's shift plus the filter's prediction from the
+// four samples before, unrounded. coef(filter) gives the filter's taps in 1/8192ths.
+template <typename Coef>
+nx::vector<f64> vag_reference(const u8* vag, u32 blocks, Coef coef) {
+    nx::vector<f64> out;
+    f64 h[4] = {};
+    for (u32 blk = 0; blk < blocks; ++blk) {
+        const u8* bp = vag + 16 * blk;
+        const i32 shift = bp[0] & 15;
+        const std::array<i32, 4> c = coef(static_cast<u32>((bp[0] >> 4) | ((bp[1] >> 4) << 4)));
+        for (u32 i = 0; i < 28; ++i) {
+            i32 nib = (i & 1) ? bp[2 + i / 2] >> 4 : bp[2 + i / 2] & 15;
+            if (nib >= 8) nib -= 16;
+            const f64 s = std::clamp((nib * 4096 >> shift) + (c[0] * h[0] + c[1] * h[1] + c[2] * h[2] + c[3] * h[3]) / 8192.0,
+                                     -32768.0, 32767.0);
+            h[3] = h[2], h[2] = h[1], h[1] = h[0], h[0] = s;
+            out.push_back(s);
+        }
+    }
+    return out;
+}
+
+// Whether the master's output is the formula's rounded, sample for sample (give or take the f32 in between).
+bool decodes_as(const nx::vector<i16>& out, const nx::vector<f64>& want) {
+    bool same = true;
+    for (usize i = 0; i < want.size(); ++i) same &= std::fabs(out[2 * i] - want[i]) <= 0.51;
+    return same;
+}
+
+}  // namespace
+
+TEST_CASE("ngs: VAG blocks decode as the ADPCM filters say (unrounded); the bytes count per block") {
     TestRuntime t;
     PsvContext* ctx = t.ctx();
     Ngs ngs(ctx);
@@ -450,22 +484,11 @@ TEST_CASE("ngs: VAG blocks decode as the ADPCM filters say; the bytes count per 
     }
     const u32 at = aligned(32);
     std::memcpy(t.rt.memory().host(at), vag, 32);
-    // (the reference: the PlayStation ADPCM formula)
-    nx::vector<i16> want;
-    i32 h1 = 0, h2 = 0;
-    const i32 coef[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
-    for (u32 blk = 0; blk < 2; ++blk) {
-        const u8* bp = vag + 16 * blk;
-        const i32 shift = bp[0] & 15, filter = bp[0] >> 4;
-        for (u32 i = 0; i < 28; ++i) {
-            i32 nib = (i & 1) ? bp[2 + i / 2] >> 4 : bp[2 + i / 2] & 15;
-            if (nib >= 8) nib -= 16;
-            i32 s = ((nib * 4096) >> shift) + ((h1 * coef[filter][0] + h2 * coef[filter][1] + 32) >> 6);
-            s = std::clamp(s, -32768, 32767);
-            h2 = h1, h1 = s;
-            want.push_back(static_cast<i16>(s));
-        }
-    }
+    // (the reference: the PlayStation ADPCM filters, in 1/64ths there)
+    const nx::vector<f64> want = vag_reference(vag, 2, [](u32 f) {
+        const i32 c[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
+        return std::array<i32, 4>{c[f][0] * 128, c[f][1] * 128, 0, 0};
+    });
     PlayerParams p = player(1);
     p.type = 1;  // SCE_NGS_PLAYER_TYPE_ADPCM
     p.buffs[0] = PlayerBuffer{at, 32, 0, -1};
@@ -474,14 +497,54 @@ TEST_CASE("ngs: VAG blocks decode as the ADPCM filters say; the bytes count per 
     REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
     ngs.update();
     const nx::vector<i16> out = ngs.output(master);
-    bool same = true;
-    for (u32 i = 0; i < 56; ++i) same &= out[2 * i] == want[i];
-    CHECK(same);
+    CHECK(decodes_as(out, want));
     CHECK(out[2 * 56] == 0);
     const u32 st = scratch(24);
     REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
     CHECK(psv_ld32(st + 8) == 56);
     CHECK(psv_ld32(st + 12) == 32);
+}
+
+TEST_CASE("ngs: HE-VAG blocks take a 7-bit filter and up to 4 taps") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 1)[0];
+    REQUIRE(ngs.patch(voice, master) == 0);
+    // A classic block to start from (filter 0 shift 2), then HE filters 12 (2 taps) shift 8, 45 and 127 (4 taps)
+    // shifts 9 and 10, and classic filter 4 shift 11 on what they left. The filter's bits 4-6 are byte 1's high nibble.
+    u8 vag[80] = {};
+    const u8 head[5][2] = {{0x02, 0x00}, {0xC8, 0x00}, {0xD9, 0x20}, {0xFA, 0x70}, {0x4B, 0x00}};
+    for (u32 b = 0; b < 5; ++b) {
+        vag[16 * b] = head[b][0], vag[16 * b + 1] = head[b][1];
+        for (u32 i = 0; i < 14; ++i) vag[16 * b + 2 + i] = static_cast<u8>((i * 0x3B + b * 0x55 + 0x17) & 0xFF);
+    }
+    const u32 at = aligned(80);
+    std::memcpy(t.rt.memory().host(at), vag, 80);
+    // (the filters as measured against vagconv2, in 1/8192ths)
+    const nx::vector<f64> want = vag_reference(vag, 5, [](u32 f) {
+        switch (f) {
+            case 12: return std::array<i32, 4>{7832, -7680, 0, 0};
+            case 45: return std::array<i32, 4>{-4745, -4122, -5486, -1493};
+            case 127: return std::array<i32, 4>{5333, 2999, 775, -1132};
+            case 4: return std::array<i32, 4>{122 * 128, -60 * 128, 0, 0};
+            default: return std::array<i32, 4>{};
+        }
+    });
+    PlayerParams p = player(1);
+    p.type = 1;  // SCE_NGS_PLAYER_TYPE_ADPCM
+    p.buffs[0] = PlayerBuffer{at, 80, 0, -1};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    ngs.update();
+    const nx::vector<i16> out = ngs.output(master);
+    CHECK(decodes_as(out, want));
+    i32 loudest = 0;  // (not silence)
+    for (u32 i = 28; i < 140; ++i) loudest = std::max(loudest, std::abs(static_cast<i32>(out[2 * i])));
+    CHECK(loudest > 1000);
+    CHECK(out[2 * 140] == 0);
 }
 
 TEST_CASE("ngs: a generated tone, and a low-pass EQ on the send taking it away") {
