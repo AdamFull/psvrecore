@@ -36,6 +36,7 @@ add_library(psvrecore_runtime STATIC
 )
 if(WIN32)
     target_sources(psvrecore_runtime PRIVATE src/host_win32.cpp)
+    target_link_libraries(psvrecore_runtime PRIVATE dbghelp)
 else()
     target_sources(psvrecore_runtime PRIVATE src/host_posix.cpp)
 endif()

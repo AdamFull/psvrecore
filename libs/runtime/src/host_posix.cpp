@@ -71,6 +71,14 @@ bool decommit(void* address, usize size) {
     return mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) != MAP_FAILED;
 }
 
+bool watch(void* const*, const u32*, u32, WatchHandler) { return false; }
+
+void* find_code(const char*) { return nullptr; }
+
+void describe_code(void* pc, char* out, usize out_size) {
+    if (out_size) snprintf(out, out_size, "%p", pc);
+}
+
 void set_fault_region(void* base, u64 size, FaultHandler on_fault) {
     g_fault.handler.store(nullptr, std::memory_order_release);
     g_fault.base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_relaxed);

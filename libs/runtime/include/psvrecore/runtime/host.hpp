@@ -19,6 +19,18 @@ bool decommit(void* address, usize size);
 using FaultHandler = void (*)(u64 offset, bool write);
 void set_fault_region(void* base, u64 size, FaultHandler on_fault);
 
+// Debugging: up to four hardware watchpoints, in every thread of the process (threads started later are covered
+// within a few milliseconds). Each is an aligned range of 1, 2, 4 or 8 bytes, hit by a write, or (size 0) an
+// instruction, hit when it runs. `on_hit` is called from the thread that hit it, with the watchpoint's index, the
+// host instruction (after the write; the instruction itself) and the first argument register (at a function's
+// first instruction: its first argument). False where the host has none (only Windows on x86-64 does here).
+using WatchHandler = void (*)(u32 index, void* host_pc, void* first_argument);
+bool watch(void* const* addresses, const u32* sizes, u32 count, WatchHandler on_hit);
+// A host function by name, and the host function holding `pc` ("name+0xoffset"), from the executable's debug
+// symbols, when it has them.
+void* find_code(const char* name);
+void describe_code(void* pc, char* out, usize out_size);
+
 enum class OpenMode : u32 {
     Read = 1,
     Write = 2,

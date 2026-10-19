@@ -44,6 +44,78 @@ void on_guest_fault(u64 offset, bool write) {
     std::fflush(stderr);
 }
 
+// PSVRECORE_WATCH=<address>[:<size>],<function>,...: up to four, for finding what corrupts guest memory (they slow
+// nothing until one is hit):
+// - every write to a guest address (1, 2, 4 or 8 bytes, 4 by default, aligned to its size) is reported with the
+//   value now there, the guest thread and its registers, and the host function that wrote;
+// - every call of a host function by its name (a generated one, f_<address>) is reported with the guest registers
+//   it is called with.
+u32 g_watched[4];
+u32 g_watched_size[4];  // (0: a function)
+const char* g_watched_name[4];
+
+void on_watched(u32 index, void* host_pc, void* first_argument) {
+    if (g_watched_size[index] == 0) {
+        const auto* ctx = static_cast<const PsvContext*>(first_argument);
+        kernel::Thread* t = Kernel::current();
+        std::fprintf(stderr, "watch: %s in thread '%s' r0 %08x r1 %08x r2 %08x r3 %08x sp %08x lr %08x\n",
+                     g_watched_name[index], t ? t->name.c_str() : "(host)", ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3],
+                     ctx->r[13], ctx->r[14]);
+        std::fflush(stderr);
+        return;
+    }
+    const u32 at = g_watched[index];
+    char where[320];
+    host::describe_code(host_pc, where, sizeof where);
+    kernel::Thread* t = Kernel::current();
+    std::fprintf(stderr, "watch: write to 0x%08x, now", at);
+    for (u32 i = 0; i < g_watched_size[index]; i += 4) std::fprintf(stderr, " %08x", psv_ld32(at + i));
+    std::fprintf(stderr, " by %s", where);
+    if (t)
+        std::fprintf(stderr,
+                     " in thread '%s' lr %08x sp %08x r0 %08x r1 %08x r2 %08x r3 %08x r4 %08x r5 %08x r6 %08x r7 %08x r8 %08x",
+                     t->name.c_str(), t->ctx.r[14], t->ctx.r[13], t->ctx.r[0], t->ctx.r[1], t->ctx.r[2], t->ctx.r[3],
+                     t->ctx.r[4], t->ctx.r[5], t->ctx.r[6], t->ctx.r[7], t->ctx.r[8]);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
+void watch_from_environment(u8* base) {
+    const char* spec = std::getenv("PSVRECORE_WATCH");
+    if (!spec || !*spec) return;
+    void* addresses[4];
+    u32 count = 0;
+    static char names[256];
+    std::snprintf(names, sizeof names, "%s", spec);
+    for (char* p = names; *p && count < 4;) {
+        char* end = p;
+        while (*end && *end != ',') ++end;
+        const bool more = *end == ',';
+        *end = '\0';
+        if (*p >= '0' && *p <= '9') {
+            char* rest = nullptr;
+            g_watched[count] = static_cast<u32>(std::strtoul(p, &rest, 0));
+            g_watched_size[count] = *rest == ':' ? static_cast<u32>(std::strtoul(rest + 1, nullptr, 0)) : 4;
+            if (g_watched_size[count] == 0) g_watched_size[count] = 4;
+            addresses[count] = base + g_watched[count];
+        } else {
+            addresses[count] = host::find_code(p);
+            if (!addresses[count]) {
+                nx::logw(logs::kernel, "PSVRECORE_WATCH: no host function '{}'", p);
+                return;
+            }
+            g_watched_size[count] = 0;
+            g_watched_name[count] = p;
+        }
+        ++count;
+        p = more ? end + 1 : end;
+    }
+    if (host::watch(addresses, g_watched_size, count, on_watched))
+        nx::logi(logs::kernel, "{} watchpoint(s) from PSVRECORE_WATCH", count);
+    else
+        nx::logw(logs::kernel, "PSVRECORE_WATCH: these cannot be watched on this host");
+}
+
 }  // namespace
 
 Runtime* current_runtime() { return g_runtime.load(std::memory_order_acquire); }
@@ -58,6 +130,7 @@ Runtime::Runtime(const Config& config) : config_(config) {
         return;
     }
     host::set_fault_region(memory_.base(), (1ull << 32) + (1ull << 20), on_guest_fault);
+    watch_from_environment(memory_.base());
     Kernel::Config kc = config.kernel;
     kc.stack_region = layout::kStacks;
     kernel_ = nx::make_unique<Kernel>(memory_, kc);
