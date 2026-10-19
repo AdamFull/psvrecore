@@ -8,6 +8,7 @@
 // Progressive streams only (interlaced stream mode is not implemented).
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
 
 #include "hle_common.hpp"

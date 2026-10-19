@@ -1,6 +1,7 @@
 // psvrecore::formats on synthetic files: SFO, SELF -> ELF (stored and zlib segments), module information,
 // exports and imports, relocations (both encodings, applying and checking), NID databases and stub archives.
 
+#include <cstdio>
 #include <cstring>
 
 #include "formats_builders.hpp"

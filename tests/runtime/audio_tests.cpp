@@ -1,6 +1,8 @@
 // Audio output (SceAudio): port arguments and limits, pacing on the kernel's clock, what reaches the sink.
 
 #include "nxtest.h"
+
+#include <cstring>
 #include "runtime_support.hpp"
 
 using namespace psvrecore;

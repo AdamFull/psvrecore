@@ -13,6 +13,7 @@
 // Built by tests/samples/CMakeLists.txt with the sample's and libc's generated code.
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

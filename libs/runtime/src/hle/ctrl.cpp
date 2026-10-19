@@ -7,6 +7,8 @@
 
 #include "sampling.hpp"
 
+#include <cstring>
+
 namespace psvrecore::runtime::hle {
 
 namespace {

@@ -1,6 +1,8 @@
 // Threads, synchronisation and time: SceThreadmgr, the thread parts of SceLibKernel, SceThreadmgrCoredumpTime.
 
 #include "hle_common.hpp"
+
+#include <cstring>
 #include "core/foundation/containers/hash_map.h"
 
 namespace psvrecore::runtime::hle {

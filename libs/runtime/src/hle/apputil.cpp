@@ -10,6 +10,7 @@
 // titles' save data (savedata1:) is never there: an application may mount only the titles its param.sfo lists.
 
 #include <algorithm>
+#include <cstring>
 #include <optional>
 
 #include "hle_common.hpp"

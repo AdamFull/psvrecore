@@ -1,6 +1,7 @@
 // SceLibKernel's C library helpers (sceClib*), formatted output, and the stack protector's guard and failure.
 
 #include <cstdio>
+#include <cstring>
 
 #include "hle_common.hpp"
 

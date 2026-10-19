@@ -4,6 +4,9 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

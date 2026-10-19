@@ -5,6 +5,8 @@
 // the guest calling convention, as recompiled code makes them.
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 

@@ -8,6 +8,7 @@
 // Built by tests/probes/CMakeLists.txt, which passes the module files and addresses as definitions.
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "psvrecore/analysis/image.hpp"

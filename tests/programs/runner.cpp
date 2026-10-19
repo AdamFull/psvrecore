@@ -6,6 +6,7 @@
 //
 // Built by tests/programs/CMakeLists.txt with the program's and libc's generated code.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 

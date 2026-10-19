@@ -5,6 +5,9 @@
 // tests use one CPU where the order of events is then fully determined.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"

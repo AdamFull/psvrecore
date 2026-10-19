@@ -1,6 +1,7 @@
 #include "shader_cache.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 #include "psvrecore/log.hpp"

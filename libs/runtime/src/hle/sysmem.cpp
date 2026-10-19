@@ -1,6 +1,7 @@
 // Memory blocks: SceSysmem.
 
 #include <atomic>
+#include <cstring>
 
 #include "hle_common.hpp"
 

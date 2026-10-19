@@ -1,6 +1,7 @@
 // The display (SceDisplay): the frame buffer shown, and vertical blanks at the display's refresh rate on the host
 // clock. Also the thread of GXM's display queue, which calls the game's display callback for each queued frame.
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 

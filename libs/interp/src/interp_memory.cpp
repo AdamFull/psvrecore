@@ -1,6 +1,7 @@
 // Loads and stores of core registers (A8.8: LDR, STR and kin, LDRD/STRD, LDM/STM, LDREX/STREX, SWP).
 
 #include <bit>
+#include <cstring>
 
 #include "exec.hpp"
 

@@ -1,5 +1,8 @@
 #include "psvrecore/formats/cpk.hpp"
 
+#include <bit>
+#include <optional>
+
 #include "psvrecore/io/bytes.hpp"
 #include "core/foundation/strings/format.h"
 

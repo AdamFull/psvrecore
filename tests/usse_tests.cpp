@@ -3,6 +3,7 @@
 // checked separately (scripts/usse_check.py).
 
 #include <cstring>
+#include <optional>
 
 #include "nxtest.h"
 #include "psvrecore/usse/format.hpp"

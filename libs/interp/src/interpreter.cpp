@@ -1,5 +1,7 @@
 #include "psvrecore/interp/interpreter.hpp"
 
+#include <cstring>
+
 #include "exec.hpp"
 
 namespace psvrecore::interp {

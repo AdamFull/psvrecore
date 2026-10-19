@@ -8,6 +8,8 @@
 //
 // Not modelled: the BGM port's dynamic normalizer (ALC) and effects, the system taking the BGM port over.
 
+#include <chrono>
+#include <cstring>
 #include <thread>
 
 #include "hle_common.hpp"

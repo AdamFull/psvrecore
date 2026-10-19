@@ -1,6 +1,9 @@
 // Input (SceCtrl, SceTouch): samples at the vertical blanks, their timestamps, presses between blanks, lag.
 
 #include "nxtest.h"
+
+#include <cmath>
+#include <cstring>
 #include "runtime_support.hpp"
 
 using namespace psvrecore;

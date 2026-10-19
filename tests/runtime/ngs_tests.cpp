@@ -5,6 +5,8 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"

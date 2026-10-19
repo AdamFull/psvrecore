@@ -10,6 +10,8 @@
 // Every message's text is logged, to see what the game asks.
 
 #include "hle_common.hpp"
+
+#include <cstring>
 #include "psvrecore/runtime/savedata.hpp"
 
 namespace psvrecore::runtime::hle {

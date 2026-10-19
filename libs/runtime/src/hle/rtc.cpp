@@ -2,6 +2,7 @@
 // assertion handler (SceDbg).
 
 #include <chrono>
+#include <cstring>
 #include <ctime>
 
 #include "hle_common.hpp"

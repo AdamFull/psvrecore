@@ -2,6 +2,7 @@
 // lightweight ones), callbacks.
 
 #include <algorithm>
+#include <optional>
 
 #include "kernel_impl.hpp"
 

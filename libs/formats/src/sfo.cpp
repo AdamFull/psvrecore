@@ -1,5 +1,7 @@
 #include "psvrecore/formats/sfo.hpp"
 
+#include <optional>
+
 #include "psvrecore/io/bytes.hpp"
 #include "core/foundation/strings/format.h"
 

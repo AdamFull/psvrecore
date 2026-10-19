@@ -1,6 +1,8 @@
 // The kernel's core: objects and UIDs, the CPUs and who runs on them, waiting and waking.
 
 #include <algorithm>
+#include <chrono>
+#include <optional>
 
 #include "kernel_impl.hpp"
 #include "psvrecore/runtime/hle.hpp"

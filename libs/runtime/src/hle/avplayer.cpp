@@ -9,9 +9,10 @@
 // autoStart does (its first video and audio streams).
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
-#include <optional>
 #include <memory>
+#include <optional>
 
 #include "../media/decoders.hpp"
 #include "../media/mp4.hpp"

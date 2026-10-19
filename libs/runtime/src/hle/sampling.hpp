@@ -4,6 +4,8 @@
 // read pointer. Samples are taken when asked for (every blank since the last one asked about, up to 64), each of the
 // state at its blank's time: as if a service had sampled at every blank.
 
+#include <chrono>
+
 #include "hle_common.hpp"
 #include "core/foundation/threading/thread.h"
 

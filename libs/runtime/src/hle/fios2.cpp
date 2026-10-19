@@ -8,6 +8,8 @@
 
 #include "hle_common.hpp"
 
+#include <cstring>
+
 namespace psvrecore::runtime::hle {
 
 namespace {

@@ -11,8 +11,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
+#include <vector>
 
 #include "../ngs/modules.hpp"
 #include "libatrac9.h"

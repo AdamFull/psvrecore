@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"

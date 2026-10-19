@@ -1,5 +1,7 @@
 #include "psvrecore/usse/gxp.hpp"
 
+#include <optional>
+
 #include "psvrecore/io/bytes.hpp"
 
 namespace psvrecore::usse {

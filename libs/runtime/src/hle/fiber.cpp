@@ -8,6 +8,7 @@
 // own. Everything stays on the thread's OS thread: the kernel's current thread is the same throughout.
 
 #include <array>
+#include <cstring>
 
 #include "hle_common.hpp"
 #include "core/foundation/containers/hash_map.h"

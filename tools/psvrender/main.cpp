@@ -18,6 +18,7 @@
 // The comparison leaves out the pixels the reference marks as next to an edge; a channel may differ by the
 // tolerance (rounding of interpolation and filtering).
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 

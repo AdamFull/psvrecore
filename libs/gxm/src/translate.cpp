@@ -10,6 +10,7 @@
 
 #include "psvrecore/gxm/translate.hpp"
 
+#include <algorithm>
 #include <bit>
 
 #include "core/foundation/strings/format.h"
