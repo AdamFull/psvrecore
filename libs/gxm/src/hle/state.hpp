@@ -103,12 +103,14 @@ struct ColorSurface {
 static_assert(sizeof(ColorSurface) == 48);
 
 struct DepthStencilSurface {
-    u32 control;  // format | type << 28? (see surfaces.cpp)
+    u32 control;  // format | kDs* bits (see surfaces.cpp)
     u32 depth_data, stencil_data;
     f32 background_depth;
     u32 background_control;  // stencil | mask bit << 8 (see surfaces.cpp)
 };
 static_assert(sizeof(DepthStencilSurface) == 20);
+// DepthStencilSurface::control bits besides the format.
+inline constexpr u32 kDsTiled = 1u << 28, kDsForceLoad = 1u << 29, kDsForceStore = 1u << 30, kDsEnabled = 1u << 31;
 
 struct Notification {
     u32 address, value;
@@ -163,6 +165,9 @@ struct FragmentProgram {
     BlendInfo blend{};
     u32 vertex_gxp = 0;  // (the vertex program it was made for; varyings are matched to it)
     u32 references = 1;
+    // A mask update program (sceGxmShaderPatcherCreateMaskUpdateFragmentProgram): its draws set or clear the mask
+    // bit of a DF32M surface; `program` is an empty program of the driver's (State::mask_update_program).
+    bool mask_update = false;
 };
 
 struct Patcher {
@@ -260,6 +265,7 @@ struct State {
     nx::hash_map<u32, nx::unique_ptr<Program>> programs;
     nx::hash_map<u32, nx::unique_ptr<VertexProgram>> vertex_programs;
     nx::hash_map<u32, nx::unique_ptr<FragmentProgram>> fragment_programs;
+    nx::unique_ptr<Program> mask_update_program;  // (made on first use)
     nx::vector<std::pair<u32, u32>> mappings;  // (base, size) mapped for the GPU
 
     // The display queue: entries waiting for the display thread, which calls the game's callback for each.
@@ -292,5 +298,9 @@ void register_surfaces();
 void register_patcher();
 void register_context();
 void register_textures();
+void register_transfer();
+
+// Writes a notification's value to its address (if any).
+void notify(Ptr<const Notification> n);
 
 }  // namespace psvrecore::gxm::hle

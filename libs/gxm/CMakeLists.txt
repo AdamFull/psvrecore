@@ -22,6 +22,7 @@ add_library(psvrecore_gxm_hle STATIC
     src/hle/render.cpp
     src/hle/surfaces.cpp
     src/hle/textures.cpp
+    src/hle/transfer.cpp
 )
 add_library(psvrecore::gxm_hle ALIAS psvrecore_gxm_hle)
 target_include_directories(psvrecore_gxm_hle PRIVATE "${PSVRECORE_DIR}/third_party/SPIRV-Headers/include")

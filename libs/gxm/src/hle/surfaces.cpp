@@ -93,7 +93,6 @@ u32 sceGxmColorSurfaceGetStrideInPixels(Ptr<const ColorSurface> s) { return s ? 
 
 // DepthStencilSurface::control: the format (its bits are 12-25) | tiled << 28 | force load << 29 | force store
 // << 30 | enabled << 31. background_control: the stencil value | the mask bit << 8 | the stride in tiles << 16.
-constexpr u32 kDsTiled = 1u << 28, kDsForceLoad = 1u << 29, kDsForceStore = 1u << 30, kDsEnabled = 1u << 31;
 
 i32 sceGxmDepthStencilSurfaceInit(Ptr<DepthStencilSurface> s, u32 format, u32 type, u32 stride, u32 depth,
                                   u32 stencil) {
@@ -106,7 +105,7 @@ i32 sceGxmDepthStencilSurfaceInit(Ptr<DepthStencilSurface> s, u32 format, u32 ty
     d.depth_data = depth;
     d.stencil_data = stencil;
     d.background_depth = 1.0f;
-    d.background_control = (stride / 32) << 16;
+    d.background_control = (stride / 32) << 16 | 0x100;  // (the mask set: assumed, as drawing needs it)
     *s = d;
     return 0;
 }

@@ -160,7 +160,9 @@ bool components(u32 code, u32 mode, u64 texel, f32 c[4], u32& count, bool& wide)
         case kF32M:
         case kF32F32: {
             count = code == kF32F32 ? 2 : 1;
-            for (u32 k = 0; k < count; ++k) c[k] = std::bit_cast<f32>(static_cast<u32>(texel >> (32 * k)));
+            // (F32M: the sign bit is a mask, as in DF32M depth surfaces: not part of the value)
+            const u32 sign = code == kF32M ? 0x7FFFFFFFu : 0xFFFFFFFFu;
+            for (u32 k = 0; k < count; ++k) c[k] = std::bit_cast<f32>(static_cast<u32>(texel >> (32 * k)) & sign);
             wide = true;
             return true;
         }
@@ -198,8 +200,11 @@ void decode_bc(u32 code, const u8* block, f32 out[16][4]) {
     }
 }
 
-// The offset of element (x, y) in a level of the swizzled layout (pow2 width w, height h, in elements).
-u64 morton(u32 x, u32 y, u32 w, u32 h) {
+u64 morton(u32 x, u32 y, u32 w, u32 h) { return swizzled_index(x, y, w, h); }
+
+}  // namespace
+
+u64 swizzled_index(u32 x, u32 y, u32 w, u32 h) {
     const u32 lw = log2_ceil(w), lh = log2_ceil(h), common = nx::min(lw, lh);
     u64 a = 0;
     for (u32 b = 0; b < common; ++b) a |= (u64{(y >> b) & 1} << (2 * b)) | (u64{(x >> b) & 1} << (2 * b + 1));
@@ -208,8 +213,6 @@ u64 morton(u32 x, u32 y, u32 w, u32 h) {
     else if (lh > lw) a |= u64{y >> common} << (2 * common);
     return a;
 }
-
-}  // namespace
 
 u32 texel_bits(u32 base_format) {
     switch (code_of(base_format)) {
@@ -386,8 +389,9 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
         bool w = false;
         if (components(code, t.swizzle, 0, c, n, w)) wide |= w;
     }
-    out.half = wide;
-    const u32 out_bytes = wide ? 8 : 4;
+    const bool full = code == kF32 || code == kF32M || code == kF32F32;
+    out.bytes = full ? 16 : wide ? 8 : 4;
+    const u32 out_bytes = out.bytes;
     usize total = 0;
     for (const Level& l : levels) total += usize{l.width} * l.height * out_bytes;
     out.data.resize(total * out.faces);
@@ -399,7 +403,9 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
             const bool srgb = (t.gamma == 1 && k < 3) || (t.gamma == 3 && k < 2);
             if (srgb) v[k] = v[k] <= 0.04045f ? v[k] / 12.92f : std::pow((v[k] + 0.055f) / 1.055f, 2.4f);
         }
-        if (wide) {
+        if (full) {
+            std::memcpy(dst, v, 16);
+        } else if (wide) {
             for (u32 k = 0; k < 4; ++k) {
                 const u16 h = float_to_half(v[k]);
                 std::memcpy(dst + 2 * k, &h, 2);

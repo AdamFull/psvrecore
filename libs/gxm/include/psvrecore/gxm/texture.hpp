@@ -56,7 +56,7 @@ u32 texel_bits(u32 base_format);
 
 // The decoded texels: faces of mip levels, each level's texels as 16-bit floats or 8-bit unorm RGBA.
 struct Texels {
-    bool half = false;  // (RGBA16F; else RGBA8)
+    u32 bytes = 4;  // per texel: 4 (RGBA8), 8 (RGBA16F) or 16 (RGBA32F: formats with 32-bit float components)
     u32 width = 0, height = 0, levels = 1, faces = 1;
     nx::vector<u8> data;  // face 0's levels, then face 1's, ...: each level width x height of its own, rows packed
 };
@@ -68,5 +68,9 @@ Result<Texels> read_texels(const TextureInfo& info, ReadGuest read);
 
 // The bytes a texture's data occupies in guest memory (all levels and faces).
 u32 texture_size(const TextureInfo& info);
+
+// The index of element (x, y) in the swizzled layout of a w x h image (powers of two): Morton order, y in the low
+// bit; the larger dimension's remaining bits on top.
+u64 swizzled_index(u32 x, u32 y, u32 w, u32 h);
 
 }  // namespace psvrecore::gxm

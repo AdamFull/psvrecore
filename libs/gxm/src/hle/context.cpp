@@ -101,10 +101,6 @@ i32 sceGxmBeginSceneEx(u32 context, u32 flags, u32 target, Ptr<const ValidRegion
     return begin_scene(context, flags, target, region, color, load_depth);
 }
 
-void notify(Ptr<const Notification> n) {
-    if (n && memory().valid(n->address, 4, true)) *reinterpret_cast<u32*>(memory().host(n->address)) = n->value;
-}
-
 i32 sceGxmEndScene(u32 context, Ptr<const Notification> vertex_notification, Ptr<const Notification> fragment_notification) {
     if (!context) return err::kInvalidPointer;
     State& st = state();
@@ -464,6 +460,10 @@ const runtime::hle::Function kFunctions[] = {
 };
 
 }  // namespace
+
+void notify(Ptr<const Notification> n) {
+    if (n && memory().valid(n->address, 4, true)) *reinterpret_cast<u32*>(memory().host(n->address)) = n->value;
+}
 
 void register_context() { runtime::hle::register_library({"SceGxm", kSceGxm, kFunctions}); }
 

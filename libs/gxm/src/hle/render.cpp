@@ -12,9 +12,15 @@
 // - Textures are decoded on the CPU (gxm/texture.hpp) into RGBA images, cached by their control words and a hash
 //   of their data; units a program declares but the draw leaves unset read a white texel.
 //
-// Not yet: tiled and swizzled surfaces, depth/stencil surfaces that load or store, multisampling, visibility
-// queries, programmable blending.
+// - Depth and stencil: an image per scene, cleared to the surface's background values; a surface in force load
+//   or force store mode is loaded from guest memory at the start or stored back at the end (linear or tiled,
+//   every format but the DF32M mask bits, which are not tracked: stored as the background mask).
+// - A scene without a colour surface (depth only) renders at the render target's size.
+//
+// Not yet: tiled and swizzled colour surfaces, multisampling, visibility queries.
 
+#include <bit>
+#include <cmath>
 #include <cstring>
 
 #include "psvrecore/gxm/texture.hpp"
@@ -107,6 +113,101 @@ VkBlendFactor blend_factor(u32 f) {
         VK_BLEND_FACTOR_ONE,  // (DST_ALPHA_SATURATE: Vulkan has none)
     };
     return f < std::size(kMap) ? kMap[f] : VK_BLEND_FACTOR_ONE;
+}
+
+// ---- Depth/stencil surfaces in guest memory --------------------------------------------------------------------
+
+struct DepthLayout {
+    u32 depth_bytes = 0;  // per sample at the depth address (0: no depth)
+    bool stencil = false;  // a stencil byte per sample at the stencil address
+    bool packed = false;   // S8D24: the stencil is the depth word's top byte
+    bool mask = false;     // DF32M: the sign bit is the mask
+};
+
+bool depth_layout(u32 format, DepthLayout& out) {
+    switch (format) {
+        case 0x0044000u: out = {4, false, false, false}; return true;  // DF32
+        case 0x00CC000u: out = {4, false, false, true}; return true;   // DF32M
+        case 0x0066000u: out = {4, true, false, false}; return true;   // DF32_S8
+        case 0x00EE000u: out = {4, true, false, true}; return true;    // DF32M_S8
+        case 0x0022000u: out = {0, true, false, false}; return true;   // S8
+        case 0x1266000u: out = {4, false, true, false}; return true;   // S8D24
+        case 0x2444000u: out = {2, false, false, false}; return true;  // D16
+        default: return false;
+    }
+}
+
+// The index of a sample: rows of the stride (in samples), or 32 x 32 tiles in rows, each tile's samples in rows.
+u32 depth_sample(const DepthStencilSurface& s, u32 x, u32 y) {
+    const u32 stride = (s.background_control >> 16) * 32;
+    if (!(s.control & kDsTiled)) return y * stride + x;
+    return ((y / 32) * (stride / 32) + x / 32) * 1024 + (y % 32) * 32 + x % 32;
+}
+
+// Samples a surface of this size spans.
+u32 depth_samples(const DepthStencilSurface& s, u32 width, u32 height) {
+    const u32 stride = (s.background_control >> 16) * 32;
+    if (s.control & kDsTiled) return (height + 31) / 32 * (stride / 32) * 1024;
+    return (height - 1) * stride + width;
+}
+
+bool depth_surface_valid(const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height) {
+    const u32 n = depth_samples(s, width, height);
+    if (l.depth_bytes && !memory().valid(s.depth_data, n * l.depth_bytes, true)) return false;
+    if (l.stencil && !memory().valid(s.stencil_data, n, true)) return false;
+    return true;
+}
+
+// Whether the depth image's stencil aspect holds the mask bit (bit 0): DF32M surfaces, which have no stencil.
+bool mask_in_stencil(const DepthLayout& l) { return l.mask && !l.stencil; }
+
+// The surface's samples as the depth image's aspects take them: depth (f32, or 24-bit unorm words for a
+// D24_UNORM_S8_UINT image) and stencil bytes (or the mask bits).
+void read_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height, bool unorm24,
+                        u32* depth, u8* stencil) {
+    for (u32 y = 0; y < height; ++y) {
+        for (u32 x = 0; x < width; ++x) {
+            const u32 i = depth_sample(s, x, y), at = y * width + x;
+            f32 z = s.background_depth;
+            u8 st = static_cast<u8>(mask_in_stencil(l) ? (s.background_control >> 8) & 1 : s.background_control & 0xFF);
+            if (l.depth_bytes == 4) {
+                u32 w;
+                std::memcpy(&w, memory().host(s.depth_data + i * 4), 4);
+                if (l.packed) z = static_cast<f32>(w & 0xFFFFFF) / 16777215.0f, st = static_cast<u8>(w >> 24);
+                else z = std::bit_cast<f32>(l.mask ? w & 0x7FFFFFFFu : w);
+                if (mask_in_stencil(l)) st = static_cast<u8>(w >> 31);
+            } else if (l.depth_bytes == 2) {
+                u16 h;
+                std::memcpy(&h, memory().host(s.depth_data + i * 2), 2);
+                z = static_cast<f32>(h) / 65535.0f;
+            }
+            if (l.stencil) st = *memory().host(s.stencil_data + i);
+            z = nx::clamp(std::isnan(z) ? 0.0f : z, 0.0f, 1.0f);
+            depth[at] = unorm24 ? static_cast<u32>(std::lround(z * 16777215.0f)) : std::bit_cast<u32>(z);
+            stencil[at] = st;
+        }
+    }
+}
+
+// And back. (DF32M_S8: the mask bit of every sample is the surface's background mask.)
+void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height, bool unorm24,
+                         const u32* depth, const u8* stencil) {
+    const u32 mask = l.mask && (s.background_control & 0x100) ? 0x80000000u : 0;
+    for (u32 y = 0; y < height; ++y) {
+        for (u32 x = 0; x < width; ++x) {
+            const u32 i = depth_sample(s, x, y), at = y * width + x;
+            const f32 z = unorm24 ? static_cast<f32>(depth[at] & 0xFFFFFF) / 16777215.0f : std::bit_cast<f32>(depth[at]);
+            if (l.depth_bytes == 4) {
+                const u32 w = l.packed ? static_cast<u32>(std::lround(z * 16777215.0f)) | u32{stencil[at]} << 24
+                                       : std::bit_cast<u32>(z) | (mask_in_stencil(l) ? u32{stencil[at] & 1u} << 31 : mask);
+                std::memcpy(memory().host(s.depth_data + i * 4), &w, 4);
+            } else if (l.depth_bytes == 2) {
+                const u16 h = static_cast<u16>(std::lround(z * 65535.0f));
+                std::memcpy(memory().host(s.depth_data + i * 2), &h, 2);
+            }
+            if (l.stencil) *memory().host(s.stencil_data + i) = stencil[at];
+        }
+    }
 }
 
 // ---- The renderer ----------------------------------------------------------------------------------------------
@@ -282,7 +383,7 @@ Result<void> upload_texels(vk::Device& d, vk::Image& image, const Texels& t) {
     vk::flush(d, *staging);
     nx::vector<VkBufferImageCopy> regions;
     VkDeviceSize at = 0;
-    const u32 bytes = t.half ? 8 : 4;
+    const u32 bytes = t.bytes;
     for (u32 face = 0; face < t.faces; ++face) {
         for (u32 l = 0; l < t.levels; ++l) {
             const u32 w = nx::max(1u, t.width >> l), h = nx::max(1u, t.height >> l);
@@ -338,7 +439,9 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
         return nullptr;
     }
     vk::ImageDesc d;
-    d.format = texels->half ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    d.format = texels->bytes == 16 ? VK_FORMAT_R32G32B32A32_SFLOAT
+               : texels->bytes == 8 ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                    : VK_FORMAT_R8G8B8A8_UNORM;
     d.width = texels->width;
     d.height = texels->height;
     d.mips = texels->levels;
@@ -351,8 +454,12 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
         return nullptr;
     }
     vk::SamplerDesc sd;
-    sd.mag = info.mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    sd.min = info.min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    // (32-bit float images are not filterable everywhere: nearest there)
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(r.device->physical(), d.format, &fp);
+    const bool filterable = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    sd.mag = info.mag_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sd.min = info.min_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     sd.mip = info.mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sd.u = address_mode(info.u_address);
     sd.v = address_mode(info.v_address);
@@ -400,50 +507,77 @@ struct DrawPlan {
 void render_scene(Context& context, Scene& scene) {
     (void)context;
     Renderer& r = renderer();
-    if (!scene.has_color || !ensure(r)) return;
+    if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return;
     ++r.scenes;
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
+    const DepthStencilSurface& ds = scene.depth;
     ColorFormat cf;
-    if (!color_format(cs.format, cf)) {
-        nx::logw(logs::gxm, "colour surface format 0x{:08x} not implemented: scene not rendered", cs.format);
-        return;
-    }
-    if (cs.modes & 3) {
-        nx::logw(logs::gxm, "tiled and swizzled colour surfaces not implemented: scene not rendered");
-        return;
-    }
-    const u32 width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
-    const u32 target_w = nx::min(width, scene.target->width), target_h = nx::min(height, scene.target->height);
-    if (!memory().valid(cs.data, stride * cf.bytes * (height - 1) + width * cf.bytes, true)) return;
-    vk::Image* color = color_target(r, cs.data, cs.format, cf.format, width, height);
-    if (!color) return;
+    // (without a colour surface, a depth-only scene: the render target's size)
+    u32 width = scene.target->width, height = scene.target->height, stride = 0;
+    vk::Image* color = nullptr;
+    if (scene.has_color) {
+        if (!color_format(cs.format, cf)) {
+            nx::logw(logs::gxm, "colour surface format 0x{:08x} not implemented: scene not rendered", cs.format);
+            return;
+        }
+        if (cs.modes & 3) {
+            nx::logw(logs::gxm, "tiled and swizzled colour surfaces not implemented: scene not rendered");
+            return;
+        }
+        width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
+        if (!memory().valid(cs.data, stride * cf.bytes * (height - 1) + width * cf.bytes, true)) return;
+        color = color_target(r, cs.data, cs.format, cf.format, width, height);
+        if (!color) return;
 
-    // The colour as it is in guest memory (GXM loads it at the start of every scene).
-    nx::vector<u8> texels(usize{width} * height * cf.bytes);
-    for (u32 y = 0; y < height; ++y)
-        std::memcpy(texels.data() + usize{y} * width * cf.bytes, memory().host(cs.data + y * stride * cf.bytes), usize{width} * cf.bytes);
-    if (auto done = vk::upload_image(d, *color, texels, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); !done) {
-        nx::logw(logs::gpu, "{}", done.error().message);
-        return;
+        // The colour as it is in guest memory (GXM loads it at the start of every scene).
+        nx::vector<u8> texels(usize{width} * height * cf.bytes);
+        for (u32 y = 0; y < height; ++y)
+            std::memcpy(texels.data() + usize{y} * width * cf.bytes, memory().host(cs.data + y * stride * cf.bytes), usize{width} * cf.bytes);
+        if (auto done = vk::upload_image(d, *color, texels, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); !done) {
+            nx::logw(logs::gpu, "{}", done.error().message);
+            return;
+        }
     }
+    const u32 target_w = nx::min(width, scene.target->width), target_h = nx::min(height, scene.target->height);
+
+    // Depth and stencil: an image of the scene, cleared to the surface's background values, or loaded from the
+    // surface (force load) and stored back to it (force store).
     vk::Image depth;
-    const bool has_depth = scene.has_depth && d.caps().depth_stencil_format != VK_FORMAT_UNDEFINED;
+    DepthLayout dl;
+    bool has_depth = scene.has_depth && d.caps().depth_stencil_format != VK_FORMAT_UNDEFINED;
+    if (has_depth && !depth_layout(ds.control & 0x03FFF000u, dl)) {
+        nx::logw(logs::gxm, "depth/stencil format 0x{:08x} not implemented: no depth test", ds.control & 0x03FFF000u);
+        has_depth = false;
+    }
+    const bool unorm24 = d.caps().depth_stencil_format == VK_FORMAT_D24_UNORM_S8_UINT;
+    // The mask bit (DF32M): in the stencil aspect, tested by every draw and set by mask update draws. (DF32M_S8
+    // needs the stencil aspect for the stencil: its mask is not implemented, every sample passes.)
+    const bool mask_bits = has_depth && mask_in_stencil(dl);
+    if (has_depth && dl.mask && dl.stencil) nx::logw(logs::gxm, "the mask bit of DF32M_S8 surfaces is not implemented");
+    bool load_depth = has_depth && (ds.control & kDsForceLoad);
+    bool store_depth = has_depth && (ds.control & kDsForceStore);
+    if ((load_depth || store_depth) && !depth_surface_valid(ds, dl, width, height)) {
+        nx::logw(logs::gxm, "depth/stencil surface outside guest memory: not loaded or stored");
+        load_depth = store_depth = false;
+    }
     if (has_depth) {
         vk::ImageDesc dd;
         dd.format = d.caps().depth_stencil_format;
         dd.width = width;
         dd.height = height;
-        dd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        dd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (auto img = vk::create_image(d, dd)) depth = *img;
     }
+    if (!color && !depth.image) return;
 
     // ---- What the draws need: secondary attributes, memory, vertices and indices -----------------------------
     const u32 draws = static_cast<u32>(scene.draws.size());
     // (a pass with a draw that reads the colour reads it as an input attachment: every pipeline of the pass is
     // made for that render pass)
     bool reads_color = false;
-    for (const Draw& dr : scene.draws) reads_color |= dr.fragment->program->gxp.native_color && dr.fragment->program->gxp.frag_color;
+    for (const Draw& dr : scene.draws)
+        reads_color |= color && dr.fragment->program->gxp.native_color && dr.fragment->program->gxp.frag_color;
     nx::vector<u32> sa(usize{nx::max(draws, 1u)} * kDrawSecondaryWords, 0);
     constexpr u32 kMemoryBase = 0x1000;  // (the guest addresses the programs see for the memory buffer's words)
     nx::vector<u8> mem;  // (the memory buffer's words, after its two-word header)
@@ -495,7 +629,8 @@ void render_scene(Context& context, Scene& scene) {
         FragmentShader fs;
         fs.output_format = dr.fragment->output_format;
         std::memcpy(fs.swizzle, cf.swizzle, 4);
-        const u64 fkey = hash_of({reinterpret_cast<u64>(&fp), 3, fs.output_format}, fs.swizzle, 4);
+        fs.color_output = color != nullptr;
+        const u64 fkey = hash_of({reinterpret_cast<u64>(&fp), 3, fs.output_format, fs.color_output ? 1u : 0u}, fs.swizzle, 4);
         const VkShaderModule fmod = module_for(r, fkey, [&] { return translate_fragment(fp.gxp, fp.primary, fs); });
         if (!vmod || !fmod) continue;
 
@@ -558,7 +693,15 @@ void render_scene(Context& context, Scene& scene) {
         // coordinates share: assumed until a sample with culling is checked)
         desc.front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         desc.cull = st.cull == 1 ? VK_CULL_MODE_BACK_BIT : st.cull == 2 ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_NONE;
-        if (has_depth && depth.image) {
+        const bool mask_update = dr.fragment->mask_update;
+        if (has_depth && depth.image && mask_update) {
+            // (no depth or stencil test or write; the stencil function's bit 0 is the mask bit to write)
+            if (mask_bits) {
+                desc.stencil_test = 1;
+                desc.stencil_front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS};
+                desc.stencil_back = desc.stencil_front;
+            }
+        } else if (has_depth && depth.image) {
             desc.depth_test = 1;
             desc.depth_compare = static_cast<VkCompareOp>((st.depth_func[0] >> 22) & 7);
             desc.depth_write = st.depth_write[0] ? 1 : 0;
@@ -574,6 +717,12 @@ void render_scene(Context& context, Scene& scene) {
             desc.stencil_back = stencil_state(st.stencil[st.two_sided ? 1 : 0]);
             auto active = [](const StencilState& s) { return ((s.func >> 25) & 7) != 7 || s.fail || s.depth_fail || s.pass; };
             desc.stencil_test = active(st.stencil[0]) || (st.two_sided && active(st.stencil[1])) ? 1 : 0;
+            if (mask_bits) {
+                // (the mask test: samples whose mask bit is 0 are not drawn)
+                desc.stencil_test = 1;
+                desc.stencil_front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL};
+                desc.stencil_back = desc.stencil_front;
+            }
         }
         if (dr.fragment->blend_enabled && dr.fragment->blend.color_func()) {
             const BlendInfo& b = dr.fragment->blend;
@@ -590,6 +739,8 @@ void render_scene(Context& context, Scene& scene) {
             desc.blend.write_mask = ((m & 2) ? VK_COLOR_COMPONENT_R_BIT : 0) | ((m & 4) ? VK_COLOR_COMPONENT_G_BIT : 0) |
                                     ((m & 8) ? VK_COLOR_COMPONENT_B_BIT : 0) | ((m & 1) ? VK_COLOR_COMPONENT_A_BIT : 0);
         }
+        // (a mask update program, or a disabled fragment program, writes no colour)
+        if (mask_update || !st.fragment_enabled[0]) desc.blend.write_mask = 0;
         vk::Pass pass_formats;
         pass_formats.color.image = color;
         pass_formats.color_input = reads_color;
@@ -610,8 +761,11 @@ void render_scene(Context& context, Scene& scene) {
         std::memcpy(c.viewport, st.viewport, sizeof c.viewport);
         c.w_clamp = st.w_clamp_enabled ? st.w_clamp : 0.0f;
         // Region clip (tile-aligned, as the hardware applies it) and the surface's clip, as a scissor.
-        i32 x0 = static_cast<i32>(cs.clip_min & 0xFFFF), y0 = static_cast<i32>(cs.clip_min >> 16);
-        i32 x1 = static_cast<i32>(cs.clip_max & 0xFFFF), y1 = static_cast<i32>(cs.clip_max >> 16);
+        i32 x0 = 0, y0 = 0, x1 = static_cast<i32>(width) - 1, y1 = static_cast<i32>(height) - 1;
+        if (color) {
+            x0 = static_cast<i32>(cs.clip_min & 0xFFFF), y0 = static_cast<i32>(cs.clip_min >> 16);
+            x1 = static_cast<i32>(cs.clip_max & 0xFFFF), y1 = static_cast<i32>(cs.clip_max >> 16);
+        }
         if (st.region_clip_mode == 0x80000000u) {
             x0 = nx::max<i32>(x0, static_cast<i32>(st.region_min[0] & ~31u));
             y0 = nx::max<i32>(y0, static_cast<i32>(st.region_min[1] & ~31u));
@@ -639,13 +793,25 @@ void render_scene(Context& context, Scene& scene) {
         buffers.push_back(*b);
         return &buffers.back();
     };
-    buffers.reserve(5);
+    buffers.reserve(6);
     vk::Buffer* sa_buf = make(sa.data(), sa.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     vk::Buffer* mem_buf = make(mem_words.data(), mem_words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     vk::Buffer* vb = make(vertices.data(), vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     vk::Buffer* ib = make(indices.data(), indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    const VkDeviceSize readback_bytes = VkDeviceSize{width} * height * cf.bytes;
+    const VkDeviceSize readback_bytes = color ? VkDeviceSize{width} * height * cf.bytes : 0;
     vk::Buffer* readback = make(nullptr, readback_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    // (depth and stencil, to load and store: the depth words, then the stencil bytes)
+    const VkDeviceSize samples = VkDeviceSize{width} * height;
+    vk::Buffer* depth_buf = nullptr;
+    if (load_depth || store_depth) {
+        nx::vector<u8> init;
+        if (load_depth) {
+            init.resize(samples * 5);
+            read_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<u32*>(init.data()), init.data() + samples * 4);
+        }
+        depth_buf = make(load_depth ? init.data() : nullptr, samples * 5,
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
     auto cleanup = [&] {
         for (vk::Buffer& b : buffers) vk::destroy_buffer(d, b);
         if (depth.image) {
@@ -653,7 +819,7 @@ void render_scene(Context& context, Scene& scene) {
             vk::destroy_image(d, depth);
         }
     };
-    if (!sa_buf || !mem_buf || !vb || !ib || !readback) {
+    if (!sa_buf || !mem_buf || !vb || !ib || !readback || ((load_depth || store_depth) && !depth_buf)) {
         cleanup();
         return;
     }
@@ -681,7 +847,7 @@ void render_scene(Context& context, Scene& scene) {
         VkDescriptorImageInfo ii[kDrawBindings];
         for (u32 b = kDrawBindingFragmentTextures; b < kDrawBindings; ++b)
             ii[b] = {r.sampler, r.white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        ii[kDrawBindingColor] = {VK_NULL_HANDLE, color->view, VK_IMAGE_LAYOUT_GENERAL};
+        if (color) ii[kDrawBindingColor] = {VK_NULL_HANDLE, color->view, VK_IMAGE_LAYOUT_GENERAL};
         for (u32 stage = 0; stage < 2; ++stage) {
             const Draw& dr = *plans[i].draw;
             const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
@@ -750,13 +916,22 @@ void render_scene(Context& context, Scene& scene) {
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &b, 0,
                              nullptr, 0, nullptr);
     }
+    const VkBufferImageCopy depth_regions[2] = {
+        {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}},
+        {samples * 4, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}}};
+    if (load_depth && depth.image) {
+        vk::transition(*cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyBufferToImage(*cmd, depth_buf->buffer, depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, depth_regions);
+    }
     vk::Pass pass;
-    pass.color = {color, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {}};
+    if (color) pass.color = {color, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {}};
     pass.color_input = reads_color;
     if (has_depth && depth.image) {
         pass.depth.image = &depth;
-        pass.depth.clear_depth = scene.depth.background_depth;
-        pass.depth.clear_stencil = scene.depth.background_control & 0xFF;
+        pass.depth.clear_depth = nx::clamp(ds.background_depth, 0.0f, 1.0f);
+        pass.depth.clear_stencil = mask_bits ? (ds.background_control >> 8) & 1 : ds.background_control & 0xFF;
+        if (load_depth) pass.depth.load = pass.depth.stencil_load = VK_ATTACHMENT_LOAD_OP_LOAD;
+        if (store_depth) pass.depth.store = pass.depth.stencil_store = VK_ATTACHMENT_STORE_OP_STORE;
     }
     pass.area = {{0, 0}, {target_w, target_h}};
     if (auto begun = r.passes->begin(*cmd, pass); begun) {
@@ -777,12 +952,22 @@ void render_scene(Context& context, Scene& scene) {
             }
             vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
             vkCmdSetScissor(*cmd, 0, 1, &p.scissor);
-            vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_FRONT_BIT, st.stencil[0].ref);
-            vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_BACK_BIT, st.stencil[st.two_sided ? 1 : 0].ref);
-            vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_FRONT_BIT, st.stencil[0].compare_mask);
-            vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_BACK_BIT, st.stencil[st.two_sided ? 1 : 0].compare_mask);
-            vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_FRONT_BIT, st.stencil[0].write_mask);
-            vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_BACK_BIT, st.stencil[st.two_sided ? 1 : 0].write_mask);
+            const StencilState& front = st.stencil[0];
+            const StencilState& back = st.stencil[st.two_sided ? 1 : 0];
+            if (mask_bits) {
+                const bool update = p.draw->fragment->mask_update;
+                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_FRONT_BIT, update ? (front.func >> 25) & 1 : 1);
+                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_BACK_BIT, update ? (back.func >> 25) & 1 : 1);
+                vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+                vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_FRONT_AND_BACK, update ? 1 : 0);
+            } else {
+                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_FRONT_BIT, front.ref);
+                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_BACK_BIT, back.ref);
+                vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_FRONT_BIT, front.compare_mask);
+                vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_BACK_BIT, back.compare_mask);
+                vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_FRONT_BIT, front.write_mask);
+                vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_BACK_BIT, back.write_mask);
+            }
             vkCmdSetDepthBias(*cmd, static_cast<f32>(st.depth_bias_units[0]), 0.0f, static_cast<f32>(st.depth_bias_factor[0]));
             vkCmdSetBlendConstants(*cmd, blend);
             vkCmdBindDescriptorSets(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 0, 1, &descriptor_sets[i], 0, nullptr);
@@ -795,20 +980,33 @@ void render_scene(Context& context, Scene& scene) {
     } else {
         nx::logw(logs::gpu, "{}", begun.error().message);
     }
-    vk::transition(*cmd, *color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {width, height, 1};
-    vkCmdCopyImageToBuffer(*cmd, color->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &copy);
+    if (color) {
+        vk::transition(*cmd, *color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        vkCmdCopyImageToBuffer(*cmd, color->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->buffer, 1, &copy);
+    }
+    if (store_depth && depth.image) {
+        vk::transition(*cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkCmdCopyImageToBuffer(*cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, depth_buf->buffer, 2, depth_regions);
+    }
     VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(*cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
     if (auto done = shot.submit_and_wait(); done) {
-        vk::invalidate(d, *readback);
-        const u8* src = static_cast<const u8*>(readback->mapped);
-        for (u32 y = 0; y < height; ++y)
-            std::memcpy(memory().host(cs.data + y * stride * cf.bytes), src + usize{y} * width * cf.bytes, usize{width} * cf.bytes);
+        if (color) {
+            vk::invalidate(d, *readback);
+            const u8* src = static_cast<const u8*>(readback->mapped);
+            for (u32 y = 0; y < height; ++y)
+                std::memcpy(memory().host(cs.data + y * stride * cf.bytes), src + usize{y} * width * cf.bytes, usize{width} * cf.bytes);
+        }
+        if (store_depth && depth.image) {
+            vk::invalidate(d, *depth_buf);
+            const u8* src = static_cast<const u8*>(depth_buf->mapped);
+            write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src), src + samples * 4);
+        }
     } else {
         nx::loge(logs::gpu, "scene: {}", done.error().message);
     }

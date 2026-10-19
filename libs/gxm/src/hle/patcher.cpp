@@ -288,6 +288,40 @@ i32 sceGxmShaderPatcherCreateFragmentProgram(u32 patcher, u32 id, u32 output_for
     return 0;
 }
 
+// One per patcher, shared (reference counted). Its program is an empty fragment program with no resources (the
+// driver's own has no SceGxmProgram the game may read: sceGxmFragmentProgramGetProgram returns 0 for it).
+i32 sceGxmShaderPatcherCreateMaskUpdateFragmentProgram(u32 patcher, Ptr<u32> out) {
+    if (!patcher || !out) return err::kInvalidPointer;
+    State& s = state();
+    nx::scoped_lock<nx::mutex> held(s.lock);
+    Patcher* p = patcher_of(patcher);
+    if (!p) return err::kInvalidPointer;
+    for (FragmentProgram* f : p->fragment_programs) {
+        if (!f->mask_update) continue;
+        ++f->references;
+        *out = f->guest;
+        return 0;
+    }
+    if (!s.mask_update_program) {
+        s.mask_update_program = nx::make_unique<Program>();
+        usse::Gxp& g = s.mask_update_program->gxp;
+        g.type = usse::ShaderType::Fragment;
+        g.output_type = usse::ParameterType::F16;
+        g.output_components = 4;
+    }
+    const u32 guest = guest_alloc(16);
+    if (!guest) return err::kOutOfMemory;
+    auto f = nx::make_unique<FragmentProgram>();
+    f->guest = guest;
+    f->program = s.mask_update_program.get();
+    f->mask_update = true;
+    *reinterpret_cast<u32*>(memory().host(guest)) = 0;
+    p->fragment_programs.push_back(f.get());
+    s.fragment_programs[guest] = std::move(f);
+    *out = guest;
+    return 0;
+}
+
 i32 sceGxmShaderPatcherAddRefVertexProgram(u32 patcher, u32 program) {
     nx::scoped_lock<nx::mutex> held(state().lock);
     auto it = state().vertex_programs.find(program);
@@ -344,7 +378,11 @@ u32 sceGxmVertexProgramGetProgram(u32 program) {
     return program && memory().valid(program, 4) ? *reinterpret_cast<const u32*>(memory().host(program)) : 0;
 }
 u32 sceGxmFragmentProgramGetProgram(u32 program) { return sceGxmVertexProgramGetProgram(program); }
-u32 sceGxmFragmentProgramIsEnabled(u32 program) { return program ? 1 : 0; }
+u32 sceGxmFragmentProgramIsEnabled(u32 program) {
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    auto it = state().fragment_programs.find(program);
+    return it != state().fragment_programs.end() && !it->second->mask_update ? 1 : 0;
+}
 
 const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xED8B6C69, sceGxmProgramCheck),
@@ -388,6 +426,7 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xA949A803, sceGxmShaderPatcherGetProgramFromId),
     HLE_FUNCTION(0xB7BBA6D5, sceGxmShaderPatcherCreateVertexProgram),
     HLE_FUNCTION(0x4ED2E49D, sceGxmShaderPatcherCreateFragmentProgram),
+    HLE_FUNCTION(0xA4433427, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram),
     HLE_FUNCTION(0x0FD1E589, sceGxmShaderPatcherAddRefVertexProgram),
     HLE_FUNCTION(0x4CD2D19F, sceGxmShaderPatcherAddRefFragmentProgram),
     HLE_FUNCTION(0xA1A16FF6, sceGxmShaderPatcherGetVertexProgramRefCount),
