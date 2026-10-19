@@ -1,0 +1,213 @@
+// The display (SceDisplay): the frame buffer shown, and vertical blanks at the display's refresh rate on the host
+// clock. Also the thread of GXM's display queue, which calls the game's display callback for each queued frame.
+
+#include <cmath>
+#include <cstring>
+
+#include "psvrecore/log.hpp"
+#include "state.hpp"
+#include "core/foundation/platform/os.h"
+#include "core/foundation/strings/format.h"
+
+namespace psvrecore::gxm::hle {
+
+namespace {
+
+constexpr u32 kSceDisplay = 0x5ED8F994, kSceDisplayUser = 0x4FAACD11;
+constexpr i32 kErrorInvalidValue = static_cast<i32>(0x80290001u), kErrorInvalidAddr = static_cast<i32>(0x80290002u),
+              kErrorInvalidPixelFormat = static_cast<i32>(0x80290003u), kErrorInvalidPitch = static_cast<i32>(0x80290004u),
+              kErrorInvalidResolution = static_cast<i32>(0x80290005u),
+              kErrorInvalidUpdateTiming = static_cast<i32>(0x80290006u);
+
+struct Display {
+    nx::mutex lock;
+    DisplayFrameBuf current{};
+    bool shown = false;
+    u64 epoch_ns = 0;  // (the first vertical blank)
+};
+
+Display& display() {
+    static Display d;
+    return d;
+}
+
+f64 period_ns() { return 1e9 / state().options->refresh_hz; }
+
+u64 now_ns() {
+    Display& d = display();
+    const u64 now = nx::os::ticks_ns();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (!d.epoch_ns) d.epoch_ns = now;
+    return now - d.epoch_ns;
+}
+
+u64 vcount_at(u64 t) { return static_cast<u64>(static_cast<f64>(t) / period_ns()); }
+
+// Waits (giving up the guest CPU) until `count` more vertical blanks have started.
+void wait_vblanks(u32 count, bool callbacks) {
+    const u64 now = now_ns();
+    const u64 target = vcount_at(now) + count;
+    const u64 at = static_cast<u64>(std::ceil(static_cast<f64>(target) * period_ns()));
+    {
+        runtime::Kernel::Blocking blocking(runtime::runtime().kernel());
+        while (true) {
+            const u64 t = now_ns();
+            if (t >= at) break;
+            nx::this_thread::sleep_for(std::chrono::nanoseconds(at - t));
+        }
+    }
+    if (callbacks) runtime::runtime().kernel().check_callbacks();
+}
+
+i32 set_frame_buf(Ptr<const DisplayFrameBuf> p, i32 sync) {
+    if (sync != 0 && sync != 1) return kErrorInvalidUpdateTiming;  // (immediate, next frame)
+    Display& d = display();
+    if (!p) {  // (no frame buffer: the display shows black)
+        nx::scoped_lock<nx::mutex> held(d.lock);
+        d.shown = false;
+        return 0;
+    }
+    const DisplayFrameBuf f = *p;
+    if (f.size != sizeof(DisplayFrameBuf)) return kErrorInvalidValue;
+    if (!f.base || (f.base & 0xFF)) return kErrorInvalidAddr;
+    if (f.pixel_format != 0 && f.pixel_format != 0x50000000u) return kErrorInvalidPixelFormat;  // A8B8G8R8, A2B10G10R10
+    if (f.pitch < f.width) return kErrorInvalidPitch;
+    if (!f.width || !f.height || f.width > 960 || f.height > 544) return kErrorInvalidResolution;
+    if (!runtime::runtime().memory().valid(f.base, f.pitch * f.height * 4)) return kErrorInvalidAddr;
+    {
+        nx::scoped_lock<nx::mutex> held(d.lock);
+        d.current = f;
+        d.shown = true;
+    }
+    if (DisplaySink* sink = state().options->display) {
+        Frame frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount_at(now_ns())};
+        sink->show(frame);
+    }
+    return 0;
+}
+
+i32 sceDisplaySetFrameBuf(Ptr<const DisplayFrameBuf> p, i32 sync) { return set_frame_buf(p, sync); }
+
+i32 sceDisplayGetFrameBuf(Ptr<DisplayFrameBuf> p, i32 sync) {
+    if (!p) return kErrorInvalidValue;
+    if (sync != 0 && sync != 1) return kErrorInvalidUpdateTiming;
+    if (p->size != sizeof(DisplayFrameBuf)) return kErrorInvalidValue;
+    Display& d = display();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (!d.shown) {
+        std::memset(p.get(), 0, sizeof(DisplayFrameBuf));
+        p->size = sizeof(DisplayFrameBuf);
+        return 0;
+    }
+    *p = d.current;
+    return 0;
+}
+
+i32 sceDisplayWaitVblankStart() {
+    wait_vblanks(1, false);
+    return 0;
+}
+i32 sceDisplayWaitVblankStartCB() {
+    wait_vblanks(1, true);
+    return 0;
+}
+i32 sceDisplayWaitVblankStartMulti(u32 count) {
+    wait_vblanks(count ? count : 1, false);
+    return 0;
+}
+i32 sceDisplayWaitVblankStartMultiCB(u32 count) {
+    wait_vblanks(count ? count : 1, true);
+    return 0;
+}
+// (frame buffers take effect at once here: waiting for one to be set is waiting for the next vertical blank)
+i32 sceDisplayWaitSetFrameBuf() { return sceDisplayWaitVblankStart(); }
+i32 sceDisplayWaitSetFrameBufCB() { return sceDisplayWaitVblankStartCB(); }
+
+i32 sceDisplayGetVcount() { return static_cast<i32>(vcount_at(now_ns()) & 0xFFFF); }
+
+i32 sceDisplayGetRefreshRate(Ptr<f32> hz) {
+    if (!hz) return kErrorInvalidValue;
+    *hz = static_cast<f32>(state().options->refresh_hz);
+    return 0;
+}
+
+i32 sceDisplayGetMaximumFrameBufResolution(Ptr<i32> width, Ptr<i32> height) {
+    if (width) *width = 960;
+    if (height) *height = 544;
+    return 0;
+}
+
+const runtime::hle::Function kDisplayFunctions[] = {
+    HLE_FUNCTION(0x5795E898, sceDisplayWaitVblankStart),
+    HLE_FUNCTION(0x78B41B92, sceDisplayWaitVblankStartCB),
+    HLE_FUNCTION(0xDD0A13B8, sceDisplayWaitVblankStartMulti),
+    HLE_FUNCTION(0x05F27764, sceDisplayWaitVblankStartMultiCB),
+    HLE_FUNCTION(0x9423560C, sceDisplayWaitSetFrameBuf),
+    HLE_FUNCTION(0x814C90AF, sceDisplayWaitSetFrameBufCB),
+    HLE_FUNCTION(0xB6FDE0BA, sceDisplayGetVcount),
+    HLE_FUNCTION(0xA08CA60D, sceDisplayGetRefreshRate),
+    HLE_FUNCTION(0xF51523CB, sceDisplaySetFrameBuf),  // (_sceDisplaySetFrameBuf)
+    HLE_FUNCTION(0xA753B0CA, sceDisplayGetFrameBuf),  // (_sceDisplayGetFrameBuf)
+};
+const runtime::hle::Function kDisplayUserFunctions[] = {
+    HLE_FUNCTION(0x7A410B64, sceDisplaySetFrameBuf),
+    HLE_FUNCTION(0x42AE6BBC, sceDisplayGetFrameBuf),
+    HLE_FUNCTION(0x8848ADDD, sceDisplayGetMaximumFrameBufResolution),
+};
+
+// ---- The display queue thread ----------------------------------------------------------------------------------
+
+void display_queue_main() {
+    State& s = state();
+    runtime::Runtime& rt = runtime::runtime();
+    rt.kernel().adopt_host_thread("SceGxmDisplayQueue", 64);  // (a high priority, as libgxm's thread has)
+    while (true) {
+        DisplayEntry entry;
+        {
+            runtime::Kernel::Blocking blocking(rt.kernel());
+            nx::scoped_lock<nx::mutex> held(s.queue_lock);
+            s.queue_changed.wait(s.queue_lock, [&] { return s.stopping || !s.queue.empty(); });
+            if (s.stopping) break;
+            entry = s.queue.front();
+            s.queue.erase(s.queue.begin());
+            s.queue_busy = 1;
+        }
+        // (scenes are rendered when they end, so the new buffer is complete: the callback can run at once)
+        if (s.init.display_queue_callback) {
+            const u32 args[] = {entry.data};
+            runtime::hle::call_guest(&runtime::Kernel::current()->ctx, s.init.display_queue_callback, args);
+        }
+        {
+            nx::scoped_lock<nx::mutex> held(s.queue_lock);
+            s.queue_data_free.push_back(entry.data);
+            s.queue_busy = 0;
+        }
+        s.queue_changed.notify_all();
+    }
+    rt.kernel().release_host_thread();
+}
+
+}  // namespace
+
+void start_display_queue() {
+    State& s = state();
+    s.stopping = false;
+    s.display_thread = nx::thread([] { display_queue_main(); });
+}
+
+void stop_display_queue() {
+    State& s = state();
+    {
+        nx::scoped_lock<nx::mutex> held(s.queue_lock);
+        s.stopping = true;
+    }
+    s.queue_changed.notify_all();
+    if (s.display_thread.joinable()) s.display_thread.join();
+}
+
+void register_display() {
+    runtime::hle::register_library({"SceDisplay", kSceDisplay, kDisplayFunctions});
+    runtime::hle::register_library({"SceDisplayUser", kSceDisplayUser, kDisplayUserFunctions});
+}
+
+}  // namespace psvrecore::gxm::hle
