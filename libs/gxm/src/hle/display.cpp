@@ -209,6 +209,8 @@ void display_queue_main() {
         }
         s.queue_changed.notify_all();
     }
+            if (auto it = s.display_holds.find(entry.old_buffer); it != s.display_holds.end() && it->second)
+                if (--it->second == 0) s.display_holds.erase(it);
     rt.kernel().release_host_thread();
 }
 

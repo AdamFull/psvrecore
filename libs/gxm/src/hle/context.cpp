@@ -64,7 +64,8 @@ void set_default_region_and_viewport(Context& c, u32 x_max, u32 y_max) {
     s.viewport[5] = 0.5f;
 }
 
-i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> region, u32 color, u32 depth) {
+i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> region, u32 fragment_sync, u32 color,
+                u32 depth) {
     if (!context || !target) return err::kInvalidPointer;
     State& st = state();
     nx::scoped_lock<nx::mutex> held(st.lock);
@@ -77,6 +78,7 @@ i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> regio
     scene.target = t->second.get();
     scene.flags = flags;
     scene.visibility_buffer = c->visibility_buffer;
+    scene.fragment_sync = fragment_sync;
     scene.region = region ? *region : ValidRegion{scene.target->width - 1, scene.target->height - 1};
     if (color && memory().valid(color, sizeof(ColorSurface))) {
         scene.color = *reinterpret_cast<const ColorSurface*>(memory().host(color));
@@ -94,14 +96,14 @@ i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> regio
 
 i32 sceGxmBeginScene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> region, u32 vertex_sync,
                      u32 fragment_sync, u32 color, u32 depth) {
-    (void)vertex_sync, (void)fragment_sync;  // (scenes are rendered when they end: nothing waits)
-    return begin_scene(context, flags, target, region, color, depth);
+    (void)vertex_sync;  // (scenes are rendered when they end: the vertex stage waits for nothing)
+    return begin_scene(context, flags, target, region, fragment_sync, color, depth);
 }
 
 i32 sceGxmBeginSceneEx(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> region, u32 vertex_sync,
                        u32 fragment_sync, u32 color, u32 load_depth, u32 store_depth) {
-    (void)vertex_sync, (void)fragment_sync, (void)store_depth;
-    return begin_scene(context, flags, target, region, color, load_depth);
+    (void)vertex_sync, (void)store_depth;
+    return begin_scene(context, flags, target, region, fragment_sync, color, load_depth);
 }
 
 i32 sceGxmEndScene(u32 context, Ptr<const Notification> vertex_notification, Ptr<const Notification> fragment_notification) {
@@ -117,6 +119,12 @@ i32 sceGxmEndScene(u32 context, Ptr<const Notification> vertex_notification, Ptr
         c->in_scene = false;
         scene = std::move(c->scene);
         c->scene = Scene{};
+    }
+    // (the GPU's wait for the fragment sync object: its buffer drawn only once the display has let it go)
+    if (scene.fragment_sync) {
+        runtime::Kernel::Blocking blocking(runtime::runtime().kernel());
+        nx::scoped_lock<nx::mutex> held(st.queue_lock);
+        st.queue_changed.wait(st.queue_lock, [&] { return st.stopping || !st.display_holds.contains(scene.fragment_sync); });
     }
     render_scene(*c, scene);
     notify(vertex_notification);

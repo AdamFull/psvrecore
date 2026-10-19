@@ -272,6 +272,7 @@ struct Scene {
     ValidRegion region{};
     u32 flags = 0;
     u32 visibility_buffer = 0;  // (core 0's counters; 0: none)
+    u32 fragment_sync = 0;      // (the sync object it waits for; 0: none)
     nx::vector<Draw> draws;
 };
 
@@ -335,6 +336,11 @@ struct State {
     nx::cond_var queue_changed;
     nx::vector<DisplayEntry> queue;
     u32 queue_busy = 0;  // (an entry being shown)
+    // Display buffers' sync objects the queue holds (by handle): from the entry that shows a buffer until a later
+    // entry's flip replaces it (its callback has run), as the console's display queue holds them. A scene whose
+    // fragment sync object is held waits for it before it renders (the GPU's wait), so a buffer is not drawn into
+    // while it is shown.
+    nx::hash_map<u32, u32> display_holds;
     nx::vector<u32> queue_data_free;  // guest blocks for callback data
     nx::thread display_thread;
     bool stopping = false;
