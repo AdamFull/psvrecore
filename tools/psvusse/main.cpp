@@ -260,7 +260,7 @@ Result<nx::vector<u32>> translate(const usse::Gxp& g, const nx::string& form) {
     if (form == "secondary")
         return gxm::translate_secondary(g, usse::decode_program(g.secondary, usse::ProgramKind::Secondary));
     const auto primary = usse::decode_program(g.primary, usse::ProgramKind::Primary);
-    if (form == "vertex" || form == "fragment") {
+    if (form == "draw" || form == "vertex" || form == "fragment") {
         if (g.type == usse::ShaderType::Vertex) {
             gxm::VertexShader shader;
             for (const usse::Parameter& p : g.parameters) {

@@ -75,8 +75,10 @@ inline constexpr u32 kDrawViewport = 1, kDrawPoints = 2;
 inline constexpr u32 kVaryingColor0 = 0, kVaryingColor1 = 1, kVaryingFog = 2, kVaryingTexCoord0 = 3;
 
 // A vertex attribute as the patcher gives it (SceGxmVertexAttribute): its Vulkan input is at `location`, read as
-// floats (formats U8-F32: normalized or not as the format says) or as unsigned integers holding the data's bits
-// (raw: untyped attributes, and attributes the program reads in their declared format).
+// (vertex_input_read): floats (the normalized formats, F16, F32), unsigned or signed integers converted to floats
+// in the shader (U8, U16, S8, S16), or unsigned integers holding the data's bits (raw: untyped attributes, and
+// attributes the program reads in their declared format). The input may fetch more components than the attribute
+// has (a 4-component format for a 3-component one): the shader takes the missing ones as 0, 0, 0, 1.
 struct VertexInput {
     u32 location = 0;
     u32 reg = 0;         // the first primary attribute register
@@ -85,7 +87,9 @@ struct VertexInput {
     bool raw = false;
 };
 
-// The register contents a raw input is read as, for its Vulkan format (bits per component).
+enum class VertexRead : u8 { Float, Unsigned, Signed, Raw };
+VertexRead vertex_input_read(const VertexInput& in);
+// Bits per component of an attribute format (raw inputs pack them in this size).
 u32 vertex_input_bits(u8 format);
 
 struct VertexShader {
@@ -93,7 +97,9 @@ struct VertexShader {
 };
 
 struct FragmentShader {
-    u32 output_format = 0;  // SceGxmOutputRegisterFormat (0: as the program declares)
+    // SceGxmOutputRegisterFormat the program was made for (the colour is read in the program's declared output type:
+    // the attachment quantizes it to this format).
+    u32 output_format = 0;
     // The colour's components from the output register's lanes (0-3: x, y, z, w; 4: zero, 5: one), in the
     // attachment's red, green, blue, alpha order.
     u8 swizzle[4] = {0, 1, 2, 3};

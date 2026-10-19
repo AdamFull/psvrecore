@@ -1299,13 +1299,22 @@ void Translator::vertex_prologue() {
         for (const usse::Parameter& q : gxp_.parameters)
             if (q.category == usse::ParameterCategory::Attribute && q.resource == in.reg) p = &q;
         if (!p) continue;  // (the program does not read it)
-        const Id type = in.raw ? tuv4 : tv4_;
+        const VertexRead read = vertex_input_read(in);
+        const Id tiv4 = b_.t_vector(ti_, 4);
+        const Id type = read == VertexRead::Float ? tv4_ : read == VertexRead::Signed ? tiv4 : tuv4;
         const Id var = b_.variable(b_.t_pointer(SpvStorageClassInput, type), SpvStorageClassInput);
         b_.decorate(var, SpvDecorationLocation, {in.location});
         interface_.push_back(var);
         const Id v = load(type, var);
-        auto comp = [&](u32 k) { return b_.op(SpvOpCompositeExtract, in.raw ? tu_ : tf_, {v, k}); };
-        if (in.raw) {
+        // Component k as a float (raw: its bits); past the attribute's components, 0, 0, 0, 1.
+        auto comp = [&](u32 k) -> Id {
+            if (read == VertexRead::Raw) return b_.op(SpvOpCompositeExtract, tu_, {v, k});
+            if (k >= in.components) return f(k == 3 ? 1.0f : 0.0f);
+            if (read == VertexRead::Float) return b_.op(SpvOpCompositeExtract, tf_, {v, k});
+            const Id x = b_.op(SpvOpCompositeExtract, read == VertexRead::Signed ? ti_ : tu_, {v, k});
+            return un(read == VertexRead::Signed ? SpvOpConvertSToF : SpvOpConvertUToF, tf_, x);
+        };
+        if (read == VertexRead::Raw) {
             // The data's bits, packed into the registers in order.
             const u32 bits = vertex_input_bits(in.format);
             const u32 count = in.components;  // (untyped: 32-bit words)
@@ -1493,9 +1502,10 @@ void Translator::fragment_prologue() {
 }
 
 void Translator::fragment_epilogue() {
-    // The output register's lanes, as its format reads them.
-    u32 format = fragment_shader->output_format;
-    if (format == 0) {
+    // The output register's lanes, in the type the program declares for its output (the patcher converts that to
+    // the format the fragment program was made for, as the attachment's format does here).
+    u32 format = 0;
+    {
         switch (gxp_.output_type) {
             case usse::ParameterType::F32: format = gxp_.output_components <= 1 ? 8 : 7; break;
             case usse::ParameterType::U8: format = 1; break;
@@ -1554,8 +1564,9 @@ void Translator::fragment_epilogue() {
                                                       lane[nx::min<u8>(z[2], 5)], lane[nx::min<u8>(z[3], 5)]}));
     // A discarded instance: no colour, no depth.
     const Id kill = b_.new_label(), merge = b_.new_label();
+    const Id killed = load(tb_, killed_);
     b_.op0(SpvOpSelectionMerge, {merge, SpvSelectionControlMaskNone});
-    b_.op0(SpvOpBranchConditional, {load(tb_, killed_), kill, merge});
+    b_.op0(SpvOpBranchConditional, {killed, kill, merge});
     b_.block(kill);
     b_.op0(SpvOpKill, {});
     b_.block(merge);
@@ -1582,6 +1593,8 @@ Result<nx::vector<u32>> Translator::translate() {
     const Id block = b_.t_struct({words});
     b_.decorate(block, SpvDecorationBlock);
     b_.member_decorate(block, 0, SpvDecorationOffset, {0});
+    // (a draw's shaders only read their buffers: vertex shaders may not write them without a device feature)
+    if (form_ == Form::Vertex || form_ == Form::Fragment) b_.member_decorate(block, 0, SpvDecorationNonWritable);
     const Id tp_block = b_.t_pointer(SpvStorageClassStorageBuffer, block);
     auto buffer = [&](u32 binding, const char* name) {
         const Id v = b_.variable(tp_block, SpvStorageClassStorageBuffer);
@@ -1691,6 +1704,13 @@ Result<nx::vector<u32>> Translator::translate() {
 }
 
 }  // namespace
+
+VertexRead vertex_input_read(const VertexInput& in) {
+    if (in.raw || in.format > 9) return VertexRead::Raw;
+    if (in.format == 0 || in.format == 2) return VertexRead::Unsigned;
+    if (in.format == 1 || in.format == 3) return VertexRead::Signed;
+    return VertexRead::Float;
+}
 
 u32 vertex_input_bits(u8 format) {
     switch (format) {
