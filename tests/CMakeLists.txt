@@ -27,6 +27,7 @@ add_executable(psvrecore_tests
     core_tests.cpp
     address_space_tests.cpp
     formats_tests.cpp
+    cpk_tests.cpp
     arm_tests.cpp
     generator_tests.cpp
     interp_tests.cpp

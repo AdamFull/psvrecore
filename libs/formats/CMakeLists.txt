@@ -1,6 +1,7 @@
 # File formats of Vita software: SELF, ELF and stub archives, SCE module information and imports/exports,
-# SCE relocations, SFO, and the NID database.
+# SCE relocations, SFO, CPK archives (CRI), and the NID database.
 add_library(psvrecore_formats STATIC
+    src/cpk.cpp
     src/elf.cpp
     src/module.cpp
     src/nids.cpp
