@@ -69,14 +69,18 @@
 
 ## Shader interpreter (USSE)
 
-- **Vertex programs only.** Fragment inputs, the fixed-point families (16, 17, 18, 25), texture sampling, the
-  per-instance predicate, `rlp`, per-lane predicate tests, and loads and stores other than absolute ones fail with
-  "not implemented". Derivatives read as zero (one instance, no neighbours), and so do the special registers.
+- **Not implemented:** texture sampling, the per-instance predicate, `rlp`, per-lane predicate tests, o8 packs,
+  loads and stores other than absolute ones, depth output. These fail with "not implemented". Derivatives and the
+  special registers read as zero (one instance, no neighbours).
+- **Fixed point is the least certain part.** fx10 is a signed 10-bit value with 1.0 = 255. x, y and z are in bits
+  0-9, 10-19 and 20-29 of a register, w in the next one; this layout is read from the compiler's literals, and an fx10
+  varying takes two registers. Products round to nearest (assumed). 7 of 600 random fixed-point programs disagree,
+  unexplained.
 - **Semantics marked "(assumed)" in `interp.cpp` are not covered by the same-source check.** These are the
   index-register destination numbering, the 16-bit integer multiply-add without a byte part, rounding in scaled
   (normalized) conversions, and unfused multiply-add rounding.
-- **5 of 1949 random programs disagree, unexplained.** They involve integers that go through the compiler's 16-bit
-  conversion shortcuts, or multiplies by selected constants that it turns into shifts. It is not known whether the
+- **8 of 981 random vertex programs disagree, unexplained.** Most involve integers that go through the compiler's
+  16-bit conversion shortcuts, or integer arithmetic on indexed array elements. It is not known whether the
   interpreter or the compiler is wrong there.
 - **The SDK's shader compiler (psp2cgc) miscompiles some expressions.** The check avoids these patterns, or reports
   them separately, since they say nothing about the interpreter:
@@ -87,6 +91,12 @@
     case dropped a declared output). Such programs agree once their uniforms are made attributes, and the check
     reports them as "disagree only with uniforms".
   - Deep expressions crash the compiler (status 0xC0000409).
+  - In fixed point, `x - y.w` (subtracting a scalar broadcast) compiles to `sub t, 0, y` (a negation) followed by
+    `x - t`. That is only right if the first `sub` does not negate, yet `-y` compiles to the same instruction. The
+    interpreter negates, as the instruction reads, and the check reports such programs separately ("subtract a
+    negated value").
+  - `lerp(x, constant, t)` with a constant t > 1 folds with the wrong sign in fixed point.
+  - A half vector cast to int is converted in one lane, which is then read for every lane.
 - **The compiler converts float to int by flooring** (`(int)-2.5` is -3). Cg says truncation; the check follows the
   compiler.
 
