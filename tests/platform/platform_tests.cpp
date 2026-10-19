@@ -404,3 +404,56 @@ TEST_CASE("window: in the background nothing is presented; back, a new surface a
     CHECK(w.device()->surface() != VK_NULL_HANDLE);
     CHECK(presented_fitted(w, &shot));
 }
+
+TEST_CASE("window: overlay quads are blended over the picture, cut from their atlas") {
+    Window::Options o;
+    o.title = "psvrecore test";
+    o.hidden = true;
+    auto opened = Window::open(o);
+    if (!opened) SKIP(nx::format("no window: {}", opened.error().message).c_str());
+    Window& w = **opened;
+    w.keep_last(true);
+    const nx::vector<u8> picture = quadrants();
+    w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+    Shot shot;
+    REQUIRE(w.wait_presented(1, 3000));
+    if (!w.last_image(&shot.rgba, &shot.w, &shot.h)) SKIP("the window's images cannot be read back");
+    REQUIRE(presented_fitted(w, &shot));
+    if (shot.w != kScreenWidth || shot.h != kScreenHeight) SKIP("the window is not at 1:1");
+    // An atlas of two texels: white half transparent, and clear.
+    const u8 atlas[] = {255, 255, 255, 128, 0, 0, 0, 0};
+    w.set_overlay_atlas(atlas, 2, 1);
+    Quad white;  // (over the red quadrant: the left texel only)
+    white.x0 = 100, white.y0 = 100, white.x1 = 200, white.y1 = 200;
+    white.u0 = 0.1f, white.u1 = 0.4f;
+    Quad tinted = white;  // (over the green one, tinted blue)
+    tinted.x0 = 600, tinted.x1 = 700;
+    tinted.r = 0, tinted.g = 0;
+    Quad clear = white;  // (the clear texel over the blue one: nothing)
+    clear.y0 = 350, clear.y1 = 450;
+    clear.u0 = 0.6f, clear.u1 = 0.9f;
+    w.set_overlay({white, tinted, clear});
+    static constexpr u8 kPink[3] = {255, 128, 128}, kTeal[3] = {0, 127, 128};
+    bool seen = false;
+    for (u32 i = 0; i < 3000 && !seen; ++i) {
+        w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+        w.pump(nullptr);
+        seen = w.last_image(&shot.rgba, &shot.w, &shot.h) && is(shot.at(150, 150), kPink);
+        SDL_Delay(1);
+    }
+    REQUIRE(seen);
+    std::printf("overlay: %u %u %u over red, %u %u %u over green\n", shot.at(150, 150)[0], shot.at(150, 150)[1],
+                shot.at(150, 150)[2], shot.at(650, 150)[0], shot.at(650, 150)[1], shot.at(650, 150)[2]);
+    CHECK(is(shot.at(650, 150), kTeal));
+    CHECK(is(shot.at(150, 400), kQuadrant[2]));
+    CHECK(is(shot.at(250, 150), kQuadrant[0]));  // (outside the quads)
+    w.set_overlay({});
+    bool gone = false;
+    for (u32 i = 0; i < 3000 && !gone; ++i) {
+        w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+        w.pump(nullptr);
+        gone = w.last_image(&shot.rgba, &shot.w, &shot.h) && is(shot.at(150, 150), kQuadrant[0]);
+        SDL_Delay(1);
+    }
+    CHECK(gone);
+}

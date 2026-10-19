@@ -16,6 +16,7 @@
 #include "psvrecore/error.hpp"
 #include "psvrecore/gxm/hle.hpp"
 #include "psvrecore/platform/input.hpp"
+#include "psvrecore/platform/quad.hpp"
 #include "core/foundation/core/foundation.h"
 
 struct SDL_Window;
@@ -68,6 +69,10 @@ public:
     bool last_image(nx::vector<u8>* rgba, u32* width, u32* height);
 
     SDL_Window* sdl() const { return window_; }
+    // What is drawn over the picture (the on-screen controls): quads cut from one texture, the atlas (RGBA, straight
+    // alpha). From any thread; the quads are in the window's pixels.
+    void set_overlay(nx::vector<Quad> quads);
+    void set_overlay_atlas(const u8* rgba, u32 width, u32 height);
     // The application to the background (on Android: before its window's surface goes) and back: nothing is drawn
     // meanwhile. From any thread.
     void set_background(bool background);

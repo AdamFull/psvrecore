@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "psvrecore/log.hpp"
+#include "quads.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "psvrecore/vulkan/device.hpp"
 #include "psvrecore/vulkan/resources.hpp"
@@ -39,21 +40,6 @@ Rect fit(f32 w, f32 h) {
     const f32 scale = std::min(w / kScreenWidth, h / kScreenHeight);
     const f32 sw = kScreenWidth * scale, sh = kScreenHeight * scale;
     return Rect{(w - sw) * 0.5f, (h - sh) * 0.5f, sw, sh};
-}
-
-// A barrier for a swapchain image (whose acquisition is waited for at the transfer stage, which every barrier on
-// it must then start from).
-void barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags src_access,
-             VkAccessFlags dst_access, VkPipelineStageFlags dst_stage) {
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = src_access;
-    b.dstAccessMask = dst_access;
-    b.oldLayout = from;
-    b.newLayout = to;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
 bool is_srgb(VkFormat f) {
@@ -113,6 +99,17 @@ struct Window::Presenter {
     nx::vector<VkImage> images;
     nx::vector<VkSemaphore> rendered;  // (one per swapchain image: a present's wait may outlive a frame in flight)
 
+    // The drawing (made with the device), the overlay's quads and its sprites (set from the thread pumping events,
+    // under `lock`), and the atlas as an image (the presenting thread's).
+    std::unique_ptr<QuadRenderer> quads;
+    nx::vector<Quad> overlay, overlay_drawn;
+    nx::vector<u8> atlas_upload;  // (taken from atlas_pixels by the presenting thread)
+    u32 atlas_upload_w = 0, atlas_upload_h = 0;
+    nx::vector<u8> atlas_pixels;
+    u32 atlas_w = 0, atlas_h = 0;
+    bool atlas_changed = false;
+    vulkan::Image atlas;
+
     // The last image presented (keep_last).
     nx::mutex readback_lock;
     std::atomic<bool> keep{false};
@@ -141,6 +138,8 @@ struct Window::Presenter {
             if (f.acquired) vkDestroySemaphore(d, f.acquired, nullptr);
         }
         vulkan::destroy_buffer(*device, readback);
+        vulkan::destroy_image(*device, atlas);
+        quads.reset();
         if (pool) vkDestroyCommandPool(d, pool, nullptr);
     }
 
@@ -166,6 +165,7 @@ struct Window::Presenter {
             if (VkResult r = vkCreateSemaphore(d, &si, nullptr, &f.acquired); r != VK_SUCCESS)
                 return nx::err(vulkan::vk_error("vkCreateSemaphore", r));
         }
+        quads = std::make_unique<QuadRenderer>(*device);
         thread = nx::thread([this] { run(); });
         return {};
     }
@@ -190,6 +190,12 @@ struct Window::Presenter {
                     current_w = pending_w, current_h = pending_h;
                     has_pending = false;
                 }
+                overlay_drawn = overlay;
+                if (atlas_changed) {
+                    atlas_upload = std::move(atlas_pixels);
+                    atlas_upload_w = atlas_w, atlas_upload_h = atlas_h;
+                    atlas_changed = false;
+                }
                 redraw = false;
             }
             if (failed) continue;
@@ -203,6 +209,7 @@ struct Window::Presenter {
 
     void destroy_swapchain() {
         const VkDevice d = device->device();
+        if (quads) (void)quads->set_targets({}, {});
         for (VkSemaphore s : rendered) vkDestroySemaphore(d, s, nullptr);
         rendered.clear();
         images.clear();
@@ -227,8 +234,8 @@ struct Window::Presenter {
             e.height = std::clamp(h, caps.minImageExtent.height, caps.maxImageExtent.height);
         }
         if (!e.width || !e.height) return false;
-        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-            nx::loge(logs::display, "display: the window's images cannot be copied to: nothing is shown");
+        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+            nx::loge(logs::display, "display: the window's images cannot be drawn into: nothing is shown");
             failed = true;
             return false;
         }
@@ -238,8 +245,8 @@ struct Window::Presenter {
         nx::vector<VkSurfaceFormatKHR> formats(n);
         vkGetPhysicalDeviceSurfaceFormatsKHR(p, surface, &n, formats.data());
         if (formats.empty()) return false;
-        // (UNORM, so the guest's bytes go to the display as they are, as on the console; an sRGB swapchain gets an
-        // sRGB staging image, the blit then decoding and encoding again)
+        // (UNORM, so the guest's bytes go to the display as they are, as on the console; an sRGB swapchain gets sRGB
+        // textures, sampling then decoding what drawing encodes again)
         VkSurfaceFormatKHR chosen = formats[0];
         for (const VkSurfaceFormatKHR& f : formats) {
             if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM ||
@@ -248,14 +255,6 @@ struct Window::Presenter {
                 chosen = f;
                 break;
             }
-        }
-        VkFormatProperties fp{};
-        vkGetPhysicalDeviceFormatProperties(p, chosen.format, &fp);
-        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
-            nx::loge(logs::display, "display: the window's format ({}) cannot be blitted to: nothing is shown",
-                     static_cast<i32>(chosen.format));
-            failed = true;
-            return false;
         }
 
         vkGetPhysicalDeviceSurfacePresentModesKHR(p, surface, &n, nullptr);
@@ -279,7 +278,7 @@ struct Window::Presenter {
         ci.imageColorSpace = chosen.colorSpace;
         ci.imageExtent = e;
         ci.imageArrayLayers = 1;
-        ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | (can_read ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+        ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (can_read ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         // (the compositor rotates: Android's pre-rotation is not done)
         ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
@@ -312,6 +311,15 @@ struct Window::Presenter {
             VkSemaphore s = VK_NULL_HANDLE;
             vkCreateSemaphore(d, &si, nullptr, &s);
             rendered.push_back(s);
+        }
+        if (auto r = quads->init(chosen.format, kFramesInFlight * 2); !r) {
+            nx::loge(logs::display, "display: {}", r.error().message);
+            failed = true;
+            return false;
+        }
+        if (auto r = quads->set_targets(images, e); !r) {
+            nx::loge(logs::display, "display: {}", r.error().message);
+            return false;
         }
         if (format != chosen.format || extent.width != e.width || extent.height != e.height)
             nx::logi(logs::display, "display: {} x {}, format {}, {} images, {}", e.width, e.height,
@@ -369,6 +377,22 @@ struct Window::Presenter {
             return true;
         }
 
+        // The overlay's atlas, when it is new (rarely: the frames in flight done with the old one first).
+        const VkFormat texture_format = is_srgb(format) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        if (!atlas_upload.empty()) {
+            device->wait_idle();
+            vulkan::destroy_image(*device, atlas);
+            vulkan::ImageDesc desc;
+            desc.format = texture_format;
+            desc.width = atlas_upload_w, desc.height = atlas_upload_h;
+            if (auto image = vulkan::create_image(*device, desc)) {
+                atlas = *image;
+                if (auto r = vulkan::upload_image(*device, atlas, atlas_upload); !r)
+                    nx::loge(logs::display, "display: the overlay: {}", r.error().message);
+            }
+            atlas_upload.clear();
+        }
+
         // The frame into this slot's image.
         const bool have = current_w && current_h;
         if (have) {
@@ -384,15 +408,12 @@ struct Window::Presenter {
             }
             std::memcpy(f.staging.mapped, current.data(), bytes);
             vulkan::flush(*device, f.staging);
-            const VkFormat image_format = is_srgb(format) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
             if (!f.image.image || f.image.desc.width != current_w || f.image.desc.height != current_h ||
-                f.image.desc.format != image_format) {
+                f.image.desc.format != texture_format) {
                 vulkan::destroy_image(*device, f.image);
                 vulkan::ImageDesc desc;
-                desc.format = image_format;
+                desc.format = texture_format;
                 desc.width = current_w, desc.height = current_h;
-                desc.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                             VK_IMAGE_USAGE_SAMPLED_BIT;
                 auto image = vulkan::create_image(*device, desc);
                 if (!image) {
                     nx::loge(logs::display, "display: {}", image.error().message);
@@ -425,46 +446,44 @@ struct Window::Presenter {
             copy.imageExtent = {current_w, current_h, 1};
             vkCmdCopyBufferToImage(f.cmd, f.staging.buffer, f.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                    &copy);
-            vulkan::transition(f.cmd, f.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            vulkan::transition(f.cmd, f.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
-        const VkImage target = images[index];
-        barrier(f.cmd, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        const VkClearColorValue black{};
-        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(f.cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+        const u32 slot = static_cast<u32>(&f - frames);
+        quads->begin(f.cmd, index);
         if (have) {
+            // (the screen as large as fits, centred; sharp pixels at 1:1)
             const Rect v = fit(static_cast<f32>(extent.width), static_cast<f32>(extent.height));
-            const i32 x0 = static_cast<i32>(v.x + 0.5f), y0 = static_cast<i32>(v.y + 0.5f);
-            const i32 x1 = static_cast<i32>(v.x + v.w + 0.5f), y1 = static_cast<i32>(v.y + v.h + 0.5f);
-            if (x1 > x0 && y1 > y0) {
-                // (the clear's writes before the blit's)
-                VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                vkCmdPipelineBarrier(f.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb,
-                                     0, nullptr, 0, nullptr);
-                VkImageBlit blit{};
-                blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                blit.srcOffsets[1] = {static_cast<i32>(current_w), static_cast<i32>(current_h), 1};
-                blit.dstOffsets[0] = {x0, y0, 0};
-                blit.dstOffsets[1] = {x1, y1, 1};
-                const bool exact = x1 - x0 == static_cast<i32>(current_w) && y1 - y0 == static_cast<i32>(current_h);
-                vkCmdBlitImage(f.cmd, f.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                               smooth && !exact ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-            }
+            Quad q;
+            q.x0 = std::round(v.x), q.y0 = std::round(v.y);
+            q.x1 = std::round(v.x + v.w), q.y1 = std::round(v.y + v.h);
+            const bool exact = q.x1 - q.x0 == static_cast<f32>(current_w) && q.y1 - q.y0 == static_cast<f32>(current_h);
+            quads->draw(f.cmd, quads->texture(slot * 2, f.image.view, smooth && !exact), q, false);
         }
-        VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        VkAccessFlags access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        if (atlas.image && !overlay_drawn.empty()) {
+            const VkDescriptorSet sprites = quads->texture(slot * 2 + 1, atlas.view, true);
+            for (const Quad& q : overlay_drawn) quads->draw(f.cmd, sprites, q, true);
+        }
+        quads->end(f.cmd);
         if (read && readback.buffer) {
-            barrier(f.cmd, target, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, access, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT);
-            layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            access = VK_ACCESS_TRANSFER_READ_BIT;
+            auto layout_barrier = [&](VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst,
+                                      VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.srcAccessMask = src;
+                b.dstAccessMask = dst;
+                b.oldLayout = from;
+                b.newLayout = to;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = images[index];
+                b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(f.cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+            };
+            layout_barrier(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             copy.imageExtent = {extent.width, extent.height, 1};
-            vkCmdCopyImageToBuffer(f.cmd, target, layout, readback.buffer, 1, &copy);
+            vkCmdCopyImageToBuffer(f.cmd, images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &copy);
             VkBufferMemoryBarrier hb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
             hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -473,15 +492,16 @@ struct Window::Presenter {
             hb.size = VK_WHOLE_SIZE;
             vkCmdPipelineBarrier(f.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
                                  &hb, 0, nullptr);
+            layout_barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                           VK_ACCESS_TRANSFER_READ_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             readback_w = extent.width, readback_h = extent.height;
             readback_format = format;
             readback_fence = f.fence;
         }
-        barrier(f.cmd, target, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, access, 0,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         vkEndCommandBuffer(f.cmd);
 
-        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.waitSemaphoreCount = 1;
         si.pWaitSemaphores = &f.acquired;
@@ -652,6 +672,28 @@ void Window::show_pixels(const u8* pixels, u32 width, u32 height, u32 pitch, u32
         p.has_pending = true;
     }
     p.wake.notify_one();
+}
+
+void Window::set_overlay(nx::vector<Quad> quads) {
+    if (!presenter_) return;
+    {
+        nx::scoped_lock<nx::mutex> held(presenter_->lock);
+        presenter_->overlay = std::move(quads);
+        presenter_->redraw = true;
+    }
+    presenter_->wake.notify_one();
+}
+
+void Window::set_overlay_atlas(const u8* rgba, u32 width, u32 height) {
+    if (!presenter_) return;
+    {
+        nx::scoped_lock<nx::mutex> held(presenter_->lock);
+        presenter_->atlas_pixels.assign(rgba, rgba + usize{width} * height * 4);
+        presenter_->atlas_w = width, presenter_->atlas_h = height;
+        presenter_->atlas_changed = true;
+        presenter_->redraw = true;
+    }
+    presenter_->wake.notify_one();
 }
 
 void Window::set_background(bool background) {

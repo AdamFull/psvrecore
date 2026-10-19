@@ -20,9 +20,11 @@ endif()
 add_library(psvrecore_platform STATIC
     src/audio.cpp
     src/input.cpp
+    src/quads.cpp
     src/window.cpp
 )
 add_library(psvrecore::platform ALIAS psvrecore_platform)
-target_include_directories(psvrecore_platform PUBLIC include)
+target_include_directories(psvrecore_platform PUBLIC include
+    PRIVATE "${PSVRECORE_DIR}/third_party/SPIRV-Headers/include")
 target_link_libraries(psvrecore_platform PUBLIC psvrecore::runtime psvrecore::gxm_hle psvrecore::vulkan SDL3::SDL3)
 psvrecore_target_defaults(psvrecore_platform)
