@@ -1,5 +1,9 @@
 // The application utility (SceAppUtil): save data (SaveData, on the folder mounted as savedata0:), safe memory, the
-// console's settings (Runtime::Config::system) and application events (none).
+// console's settings (Runtime::Config::system), application events (none), and add-ons.
+//
+// Add-ons are the folders of addcont0: (a gated device: see FileSystem), each named after its content ID's label.
+// sceAppUtilDrmOpen opens one (what is in it can be read until sceAppUtilDrmClose), 16 at most at once. Every add-on
+// there is owned. Another title's add-ons (addcont1:, sceAppUtilAddcontMount) are never there.
 //
 // savedata0: is the mount the platform layer gives the files (read-only to sceIo, as on the console: data is written
 // only through sceAppUtilSaveDataDataSave). Without that mount the save data functions answer "not mounted". Other
@@ -39,6 +43,12 @@ struct AppEventParam {
 struct MountPoint {
     char data[16];
 };
+struct DrmAddcontId {
+    char data[17];
+    u8 padding[3];
+};
+static_assert(sizeof(DrmAddcontId) == 20);
+constexpr usize kMaxOpenAddcont = 16;
 struct DataSlot {
     u32 id;
     Ptr<SlotParam> param;
@@ -88,6 +98,7 @@ struct AppUtil {
     std::optional<SaveData> save;
     u8 safe_memory[kSafeMemorySize] = {};
     bool safe_memory_loaded = false;
+    usize addcont_open = 0;  // add-ons opened with sceAppUtilDrmOpen
 };
 
 AppUtil& apputil() {
@@ -468,6 +479,59 @@ i32 sceAppUtilAppParamGetInt(u32 id, Ptr<i32> value) {
     return 0;
 }
 
+// The add-on folder a guest names (a content ID label: letters and digits), or empty when it is not one.
+nx::string addcont_name(Ptr<const DrmAddcontId> id) {
+    if (!id || !memory().valid(id.address, sizeof(DrmAddcontId))) return {};
+    const usize n = strnlen(id->data, sizeof id->data);
+    if (n == 0 || n == sizeof id->data) return {};
+    for (usize i = 0; i < n; ++i) {
+        const char c = id->data[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return {};
+    }
+    return nx::string(id->data, n);
+}
+
+// The common start of the add-on functions: initialized, the add-on named, the mount point NULL or addcont0: (and
+// mounted). addcont1: (another title's add-ons) is never mounted.
+i32 enter_addcont(const AppUtil& a, Ptr<const DrmAddcontId> id, Ptr<const MountPoint> mp, nx::string* name) {
+    if (!a.initialized) return kNotInitialized;
+    *name = addcont_name(id);
+    if (name->empty()) return kParameter;
+    if (mp) {
+        if (!memory().valid(mp.address, sizeof(MountPoint))) return kParameter;
+        const nx::string_view point(mp->data, strnlen(mp->data, sizeof mp->data));
+        if (point == "addcont1:") return kNotMounted;
+        if (point != "addcont0:") return kParameter;
+    }
+    io::Stat st;
+    return runtime().files().stat("addcont0:", &st) < 0 ? kNotMounted : 0;
+}
+
+i32 sceAppUtilDrmOpen(Ptr<const DrmAddcontId> id, Ptr<const MountPoint> mp) {
+    AppUtil& a = apputil();
+    nx::scoped_lock<nx::mutex> held(a.lock);
+    nx::string name;
+    if (const i32 r = enter_addcont(a, id, mp, &name)) return r;
+    if (runtime().files().folder_open("addcont0", name)) return err::kAlready;
+    if (a.addcont_open >= kMaxOpenAddcont) return err::kNoSpace;
+    const i32 r = runtime().files().open_folder("addcont0", name);
+    nx::logi(logs::io, "add-on {}: {}", name, r == 0 ? "open" : "not there");
+    if (r == 0) ++a.addcont_open;
+    return r;
+}
+
+i32 sceAppUtilDrmClose(Ptr<const DrmAddcontId> id, Ptr<const MountPoint> mp) {
+    AppUtil& a = apputil();
+    nx::scoped_lock<nx::mutex> held(a.lock);
+    nx::string name;
+    if (const i32 r = enter_addcont(a, id, mp, &name)) return r;
+    const i32 r = runtime().files().close_folder("addcont0", name);
+    if (r == err::kBusy) return kBusy;
+    if (r < 0) return kParameter;  // (not open)
+    --a.addcont_open;
+    return 0;
+}
+
 const Function kFunctions[] = {
     HLE_FUNCTION(0xDAFFE671, sceAppUtilInit),
     HLE_FUNCTION(0xB220B00B, sceAppUtilShutdown),
@@ -487,6 +551,8 @@ const Function kFunctions[] = {
     HLE_FUNCTION(0x5DFB9CA0, sceAppUtilSystemParamGetInt),
     HLE_FUNCTION(0x6E6AA267, sceAppUtilSystemParamGetString),
     HLE_FUNCTION(0xCD7FD67A, sceAppUtilAppParamGetInt),
+    HLE_FUNCTION(0x2DB7BE3B, sceAppUtilDrmOpen),
+    HLE_FUNCTION(0x6A140498, sceAppUtilDrmClose),
 };
 
 }  // namespace
@@ -497,6 +563,7 @@ void register_apputil() {
     a.initialized = false;
     a.save.reset();
     a.safe_memory_loaded = false;
+    a.addcont_open = 0;
     std::memset(a.safe_memory, 0, sizeof a.safe_memory);
     register_library({"SceAppUtil", kSceAppUtil, kFunctions});
 }

@@ -1,5 +1,9 @@
 // Save data and the rest of the application utility (SceAppUtil): slots, saves written all or none, removal, the
-// quota's count, savedata0: read-only to sceIo, a save cut short, safe memory and the system's settings.
+// quota's count, savedata0: read-only to sceIo, a save cut short, safe memory, the system's settings, and add-ons
+// (addcont0:, opened and closed).
+
+#include <algorithm>
+#include <cstring>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
@@ -390,5 +394,93 @@ TEST_CASE("apputil: safe memory survives the process; the system's settings") {
         CHECK(p[4] == 1);
         CHECK(p[11] == 8);
         CHECK(p[12] == 0);
+    }
+}
+
+namespace {
+
+constexpr u32 kDrmOpen = 0x2DB7BE3B, kDrmClose = 0x6A140498;
+constexpr i32 kNoEntry = static_cast<i32>(0x80010002u), kNoSpace = static_cast<i32>(0x8001001Cu),
+              kAlready = static_cast<i32>(0x80010078u);
+
+// A SceAppUtilDrmAddcontId (and a mount point) in guest memory.
+u32 addcont_id(const char* name) {
+    const u32 p = scratch(20);
+    std::memset(current_runtime()->memory().host(p), 0, 20);
+    std::memcpy(current_runtime()->memory().host(p), name, std::min<usize>(std::strlen(name), 17));
+    return p;
+}
+u32 mount_point(const char* name) {
+    const u32 p = scratch(16);
+    std::memset(current_runtime()->memory().host(p), 0, 16);
+    std::strcpy(reinterpret_cast<char*>(current_runtime()->memory().host(p)), name);
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("apputil: add-ons in addcont0: open with sceAppUtilDrmOpen, 16 at once, and close when nothing is in use") {
+    TempDir dir;
+    (void)nx::fs::create_directories(nx::fs::path_view(dir.path + "/ADDCONTDLC00001"));
+    (void)nx::fs::file_write_text(nx::fs::path_view(dir.path + "/ADDCONTDLC00001/song.cpk"), "song");
+    for (int i = 0; i < 16; ++i)
+        (void)nx::fs::create_directories(nx::fs::path_view(nx::format("{}/ADDCONTMORE{:05}", dir.path, i)));
+    TestRuntime t;
+    t.rt.files().mount({"addcont0", dir.path, false, {}, true});
+    PsvContext* ctx = t.ctx();
+    const u32 song = addcont_id("ADDCONTDLC00001");
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {song, 0}) == kNotInitialized);
+    REQUIRE(init(ctx) == 0);
+
+    // The folders are listed, but what is in one opens only while it is open.
+    const u32 st = scratch(88);
+    CHECK(call32(ctx, kSceLibKernel, kGetstat, {guest_string("addcont0:ADDCONTDLC00001"), st}) == 0);
+    CHECK(call32(ctx, kSceLibKernel, kOpen, {guest_string("addcont0:ADDCONTDLC00001/song.cpk"), 0x1, 0}) == kNoEntry);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {song, 0}) == 0);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {song, mount_point("addcont0:")}) == kAlready);
+    const i32 fd = call32(ctx, kSceLibKernel, kOpen, {guest_string("addcont0:ADDCONTDLC00001/song.cpk"), 0x1, 0});
+    REQUIRE(fd > 0);
+    const u32 buf = scratch(8);
+    CHECK(call32(ctx, kSceIofilemgr, kRead, {u(fd), buf, 8}) == 4);
+    CHECK(call32(ctx, kSceAppUtil, kDrmClose, {song, 0}) == kBusy);  // (a file in it is open)
+    call32(ctx, kSceIofilemgr, kClose, {u(fd)});
+    CHECK(call32(ctx, kSceAppUtil, kDrmClose, {song, 0}) == 0);
+    CHECK(call32(ctx, kSceAppUtil, kDrmClose, {song, 0}) == kParameter);  // (not open)
+    CHECK(call32(ctx, kSceLibKernel, kOpen, {guest_string("addcont0:ADDCONTDLC00001/song.cpk"), 0x1, 0}) == kNoEntry);
+
+    // Names, mount points.
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {addcont_id("NOTINSTALLED0000"), 0}) == kNoEntry);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {addcont_id("../ADDCONTDLC001"), 0}) == kParameter);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {addcont_id(""), 0}) == kParameter);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {0, 0}) == kParameter);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {song, mount_point("addcont1:")}) == kNotMounted);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {song, mount_point("savedata0:")}) == kParameter);
+
+    // 16 open at once.
+    for (int i = 0; i < 16; ++i)
+        CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {addcont_id(nx::format("ADDCONTMORE{:05}", i).c_str()), 0}) == 0);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {song, 0}) == kNoSpace);
+    CHECK(call32(ctx, kSceAppUtil, kDrmClose, {addcont_id("ADDCONTMORE00003"), 0}) == 0);
+    CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {song, 0}) == 0);
+}
+
+TEST_CASE("apputil: without add-ons addcont0: is an empty device; without it, not mounted") {
+    {
+        TestRuntime t;
+        t.rt.files().mount({"addcont0", "", false, {}, true});
+        PsvContext* ctx = t.ctx();
+        REQUIRE(init(ctx) == 0);
+        const i32 d = call32(ctx, kSceLibKernel, 0xA9283DD0 /*sceIoDopen*/, {guest_string("addcont0:")});
+        REQUIRE(d > 0);
+        CHECK(call32(ctx, kSceLibKernel, 0x9C8B6624 /*sceIoDread*/, {u(d), scratch(352)}) == 0);
+        CHECK(call32(ctx, kSceIofilemgr, 0x422A221A /*sceIoDclose*/, {u(d)}) == 0);
+        CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {addcont_id("ADDCONTDLC00001"), 0}) == kNoEntry);
+        CHECK(call32(ctx, kSceLibKernel, kOpen, {guest_string("addcont0:x"), 0x1, 0}) == kNoEntry);
+    }
+    {
+        TestRuntime t;
+        PsvContext* ctx = t.ctx();
+        REQUIRE(init(ctx) == 0);
+        CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {addcont_id("ADDCONTDLC00001"), 0}) == kNotMounted);
     }
 }
