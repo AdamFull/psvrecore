@@ -2,8 +2,8 @@
 
 ## Build and platforms
 
-- **Linux has not been built or tested.** The development host has no Linux machine and no WSL. The CI workflow
-  covers Linux, but it runs only once the repository is pushed.
+- **Linux is built and tested only in CI** (Ubuntu 24.04, clang; the GPU tests on Mesa's lavapipe). The development
+  host has no Linux machine, so the frontend has not been run with a real window, sound or a game there.
 - **Android: one device so far.** SDK samples run as applications on a Pixel 10 Pro (Android 17); no other device,
   GPU or Android version has been tried. The unit tests have not run on a device (they are host-only; there is no
   device test runner).
@@ -262,8 +262,8 @@
 - **Memory budgets are fixed defaults.** Main memory 256 MiB and CDRAM 128 MiB for memory blocks, set in
   `Runtime::Config`. The console's figures for a game are not reproduced exactly.
 - **Run on Windows and Android.** The POSIX host layer (faults, files, decommit) runs on Android arm64 (the SDK
-  samples on a Pixel 10 Pro: the whole guest address space reserved, guest threads, files); it has not run on Linux
-  (no Linux machine; CI covers Linux once the repository is pushed). A guest memory fault has not been seen on Android.
+  samples on a Pixel 10 Pro: the whole guest address space reserved, guest threads, files); on Linux it runs the unit
+  and runtime tests in CI. A guest memory fault has not been seen on Android.
 
 ## Audio (AudioOut, NGS)
 

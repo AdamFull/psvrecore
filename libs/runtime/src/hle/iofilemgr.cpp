@@ -22,17 +22,31 @@ i32 sceIoOpen(Ptr<const char> path, i32 flags, i32 mode) {
     nx::logd(logs::io, "sceIoOpen('{}', 0x{:x}) = 0x{:08x}", p, static_cast<u32>(flags), static_cast<u32>(r));
     return r;
 }
-i32 sceIoClose(i32 fd) { return files().close(fd); }
+i32 sceIoClose(i32 fd) {
+    const i32 r = files().close(fd);
+    nx::logd(logs::io, "sceIoClose(0x{:x}) = 0x{:08x}", fd, static_cast<u32>(r));
+    return r;
+}
 
 i32 sceIoRead(i32 fd, Ptr<u8> buffer, u32 size) {
     if (size && !writable(buffer.address, size)) return err::kFault;
-    Kernel::Blocking blocking(kernel());
-    return static_cast<i32>(files().read(fd, buffer.get(), size));
+    i32 r;
+    {
+        Kernel::Blocking blocking(kernel());
+        r = static_cast<i32>(files().read(fd, buffer.get(), size));
+    }
+    nx::logd(logs::io, "sceIoRead(0x{:x}, 0x{:x} bytes) = 0x{:x}", fd, size, static_cast<u32>(r));
+    return r;
 }
 i32 sceIoWrite(i32 fd, Ptr<const u8> buffer, u32 size) {
     if (size && !memory().valid(buffer.address, size)) return err::kFault;
-    Kernel::Blocking blocking(kernel());
-    return static_cast<i32>(files().write(fd, buffer.get(), size));
+    i32 r;
+    {
+        Kernel::Blocking blocking(kernel());
+        r = static_cast<i32>(files().write(fd, buffer.get(), size));
+    }
+    nx::logd(logs::io, "sceIoWrite(0x{:x}, 0x{:x} bytes) = 0x{:x}", fd, size, static_cast<u32>(r));
+    return r;
 }
 i32 sceIoPread(i32 fd, Ptr<u8> buffer, u32 size, i64 offset) {
     if (size && !writable(buffer.address, size)) return err::kFault;

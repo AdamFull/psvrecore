@@ -10,7 +10,7 @@ SDK. Those files and the outputs derived from them are not in the repository, so
 
 | Component | State | Notes |
 | --- | --- | --- |
-| Build system (presets, compiler options, build script) | Tested (Windows) | Windows debug and release build and pass their tests. Android: the preset configures with NDK 29.0, and the libraries (the media decoders included) build for arm64 without warnings; SDK samples run on a Pixel 10 Pro (below). Linux runs only in CI, which has not run yet |
+| Build system (presets, compiler options, build script) | Tested (Windows) | Windows debug and release build and pass their tests. Android: the preset configures with NDK 29.0, and the libraries (the media decoders included) build for arm64 without warnings; SDK samples run on a Pixel 10 Pro (below). Linux (Ubuntu 24.04, clang) builds and passes the tests in CI, the GPU tests on Mesa's lavapipe |
 | nx-foundation integration | Tested (Windows) | Submodule at 5489a63, built with clang-cl. Also builds for Android arm64 |
 | `core`: errors, logs, binary reader, files, text, CLI | Tested | Unit tests |
 | Guest address-space reservation | Tested (Windows) | 4 GiB plus a guard region can be reserved; pages at both ends of the guest space can be committed and reached |
