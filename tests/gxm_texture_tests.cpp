@@ -1,10 +1,11 @@
 // GXM texture decoding: YUV textures (planar 4:2:0 in two or three planes, interleaved 4:2:2) through their colour
-// space conversions.
+// space conversions; colour surfaces' layouts as textures read them.
 
 #include <cmath>
 #include <cstring>
 
 #include "nxtest.h"
+#include "psvrecore/gxm/surface.hpp"
 #include "psvrecore/gxm/texture.hpp"
 
 using namespace psvrecore;
@@ -123,4 +124,49 @@ TEST_CASE("gxm textures: YUV420 in three planes and YUV422, BT.601 through CSC0;
     CHECK(texels->data[0] == 0);
     CHECK(texels->data[4] == 255);
     CHECK(texels->data[6] == 255);
+}
+
+TEST_CASE("gxm colour surfaces: what a scene writes in each layout reads back as a texture of that type") {
+    // Pixels (x, y, x + y, 255) written where a surface of each layout has them; a 4-byte RGBA texture of the same
+    // type over the same memory reads them back in place.
+    struct Case {
+        u32 kind, texture_type, width, height, stride;
+    };
+    const Case cases[] = {
+        {SurfaceLayout::kLinear, texture_type::kLinearStrided, 40, 20, 48},
+        {SurfaceLayout::kTiled, texture_type::kTiled, 40, 36, 64},  // (2 x 2 tiles, the last ones cut)
+        {SurfaceLayout::kSwizzled, texture_type::kSwizzled, 32, 16, 32},
+        {SurfaceLayout::kSwizzled, texture_type::kSwizzled, 16, 64, 16},
+    };
+    for (const Case& c : cases) {
+        SurfaceLayout l;
+        l.kind = c.kind, l.stride = c.stride, l.bytes = 4, l.width = c.width, l.height = c.height;
+        TextureInfo t;
+        t.type = c.texture_type;
+        t.base_format = 0x0C000000u;  // SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 (ABGR: memory order R, G, B, A)
+        t.width = c.width, t.height = c.height;
+        t.stride = c.stride * 4;
+        Memory m;  // (as much as the texture reads: its footprint, at least the surface's)
+        m.bytes.assign(nx::max(static_cast<usize>(l.span()), static_cast<usize>(texture_size(t))) + 8, 0);
+        for (u32 y = 0; y < c.height; ++y)
+            for (u32 x = 0; x < c.width;) {
+                // (in runs, as the renderer writes them back)
+                const u32 n = l.run(x);
+                for (u32 i = 0; i < n; ++i) {
+                    u8* p = m.bytes.data() + l.offset(x, y) + i * 4;
+                    p[0] = static_cast<u8>(x + i), p[1] = static_cast<u8>(y), p[2] = static_cast<u8>(x + i + y), p[3] = 255;
+                }
+                x += n;
+            }
+        auto texels = read_texels(t, [&](u32 a, void* o, u32 s) { return m.read(a, o, s); });
+        REQUIRE(texels.has_value());
+        REQUIRE(texels->bytes == 4);
+        bool all = true;
+        for (u32 y = 0; y < c.height; ++y)
+            for (u32 x = 0; x < c.width; ++x) {
+                const u8* p = texels->data.data() + (usize{y} * c.width + x) * 4;
+                all &= p[0] == static_cast<u8>(x) && p[1] == static_cast<u8>(y) && p[2] == static_cast<u8>(x + y) && p[3] == 255;
+            }
+        CHECK(all);
+    }
 }

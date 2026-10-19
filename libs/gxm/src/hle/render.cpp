@@ -20,7 +20,10 @@
 // - Visibility testing: an occlusion query per draw that tests it; when the scene is done, its count is added to
 //   (or, SET, sets to 1) the counter in core 0's visibility buffer (the game sums the cores' buffers).
 //
-// Not yet: tiled and swizzled colour surfaces, multisampling.
+// - Colour surfaces linear, tiled or swizzled: loaded from and written back to guest memory in their layout, drawn
+//   as images in rows.
+//
+// Not yet: multisampling.
 
 #include <algorithm>
 #include <atomic>
@@ -28,6 +31,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "psvrecore/gxm/surface.hpp"
 #include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/log.hpp"
@@ -219,8 +223,31 @@ void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32
 
 // ---- The renderer ----------------------------------------------------------------------------------------------
 
+// The surface's pixels as rows of its width (an image's), from guest memory, and back.
+void gather(const SurfaceLayout& l, u32 address, u8* out) {
+    const usize row = usize{l.width} * l.bytes;
+    for (u32 y = 0; y < l.height; ++y)
+        for (u32 x = 0; x < l.width;) {
+            const u32 n = l.run(x);
+            std::memcpy(out + y * row + usize{x} * l.bytes, memory().host(address + static_cast<u32>(l.offset(x, y))),
+                        usize{n} * l.bytes);
+            x += n;
+        }
+}
+void scatter(const SurfaceLayout& l, u32 address, const u8* in) {
+    const usize row = usize{l.width} * l.bytes;
+    for (u32 y = 0; y < l.height; ++y)
+        for (u32 x = 0; x < l.width;) {
+            const u32 n = l.run(x);
+            std::memcpy(memory().host(address + static_cast<u32>(l.offset(x, y))), in + y * row + usize{x} * l.bytes,
+                        usize{n} * l.bytes);
+            x += n;
+        }
+}
+
 struct Target {
     u32 address = 0, format = 0, width = 0, height = 0;
+    SurfaceLayout layout;
     vk::Image image;  // the surface's size: loaded from guest memory and read back to it
     // At an internal resolution above 1: the surface as drawn (scale times its size), and its bytes as last written
     // back. While guest memory still holds those bytes, `scaled` is the surface; once anything else wrote there, the
@@ -447,13 +474,18 @@ Result<vk::Image> target_image(Renderer& r, VkFormat format, u32 width, u32 heig
     return vk::create_image(*r.device, d);
 }
 
-Target* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format, u32 width, u32 height) {
-    for (auto& t : r.targets)
-        if (t->address == address && t->format == format && t->width == width && t->height == height) return t.get();
+Target* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format, const SurfaceLayout& layout) {
+    const u32 width = layout.width, height = layout.height;
+    for (auto& t : r.targets) {
+        if (t->address != address || t->format != format || t->width != width || t->height != height) continue;
+        if (t->layout != layout) t->layout = layout, t->written.clear();  // (the same memory, laid out otherwise)
+        return t.get();
+    }
     auto img = target_image(r, vk_format, width, height);
     if (!img) return nullptr;
     auto t = nx::make_unique<Target>();
     t->address = address, t->format = format, t->width = width, t->height = height;
+    t->layout = layout;
     t->image = *img;
     r.targets.push_back(std::move(t));
     return r.targets.back().get();
@@ -496,7 +528,7 @@ bool ensure_scaled(Renderer& r, Target& t, u32 scale) {
     return true;
 }
 
-// The parts of a surface (rows of `stride` pixels in guest memory) that differ from what was last written back:
+// The parts of a surface (in guest memory, laid out as the target's) that differ from what was last written back:
 // what the CPU drew over it since (text, a cleared area), or all of it when nothing was written back.
 constexpr u32 kTile = 32;
 struct Changes {
@@ -504,8 +536,10 @@ struct Changes {
     usize pixels = 0;            // changed pixels
     bool all = false;
 };
-Changes surface_changes(const Target& t, u32 stride, u32 bytes) {
+Changes surface_changes(const Target& t) {
     Changes c;
+    const SurfaceLayout& l = t.layout;
+    const u32 bytes = l.bytes;
     if (t.written.empty()) {
         c.all = true;
         c.pixels = usize{t.width} * t.height;
@@ -518,14 +552,20 @@ Changes surface_changes(const Target& t, u32 stride, u32 bytes) {
     const u32 tiles_x = (t.width + kTile - 1) / kTile;
     nx::vector<u8> dirty(usize{tiles_x} * ((t.height + kTile - 1) / kTile), 0);
     for (u32 y = 0; y < t.height; ++y) {
-        const u8* guest = memory().host(t.address + y * stride * bytes);
         const u8* had = t.written.data() + y * row;
-        if (std::memcmp(guest, had, row) == 0) continue;
-        for (u32 x = 0; x < t.width; ++x)
-            if (std::memcmp(guest + usize{x} * bytes, had + usize{x} * bytes, bytes) != 0) {
-                ++c.pixels;
-                dirty[usize{y / kTile} * tiles_x + x / kTile] = 1;
+        for (u32 x = 0; x < t.width;) {
+            // (a run of pixels next to each other in both: compared at once, then pixel by pixel if it differs)
+            const u32 n = l.run(x);
+            const u8* guest = memory().host(t.address + static_cast<u32>(l.offset(x, y)));
+            if (std::memcmp(guest, had + usize{x} * bytes, usize{n} * bytes) != 0) {
+                for (u32 i = 0; i < n; ++i)
+                    if (std::memcmp(guest + usize{i} * bytes, had + usize{x + i} * bytes, bytes) != 0) {
+                        ++c.pixels;
+                        dirty[usize{y / kTile} * tiles_x + (x + i) / kTile] = 1;
+                    }
             }
+            x += n;
+        }
     }
     for (usize i = 0; i < dirty.size(); ++i) {
         if (!dirty[i]) continue;
@@ -634,18 +674,29 @@ bool texels_as_image(const TextureInfo& info, VkFormat format) {
     return true;
 }
 
+// Whether a texture reads its texels where a colour surface of this layout has its pixels (4-byte texels).
+bool texture_reads_layout(const TextureInfo& info, const SurfaceLayout& l) {
+    switch (info.type) {
+        case texture_type::kLinear:
+        case texture_type::kLinearStrided: return l.kind == SurfaceLayout::kLinear && info.stride == l.stride * 4;
+        case texture_type::kTiled: return l.kind == SurfaceLayout::kTiled && (l.stride + 31) / 32 == (info.width + 31) / 32;
+        case texture_type::kSwizzled:
+        case texture_type::kSwizzledArbitrary: return l.kind == SurfaceLayout::kSwizzled;
+        default: return false;
+    }
+}
+
 // A texture that reads a colour surface drawn at the internal resolution: its scaled image, when the texture is
-// that surface (its address, size and rows, one level, texels as the image holds them), guest memory still holds
+// that surface (its address, size and layout, one level, texels as the image holds them), guest memory still holds
 // what its last scene wrote back, and it is not what this scene draws into.
 Target* scaled_texture(Renderer& r, const TextureInfo& info, const Target* drawing) {
-    if (info.type != texture_type::kLinear && info.type != texture_type::kLinearStrided) return nullptr;
-    if (info.levels != 1 || !info.address || info.stride % 4) return nullptr;
+    if (info.levels != 1 || !info.address) return nullptr;
     for (auto& t : r.targets) {
         if (t->scale <= 1 || t.get() == drawing || t->address != info.address || t->width != info.width ||
             t->height != info.height)
             continue;
-        if (!texels_as_image(info, t->image.desc.format)) return nullptr;
-        const Changes changes = surface_changes(*t, info.stride / 4, 4);
+        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) return nullptr;
+        const Changes changes = surface_changes(*t);
         return changes.all || changes.pixels ? nullptr : t.get();
     }
     return nullptr;
@@ -899,6 +950,7 @@ void render_scene(Context& context, Scene& scene) {
     ColorFormat cf;
     // (without a colour surface, a depth-only scene: the render target's size)
     u32 width = scene.target->width, height = scene.target->height, stride = 0;
+    SurfaceLayout layout;  // (where the colour surface's pixels are in guest memory)
     vk::Image* color = nullptr;
     // The internal resolution: drawn into `color` at `scale` times the surface's size (the target's scaled image),
     // and blitted down into the surface's image for guest memory. A depth-only scene is drawn at its own size.
@@ -910,19 +962,22 @@ void render_scene(Context& context, Scene& scene) {
             nx::logw(logs::gxm, "colour surface format 0x{:08x} not implemented: scene not rendered", cs.format);
             return;
         }
-        if (cs.modes & 3) {
-            nx::logw(logs::gxm, "tiled and swizzled colour surfaces not implemented: scene not rendered");
+        width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
+        layout.kind = cs.modes & 3;
+        if (layout.kind > SurfaceLayout::kSwizzled) {
+            nx::logw(logs::gxm, "colour surface type {} not implemented: scene not rendered", layout.kind);
             return;
         }
-        width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
-        if (!memory().valid(cs.data, stride * cf.bytes * (height - 1) + width * cf.bytes, true)) return;
-        target = color_target(r, cs.data, cs.format, cf.format, width, height);
+        layout.stride = stride, layout.bytes = cf.bytes, layout.width = width, layout.height = height;
+        if (!width || !height || layout.span() > 0xFFFFFFFFu || !memory().valid(cs.data, static_cast<u32>(layout.span()), true))
+            return;
+        target = color_target(r, cs.data, cs.format, cf.format, layout);
         if (!target) return;
         color = &target->image;
         if (const u32 s = surface_scale(r, cf.format); s > 1 && ensure_scaled(r, *target, s)) {
             scale = s;
             color = &target->scaled;
-            changes = surface_changes(*target, stride, cf.bytes);
+            changes = surface_changes(*target);
         }
 
         // The colour as it is in guest memory (GXM loads it at the start of every scene). At the internal
@@ -930,9 +985,7 @@ void render_scene(Context& context, Scene& scene) {
         // in the commands below (the CPU's text over a frame, a cleared area); the rest of it is kept.
         if (scale == 1 || !changes.tiles.empty()) {
             nx::vector<u8> texels(usize{width} * height * cf.bytes);
-            for (u32 y = 0; y < height; ++y)
-                std::memcpy(texels.data() + usize{y} * width * cf.bytes, memory().host(cs.data + y * stride * cf.bytes),
-                            usize{width} * cf.bytes);
+            gather(layout, cs.data, texels.data());
             const VkImageLayout layout = scale > 1 ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             if (auto done = vk::upload_image(d, target->image, texels, 0, layout); !done) {
                 nx::logw(logs::gpu, "{}", done.error().message);
@@ -1559,8 +1612,7 @@ void render_scene(Context& context, Scene& scene) {
         if (color) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
-            for (u32 y = 0; y < height; ++y)
-                std::memcpy(memory().host(cs.data + y * stride * cf.bytes), src + usize{y} * width * cf.bytes, usize{width} * cf.bytes);
+            scatter(layout, cs.data, src);
             // (what guest memory holds now, to know whether the scaled image is still the surface)
             if (scale > 1) target->written.assign(src, src + usize{width} * height * cf.bytes);
         }
@@ -1622,9 +1674,10 @@ bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, 
         if (t->address != f.base || t->width != f.width || t->height != f.height || t->scale <= 1) continue;
         ColorFormat cf;
         if (!color_format(t->format, cf) || cf.bytes != 4) return false;
+        if (t->layout.kind != SurfaceLayout::kLinear || t->layout.stride != f.pitch) return false;
         // (what the CPU drew over the frame since its scene, scaled up over it; the frame as it is in guest memory
         // when that is most of it)
-        const Changes changes = surface_changes(*t, f.pitch, 4);
+        const Changes changes = surface_changes(*t);
         if (changes.all || changes.pixels * 4 > usize{t->width} * t->height) return false;
         auto read = vk::read_image(*r.device, t->scaled);
         if (!read) {
