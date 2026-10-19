@@ -670,6 +670,8 @@ void Window::handle(const SDL_Event& e, runtime::Runtime* rt) {
 }
 
 void Window::show(const gxm::Frame& f) {
+    // (drawn at a higher internal resolution: that picture)
+    if (f.scaled) return show_pixels(f.scaled, f.scaled_width, f.scaled_height, f.scaled_width, f.pixel_format);
     const u8* base = runtime::runtime().memory().host(f.address);
     if (!base) return;
     show_pixels(base, f.width, f.height, f.pitch, f.pixel_format);

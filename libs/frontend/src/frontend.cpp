@@ -47,12 +47,15 @@ public:
             name = shots.front();
             shots.erase(shots.begin());
         }
-        const u8* base = runtime::runtime().memory().host(f.address);
-        nx::vector<u8> rgba(usize{f.width} * f.height * 4);
-        for (u32 y = 0; y < f.height; ++y) {
-            const u8* row = base + usize{y} * f.pitch * 4;
-            u8* dst = rgba.data() + usize{y} * f.width * 4;
-            for (u32 x = 0; x < f.width; ++x) {
+        // (at the internal resolution when the frame was drawn at one)
+        const u8* base = f.scaled ? f.scaled : runtime::runtime().memory().host(f.address);
+        const u32 width = f.scaled ? f.scaled_width : f.width, height = f.scaled ? f.scaled_height : f.height;
+        const u32 pitch = f.scaled ? f.scaled_width : f.pitch;
+        nx::vector<u8> rgba(usize{width} * height * 4);
+        for (u32 y = 0; y < height; ++y) {
+            const u8* row = base + usize{y} * pitch * 4;
+            u8* dst = rgba.data() + usize{y} * width * 4;
+            for (u32 x = 0; x < width; ++x) {
                 u32 v;
                 std::memcpy(&v, row + x * 4, 4);
                 if (f.pixel_format == 0x50000000u) {  // (A2B10G10R10)
@@ -65,7 +68,7 @@ public:
             }
         }
         const nx::string path = nx::format("{}/{}.png", out, name);
-        if (!io::write_png(path.c_str(), f.width, f.height, rgba.data()))
+        if (!io::write_png(path.c_str(), width, height, rgba.data()))
             nx::loge(logs::frontend, "could not write {}", path);
         else
             nx::logi(logs::frontend, "shot: {}", path);
@@ -389,6 +392,7 @@ int run(const Game& game, int argc, char** argv) {
     gxm_options.device.validation = s.validation;
     gxm_options.shared_device = (*window)->device();
     gxm_options.cache_folder = join(data, "cache");
+    gxm_options.render_scale = s.render_scale;
     runtime::Runtime rt(config);
     if (!rt.ok()) return fail("The runtime could not start (see the log).", cl.hidden);
     gxm::register_libraries(gxm_options);

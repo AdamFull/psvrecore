@@ -91,6 +91,11 @@ const Key kKeys[] = {
     {"display", "vsync", "Present at the display's refresh (the game's pace is its own either way).",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.vsync); },
      [](const Settings& s) { return nx::string(yes_no(s.vsync)); }, "true or false"},
+    {"display", "internal_resolution", "Draw the game at this many times the console's resolution (1: as it is).",
+     [](Settings& s, nx::string_view v) {
+         return parse_int(v, &s.render_scale) && s.render_scale >= 1 && s.render_scale <= 4;
+     },
+     [](const Settings& s) { return nx::format("{}", s.render_scale); }, "1 to 4"},
     {"display", "smooth", "Filter the picture when it is scaled (false: sharp pixels).",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.smooth); },
      [](const Settings& s) { return nx::string(yes_no(s.smooth)); }, "true or false"},
@@ -182,6 +187,7 @@ const Schema kSchema[] = {
     {"game", "folder", K::Folder, 0, 0, false, true},       {"game", "data", K::Folder, 0, 0, false, true},
     {"display", "fullscreen", K::Bool, 0, 0, false, true},  {"display", "scale", K::Int, 1, 8, false, true},
     {"display", "vsync", K::Bool, 0, 0, false, false},      {"display", "smooth", K::Bool, 0, 0, true, false},
+    {"display", "internal_resolution", K::Int, 1, 4, false, false},
     {"display", "gpu", K::Int, -1, 8, false, true},         {"display", "validation", K::Bool, 0, 0, false, true},
     {"audio", "enabled", K::Bool, 0, 0, true, false},       {"audio", "latency_ms", K::Int, 20, 2000, false, false},
     {"controls", "on_screen", K::Choice, 0, 0, true, false}, {"controls", "opacity", K::Float, 0, 1, true, false},

@@ -42,14 +42,17 @@ extern const PsvModuleCode libfios2_module;
 
 namespace {
 
+// (at the internal resolution when the frame was drawn at one: PSVRECORE_RENDER_SCALE)
 void write_frame(const gxm::Frame& f, const nx::string& path) {
-    const u8* base = runtime::runtime().memory().host(f.address);
-    nx::vector<u8> rgba(usize{f.width} * f.height * 4);
-    for (u32 y = 0; y < f.height; ++y) {
-        std::memcpy(rgba.data() + usize{y} * f.width * 4, base + usize{y} * f.pitch * 4, usize{f.width} * 4);
-        for (u32 x = 0; x < f.width; ++x) rgba[(usize{y} * f.width + x) * 4 + 3] = 255;  // (the display ignores alpha)
+    const u8* base = f.scaled ? f.scaled : runtime::runtime().memory().host(f.address);
+    const u32 width = f.scaled ? f.scaled_width : f.width, height = f.scaled ? f.scaled_height : f.height;
+    const u32 pitch = f.scaled ? f.scaled_width : f.pitch;
+    nx::vector<u8> rgba(usize{width} * height * 4);
+    for (u32 y = 0; y < height; ++y) {
+        std::memcpy(rgba.data() + usize{y} * width * 4, base + usize{y} * pitch * 4, usize{width} * 4);
+        for (u32 x = 0; x < width; ++x) rgba[(usize{y} * width + x) * 4 + 3] = 255;  // (the display ignores alpha)
     }
-    if (!psvrecore::io::write_png(path.c_str(), f.width, f.height, rgba.data())) std::fprintf(stderr, "could not write %s\n", path.c_str());
+    if (!psvrecore::io::write_png(path.c_str(), width, height, rgba.data())) std::fprintf(stderr, "could not write %s\n", path.c_str());
 }
 
 class FrameWriter : public gxm::DisplaySink {
@@ -155,6 +158,8 @@ int main(int argc, char** argv) {
     gxm::Options gxm_options;
     gxm_options.display = &frames;
     gxm_options.device.validation = true;
+    if (auto scale = nx::os::environment_variable("PSVRECORE_RENDER_SCALE"))
+        gxm_options.render_scale = static_cast<u32>(std::strtoul(scale->c_str(), nullptr, 10));
 
     Runtime::Config config;
     config.files.mounts.push_back({"app0", argv[1], false});
