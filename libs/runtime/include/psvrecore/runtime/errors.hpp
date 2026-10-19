@@ -88,6 +88,7 @@ inline constexpr i32 kReadOnlyFs = code(0x8001001E);
 inline constexpr i32 kNotEmpty = code(0x8001005A);
 inline constexpr i32 kNameTooLong = code(0x8001005B);
 inline constexpr i32 kOpNotSupported = code(0x8001005F);
+inline constexpr i32 kAlready = code(0x80010078);  // EALREADY
 inline constexpr i32 kNotSupported = code(0x80010086);
 
 }  // namespace psvrecore::runtime::err

@@ -1,5 +1,7 @@
 // Guest memory, the system library calling convention, files, memory blocks and formatted output.
 
+#include <algorithm>
+
 #include "nxtest.h"
 #include "runtime_support.hpp"
 #include "core/foundation/platform/filesystem.h"
@@ -257,4 +259,80 @@ TEST_CASE("files: what the guest writes to stdout reaches the tty sink") {
     CHECK(call32(ctx, kSceIofilemgr, 0x34EFD876 /*sceIoWrite*/, {u(out), guest_string("line\n"), 5}) == 5);
     CHECK(call32(ctx, kSceLibKernel, 0xFA26BC62 /*sceClibPrintf*/, {guest_string("%d+%d"), 2, 3}) == 3);
     CHECK(captured == "line\n2+3");
+}
+
+TEST_CASE("files: a layered device shows the update's files over the base game's; folders list both") {
+    TempDir dir;
+    TestRuntime t;
+    const nx::string base = dir.path + "/app", update = dir.path + "/patch";
+    for (const nx::string& f : {base + "/data", base + "/sce_module", update + "/data"})
+        (void)nx::fs::create_directories(nx::fs::path_view(f));
+    (void)nx::fs::file_write_text(nx::fs::path_view(base + "/eboot.bin"), "base");
+    (void)nx::fs::file_write_text(nx::fs::path_view(base + "/data/a.txt"), "old");
+    (void)nx::fs::file_write_text(nx::fs::path_view(base + "/data/b.txt"), "B");
+    (void)nx::fs::file_write_text(nx::fs::path_view(base + "/sce_module/libc.suprx"), "libc");
+    (void)nx::fs::file_write_text(nx::fs::path_view(update + "/eboot.bin"), "update");
+    (void)nx::fs::file_write_text(nx::fs::path_view(update + "/data/A.TXT"), "new!");  // (the same name, other case)
+    (void)nx::fs::file_write_text(nx::fs::path_view(update + "/data/patch.cpk"), "cpk");
+    FileSystem::Mount app0{"app0", update, false};
+    app0.under.push_back(base);
+    t.rt.files().mount(app0);
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kOpen = 0x6C60AC61, kClose = 0xC70B8886, kRead = 0xFDB32293, kGetstat = 0xBCA5B623,
+                  kDopen = 0xA9283DD0, kDread = 0x9C8B6624, kDclose = 0x422A221A;
+    const u32 buf = scratch(16);
+    const auto contents = [&](const char* path) {
+        const i32 fd = call32(ctx, kSceLibKernel, kOpen, {guest_string(path), 0x1, 0});
+        if (fd < 0) return nx::string("(error)");
+        const i32 n = call32(ctx, kSceIofilemgr, kRead, {u(fd), buf, 16});
+        call32(ctx, kSceIofilemgr, kClose, {u(fd)});
+        return nx::string(reinterpret_cast<const char*>(t.rt.memory().host(buf)), static_cast<usize>(n));
+    };
+    CHECK(contents("app0:eboot.bin") == "update");
+    CHECK(contents("app0:data/a.txt") == "new!");
+    CHECK(contents("app0:data/b.txt") == "B");
+    CHECK(contents("app0:sce_module/libc.suprx") == "libc");
+    CHECK(contents("app0:data/patch.cpk") == "cpk");
+    CHECK(call32(ctx, kSceLibKernel, kOpen, {guest_string("app0:data/b.txt"), 0x2, 0}) == err::kReadOnlyFs);
+    const u32 st = scratch(sizeof(runtime::io::Stat));
+    CHECK(call32(ctx, kSceLibKernel, kGetstat, {guest_string("app0:data/b.txt"), st}) == 0);
+    CHECK(t.rt.memory().host_as<runtime::io::Stat>(st)->size == 1);
+    CHECK(call32(ctx, kSceLibKernel, kGetstat, {guest_string("app0:sce_module"), st}) == 0);
+    CHECK(call32(ctx, kSceLibKernel, kGetstat, {guest_string("app0:none"), st}) == err::kNoEntry);
+
+    // A folder lists every layer's entries once, the update's spelling for a name both have.
+    const auto list = [&](const char* path) {
+        nx::vector<nx::string> names;
+        const i32 d = call32(ctx, kSceLibKernel, kDopen, {guest_string(path)});
+        if (d < 0) return nx::string("(error)");
+        const u32 entry = scratch(sizeof(runtime::io::Dirent));
+        while (call32(ctx, kSceLibKernel, kDread, {u(d), entry}) == 1)
+            names.push_back(nx::string(t.rt.memory().host_as<runtime::io::Dirent>(entry)->name));
+        call32(ctx, kSceIofilemgr, kDclose, {u(d)});
+        std::sort(names.begin(), names.end(), [](const nx::string& a, const nx::string& b) { return a.view() < b.view(); });
+        nx::string joined;
+        for (const auto& n : names) joined += joined.empty() ? n : nx::format(",{}", n);
+        return joined;
+    };
+    CHECK(list("app0:data") == "A.TXT,b.txt,patch.cpk");
+    CHECK(list("app0:") == "data,eboot.bin,sce_module");
+    CHECK(list("app0:sce_module") == "libc.suprx");
+    nx::string host;
+    CHECK(t.rt.files().resolve("app0:data/b.txt", &host, nullptr) == 0);
+    CHECK(host == base + "/data/b.txt");
+    CHECK(t.rt.files().resolve("app0:data/c.txt", &host, nullptr) == 0);  // (none has it: the top layer's)
+    CHECK(host == update + "/data/c.txt");
+    CHECK(t.rt.files().resolve("app0:data/c.txt", &host, nullptr, true) == err::kNoEntry);
+
+    // On a writable device, only the top layer is written: a lower layer's file is read-only, new files go on top.
+    FileSystem::Mount ux0{"ux0", update, true};
+    ux0.under.push_back(base);
+    t.rt.files().mount(ux0);
+    CHECK(call32(ctx, kSceLibKernel, kOpen, {guest_string("ux0:data/b.txt"), 0x3, 0}) == err::kReadOnlyFs);
+    CHECK(t.rt.files().remove("ux0:data/b.txt") == err::kReadOnlyFs);
+    CHECK(t.rt.files().mkdir("ux0:sce_module", 0777) == err::kExists);
+    const i32 fd = call32(ctx, kSceLibKernel, kOpen, {guest_string("ux0:data/c.txt"), 0x2 | 0x200, 0});
+    REQUIRE(fd > 0);
+    call32(ctx, kSceIofilemgr, kClose, {u(fd)});
+    CHECK(nx::fs::exists(nx::fs::path_view(update + "/data/c.txt")));
 }
