@@ -54,6 +54,14 @@ nx::string params(const usse::Gxp& g) {
             static_cast<u32>(p.components), p.array_size, p.resource, static_cast<u32>(p.container),
             p.sampler_cube ? 1 : 0, p.reg_format ? 1 : 0);
     }
+    if (g.type == usse::ShaderType::Vertex) {
+        const usse::VertexOutputLayout l = usse::vertex_output_layout(g);
+        out += nx::format("outputs position={} color0={} color1={} fog={} point_size={} registers={} declared={}",
+                          l.position, l.color[0], l.color[1], l.fog, l.point_size, l.registers, g.vertex_output_registers);
+        for (u32 k = 0; k < 10; ++k)
+            if (l.texcoord[k] >= 0) out += nx::format(" texcoord{}={}+{}", k, l.texcoord[k], l.texcoord_registers[k]);
+        out += "\n";
+    }
     return out;
 }
 
@@ -246,15 +254,40 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
     return out;
 }
 
+// The translation of --spirv in a form: compute (the primary program), secondary, vertex (the attributes the program
+// declares, as f32 streams), fragment (its declared output format).
+Result<nx::vector<u32>> translate(const usse::Gxp& g, const nx::string& form) {
+    if (form == "secondary")
+        return gxm::translate_secondary(g, usse::decode_program(g.secondary, usse::ProgramKind::Secondary));
+    const auto primary = usse::decode_program(g.primary, usse::ProgramKind::Primary);
+    if (form == "vertex" || form == "fragment") {
+        if (g.type == usse::ShaderType::Vertex) {
+            gxm::VertexShader shader;
+            for (const usse::Parameter& p : g.parameters) {
+                if (p.category != usse::ParameterCategory::Attribute) continue;
+                gxm::VertexInput in;
+                in.location = static_cast<u32>(shader.inputs.size());
+                in.reg = p.resource;
+                in.format = 9;  // F32
+                in.components = static_cast<u8>(nx::max<u32>(p.components, 1));
+                in.raw = p.reg_format;
+                shader.inputs.push_back(in);
+            }
+            return gxm::translate_vertex(g, primary, shader);
+        }
+        return gxm::translate_fragment(g, primary, gxm::FragmentShader{});
+    }
+    return gxm::translate_compute(g, primary);
+}
+
 Result<void> run(nx::fs::path_view path, bool show_params, const nx::string& run_inputs, bool tracing,
-                 const nx::string& spirv_out, const psvusse::GpuOptions* gpu) {
+                 const nx::string& spirv_out, const nx::string& form, const psvusse::GpuOptions* gpu) {
     const auto data = io::read_file(path);
     if (!data) return nx::err(data.error());
     const auto gxp = usse::parse_gxp(*data);
     if (!gxp) return nx::err(gxp.error());
     if (!spirv_out.empty()) {
-        const auto primary = usse::decode_program(gxp->primary, usse::ProgramKind::Primary);
-        const auto spirv = gxm::translate_compute(*gxp, primary);
+        const auto spirv = translate(*gxp, form);
         if (!spirv) return nx::err(spirv.error());
         return io::write_file(spirv_out, std::span(reinterpret_cast<const u8*>(spirv->data()), spirv->size() * 4));
     }
@@ -294,6 +327,7 @@ int main(int argc, char** argv) {
     nx::string run_inputs;
     bool tracing = false;
     nx::string spirv_out;
+    nx::string form = "compute";
     psvusse::GpuOptions gpu;
     bool use_gpu = false;
     nx::cli::Parser cli("psvusse", "Disassembles the shader programs of GXP files.");
@@ -307,13 +341,15 @@ int main(int argc, char** argv) {
         .option("gpu-index", gpu.gpu, "with --gpu: the Vulkan device's index (default: a discrete GPU)",
                 {.value_name = "N"})
         .flag("validate", gpu.validation, "with --gpu: enable the Vulkan validation layer (its errors fail the run)")
+        .option("form", form, "with --spirv: compute (default), secondary, or draw (vertex or fragment by the program)",
+                {.value_name = "FORM"})
         .option("spirv", spirv_out, "write the primary program's SPIR-V translation (compute form) to this file",
                 {.value_name = "FILE"});
     if (const int code = parse_command_line(cli, argc, argv); code >= 0) return code;
     int status = 0;
     for (const nx::string& file : files) {
         if (files.size() > 1) std::printf("== %s\n", file.c_str());
-        if (const auto done = run(file, show_params, run_inputs, tracing, spirv_out, use_gpu ? &gpu : nullptr); !done) {
+        if (const auto done = run(file, show_params, run_inputs, tracing, spirv_out, form, use_gpu ? &gpu : nullptr); !done) {
             nx::loge(logs::tool, "psvusse: {}: {}", file, done.error().message);
             status = 1;
         }

@@ -1,6 +1,8 @@
 // The USSE to SPIR-V translator. It follows the reference interpreter (libs/usse/src/interp.cpp) operation for
 // operation: the same lanes, conversions and orders of evaluation, so that the interpreter's checked semantics carry
 // over. Where the two differ it says so here:
+// - texture instructions of the draw forms sample the unit the program's sampler slots name, with the GPU's
+//   filtering (the interpreter samples through ShaderTextures);
 // - an instruction under a predicate computes its results and writes them with a select (no branches);
 // - an indexed register outside its bank is clamped to the bank (the interpreter fails);
 // - transcendental functions and division are the GPU's, within Vulkan's precision rather than correctly rounded;
@@ -82,11 +84,15 @@ struct BankVar {
     bool dynamic = false;
 };
 
+enum class Form { Compute, Secondary, Vertex, Fragment };
+
 class Translator {
 public:
-    Translator(const usse::Gxp& gxp, std::span<const Decoded> program) : gxp_(gxp), program_(program) {}
+    Translator(Form form, const usse::Gxp& gxp, std::span<const Decoded> program) : form_(form), gxp_(gxp), program_(program) {}
 
     Result<nx::vector<u32>> translate();
+    const VertexShader* vertex_shader = nullptr;
+    const FragmentShader* fragment_shader = nullptr;
 
 private:
     // ---- Helpers -------------------------------------------------------------------------------------------------
@@ -208,15 +214,36 @@ private:
     Id part_of(Id v, Part p, bool sgn);
     void imad_op(const Instruction& in);
     void sample(Id unit, TexDim dim, const Id coord[4], Id rgba[4]);
+    // The draw forms: a combined image sampler's sample (explicit level of detail where `lod` is given).
+    void sample_unit(u32 binding, TexDim dim, const Id coord[4], usse::TexKind kind, const Id extra[4], Id rgba[4]);
+    Id texture(u32 binding);
     void write_sample(const Id rgba[4], u32 format, Id regs[4]);
     void tex_op(const Instruction& in);
     Id memory_read(Id address, u32 size);
     void memory_op(const Instruction& in);
     // Translates one instruction; a branch's target block and condition are left to the caller.
     void emit(usize i);
+    // The program's body (straight, or a loop over its blocks); the result is true when the step limit stopped it.
+    Id body(auto&& local);
+    void compute_prologue(Id gid);
+    void compute_epilogue(Id gid, Id stopped);
+    void secondary_prologue();
+    void secondary_epilogue();
+    void vertex_prologue();
+    void vertex_epilogue();
+    void fragment_prologue();
+    void fragment_epilogue();
+    Id push_constant(u32 member, Id type);
 
-    [[maybe_unused]] const usse::Gxp& gxp_;  // (the graphics form's inputs and outputs)
+    Form form_;
+    const usse::Gxp& gxp_;
     std::span<const Decoded> program_;
+    bool branches_ = false;
+    nx::vector<Id> interface_;  // (the entry point's inputs and outputs)
+    Id push_ = 0, tp_push_f_ = 0, tp_push_u_ = 0;
+    Id sa_base_ = 0;  // (the draw forms: the first word of this program's secondary attributes)
+    Id textures_[kDrawBindings] = {};
+    Id tv4_ = 0;
     spirv::Builder b_;
     nx::string error_;
     u32 word_ = 0;
@@ -225,7 +252,7 @@ private:
     Id tu_ = 0, ti_ = 0, tf_ = 0, tb_ = 0;
     Id tp_fu_ = 0, tp_fi_ = 0, tp_fb_ = 0, tp_su_ = 0;
     Id in_buf_ = 0, sa_buf_ = 0, out_buf_ = 0, tex_buf_ = 0, mem_buf_ = 0;
-    BankVar temp_, out_, pa_;
+    BankVar temp_, out_, pa_, sa_;  // (sa_: the secondary form's secondary attributes)
     Id internal_ = 0, index_ = 0, pred_ = 0, killed_ = 0, link_ = 0;
     nx::vector<Pending> writes_;
     Id cond_ = 0;
@@ -277,9 +304,14 @@ Id Translator::word_ptr(const Operand& o, i64 word, bool write) {
     switch (o.bank) {
         case Bank::Temp: bank = &temp_; break;
         case Bank::Output: bank = &out_; break;
-        case Bank::Primary: bank = &pa_; break;
+        case Bank::Primary: bank = form_ == Form::Secondary ? &sa_ : &pa_; break;
         case Bank::Secondary:
+            if (form_ == Form::Secondary) {
+                bank = &sa_;
+                break;
+            }
             if (write) return fail("a write to the secondary attributes"), u(0);
+            if (sa_base_) return buffer_word(sa_buf_, iadd(sa_base_, reg_index(o, word, ComputeLayout::kSecondary, nullptr)));
             return buffer_word(sa_buf_, reg_index(o, word, ComputeLayout::kSecondary, nullptr));
         default: break;
     }
@@ -919,6 +951,51 @@ void Translator::write_sample(const Id rgba[4], u32 format, Id regs[4]) {
     }
 }
 
+Id Translator::texture(u32 binding) { return textures_[binding]; }
+
+void Translator::sample_unit(u32 binding, TexDim dim, const Id coord[4], usse::TexKind kind, const Id extra[4],
+                             Id rgba[4]) {
+    const bool cube = dim == TexDim::Cube;
+    const Id image = b_.t_image(tf_, cube ? SpvDimCube : SpvDim2D, 0, 0, 0, 1, SpvImageFormatUnknown);
+    const Id sampled = b_.t_sampled_image(image);
+    if (!textures_[binding]) {
+        const Id v = b_.variable(b_.t_pointer(SpvStorageClassUniformConstant, sampled), SpvStorageClassUniformConstant);
+        b_.decorate(v, SpvDecorationDescriptorSet, {0});
+        b_.decorate(v, SpvDecorationBinding, {binding});
+        textures_[binding] = v;
+    }
+    const Id t = load(sampled, textures_[binding]);
+    const u32 n = cube ? 3 : 2;
+    const Id tc = b_.t_vector(tf_, n);
+    const Id c = cube ? b_.op(SpvOpCompositeConstruct, tc, {coord[0], coord[1], coord[2]})
+                      : b_.op(SpvOpCompositeConstruct, tc, {coord[0], dim == TexDim::D1 ? f(0.5f) : coord[1]});
+    // Implicit levels of detail need derivatives: fragment shaders without branches only (else level 0).
+    const bool implicit = form_ == Form::Fragment && !branches_;
+    Id r;
+    switch (kind) {
+        case usse::TexKind::Bias:
+            r = implicit ? b_.op(SpvOpImageSampleImplicitLod, tv4_, {t, c, SpvImageOperandsBiasMask, extra[0]})
+                         : b_.op(SpvOpImageSampleExplicitLod, tv4_, {t, c, SpvImageOperandsLodMask, f(0.0f)});
+            break;
+        case usse::TexKind::Replace:
+            r = b_.op(SpvOpImageSampleExplicitLod, tv4_, {t, c, SpvImageOperandsLodMask, extra[0]});
+            break;
+        case usse::TexKind::Grad: {
+            const Id dx = cube ? b_.op(SpvOpCompositeConstruct, tc, {extra[0], extra[1], f(0.0f)})
+                               : b_.op(SpvOpCompositeConstruct, tc, {extra[0], extra[1]});
+            const Id dy = cube ? b_.op(SpvOpCompositeConstruct, tc, {extra[2], extra[3], f(0.0f)})
+                               : b_.op(SpvOpCompositeConstruct, tc, {extra[2], extra[3]});
+            r = b_.op(SpvOpImageSampleExplicitLod, tv4_, {t, c, SpvImageOperandsGradMask, dx, dy});
+            break;
+        }
+        default:
+            r = implicit ? b_.op(SpvOpImageSampleImplicitLod, tv4_, {t, c})
+                         : b_.op(SpvOpImageSampleExplicitLod, tv4_, {t, c, SpvImageOperandsLodMask, f(0.0f)});
+            break;
+    }
+    for (u32 k = 0; k < 4; ++k) rgba[k] = b_.op(SpvOpCompositeExtract, tf_, {r, k});
+}
+
 void Translator::tex_op(const Instruction& in) {
     if (in.flags & (usse::kTexRsd | usse::kTexInfo | usse::kTexMinP)) {
         fail("texture queries not implemented");
@@ -926,14 +1003,44 @@ void Translator::tex_op(const Instruction& in) {
     }
     Operand state = in.src[1];
     state.lanes = 0;
-    const Id unit = raw(state, 0, Type::U32);
-    for (u32 k = 1; k < 4; ++k)
-        if (!word_ptr(state, state.number + k, false)) return;
     Id coord[4] = {f(0.0f), f(0.0f), f(0.0f), f(0.0f)};
     const u32 n = static_cast<u32>(in.tex_dim) + 1;
     for (u32 k = 0; k < n; ++k) coord[k] = fval(in.src[0], k, Type::F32);
     Id rgba[4];
-    sample(unit, in.tex_dim, coord, rgba);
+    if (form_ == Form::Compute) {
+        const Id unit = raw(state, 0, Type::U32);
+        for (u32 k = 1; k < 4; ++k)
+            if (!word_ptr(state, state.number + k, false)) return;
+        sample(unit, in.tex_dim, coord, rgba);
+    } else {
+        // The unit whose state words the driver put where the instruction reads them (the program's sampler slots).
+        const usse::Container* k = gxp_.container(usse::kConstantsContainer);
+        i32 unit = -1;
+        // (a secondary program names the secondary attributes as its primary ones)
+        const bool sa_bank = state.bank == Bank::Secondary || (form_ == Form::Secondary && state.bank == Bank::Primary);
+        if (k && sa_bank && !state.indexed)
+            for (const usse::SamplerSlot& slot : gxp_.sampler_slots)
+                if (slot.word % 4 == 0 && static_cast<i32>(k->base + slot.offset) == state.number) unit = slot.word / 4;
+        const bool vertex = gxp_.type == usse::ShaderType::Vertex;
+        const u32 units = vertex ? 4 : 16;
+        if (unit < 0 || static_cast<u32>(unit) >= units) {
+            fail("a texture instruction whose sampler is not one of the program's");
+            return;
+        }
+        Id extra[4] = {f(0.0f), f(0.0f), f(0.0f), f(0.0f)};
+        if (in.src_count > 2) {
+            // (four words from the operand: registers, an internal register's lanes, or constants)
+            Operand e = in.src[2];
+            e.lanes = 4;
+            e.negate = e.absolute = false;
+            for (u32 j = 0; j < 4; ++j) {
+                e.swizzle[j] = static_cast<Comp>(j);
+                extra[j] = cast(tf_, raw(e, j, Type::U32));
+            }
+        }
+        const u32 binding = (vertex ? kDrawBindingVertexTextures : kDrawBindingFragmentTextures) + static_cast<u32>(unit);
+        sample_unit(binding, in.tex_dim, coord, in.tex_kind, extra, rgba);
+    }
     const u32 format = in.type == Type::F32 ? 3 : in.type == Type::F16 ? 1 : 0;
     Id regs[4];
     write_sample(rgba, format, regs);
@@ -1055,16 +1162,419 @@ void Translator::emit(usize i) {
     if (!pair) commit();
 }
 
+Id Translator::push_constant(u32 member, Id type) {
+    const Id ptr = chain(type == tf_ ? tp_push_f_ : tp_push_u_, push_, {u(member)});
+    return load(type, ptr);
+}
+
+// The program: straight, or (with branches) a loop around a switch on the block to run next (pc); a block ends by
+// setting pc. Returns the condition "the step limit stopped it" (0 without branches).
+Id Translator::body(auto&& local) {
+    u32 words_count = 0;
+    for (const Decoded& d : program_) words_count = nx::max(words_count, d.word + 1);
+    const u32 size = static_cast<u32>(program_.size());
+    nx::vector<u32> start(words_count + 1, size);
+    for (u32 i = size; i-- > 0;) start[program_[i].word] = i;
+    for (u32 w = words_count; w-- > 0;)
+        if (start[w] == size) start[w] = start[w + 1];
+    nx::vector<u8> leader(size + 1, 0);
+    leader[0] = 1;
+    for (u32 i = 0; i < size; ++i) {
+        const Decoded& d = program_[i];
+        if (!d.executed || d.in.op != Op::Br) continue;
+        if (d.in.target < 0 || static_cast<u32>(d.in.target) > words_count) {
+            word_ = d.word;
+            fail("branch outside the program");
+            continue;
+        }
+        leader[start[static_cast<u32>(d.in.target)]] = 1;
+        leader[i + 1] = 1;
+    }
+    if (!branches_) {
+        for (usize i = 0; i < size; ++i) emit(i);
+        return 0;
+    }
+    nx::vector<u32> block_of(size + 1, 0);
+    nx::vector<u32> firsts;
+    for (u32 i = 0; i <= size; ++i) {
+        if (i < size && leader[i]) firsts.push_back(i);
+        block_of[i] = static_cast<u32>(firsts.size()) - 1;
+    }
+    const u32 end = static_cast<u32>(firsts.size());
+    auto case_of = [&](u32 instruction) { return instruction >= size ? end : block_of[instruction]; };
+    const Id pc = local(tu_, "pc");
+    const Id steps = local(tu_, "steps");
+    const Id header = b_.new_label(), dispatch = b_.new_label(), cont = b_.new_label(), merge = b_.new_label(),
+             sw_merge = b_.new_label();
+    b_.op0(SpvOpBranch, {header});
+    b_.block(header);
+    b_.op0(SpvOpLoopMerge, {merge, cont, SpvLoopControlMaskNone});
+    b_.op0(SpvOpBranch, {dispatch});
+    b_.block(dispatch);
+    const Id pcv = load(tu_, pc);
+    nx::vector<Id> labels;
+    nx::vector<u32> sw{pcv, sw_merge};  // (the default: no block)
+    for (u32 k = 0; k < end; ++k) {
+        labels.push_back(b_.new_label());
+        sw.push_back(k);
+        sw.push_back(labels.back());
+    }
+    b_.op0(SpvOpSelectionMerge, {sw_merge, SpvSelectionControlMaskNone});
+    b_.op0(SpvOpSwitch, sw);
+    for (u32 k = 0; k < end; ++k) {
+        b_.block(labels[k]);
+        const u32 last = (k + 1 < end ? firsts[k + 1] : size) - 1;
+        for (u32 i = firsts[k]; i <= last; ++i) emit(i);
+        const Decoded& d = program_[last];
+        Id next = u(k + 1);
+        if (d.executed && d.in.op == Op::Br && d.in.target >= 0 && static_cast<u32>(d.in.target) <= words_count) {
+            const Id target = u(case_of(start[static_cast<u32>(d.in.target)]));
+            next = cond_ ? sel(tu_, cond_, target, next) : target;
+        }
+        store(pc, next);
+        b_.op0(SpvOpBranch, {sw_merge});
+    }
+    b_.block(sw_merge);
+    b_.op0(SpvOpBranch, {cont});
+    b_.block(cont);
+    const Id count = iadd(load(tu_, steps), u(1));
+    store(steps, count);
+    const Id more = land(bin(SpvOpULessThan, tb_, load(tu_, pc), u(end)), bin(SpvOpULessThan, tb_, count, u(kMaxSteps)));
+    b_.op0(SpvOpBranchConditional, {more, header, merge});
+    b_.block(merge);
+    return bin(SpvOpUGreaterThanEqual, tb_, count, u(kMaxSteps));
+}
+
+// ---- The compute form ------------------------------------------------------------------------------------------
+
+void Translator::compute_prologue(Id gid) {
+    const Id in_base = imul(gid, u(ComputeLayout::kIn));
+    for (u32 k = 0; k < ComputeLayout::kPrimary; ++k)
+        store(chain(tp_fu_, pa_.var, {u(k)}), load(tu_, buffer_word(in_buf_, iadd(in_base, u(k)))));
+}
+
+void Translator::compute_epilogue(Id gid, Id stopped) {
+    const Id out_base = imul(gid, u(ComputeLayout::kOut));
+    for (u32 k = 0; k < ComputeLayout::kPrimary; ++k)
+        store(buffer_word(out_buf_, iadd(out_base, u(k))), load(tu_, chain(tp_fu_, pa_.var, {u(k)})));
+    for (u32 k = 0; k < ComputeLayout::kOutput; ++k)
+        store(buffer_word(out_buf_, iadd(out_base, u(ComputeLayout::kPrimary + k))),
+              load(tu_, chain(tp_fu_, out_.var, {u(k)})));
+    store(buffer_word(out_buf_, iadd(out_base, u(ComputeLayout::kPrimary + ComputeLayout::kOutput))),
+          bor(sel(tu_, load(tb_, killed_), u(1), u(0)), stopped ? sel(tu_, stopped, u(2), u(0)) : u(0)));
+}
+
+// ---- The secondary form ----------------------------------------------------------------------------------------
+
+// The draw's secondary attributes (of the stage the push constants name), into the program's registers and back.
+void Translator::secondary_prologue() {
+    sa_base_ = iadd(imul(push_constant(0, tu_), u(kDrawSecondaryWords)), imul(push_constant(5, tu_), u(256)));
+    sa_.minimum = 256;
+    for (u32 k = 0; k < 256; ++k)
+        store(chain(tp_fu_, sa_.var, {u(k)}), load(tu_, buffer_word(sa_buf_, iadd(sa_base_, u(k)))));
+}
+
+void Translator::secondary_epilogue() {
+    for (u32 k = 0; k < 256; ++k)
+        store(buffer_word(sa_buf_, iadd(sa_base_, u(k))), load(tu_, chain(tp_fu_, sa_.var, {u(k)})));
+}
+
+// ---- The vertex form -------------------------------------------------------------------------------------------
+
+u32 location_of(u32 bit) {
+    if (bit == usse::varying::kColor0) return kVaryingColor0;
+    if (bit == usse::varying::kColor1) return kVaryingColor1;
+    if (bit == usse::varying::kFog) return kVaryingFog;
+    for (u32 k = 0; k < 10; ++k)
+        if (bit == (usse::varying::kTexCoord0 << k)) return kVaryingTexCoord0 + k;
+    return ~0u;
+}
+
+void Translator::vertex_prologue() {
+    sa_base_ = imul(push_constant(0, tu_), u(kDrawSecondaryWords));
+    auto pa = [&](u32 r) { return chain(tp_fu_, pa_.var, {u(r)}); };
+    const Id tuv4 = b_.t_vector(tu_, 4);
+    for (const VertexInput& in : vertex_shader->inputs) {
+        const usse::Parameter* p = nullptr;
+        for (const usse::Parameter& q : gxp_.parameters)
+            if (q.category == usse::ParameterCategory::Attribute && q.resource == in.reg) p = &q;
+        if (!p) continue;  // (the program does not read it)
+        const Id type = in.raw ? tuv4 : tv4_;
+        const Id var = b_.variable(b_.t_pointer(SpvStorageClassInput, type), SpvStorageClassInput);
+        b_.decorate(var, SpvDecorationLocation, {in.location});
+        interface_.push_back(var);
+        const Id v = load(type, var);
+        auto comp = [&](u32 k) { return b_.op(SpvOpCompositeExtract, in.raw ? tu_ : tf_, {v, k}); };
+        if (in.raw) {
+            // The data's bits, packed into the registers in order.
+            const u32 bits = vertex_input_bits(in.format);
+            const u32 count = in.components;  // (untyped: 32-bit words)
+            const u32 words = (count * bits + 31) / 32;
+            nx::vector<Id> w(words, u(0));
+            for (u32 k = 0; k < count && k < 4; ++k) {
+                const u32 at = k * bits;
+                w[at / 32] = bor(w[at / 32], at % 32 ? shl(mask(comp(k), bits), u(at % 32)) : mask(comp(k), bits));
+            }
+            for (u32 j = 0; j < words; ++j) {
+                pa_.used = nx::max(pa_.used, in.reg + j + 1);
+                store(pa(in.reg + j), w[j]);
+            }
+            continue;
+        }
+        // Converted to the program's type for the attribute (the missing components: 0, 0, 0, 1).
+        const u32 n = nx::max<u32>(p->components, 1);
+        switch (p->type) {
+            case usse::ParameterType::F16:
+                for (u32 k = 0; k < n; k += 2) {
+                    const Id lo = to_half(cast(tu_, comp(k))), hi = k + 1 < n ? to_half(cast(tu_, comp(k + 1))) : u(0);
+                    pa_.used = nx::max(pa_.used, in.reg + k / 2 + 1);
+                    store(pa(in.reg + k / 2), bor(lo, shl(hi, u(16))));
+                }
+                break;
+            case usse::ParameterType::U8:
+            case usse::ParameterType::S8:
+            case usse::ParameterType::U16:
+            case usse::ParameterType::S16:
+            case usse::ParameterType::U32:
+            case usse::ParameterType::S32: {
+                const bool sgn = p->type == usse::ParameterType::S8 || p->type == usse::ParameterType::S16 ||
+                                 p->type == usse::ParameterType::S32;
+                const u32 bits = p->type == usse::ParameterType::U8 || p->type == usse::ParameterType::S8 ? 8
+                                 : p->type == usse::ParameterType::U32 || p->type == usse::ParameterType::S32 ? 32 : 16;
+                const u32 words = (n * bits + 31) / 32;
+                nx::vector<Id> w(words, u(0));
+                for (u32 k = 0; k < n; ++k) {
+                    const Id x = sgn ? cast(tu_, un(SpvOpConvertFToS, ti_, comp(k))) : un(SpvOpConvertFToU, tu_, comp(k));
+                    const u32 at = k * bits;
+                    w[at / 32] = bor(w[at / 32], at % 32 ? shl(mask(x, bits), u(at % 32)) : mask(x, bits));
+                }
+                for (u32 j = 0; j < words; ++j) {
+                    pa_.used = nx::max(pa_.used, in.reg + j + 1);
+                    store(pa(in.reg + j), w[j]);
+                }
+                break;
+            }
+            default:  // F32 (and the formats read as floats)
+                for (u32 k = 0; k < n && k < 4; ++k) {
+                    pa_.used = nx::max(pa_.used, in.reg + k + 1);
+                    store(pa(in.reg + k), cast(tu_, comp(k)));
+                }
+                break;
+        }
+    }
+}
+
+void Translator::vertex_epilogue() {
+    const usse::VertexOutputLayout l = usse::vertex_output_layout(gxp_);
+    out_.used = nx::max(out_.used, l.registers);
+    auto o = [&](i32 r) { return cast(tf_, load(tu_, chain(tp_fu_, out_.var, {u(static_cast<u32>(r))}))); };
+    auto output = [&](Id type, auto&& decorate) {
+        const Id var = b_.variable(b_.t_pointer(SpvStorageClassOutput, type), SpvStorageClassOutput);
+        decorate(var);
+        interface_.push_back(var);
+        return var;
+    };
+    // The position, as GXM's viewport transform puts it on the render target, back in Vulkan's clip space (w kept
+    // for clipping and perspective-correct interpolation).
+    const Id position = output(tv4_, [&](Id v) { b_.decorate(v, SpvDecorationBuiltIn, {SpvBuiltInPosition}); });
+    const Id point_size = output(tf_, [&](Id v) { b_.decorate(v, SpvDecorationBuiltIn, {SpvBuiltInPointSize}); });
+    Id cx = f(0.0f), cy = f(0.0f), cz = f(0.0f), cw = f(1.0f);
+    if (l.position >= 0) cx = o(l.position), cy = o(l.position + 1), cz = o(l.position + 2), cw = o(l.position + 3);
+    const Id clamp = push_constant(4, tf_);
+    cw = sel(tf_, land(bin(SpvOpFOrdGreaterThan, tb_, clamp, f(0.0f)), bin(SpvOpFOrdLessThan, tb_, cw, clamp)), clamp, cw);
+    auto vp = [&](u32 k) { return load(tf_, chain(tp_push_f_, push_, {u(3), u(k)})); };
+    const Id width = load(tf_, chain(tp_push_f_, push_, {u(2), u(0)})), height = load(tf_, chain(tp_push_f_, push_, {u(2), u(1)}));
+    const Id flags = push_constant(1, tu_);
+    const Id enabled = ine(band(flags, u(kDrawViewport)), u(0));
+    const Id vx = fsub(fdiv(fmul(f(2.0f), fadd(fmul(vp(0), cw), fmul(vp(1), cx))), width), cw);
+    const Id vy = fsub(fdiv(fmul(f(2.0f), fadd(fmul(vp(2), cw), fmul(vp(3), cy))), height), cw);
+    const Id vz = fadd(fmul(vp(4), cw), fmul(vp(5), cz));
+    const Id sx = fsub(fdiv(fmul(f(2.0f), cx), width), f(1.0f));
+    const Id sy = fsub(fdiv(fmul(f(2.0f), cy), height), f(1.0f));
+    const Id pos = b_.op(SpvOpCompositeConstruct, tv4_,
+                         {sel(tf_, enabled, vx, sx), sel(tf_, enabled, vy, sy), sel(tf_, enabled, vz, cz),
+                          sel(tf_, enabled, cw, f(1.0f))});
+    store(position, pos);
+    store(point_size, l.point_size >= 0 ? o(l.point_size) : f(1.0f));
+    // The varyings: four components, the missing ones 0, 0, 0, 1.
+    auto varying = [&](u32 location, i32 first, u32 count) {
+        if (first < 0) return;
+        const Id var = output(tv4_, [&](Id v) { b_.decorate(v, SpvDecorationLocation, {location}); });
+        Id c[4] = {f(0.0f), f(0.0f), f(0.0f), f(1.0f)};
+        for (u32 k = 0; k < count && k < 4; ++k) c[k] = o(first + static_cast<i32>(k));
+        store(var, b_.op(SpvOpCompositeConstruct, tv4_, {c[0], c[1], c[2], c[3]}));
+    };
+    varying(kVaryingColor0, l.color[0], 4);
+    varying(kVaryingColor1, l.color[1], 4);
+    varying(kVaryingFog, l.fog, 2);
+    for (u32 k = 0; k < 10; ++k) varying(kVaryingTexCoord0 + k, l.texcoord[k], l.texcoord_registers[k]);
+}
+
+// ---- The fragment form -----------------------------------------------------------------------------------------
+
+void Translator::fragment_prologue() {
+    sa_base_ = iadd(imul(push_constant(0, tu_), u(kDrawSecondaryWords)), u(256));
+    auto pa = [&](u32 r, Id v) {
+        pa_.used = nx::max(pa_.used, r + 1);
+        store(chain(tp_fu_, pa_.var, {u(r)}), v);
+    };
+    nx::hash_map<u32, Id> sources;  // varying bit -> its value (vec4)
+    auto source = [&](u32 bit) -> Id {
+        if (auto it = sources.find(bit); it != sources.end()) return it->second;
+        Id value;
+        if (bit == usse::varying::kPosition || bit == usse::varying::kSpriteCoord) {
+            const bool coord = bit == usse::varying::kSpriteCoord;
+            const Id type = coord ? b_.t_vector(tf_, 2) : tv4_;
+            const Id var = b_.variable(b_.t_pointer(SpvStorageClassInput, type), SpvStorageClassInput);
+            b_.decorate(var, SpvDecorationBuiltIn, {coord ? static_cast<u32>(SpvBuiltInPointCoord) : static_cast<u32>(SpvBuiltInFragCoord)});
+            interface_.push_back(var);
+            value = load(type, var);
+            if (coord) {
+                const Id x = b_.op(SpvOpCompositeExtract, tf_, {value, 0}), y = b_.op(SpvOpCompositeExtract, tf_, {value, 1});
+                value = b_.op(SpvOpCompositeConstruct, tv4_, {x, y, f(0.0f), f(1.0f)});
+            }
+        } else {
+            const u32 location = location_of(bit);
+            if (location == ~0u) {
+                fail(nx::format("fragment input of varying 0x{:x} not implemented", bit));
+                return b_.c_null(tv4_);
+            }
+            const Id var = b_.variable(b_.t_pointer(SpvStorageClassInput, tv4_), SpvStorageClassInput);
+            b_.decorate(var, SpvDecorationLocation, {location});
+            interface_.push_back(var);
+            value = load(tv4_, var);
+        }
+        sources[bit] = value;
+        return value;
+    };
+    for (const usse::FragmentInput& in : gxp_.inputs) {
+        if (in.interpolated) {
+            const Id v = source(in.interpolated);
+            auto c = [&](u32 k) { return b_.op(SpvOpCompositeExtract, tf_, {v, k}); };
+            const u32 n = nx::min<u32>(in.components, 4);
+            if (in.format == 0) {
+                for (u32 k = 0; k < n; ++k) pa(in.offset + k, cast(tu_, c(k)));
+            } else if (in.format == 2) {
+                for (u32 k = 0; k < n; k += 2)
+                    pa(in.offset + k / 2, bor(to_half(cast(tu_, c(k))), k + 1 < n ? shl(to_half(cast(tu_, c(k + 1))), u(16)) : u(0)));
+            } else {  // fx10: x, y, z in one register, w in the next (1.0 = 255)
+                Id q[4] = {u(0), u(0), u(0), u(0)};
+                for (u32 k = 0; k < n; ++k) {
+                    Id g = ext(tf_, GLSLstd450FClamp, {fmul(c(k), f(255.0f)), f(-512.0f), f(511.0f)});
+                    q[k] = fx_raw(un(SpvOpConvertFToS, ti_, ext(tf_, GLSLstd450RoundEven, {g})), Type::Fx10);
+                }
+                pa(in.offset, bor(bor(q[0], shl(q[1], u(10))), shl(q[2], u(20))));
+                pa(in.offset + 1, q[3]);
+            }
+        }
+        if (in.sampled) {
+            const Id v = source(in.sampled);
+            Id coord[4];
+            for (u32 k = 0; k < 4; ++k) coord[k] = b_.op(SpvOpCompositeExtract, tf_, {v, k});
+            if (in.projected)
+                for (u32 k = 0; k < 2; ++k) coord[k] = fdiv(coord[k], coord[3]);
+            bool cube = false;
+            for (const usse::Parameter& q : gxp_.parameters)
+                if (q.category == usse::ParameterCategory::Sampler && q.resource == in.sampler) cube = q.sampler_cube;
+            const Id extra[4] = {f(0.0f), f(0.0f), f(0.0f), f(0.0f)};
+            Id rgba[4];
+            // (before the program: uniform control flow, implicit levels of detail are defined)
+            const bool saved = branches_;
+            branches_ = false;
+            sample_unit(kDrawBindingFragmentTextures + in.sampler, cube ? TexDim::Cube : TexDim::D2, coord,
+                        usse::TexKind::Plain, extra, rgba);
+            branches_ = saved;
+            Id regs[4];
+            write_sample(rgba, in.sample_format, regs);
+            const u32 count = in.sample_format == 0 ? 1u : in.sample_format == 1 ? 2u : 4u;
+            for (u32 k = 0; k < count; ++k) pa(in.sample_offset + k, regs[k]);
+        }
+    }
+}
+
+void Translator::fragment_epilogue() {
+    // The output register's lanes, as its format reads them.
+    u32 format = fragment_shader->output_format;
+    if (format == 0) {
+        switch (gxp_.output_type) {
+            case usse::ParameterType::F32: format = gxp_.output_components <= 1 ? 8 : 7; break;
+            case usse::ParameterType::U8: format = 1; break;
+            case usse::ParameterType::S8: format = 2; break;
+            case usse::ParameterType::U16: format = 3; break;
+            case usse::ParameterType::S16: format = 4; break;
+            default: format = gxp_.output_components <= 2 ? 6 : 5; break;  // F16
+        }
+    }
+    auto p = [&](u32 r) {
+        pa_.used = nx::max(pa_.used, r + 1);
+        return load(tu_, chain(tp_fu_, pa_.var, {u(r)}));
+    };
+    Id lane[6] = {f(0.0f), f(0.0f), f(0.0f), f(1.0f), f(0.0f), f(1.0f)};
+    auto half = [&](Id w, u32 k) { return from_half(mask(k ? shr(w, u(16)) : w, 16)); };
+    switch (format) {
+        case 1:  // UCHAR4
+        case 2: {  // CHAR4
+            const Id w = p(0);
+            for (u32 k = 0; k < 4; ++k) {
+                const Id b = k ? shr(w, u(8 * k)) : w;
+                lane[k] = format == 1 ? fdiv(un(SpvOpConvertUToF, tf_, band(b, u(0xFF))), f(255.0f))
+                                      : ext(tf_, GLSLstd450FMax, {fdiv(un(SpvOpConvertSToF, tf_, sext(b, 8)), f(127.0f)), f(-1.0f)});
+            }
+            break;
+        }
+        case 3:  // USHORT2
+        case 4: {  // SHORT2
+            const Id w = p(0);
+            for (u32 k = 0; k < 2; ++k) {
+                const Id h = k ? shr(w, u(16)) : w;
+                lane[k] = format == 3 ? fdiv(un(SpvOpConvertUToF, tf_, band(h, u(0xFFFF))), f(65535.0f))
+                                      : ext(tf_, GLSLstd450FMax, {fdiv(un(SpvOpConvertSToF, tf_, sext(h, 16)), f(32767.0f)), f(-1.0f)});
+            }
+            break;
+        }
+        case 5:  // HALF4
+            lane[0] = half(p(0), 0), lane[1] = half(p(0), 1), lane[2] = half(p(1), 0), lane[3] = half(p(1), 1);
+            break;
+        case 6:  // HALF2
+            lane[0] = half(p(0), 0), lane[1] = half(p(0), 1);
+            break;
+        case 7:  // FLOAT2
+            lane[0] = cast(tf_, p(0)), lane[1] = cast(tf_, p(1));
+            break;
+        case 8:  // FLOAT
+            lane[0] = cast(tf_, p(0));
+            break;
+        default: fail(nx::format("output register format {} not implemented", format)); break;
+    }
+    const Id color = b_.variable(b_.t_pointer(SpvStorageClassOutput, tv4_), SpvStorageClassOutput);
+    b_.decorate(color, SpvDecorationLocation, {0});
+    interface_.push_back(color);
+    const u8* z = fragment_shader->swizzle;
+    store(color, b_.op(SpvOpCompositeConstruct, tv4_, {lane[nx::min<u8>(z[0], 5)], lane[nx::min<u8>(z[1], 5)],
+                                                      lane[nx::min<u8>(z[2], 5)], lane[nx::min<u8>(z[3], 5)]}));
+    // A discarded instance: no colour, no depth.
+    const Id kill = b_.new_label(), merge = b_.new_label();
+    b_.op0(SpvOpSelectionMerge, {merge, SpvSelectionControlMaskNone});
+    b_.op0(SpvOpBranchConditional, {load(tb_, killed_), kill, merge});
+    b_.block(kill);
+    b_.op0(SpvOpKill, {});
+    b_.block(merge);
+}
+
+// ---- The module ------------------------------------------------------------------------------------------------
+
 Result<nx::vector<u32>> Translator::translate() {
     b_.capability(SpvCapabilityShader);
     tu_ = b_.t_uint();
     ti_ = b_.t_int();
     tf_ = b_.t_float();
     tb_ = b_.t_bool();
+    tv4_ = b_.t_vector(tf_, 4);
     tp_fu_ = b_.t_pointer(SpvStorageClassFunction, tu_);
     tp_fi_ = b_.t_pointer(SpvStorageClassFunction, ti_);
     tp_fb_ = b_.t_pointer(SpvStorageClassFunction, tb_);
     tp_su_ = b_.t_pointer(SpvStorageClassStorageBuffer, tu_);
+    for (const Decoded& d : program_) branches_ |= d.executed && d.in.op == Op::Br;
 
     // The storage buffers: one struct of a runtime array of words.
     const Id words = b_.t_runtime_array(tu_);
@@ -1080,14 +1590,33 @@ Result<nx::vector<u32>> Translator::translate() {
         b_.name(v, name);
         return v;
     };
-    in_buf_ = buffer(kBindingIn, "in");
-    sa_buf_ = buffer(kBindingSecondary, "sa");
-    out_buf_ = buffer(kBindingOut, "out");
-    tex_buf_ = buffer(kBindingTextures, "textures");
-    mem_buf_ = buffer(kBindingMemory, "memory");
+    Id gid_var = 0;
     const Id tv3 = b_.t_vector(tu_, 3);
-    const Id gid_var = b_.variable(b_.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
-    b_.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+    if (form_ == Form::Compute) {
+        in_buf_ = buffer(kBindingIn, "in");
+        sa_buf_ = buffer(kBindingSecondary, "sa");
+        out_buf_ = buffer(kBindingOut, "out");
+        tex_buf_ = buffer(kBindingTextures, "textures");
+        mem_buf_ = buffer(kBindingMemory, "memory");
+        gid_var = b_.variable(b_.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+        b_.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+        interface_.push_back(gid_var);
+    } else {
+        sa_buf_ = buffer(kDrawBindingSecondary, "sa");
+        mem_buf_ = buffer(kDrawBindingMemory, "memory");
+        // The draw's push constants (DrawConstants).
+        const Id f2 = b_.t_array(tf_, 2), f6 = b_.t_array(tf_, 6);
+        b_.decorate(f2, SpvDecorationArrayStride, {4});
+        b_.decorate(f6, SpvDecorationArrayStride, {4});
+        const Id pc = b_.t_struct({tu_, tu_, f2, f6, tf_, tu_});
+        b_.decorate(pc, SpvDecorationBlock);
+        const u32 offsets[] = {0, 4, 8, 16, 40, 44};
+        for (u32 m = 0; m < 6; ++m) b_.member_decorate(pc, m, SpvDecorationOffset, {offsets[m]});
+        push_ = b_.variable(b_.t_pointer(SpvStorageClassPushConstant, pc), SpvStorageClassPushConstant);
+        b_.name(push_, "draw");
+        tp_push_f_ = b_.t_pointer(SpvStorageClassPushConstant, tf_);
+        tp_push_u_ = b_.t_pointer(SpvStorageClassPushConstant, tu_);
+    }
 
     const Id tvoid = b_.t_void();
     const Id fn = b_.begin_function(tvoid, b_.t_function(tvoid));
@@ -1098,11 +1627,15 @@ Result<nx::vector<u32>> Translator::translate() {
     temp_.var = b_.reserve();
     out_.var = b_.reserve();
     pa_.var = b_.reserve();
-    out_.minimum = ComputeLayout::kOutput;
-    pa_.minimum = ComputeLayout::kPrimary;
+    sa_.var = b_.reserve();
+    if (form_ == Form::Compute) {
+        out_.minimum = ComputeLayout::kOutput;
+        pa_.minimum = ComputeLayout::kPrimary;
+    }
     b_.name(temp_.var, "r");
     b_.name(out_.var, "o");
     b_.name(pa_.var, "pa");
+    b_.name(sa_.var, "sa");
     auto local = [&](Id type, const char* name) {
         const Id id = b_.reserve();
         b_.local(id, b_.t_pointer(SpvStorageClassFunction, type), b_.c_null(type));
@@ -1115,111 +1648,43 @@ Result<nx::vector<u32>> Translator::translate() {
     killed_ = local(tb_, "killed");
     link_ = local(tu_, "link");
 
-    const Id gid = b_.op(SpvOpCompositeExtract, tu_, {load(tv3, gid_var), 0});
-    const Id in_base = imul(gid, u(ComputeLayout::kIn));
-    for (u32 k = 0; k < ComputeLayout::kPrimary; ++k)
-        store(chain(tp_fu_, pa_.var, {u(k)}), load(tu_, buffer_word(in_buf_, iadd(in_base, u(k)))));
-
-    // Blocks: from the start, each branch target and the instruction after each branch.
-    u32 words_count = 0;
-    for (const Decoded& d : program_) words_count = nx::max(words_count, d.word + 1);
-    const u32 size = static_cast<u32>(program_.size());
-    nx::vector<u32> start(words_count + 1, size);
-    for (u32 i = size; i-- > 0;) start[program_[i].word] = i;
-    for (u32 w = words_count; w-- > 0;)
-        if (start[w] == size) start[w] = start[w + 1];
-    nx::vector<u8> leader(size + 1, 0);
-    leader[0] = 1;
-    bool branches = false;
-    for (u32 i = 0; i < size; ++i) {
-        const Decoded& d = program_[i];
-        if (!d.executed || d.in.op != Op::Br) continue;
-        if (d.in.target < 0 || static_cast<u32>(d.in.target) > words_count) {
-            word_ = d.word;
-            fail("branch outside the program");
-            continue;
-        }
-        branches = true;
-        leader[start[static_cast<u32>(d.in.target)]] = 1;
-        leader[i + 1] = 1;
+    Id gid = 0;
+    switch (form_) {
+        case Form::Compute:
+            gid = b_.op(SpvOpCompositeExtract, tu_, {load(tv3, gid_var), 0});
+            compute_prologue(gid);
+            break;
+        case Form::Secondary: secondary_prologue(); break;
+        case Form::Vertex: vertex_prologue(); break;
+        case Form::Fragment: fragment_prologue(); break;
     }
-
-    Id stopped = 0;  // (the step limit was reached)
-    if (!branches) {
-        for (usize i = 0; i < size; ++i) emit(i);
-    } else {
-        // A loop around a switch on the block to run next (pc); a block ends by setting pc.
-        nx::vector<u32> block_of(size + 1, 0);
-        nx::vector<u32> firsts;
-        for (u32 i = 0; i <= size; ++i) {
-            if (i < size && leader[i]) firsts.push_back(i);
-            block_of[i] = static_cast<u32>(firsts.size()) - 1;
-        }
-        const u32 end = static_cast<u32>(firsts.size());
-        auto case_of = [&](u32 instruction) { return instruction >= size ? end : block_of[instruction]; };
-        const Id pc = local(tu_, "pc");
-        const Id steps = local(tu_, "steps");
-        const Id header = b_.new_label(), dispatch = b_.new_label(), cont = b_.new_label(), merge = b_.new_label(),
-                 sw_merge = b_.new_label();
-        b_.op0(SpvOpBranch, {header});
-        b_.block(header);
-        b_.op0(SpvOpLoopMerge, {merge, cont, SpvLoopControlMaskNone});
-        b_.op0(SpvOpBranch, {dispatch});
-        b_.block(dispatch);
-        const Id pcv = load(tu_, pc);
-        nx::vector<Id> labels;
-        nx::vector<u32> sw{pcv, sw_merge};  // (the default: no block)
-        for (u32 k = 0; k < end; ++k) {
-            labels.push_back(b_.new_label());
-            sw.push_back(k);
-            sw.push_back(labels.back());
-        }
-        b_.op0(SpvOpSelectionMerge, {sw_merge, SpvSelectionControlMaskNone});
-        b_.op0(SpvOpSwitch, sw);
-        for (u32 k = 0; k < end; ++k) {
-            b_.block(labels[k]);
-            const u32 last = (k + 1 < end ? firsts[k + 1] : size) - 1;
-            for (u32 i = firsts[k]; i <= last; ++i) emit(i);
-            const Decoded& d = program_[last];
-            Id next = u(k + 1);
-            if (d.executed && d.in.op == Op::Br && d.in.target >= 0 && static_cast<u32>(d.in.target) <= words_count) {
-                const Id target = u(case_of(start[static_cast<u32>(d.in.target)]));
-                next = cond_ ? sel(tu_, cond_, target, next) : target;
-            }
-            store(pc, next);
-            b_.op0(SpvOpBranch, {sw_merge});
-        }
-        b_.block(sw_merge);
-        b_.op0(SpvOpBranch, {cont});
-        b_.block(cont);
-        const Id count = iadd(load(tu_, steps), u(1));
-        store(steps, count);
-        const Id more = land(bin(SpvOpULessThan, tb_, load(tu_, pc), u(end)), bin(SpvOpULessThan, tb_, count, u(kMaxSteps)));
-        b_.op0(SpvOpBranchConditional, {more, header, merge});
-        b_.block(merge);
-        stopped = bin(SpvOpUGreaterThanEqual, tb_, count, u(kMaxSteps));
+    const Id stopped = body(local);
+    switch (form_) {
+        case Form::Compute: compute_epilogue(gid, stopped); break;
+        case Form::Secondary: secondary_epilogue(); break;
+        case Form::Vertex: vertex_epilogue(); break;
+        case Form::Fragment: fragment_epilogue(); break;
     }
-
-    // The results.
-    const Id out_base = imul(gid, u(ComputeLayout::kOut));
-    for (u32 k = 0; k < ComputeLayout::kPrimary; ++k)
-        store(buffer_word(out_buf_, iadd(out_base, u(k))), load(tu_, chain(tp_fu_, pa_.var, {u(k)})));
-    for (u32 k = 0; k < ComputeLayout::kOutput; ++k)
-        store(buffer_word(out_buf_, iadd(out_base, u(ComputeLayout::kPrimary + k))),
-              load(tu_, chain(tp_fu_, out_.var, {u(k)})));
-    store(buffer_word(out_buf_, iadd(out_base, u(ComputeLayout::kPrimary + ComputeLayout::kOutput))),
-          bor(sel(tu_, load(tb_, killed_), u(1), u(0)), stopped ? sel(tu_, stopped, u(2), u(0)) : u(0)));
     b_.op0(SpvOpReturn, {});
     b_.end_function();
 
-    for (BankVar* bank : {&temp_, &out_, &pa_}) {
+    for (BankVar* bank : {&temp_, &out_, &pa_, &sa_}) {
         const u32 n = bank->dynamic ? kBankSize : nx::max(nx::max(bank->used, bank->minimum), 1u);
         const Id type = b_.t_array(tu_, n);
         b_.local(bank->var, b_.t_pointer(SpvStorageClassFunction, type), b_.c_null(type));
     }
-    const Id interface[] = {gid_var};
-    b_.entry_point(SpvExecutionModelGLCompute, fn, "main", interface);
-    b_.execution_mode(fn, SpvExecutionModeLocalSize, {ComputeLayout::kLocalSize, 1, 1});
+    switch (form_) {
+        case Form::Compute:
+        case Form::Secondary:
+            b_.entry_point(SpvExecutionModelGLCompute, fn, "main", interface_);
+            b_.execution_mode(fn, SpvExecutionModeLocalSize, {1, 1, 1});
+            break;
+        case Form::Vertex: b_.entry_point(SpvExecutionModelVertex, fn, "main", interface_); break;
+        case Form::Fragment:
+            b_.entry_point(SpvExecutionModelFragment, fn, "main", interface_);
+            b_.execution_mode(fn, SpvExecutionModeOriginUpperLeft);
+            break;
+    }
     if (int64_) b_.capability(SpvCapabilityInt64);
     if (!error_.empty()) return failure(error_);
     return b_.module();
@@ -1227,8 +1692,49 @@ Result<nx::vector<u32>> Translator::translate() {
 
 }  // namespace
 
+u32 vertex_input_bits(u8 format) {
+    switch (format) {
+        case 0: case 1: case 4: case 5: return 8;    // U8, S8, U8N, S8N
+        case 2: case 3: case 6: case 7: case 8: return 16;  // U16, S16, U16N, S16N, F16
+        default: return 32;                          // F32, untyped
+    }
+}
+
 Result<nx::vector<u32>> translate_compute(const usse::Gxp& gxp, std::span<const usse::Decoded> program) {
-    return Translator(gxp, program).translate();
+    return Translator(Form::Compute, gxp, program).translate();
+}
+
+Result<nx::vector<u32>> translate_secondary(const usse::Gxp& gxp, std::span<const usse::Decoded> program) {
+    return Translator(Form::Secondary, gxp, program).translate();
+}
+
+Result<nx::vector<u32>> translate_vertex(const usse::Gxp& gxp, std::span<const usse::Decoded> program,
+                                         const VertexShader& shader) {
+    Translator t(Form::Vertex, gxp, program);
+    t.vertex_shader = &shader;
+    return t.translate();
+}
+
+Result<nx::vector<u32>> translate_fragment(const usse::Gxp& gxp, std::span<const usse::Decoded> program,
+                                           const FragmentShader& shader) {
+    Translator t(Form::Fragment, gxp, program);
+    t.fragment_shader = &shader;
+    return t.translate();
+}
+
+void fill_secondary(const usse::Gxp& gxp, std::span<const u32> default_uniforms, std::span<const u32> buffer_addresses,
+                    std::span<u32, 256> out) {
+    std::fill(out.begin(), out.end(), 0u);
+    if (const usse::Container* c = gxp.container(usse::kDefaultUniformContainer))
+        for (u32 i = 0; i < c->size && c->base + i < 256; ++i) out[c->base + i] = i < default_uniforms.size() ? default_uniforms[i] : 0;
+    const usse::Container* k = gxp.container(usse::kConstantsContainer);
+    if (!k) return;
+    for (const usse::BufferSlot& s : gxp.buffer_slots)
+        if (k->base + s.offset < 256u)
+            out[k->base + s.offset] =
+                s.buffer < buffer_addresses.size() ? buffer_addresses[s.buffer] + static_cast<u32>(s.bias) : 0;
+    for (const usse::Literal& l : gxp.literals)
+        if (k->base + l.offset < 256u) out[k->base + l.offset] = l.value;
 }
 
 }  // namespace psvrecore::gxm
