@@ -52,6 +52,40 @@ struct Parameter {
     bool reg_format = false;  // an attribute read in its declared format, not converted to f32
 };
 
+// How the secondary attributes are filled before a draw (by the driver, not by the program): register ranges
+// ("containers") hold the default uniform buffer and a block of per-draw constants: the user uniform buffers'
+// addresses, the state words of the samplers whose coordinates are computed, and the program's literals.
+inline constexpr u16 kDefaultUniformContainer = 14;
+inline constexpr u16 kConstantsContainer = 19;
+
+struct Container {
+    u16 index = 0;  // kDefaultUniformContainer, kConstantsContainer
+    u16 base = 0;   // first secondary attribute
+    u16 size = 0;   // in 32-bit registers
+};
+
+// A literal: the value of a register of the constants block (offset from its base).
+struct Literal {
+    u32 offset = 0;
+    u32 value = 0;
+};
+
+// A uniform buffer's address goes to a register of the constants block, plus a bias in bytes: -4 for a user
+// buffer; for the default uniform buffer (kDefaultUniformContainer), whose first words are in secondary attributes
+// and the rest read from memory, 4 * (the first word not in a register) - 4. (Loads count their offsets from one
+// element past that address.)
+struct BufferSlot {
+    u16 buffer = 0;  // the BUFFER[n] index, or kDefaultUniformContainer
+    u16 offset = 0;
+    i32 bias = 0;
+};
+
+// A word of sampler state goes to a register of the constants block.
+struct SamplerSlot {
+    u16 word = 0;  // sampler resource index * 4 + word
+    u16 offset = 0;
+};
+
 struct Gxp {
     ShaderType type = ShaderType::Vertex;
     u8 version_major = 0, version_minor = 0;
@@ -64,12 +98,17 @@ struct Gxp {
     ParameterType output_type = ParameterType::F32;
     u8 output_components = 0;
     nx::vector<Parameter> parameters;
+    nx::vector<Container> containers;
+    nx::vector<Literal> literals;
+    nx::vector<BufferSlot> buffer_slots;
+    nx::vector<SamplerSlot> sampler_slots;
     nx::vector<u64> primary;
     nx::vector<u64> secondary;
 
     // As sceGxmProgramFindParameterByName / BySemantic (the index in parameters, or none).
     std::optional<usize> find(nx::string_view name) const;
     std::optional<usize> find(Semantic semantic, u32 index) const;
+    const Container* container(u16 index) const;
 };
 
 // Whether libgxm accepts the program: "GXP\0" and version 1.4 or 1.5 (sceGxmProgramCheck).

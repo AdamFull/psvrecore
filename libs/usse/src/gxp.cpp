@@ -13,6 +13,10 @@ namespace psvrecore::usse {
 //   0x2C self-relative offset of the varyings block
 //   0x3C/0x40, 0x44/0x48 primary and secondary programs: word count, self-relative offset
 //   0x64 default uniform buffer size in 32-bit words
+//   0x70 literals (8 bytes: offset in the constants block, value), 0x78 uniform buffer slots (8: buffer, offset, bias),
+//   0x80 sampler state slots (4: word, offset), 0x90 containers (8: index, -, base, size); each a count and a
+//   self-relative offset. (These are not checked against libgxm, which has no function reporting them; the
+//   interpreter's results on compiled shaders are what checks them.)
 // A parameter record: a self-relative name offset (0: no name); a word with the category (bits 0-3), type (4-7),
 // component count (8-11), container (12-15), semantic (16-23, attributes only), semantic index (24-27) and cube
 // sampler flag (28); the array size; the resource index.
@@ -151,8 +155,32 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
         p.reg_format = p.category == ParameterCategory::Attribute && p.resource < 32 && ((reg_formats >> p.resource) & 1);
         g.parameters.push_back(std::move(p));
     }
+    // The tables of the secondary attributes' set-up, each a count and a self-relative offset.
+    auto table = [&](usize at, usize entry, auto&& read) -> bool {
+        const u32 n = r.le<u32>(at);
+        const usize first = at + 4 + usize{r.le<u32>(at + 4)};
+        if (n && (first > data.size() || n > (data.size() - first) / entry)) return false;
+        for (u32 i = 0; i < n; ++i) read(first + entry * i);
+        return true;
+    };
+    const bool tables =
+        table(0x70, 8, [&](usize at) { g.literals.push_back(Literal{r.le<u32>(at), r.le<u32>(at + 4)}); }) &&
+        table(0x78, 8, [&](usize at) {
+            g.buffer_slots.push_back(BufferSlot{r.le<u16>(at), r.le<u16>(at + 2), static_cast<i32>(r.le<u32>(at + 4))});
+        }) &&
+        table(0x80, 4, [&](usize at) { g.sampler_slots.push_back(SamplerSlot{r.le<u16>(at), r.le<u16>(at + 2)}); }) &&
+        table(0x90, 8, [&](usize at) {
+            g.containers.push_back(Container{r.le<u16>(at), r.le<u16>(at + 4), r.le<u16>(at + 6)});
+        });
+    if (!tables) return failure("GXP table outside the file");
     if (r.failed()) return failure("GXP truncated");
     return g;
+}
+
+const Container* Gxp::container(u16 index) const {
+    for (const Container& c : containers)
+        if (c.index == index) return &c;
+    return nullptr;
 }
 
 }  // namespace psvrecore::usse
