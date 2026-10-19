@@ -184,7 +184,7 @@ TEST_CASE("ngs: PCM played through the master buss comes out sample for sample; 
     REQUIRE(call32(ctx, kSceNgs, kFinishedCallback, {voice, callback, 0x222}) == 0);
     REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
     REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
-    CHECK(ngs.state(voice) == 16);  // (pending until the next update)
+    CHECK(ngs.state(voice) == 17);  // (active at once, pending until the next update)
 
     u32 frame = 0;
     bool exact = true;

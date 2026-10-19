@@ -1064,7 +1064,9 @@ i32 sceNgsVoiceGetInfo(u32 voice, Ptr<VoiceInfo> info) {
     NGS_VOICE(v);
     if (!writable(info.address, sizeof(VoiceInfo))) return nerr::kInvalidParam;
     u32 state = v->run == Voice::Run::Active ? kStateActive : v->run == Voice::Run::Finalizing ? kStateFinalizing : kStateAvailable;
-    if (v->play_requested) state |= kStatePending;
+    // (a voice cued to play is active at once, and pending until the next update starts it: CRI's sound engine
+    // takes a voice that is neither active nor finalizing for stopped)
+    if (v->play_requested) state |= kStateActive | kStatePending;
     if (v->paused || v->pause_requested) state |= kStatePaused;
     if (v->key_off_requested) state |= kStateKeyOff;
     const Definition& d = *v->rack->def;
