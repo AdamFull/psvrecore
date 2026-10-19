@@ -178,7 +178,10 @@ application folder is `--game <folder>` or `[game] folder`; ux0: and save data a
 unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title ID>`.
 
 Keys while playing: arrows (the d-pad), Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
-Select, F11 full screen. Gamepads work as they are plugged in; the mouse touches the front panel.
+Select, F11 full screen. Gamepads work as they are plugged in; the mouse touches the front panel. On a touch screen the
+controls are drawn over the picture (`[controls] on_screen`: auto, always or never; `opacity`, `scale`): auto shows
+them from the start on Android and once the screen is touched elsewhere, and hides them while a gamepad or the keyboard
+is used.
 
 ## Android applications
 

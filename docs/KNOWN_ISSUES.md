@@ -287,14 +287,17 @@
 
 ## Platform layer (SDL3)
 
-- **Android: the application's life is not handled.** Sent to the background, the window's surface goes away; the
-  presenter is not told and does not make it again, and the game keeps running (and playing) meanwhile. Not tried.
+- **In the background the game is suspended** (Kernel::suspend): its threads stop at their next kernel call and its
+  clock stands still. A thread in a loop that makes no kernel call runs on. Host work already started (a GXM scene
+  being rendered, a file read) finishes first. The application is not told it was suspended, as on the console. If
+  Android ends the process meanwhile, what the game had not saved is lost.
+- **On desktops nothing is suspended** when the window is minimized: the game runs on (and plays) unseen.
 - **Android: the swapchain is not pre-rotated.** The compositor rotates, and `VK_SUBOPTIMAL_KHR` is ignored for that
   reason. The window is full screen and landscape only.
 - **One Vulkan device a process.** volk's entry points are loaded for the last device made, so a second device breaks
   the first one's calls (it crashed). With a window, the GXM layer renders with the window's device
   (`gxm::Options::shared_device`).
-- **Frames are copied:** from guest memory on the game's thread (about 2 MB at 960x544), then uploaded and blitted on
+- **Frames are copied:** from guest memory on the game's thread (about 2 MB at 960x544), then uploaded and drawn on
   the window's thread. Scaling is bilinear (nearest at 1:1); there is no integer scaling. The guest's bytes reach the
   display as they are (a UNORM swapchain), as on the console.
 - **A frame set for the next vertical blank is shown when the game next waits for a blank or sets a frame** after that
@@ -302,7 +305,8 @@
 - **Audio:** the device runs at 48 kHz stereo and SDL resamples ports at other rates. A port more than 200 ms behind
   drops what it holds (logged).
 - **Controls are fixed:** no remapping, no rear touch panel (the mouse and fingers touch the front one), no motion
-  sensors, no rumble. Keyboard: arrows, Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
+  sensors, no rumble. The on-screen controls have one layout (size and opacity are settings): no L3/R3, no moving
+  them, no haptic feedback; a finger on a face button presses one button, not two at once. Keyboard: arrows, Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
   Select; F11 toggles full screen.
 - **Memory block alignment:** an alignment smaller than the type's own is raised to it (the SDK's samples ask CDRAM
   for 256 bytes and run on the console); one that is not a power of two is refused. Inferred from the samples, not
