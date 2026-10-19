@@ -64,6 +64,16 @@ target_link_libraries(psvrecore_runtime_tests PRIVATE psvrecore::runtime psvreco
 psvrecore_target_defaults(psvrecore_runtime_tests)
 add_test(NAME psvrecore_runtime_tests COMMAND psvrecore_runtime_tests)
 
+# The Vulkan layer on a real device (skipped without one).
+add_executable(psvrecore_gpu_tests
+    "${_nxtest_dir}/nxtest.cpp"
+    gpu/vulkan_tests.cpp
+)
+target_include_directories(psvrecore_gpu_tests PRIVATE "${_nxtest_dir}" "${PSVRECORE_DIR}/third_party/SPIRV-Headers/include")
+target_link_libraries(psvrecore_gpu_tests PRIVATE psvrecore::vulkan psvrecore::gxm nx::foundation)
+psvrecore_target_defaults(psvrecore_gpu_tests)
+add_test(NAME psvrecore_gpu_tests COMMAND psvrecore_gpu_tests)
+
 # Test programs on the runtime, built only by scripts/program_check.py (they need the SDK: local only).
 set(PSVRECORE_PROGRAMS_DIR "" CACHE PATH "folder of SDK-built test programs and their recompiled code (scripts/program_check.py)")
 if(PSVRECORE_PROGRAMS_DIR)
