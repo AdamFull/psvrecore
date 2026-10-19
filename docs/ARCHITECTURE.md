@@ -169,6 +169,18 @@ Everything generated stays on the user's machine.
     interpreter; how the game runs them is decided with the GXM layer), and their results are the primary program's
     secondary attributes.
   - The compute form is the test form: one instance per invocation, checked on GPUs against the interpreter.
+- **Vulkan backend** (`vulkan/`). It knows nothing about GXM.
+  - Vulkan 1.1 is the minimum and 1.3 is used where the driver has it. Dynamic rendering comes from core 1.3 or
+    `VK_KHR_dynamic_rendering`; without it, drawing goes through render passes and framebuffers, made once and
+    cached. A pass whose shaders read the colour attachment always uses a render pass, with the attachment as an
+    input attachment and a self-dependency.
+  - A pipeline description is a padding-free struct, hashed and compared as bytes. Pipelines are made once and
+    kept, and the driver's pipeline cache can be saved and loaded. Viewport, scissor, stencil values, depth bias
+    and blend constants are dynamic state.
+  - Frames in flight each have a command buffer, a fence, a stream of host-visible memory for their draws' data
+    and a list of objects to release once the GPU is done with them.
+  - Every use of the queue holds one lock, since the GXM layer and the display may use it from different
+    threads.
 - **Graphics.**
   - GXM scenes map to Vulkan render passes, with load/store operations chosen for tile-based GPUs.
   - Guest surfaces are written back to guest memory only when the game can observe them.

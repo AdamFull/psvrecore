@@ -67,6 +67,17 @@
   dependent samplers) are not read yet; nothing checks their layout, and the translator will need them.
 - **`sceGxmProgramIsEquivalent` is not modelled.**
 
+## Vulkan backend
+
+- **Clearing an attachment the shaders read.** On an Intel Arc (Windows driver 101.8801), a colour attachment that
+  is also the pass's input attachment reads back wrong values where a draw wrote it, when the pass began with the
+  CLEAR load operation (the validation layer reports nothing; NVIDIA is correct). Such passes are cleared with a
+  transfer and loaded instead, so their images need `VK_IMAGE_USAGE_TRANSFER_DST_BIT`.
+- **No swapchain yet.** Presenting comes with the platform layer (SDL3).
+- **Rasterization-order attachment access** is enabled where a driver has it (`VK_EXT_` or `VK_ARM_`); neither GPU
+  tested here does, so draws that read the colour attachment are separated by barriers, which only holds between
+  draws, not between overlapping triangles of one draw.
+
 ## Shader translator (USSE to SPIR-V)
 
 - **Only the compute form exists.** It is the translator's test form: one instance per invocation, registers in

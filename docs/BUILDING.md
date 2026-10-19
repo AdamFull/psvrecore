@@ -40,6 +40,10 @@ cmake --build --preset linux-x64-release
 ctest --preset linux-x64-release
 ```
 
+`psvrecore_gpu_tests` needs a Vulkan device and is skipped without one (CI machines). It turns the validation
+layer on when the Vulkan SDK's is installed. `PSVRECORE_TEST_GPU=<index>` picks the device; by default it is a
+discrete GPU.
+
 ## Options
 
 | Option | Default | Meaning |
