@@ -29,6 +29,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "psvrecore/gxm/surface.hpp"
@@ -936,6 +937,49 @@ struct DrawPlan {
     VkRect2D scissor{};
 };
 
+// PSVRECORE_GXM_TRACE=<first scene>[-<last scene>] (or 1: all): each scene logged before it is rendered (its surfaces
+// and draws: their programs, primitives and textures), for finding what a frame draws.
+struct Trace {
+    u64 first = 0, last = 0;
+    bool on = false;
+};
+const Trace& trace() {
+    static const Trace t = [] {
+        Trace t;
+        const char* spec = std::getenv("PSVRECORE_GXM_TRACE");
+        if (!spec || !*spec) return t;
+        char* end = nullptr;
+        t.first = std::strtoull(spec, &end, 0);
+        t.last = *end == '-' ? std::strtoull(end + 1, nullptr, 0) : t.first;
+        if (t.first <= 1 && *end != '-') t.first = 0, t.last = ~u64{0};
+        t.on = true;
+        return t;
+    }();
+    return t;
+}
+
+void trace_scene(u64 number, const Scene& scene) {
+    const ColorSurface& cs = scene.color;
+    const DepthStencilSurface& ds = scene.depth;
+    nx::logi(logs::gxm, "trace: scene {}: colour {} (0x{:08x}, format 0x{:08x}, {} x {}, stride {}, type {}), depth {} "
+             "(0x{:08x}, control 0x{:08x}), {} draws", number, scene.has_color, cs.data, cs.format, cs.size & 0xFFFF,
+             cs.size >> 16, cs.stride, cs.modes & 3, scene.has_depth, ds.depth_data, ds.control, scene.draws.size());
+    for (usize i = 0; i < scene.draws.size(); ++i) {
+        const Draw& d = scene.draws[i];
+        nx::string textures;
+        for (u32 u = 0; u < 16; ++u) {
+            const TextureWords& w = d.fragment_textures[u];
+            if (!w.words[0] && !w.words[1] && !w.words[2] && !w.words[3]) continue;
+            const TextureInfo t = decode_texture(w.words);
+            textures += nx::format(" t{}=0x{:08x}:{:08x}/type {}/{}x{}", u, t.address, t.base_format, t.type, t.width, t.height);
+        }
+        nx::logi(logs::gxm, "trace:   draw {}: vertex 0x{:08x} fragment 0x{:08x} (blend {}, mask update {}), primitive {}, "
+                 "{} indices x {}{}", i, d.vertex ? d.vertex->guest : 0, d.fragment ? d.fragment->guest : 0,
+                 d.fragment && d.fragment->blend_enabled, d.fragment && d.fragment->mask_update, d.primitive,
+                 d.index_count, d.instances, textures);
+    }
+}
+
 }  // namespace
 
 void render_scene(Context& context, Scene& scene) {
@@ -944,6 +988,7 @@ void render_scene(Context& context, Scene& scene) {
     if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return;
     nx::scoped_lock<nx::mutex> targets_held(r.targets_lock);
     ++r.scenes;
+    if (const Trace& t = trace(); t.on && r.scenes >= t.first && r.scenes <= t.last) trace_scene(r.scenes, scene);
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
     const DepthStencilSurface& ds = scene.depth;
