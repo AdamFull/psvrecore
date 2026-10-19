@@ -182,7 +182,8 @@ that runs and is checked), and `addcont0:` holds the add-ons, each readable once
 `data/` beside the settings
 unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title ID>`. The shader cache is `data/cache`
 (the game's programs translated, the pipelines made, the driver's pipeline cache): what a run drew with is made before
-the next one starts. Deleting it only costs that again.
+the next one starts. Deleting it only costs that again. `[display] internal_resolution` (1 to 4) draws the game at
+that many times the console's resolution; the shadows and effects drawn into textures keep the console's.
 
 Keys while playing: arrows (the d-pad), Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
 Select, F11 full screen. Gamepads work as they are plugged in; the mouse touches the front panel. On a touch screen the

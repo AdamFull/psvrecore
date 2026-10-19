@@ -112,6 +112,17 @@
   tried.
 - **The shader cache only grows.** Nothing is evicted; a translator whose sources changed starts it again (its
   header holds a hash of them, made when CMake runs: it runs again when they change).
+- **The internal resolution (`Options::render_scale`, `[display] internal_resolution`) scales colour surfaces
+  only.** Depth-only scenes (shadow maps) are drawn at their own size, and a surface drawn at a higher resolution is
+  read as a texture at its own size (what guest memory holds, blitted down): shadows and render-to-texture effects
+  keep the console's resolution. The CPU's drawing over a surface (debug text, a cleared area) reaches the scaled
+  picture as the surface's pixels, blown up. Lines are not widened (points are). Surfaces of formats the device
+  cannot blit with filtering stay at their own size, as do frames that are not 4 bytes a pixel.
+- **A frame drawn at a higher resolution is read back to the CPU to be shown** (about 8 MB at 2x), then uploaded by
+  the window: a copy between the two GPU images would do without it.
+- **A scene waits on the game's thread** for its fragment sync object while the display holds it (the console's GPU
+  waits instead, and the CPU runs on). A game that draws into a buffer the display queue holds, and only then queues
+  the entry that lets it go, would wait for ever; GXM's display buffering does not do that.
 - **Scenes render synchronously** when they end (one submission and wait each): simple and ordered with transfers and
   the CPU, but slow (multithreaded_rendering: about 40 ms a frame).
 - **Not implemented:** tiled and swizzled colour surfaces (the scene is not rendered), multisampling, the DF32M_S8
