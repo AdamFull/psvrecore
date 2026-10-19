@@ -309,6 +309,12 @@ public:
     // Runs the calling thread's notified callbacks; returns how many ran.
     i32 check_callbacks();
 
+    // The process suspended, as the console suspends a game (the application sent to the background): no thread
+    // runs (those running stop at their next kernel call; a thread in a loop that makes none runs on), and the
+    // clock stands still, so no guest-visible time passes until resume().
+    void suspend();
+    void resume();
+    bool suspended() const;
     // Asks every thread to end and waits for those blocked in the kernel; threads running guest code end at their
     // next kernel call. Called by the destructor.
     void shutdown();

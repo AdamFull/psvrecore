@@ -8,6 +8,7 @@
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
+#include "core/foundation/threading/thread.h"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
 
@@ -573,4 +574,43 @@ TEST_CASE("kernel: shutting down ends threads blocked in the kernel") {
         delay(ctx, 5000);
     }
     CHECK(nx::os::ticks_ns() - before < 1'500'000'000ull);  // (well before the shutdown's give-up time)
+}
+
+TEST_CASE("kernel: suspended, no thread runs and the clock stands still; resumed, both go on from there") {
+    TestRuntime t;
+    g_value = 0;
+    GuestCode code;
+    // (counts, a kernel call each time round, until told to stop)
+    const u32 entry = code.add([](PsvContext* ctx, uint32_t) {
+        while (g_object == 0) {
+            g_value.fetch_add(1);
+            delay(ctx, 1000);
+        }
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    g_object = 0;
+    const i32 counter = create_thread(ctx, "counter", entry, 100);
+    start_thread(ctx, counter);
+    delay(ctx, 30'000);
+    CHECK(g_value.load() > 5);
+
+    Kernel& k = t.rt.kernel();
+    k.suspend();
+    CHECK(k.suspended());
+    nx::this_thread::sleep_for(std::chrono::milliseconds(20));  // (the counter's delay ends; it gets no CPU)
+    const u32 v1 = g_value.load();
+    const u64 c1 = k.clock_ns();
+    nx::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(g_value.load() == v1);
+    CHECK(k.clock_ns() == c1);
+    k.resume();
+    CHECK_FALSE(k.suspended());
+    // (the clock goes on from where it stood: the 150 ms are not in it)
+    CHECK(k.clock_ns() - c1 < 20'000'000ull);
+    delay(ctx, 30'000);
+    CHECK(g_value.load() > v1 + 5);
+    g_object = 1;
+    CHECK(wait_end(ctx, counter) == 0);
+    g_object = 0;
 }

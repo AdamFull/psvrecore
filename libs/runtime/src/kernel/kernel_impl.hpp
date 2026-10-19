@@ -3,6 +3,7 @@
 // The kernel's shared state and the scheduler primitives every kernel source uses. Everything here runs with
 // Impl::lock held, unless a comment says otherwise.
 
+#include <atomic>
 #include <optional>
 
 #include "psvrecore/log.hpp"
@@ -38,6 +39,11 @@ struct Kernel::Impl {
     i64 back_order = 0, front_order = 0;
 
     u64 start_ns = 0;
+    // Suspended (Kernel::suspend): no CPU is given out, and the clock stands at `suspended_at`; the time spent
+    // suspended is taken off the clock (`paused_ns`), so the guest sees none of it.
+    bool suspended = false;
+    std::atomic<u64> suspended_at{0};  // (0: running)
+    std::atomic<u64> paused_ns{0};
     bool shutting_down = false;
     bool stuck = false;  // shutdown gave up waiting for host threads
     u32 host_threads = 0;  // host threads running a guest thread

@@ -52,7 +52,10 @@ Thread* Kernel::Impl::thread(Uid uid) {
     return get<Thread>(uid, ObjectClass::Thread);
 }
 
-u64 Kernel::Impl::now_ns() const { return nx::os::ticks_ns(); }
+u64 Kernel::Impl::now_ns() const {
+    const u64 at = suspended_at.load(std::memory_order_acquire);
+    return (at ? at : nx::os::ticks_ns()) - paused_ns.load(std::memory_order_acquire);
+}
 
 bool Kernel::Impl::allowed(const Thread* t, i32 cpu) {
     const i32 mask = t->affinity ? t->affinity : kAllUserCpus;
@@ -74,6 +77,7 @@ void Kernel::Impl::release_cpu(Thread* t) {
 }
 
 void Kernel::Impl::dispatch() {
+    if (suspended) return;  // (no CPU for anyone until resume())
     // Highest priority first; FIFO among equals (a preempted thread goes to the front of its priority).
     for (bool changed = true; changed;) {
         changed = false;
@@ -300,7 +304,35 @@ void Kernel::end_blocking() {
 }
 
 u64 Kernel::process_time() const { return clock_ns() / 1000; }
-u64 Kernel::clock_ns() const { return nx::os::ticks_ns() - impl_->start_ns; }
+u64 Kernel::clock_ns() const { return impl_->now_ns() - impl_->start_ns; }
+
+void Kernel::suspend() {
+    Lock guard(impl_->lock);
+    if (impl_->suspended) return;
+    impl_->suspended = true;
+    impl_->suspended_at.store(nx::os::ticks_ns(), std::memory_order_release);
+    // (every running thread loses its CPU, and stops at its next kernel call)
+    for (Thread*& running : impl_->cpus) {
+        Thread* t = running;
+        if (!t) continue;
+        impl_->release_cpu(t);
+        t->state = ThreadState::Ready;
+        t->ready_order = static_cast<u64>(--impl_->front_order);
+        t->lost_cpu.store(true, std::memory_order_release);
+        impl_->ready.push_back(t);
+    }
+}
+
+void Kernel::resume() {
+    Lock guard(impl_->lock);
+    if (!impl_->suspended) return;
+    impl_->paused_ns.fetch_add(nx::os::ticks_ns() - impl_->suspended_at.load(), std::memory_order_acq_rel);
+    impl_->suspended_at.store(0, std::memory_order_release);
+    impl_->suspended = false;
+    impl_->dispatch();
+}
+
+bool Kernel::suspended() const { return impl_->suspended_at.load(std::memory_order_acquire) != 0; }
 
 void Kernel::shutdown() {
     if (!impl_) return;
