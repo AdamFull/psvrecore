@@ -1,6 +1,7 @@
 // Threads, synchronisation and time: SceThreadmgr, the thread parts of SceLibKernel, SceThreadmgrCoredumpTime.
 
 #include "hle_common.hpp"
+#include "core/foundation/containers/hash_map.h"
 
 namespace psvrecore::runtime::hle {
 
@@ -380,6 +381,68 @@ u32 sceKernelGetProcessTimeLow() { return static_cast<u32>(kernel().process_time
 u64 sceKernelGetProcessTimeWide() { return kernel().process_time(); }
 u64 sceKernelGetSystemTimeWide() { return kernel().process_time(); }
 
+// ---- timers: counters of microseconds of the process's time, counting while started
+
+struct Timer {
+    nx::string name;
+    bool active = false;
+    u64 base_us = 0;     // (the process time it started at, while active)
+    u64 counted_us = 0;  // (counted before it last stopped)
+    u64 now(u64 t) const { return counted_us + (active ? t - base_us : 0); }
+};
+struct Timers {
+    nx::mutex lock;
+    nx::hash_map<i32, Timer> timers;
+    i32 next = 0x40090001;
+};
+Timers& timers() {
+    static Timers t;
+    return t;
+}
+
+i32 sceKernelCreateTimer(Ptr<const char> name, u32 /*attr*/, Ptr<const void> /*opt*/) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    const i32 uid = t.next;
+    t.next += 2;
+    t.timers[uid].name = str(name, 31);
+    return uid;
+}
+i32 sceKernelDeleteTimer(i32 uid) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    return t.timers.erase(uid) ? err::kOk : err::code(0x80028241);  // (UNKNOWN_TIMER_ID)
+}
+// 0 started, 1 already counting.
+i32 sceKernelStartTimer(i32 uid) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    auto it = t.timers.find(uid);
+    if (it == t.timers.end()) return err::code(0x80028241);
+    if (it->second.active) return 1;
+    it->second.active = true;
+    it->second.base_us = kernel().process_time();
+    return 0;
+}
+// 1 stopped, 0 already stopped.
+i32 sceKernelStopTimer(i32 uid) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    auto it = t.timers.find(uid);
+    if (it == t.timers.end()) return err::code(0x80028241);
+    if (!it->second.active) return 0;
+    it->second.counted_us = it->second.now(kernel().process_time());
+    it->second.active = false;
+    return 1;
+}
+// Its count in microseconds (-1: no such timer).
+u64 sceKernelGetTimerTimeWide(i32 uid) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    auto it = t.timers.find(uid);
+    return it == t.timers.end() ? ~u64{0} : it->second.now(kernel().process_time());
+}
+
 const Function kLibKernel[] = {
     HLE_FUNCTION(0xC5C11EE7, sceKernelCreateThread),
     HLE_FUNCTION(0xF08DE149, sceKernelStartThread),
@@ -432,6 +495,7 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0x4C4672BF, sceKernelGetProcessTime),
     HLE_FUNCTION(0xE9F973B1, sceKernelGetProcessTimeLow),
     HLE_FUNCTION(0xB110C123, sceKernelGetProcessTimeWide),
+    HLE_FUNCTION(0x2255B2A5, sceKernelCreateTimer),
 };
 
 const Function kThreadmgr[] = {
@@ -467,6 +531,10 @@ const Function kThreadmgr[] = {
     HLE_FUNCTION(0x038644D5, sceKernelGetCallbackCount),
     HLE_FUNCTION(0xE53E41F6, sceKernelCheckCallback),
     HLE_FUNCTION(0xF4EE4FA9, sceKernelGetSystemTimeWide),
+    HLE_FUNCTION(0xAB1E42C4, sceKernelDeleteTimer),
+    HLE_FUNCTION(0x48091E0C, sceKernelStartTimer),
+    HLE_FUNCTION(0x869E9F20, sceKernelStopTimer),
+    HLE_FUNCTION(0x3EFD3165, sceKernelGetTimerTimeWide),
 };
 
 const Function kThreadmgrCoredumpTime[] = {
@@ -476,6 +544,11 @@ const Function kThreadmgrCoredumpTime[] = {
 }  // namespace
 
 void register_threadmgr() {
+    {
+        // (a new runtime starts with no timers)
+        nx::scoped_lock<nx::mutex> held(timers().lock);
+        timers().timers.clear();
+    }
     register_library({"SceLibKernel", kSceLibKernel, kLibKernel});
     register_library({"SceThreadmgr", kSceThreadmgr, kThreadmgr});
     register_library({"SceThreadmgrCoredumpTime", kSceThreadmgrCoredumpTime, kThreadmgrCoredumpTime});

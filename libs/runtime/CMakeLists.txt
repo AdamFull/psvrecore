@@ -5,19 +5,24 @@ add_library(psvrecore_runtime STATIC
     src/hle.cpp
     src/input.cpp
     src/hle/apputil.cpp
+    src/hle/commondialog.cpp
     src/hle/avplayer.cpp
     src/hle/audioout.cpp
     src/hle/ctrl.cpp
+    src/hle/fiber.cpp
     src/hle/fios2.cpp
     src/hle/iofilemgr.cpp
     src/hle/libkernel.cpp
     src/hle/modulemgr.cpp
     src/hle/ngs.cpp
+    src/hle/np.cpp
     src/hle/processmgr.cpp
     src/hle/rtc.cpp
     src/hle/sysmem.cpp
+    src/hle/system.cpp
     src/hle/threadmgr.cpp
     src/hle/touch.cpp
+    src/hle/videodec.cpp
     src/kernel/scheduler.cpp
     src/kernel/sync.cpp
     src/kernel/threads.cpp

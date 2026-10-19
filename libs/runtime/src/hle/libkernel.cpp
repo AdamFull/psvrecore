@@ -310,6 +310,11 @@ void register_system_libraries() {
     register_apputil();
     register_ngs();
     register_avplayer();
+    register_system();
+    register_fiber();
+    register_np();
+    register_videodec();
+    register_commondialog();
 }
 
 }  // namespace psvrecore::runtime::hle

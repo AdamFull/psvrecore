@@ -33,6 +33,7 @@ struct H264Decoder::State {
         p.eEcActiveIdc = ERROR_CON_SLICE_COPY;
         if (decoder->Initialize(&p) != 0) return false;
         // (the parameter sets first: they make no picture)
+        if (parameter_sets.empty()) return true;
         nx::vector<Picture> none;
         return feed(parameter_sets.data(), parameter_sets.size(), 0, none);
     }
@@ -125,6 +126,17 @@ bool H264Decoder::decode(std::span<const u8> sample, i64 time, nx::vector<Pictur
     }
     if (b.empty()) return true;
     return s_->feed(b.data(), b.size(), time, out);
+}
+
+bool H264Decoder::open_annexb() {
+    s_->parameter_sets.clear();
+    return s_->create();
+}
+
+bool H264Decoder::decode_annexb(std::span<const u8> au, i64 time, nx::vector<Picture>& out) {
+    if (!s_->decoder) return false;
+    if (au.empty()) return true;
+    return s_->feed(au.data(), au.size(), time, out);
 }
 
 void H264Decoder::flush(nx::vector<Picture>& out) {

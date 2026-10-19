@@ -1,12 +1,14 @@
 // Guest memory, the system library calling convention, files, memory blocks and formatted output.
 
 #include <algorithm>
+#include <chrono>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
 #include "core/foundation/platform/filesystem.h"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
+#include "core/foundation/threading/thread.h"
 
 using namespace psvrecore;
 using namespace psvrecore::runtime;
@@ -335,4 +337,29 @@ TEST_CASE("files: a layered device shows the update's files over the base game's
     REQUIRE(fd > 0);
     call32(ctx, kSceIofilemgr, kClose, {u(fd)});
     CHECK(nx::fs::exists(nx::fs::path_view(update + "/data/c.txt")));
+}
+
+TEST_CASE("timers: count microseconds of the process's time while started") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kCreate = 0x2255B2A5, kDelete = 0xAB1E42C4, kStart = 0x48091E0C, kStop = 0x869E9F20, kTime = 0x3EFD3165;
+    const i32 uid = call32(ctx, kSceLibKernel, kCreate, {guest_string("frame timer"), 0, 0});
+    REQUIRE(uid > 0);
+    CHECK(call(ctx, kSceThreadmgr, kTime, {u(uid)}) == 0);  // (not started: nothing counted)
+    CHECK(call32(ctx, kSceThreadmgr, kStart, {u(uid)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kStart, {u(uid)}) == 1);  // (already counting)
+    nx::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const u64 running = call(ctx, kSceThreadmgr, kTime, {u(uid)});
+    CHECK(running >= 15000);
+    CHECK(running < 2000000);
+    CHECK(call32(ctx, kSceThreadmgr, kStop, {u(uid)}) == 1);
+    CHECK(call32(ctx, kSceThreadmgr, kStop, {u(uid)}) == 0);  // (already stopped)
+    const u64 stopped = call(ctx, kSceThreadmgr, kTime, {u(uid)});
+    nx::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(call(ctx, kSceThreadmgr, kTime, {u(uid)}) == stopped);  // (stopped: it stands still)
+    CHECK(call32(ctx, kSceThreadmgr, kStart, {u(uid)}) == 0);     // (and goes on from there)
+    CHECK(call(ctx, kSceThreadmgr, kTime, {u(uid)}) >= stopped);
+    CHECK(call32(ctx, kSceThreadmgr, kDelete, {u(uid)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kStart, {u(uid)}) == static_cast<i32>(0x80028241u));
+    CHECK(call(ctx, kSceThreadmgr, kTime, {u(uid)}) == ~u64{0});
 }

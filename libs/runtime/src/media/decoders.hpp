@@ -28,6 +28,10 @@ public:
 
     // Starts a stream described by its avcC record (the parameter sets, the NAL length size).
     bool open(std::span<const u8> avcc);
+    // Starts a stream given as an Annex B byte stream (start codes; the parameter sets in it).
+    bool open_annexb();
+    // Decodes one access unit of an Annex B stream, as decode() does.
+    bool decode_annexb(std::span<const u8> au, i64 time, nx::vector<Picture>& out);
     // Decodes one sample (length-prefixed NAL units); the pictures it completes, in presentation order, are added
     // to `out` (with B-frames a picture can come out a few samples later).
     bool decode(std::span<const u8> sample, i64 time, nx::vector<Picture>& out);

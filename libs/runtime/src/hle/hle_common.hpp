@@ -43,5 +43,10 @@ void register_touch();
 void register_apputil();
 void register_ngs();
 void register_avplayer();
+void register_system();
+void register_fiber();
+void register_np();
+void register_videodec();
+void register_commondialog();
 
 }  // namespace psvrecore::runtime::hle
