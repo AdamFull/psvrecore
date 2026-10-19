@@ -1,6 +1,7 @@
 # GXM on Vulkan: the USSE to SPIR-V shader translator (and, later, the GXM API's state and draws).
 add_library(psvrecore_gxm STATIC
     src/spirv.cpp
+    src/texture.cpp
     src/translate.cpp
 )
 add_library(psvrecore::gxm ALIAS psvrecore_gxm)
@@ -20,6 +21,7 @@ add_library(psvrecore_gxm_hle STATIC
     src/hle/patcher.cpp
     src/hle/render.cpp
     src/hle/surfaces.cpp
+    src/hle/textures.cpp
 )
 add_library(psvrecore::gxm_hle ALIAS psvrecore_gxm_hle)
 target_include_directories(psvrecore_gxm_hle PRIVATE "${PSVRECORE_DIR}/third_party/SPIRV-Headers/include")

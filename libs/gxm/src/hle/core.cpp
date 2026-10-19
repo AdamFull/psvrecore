@@ -313,6 +313,7 @@ void register_libraries(const Options& options) {
     hle::register_surfaces();
     hle::register_patcher();
     hle::register_context();
+    hle::register_textures();
 }
 
 }  // namespace psvrecore::gxm

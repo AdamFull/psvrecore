@@ -291,5 +291,6 @@ void register_core();
 void register_surfaces();
 void register_patcher();
 void register_context();
+void register_textures();
 
 }  // namespace psvrecore::gxm::hle

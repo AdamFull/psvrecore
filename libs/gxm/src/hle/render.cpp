@@ -9,11 +9,15 @@
 // - Then one render pass: per draw a pipeline (cached) from the translated programs and the draw's state, its
 //   vertex and index data copied from guest memory.
 //
-// Not yet: textures (units read a white texel), tiled and swizzled surfaces, depth/stencil surfaces that load or
-// store, multisampling, visibility queries, programmable blending.
+// - Textures are decoded on the CPU (gxm/texture.hpp) into RGBA images, cached by their control words and a hash
+//   of their data; units a program declares but the draw leaves unset read a white texel.
+//
+// Not yet: tiled and swizzled surfaces, depth/stencil surfaces that load or store, multisampling, visibility
+// queries, programmable blending.
 
 #include <cstring>
 
+#include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/log.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
@@ -112,6 +116,12 @@ struct Target {
     vk::Image image;
 };
 
+struct CachedTexture {
+    vk::Image image;
+    VkSampler sampler = VK_NULL_HANDLE;
+    u64 used = 0;  // (the scene it was last used in)
+};
+
 struct Renderer {
     bool tried = false;
     nx::unique_ptr<vk::Device> device;
@@ -124,8 +134,11 @@ struct Renderer {
     nx::hash_map<u64, VkPipeline> compute;          // secondary programs (by program)
     nx::hash_map<u64, nx::string> failed_programs;  // (reported once)
     nx::vector<Target> targets;
-    vk::Image white;
+    vk::Image white, white_cube;
     VkSampler sampler = VK_NULL_HANDLE;
+    nx::hash_map<u64, CachedTexture> textures;
+    nx::hash_map<u64, nx::string> failed_textures;
+    u64 scenes = 0;
 };
 
 Renderer& renderer() {
@@ -172,6 +185,15 @@ bool ensure(Renderer& r) {
         r.white = *img;
         const u8 texel[4] = {255, 255, 255, 255};
         (void)vk::upload_image(d, r.white, texel);
+    }
+    vk::ImageDesc cd;
+    cd.width = cd.height = 1;
+    cd.layers = 6;
+    cd.cube = true;
+    if (auto img = vk::create_image(d, cd)) {
+        r.white_cube = *img;
+        const u8 texel[4] = {255, 255, 255, 255};
+        for (u32 f = 0; f < 6; ++f) (void)vk::upload_image(d, r.white_cube, texel, f);
     }
     vk::SamplerDesc sd;
     if (auto s = r.samplers->get(sd)) r.sampler = *s;
@@ -239,6 +261,109 @@ vk::Image* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format
     return &r.targets.back().image;
 }
 
+VkSamplerAddressMode address_mode(u32 m) {
+    switch (m) {
+        case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        case 0:
+        case 4: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;  // (clamp; mirror clamp needs an extension)
+    }
+}
+
+// Uploads decoded texels: each face's levels.
+Result<void> upload_texels(vk::Device& d, vk::Image& image, const Texels& t) {
+    auto staging = vk::create_host_buffer(d, t.data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!staging) return nx::err(staging.error());
+    std::memcpy(staging->mapped, t.data.data(), t.data.size());
+    vk::flush(d, *staging);
+    nx::vector<VkBufferImageCopy> regions;
+    VkDeviceSize at = 0;
+    const u32 bytes = t.half ? 8 : 4;
+    for (u32 face = 0; face < t.faces; ++face) {
+        for (u32 l = 0; l < t.levels; ++l) {
+            const u32 w = nx::max(1u, t.width >> l), h = nx::max(1u, t.height >> l);
+            VkBufferImageCopy c{};
+            c.bufferOffset = at;
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, face, 1};
+            c.imageExtent = {w, h, 1};
+            regions.push_back(c);
+            at += VkDeviceSize{w} * h * bytes;
+        }
+    }
+    vk::OneShot shot(d);
+    auto cmd = shot.begin();
+    Result<void> result;
+    if (!cmd) {
+        result = nx::err(cmd.error());
+    } else {
+        vk::transition(*cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyBufferToImage(*cmd, staging->buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<u32>(regions.size()), regions.data());
+        vk::transition(*cmd, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        result = shot.submit_and_wait();
+    }
+    vk::destroy_buffer(d, *staging);
+    return result;
+}
+
+// A texture as the draw's control words describe it (cached), or none if it cannot be read.
+CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
+    const TextureInfo info = decode_texture(words.words);
+    if (!info.address) return nullptr;
+    const u32 size = texture_size(info);
+    if (!size || !memory().valid(info.address, size)) return nullptr;
+    nx::fnv1a64 h;
+    h.combine_bytes(reinterpret_cast<const char*>(words.words), sizeof words.words);
+    h.combine_bytes(reinterpret_cast<const char*>(memory().host(info.address)), size);
+    if (info.palette && memory().valid(info.palette, 1024))
+        h.combine_bytes(reinterpret_cast<const char*>(memory().host(info.palette)), 1024);
+    const u64 key = h.value();
+    if (auto it = r.textures.find(key); it != r.textures.end()) {
+        it->second.used = r.scenes;
+        return &it->second;
+    }
+    if (r.failed_textures.contains(key)) return nullptr;
+    auto texels = read_texels(info, [](u32 address, void* out, u32 bytes) {
+        if (!memory().valid(address, bytes)) return false;
+        std::memcpy(out, memory().host(address), bytes);
+        return true;
+    });
+    if (!texels) {
+        nx::logw(logs::gxm, "{} (format 0x{:08x}, type {})", texels.error().message, info.base_format, info.type);
+        r.failed_textures[key] = texels.error().message;
+        return nullptr;
+    }
+    vk::ImageDesc d;
+    d.format = texels->half ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    d.width = texels->width;
+    d.height = texels->height;
+    d.mips = texels->levels;
+    d.layers = texels->faces;
+    d.cube = texels->faces == 6;
+    auto image = vk::create_image(*r.device, d);
+    if (!image) return nullptr;
+    if (!upload_texels(*r.device, *image, *texels)) {
+        vk::destroy_image(*r.device, *image);
+        return nullptr;
+    }
+    vk::SamplerDesc sd;
+    sd.mag = info.mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sd.min = info.min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sd.mip = info.mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sd.u = address_mode(info.u_address);
+    sd.v = address_mode(info.v_address);
+    sd.w = sd.u;
+    sd.lod_bias = (static_cast<f32>(info.lod_bias) - 31.0f) / 8.0f;  // (assumed: eighths of a level, 31 none)
+    sd.max_lod = static_cast<f32>(texels->levels - 1);
+    CachedTexture c;
+    c.image = *image;
+    if (auto smp = r.samplers->get(sd)) c.sampler = *smp;
+    c.used = r.scenes;
+    auto [it, added] = r.textures.emplace(key, c);
+    return &it->second;
+}
+
 // The words of a uniform buffer a program reads (from its parameters in that buffer).
 u32 buffer_words(const usse::Gxp& g, u32 index) {
     u32 words = 0;
@@ -273,6 +398,7 @@ void render_scene(Context& context, Scene& scene) {
     (void)context;
     Renderer& r = renderer();
     if (!scene.has_color || !ensure(r)) return;
+    ++r.scenes;
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
     ColorFormat cf;
@@ -542,7 +668,26 @@ void render_scene(Context& context, Scene& scene) {
         ai.pSetLayouts = &r.set_layout;
         vkAllocateDescriptorSets(d.device(), &ai, &descriptor_sets[i]);
         VkDescriptorBufferInfo bi[2] = {{sa_buf->buffer, 0, VK_WHOLE_SIZE}, {mem_buf->buffer, 0, VK_WHOLE_SIZE}};
-        VkDescriptorImageInfo ii{r.sampler, r.white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        // The units each program declares: the draw's texture there, or a white texel of the declared kind.
+        VkDescriptorImageInfo ii[kDrawBindings];
+        for (u32 b = kDrawBindingFragmentTextures; b < kDrawBindings; ++b)
+            ii[b] = {r.sampler, r.white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        for (u32 stage = 0; stage < 2; ++stage) {
+            const Draw& dr = *plans[i].draw;
+            const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
+            for (const usse::Parameter& q : p.gxp.parameters) {
+                if (q.category != usse::ParameterCategory::Sampler) continue;
+                const u32 unit = q.resource;
+                if (unit >= (stage ? 16u : 4u)) continue;
+                const u32 binding = (stage ? kDrawBindingFragmentTextures : kDrawBindingVertexTextures) + unit;
+                ii[binding].imageView = q.sampler_cube ? r.white_cube.view : r.white.view;
+                const TextureWords& words = stage ? dr.fragment_textures[unit] : dr.vertex_textures[unit];
+                if (CachedTexture* t = texture_for(r, words); t && t->image.desc.cube == q.sampler_cube) {
+                    ii[binding].imageView = t->image.view;
+                    ii[binding].sampler = t->sampler ? t->sampler : r.sampler;
+                }
+            }
+        }
         VkWriteDescriptorSet w[kDrawBindings]{};
         for (u32 b = 0; b < kDrawBindings; ++b) {
             w[b] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -554,7 +699,7 @@ void render_scene(Context& context, Scene& scene) {
                 w[b].pBufferInfo = &bi[b];
             } else {
                 w[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                w[b].pImageInfo = &ii;
+                w[b].pImageInfo = &ii[b];
             }
         }
         vkUpdateDescriptorSets(d.device(), kDrawBindings, w, 0, nullptr);
