@@ -70,6 +70,7 @@ i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> regio
     Context* c = context_of(context);
     auto t = st.render_targets.find(target);
     if (!c || t == st.render_targets.end()) return err::kInvalidPointer;
+    if (c->deferred) return err::kInvalidValue;  // (scenes are the immediate context's)
     if (c->in_scene) return err::kWithinScene;
     Scene scene;
     scene.target = t->second.get();
@@ -276,28 +277,71 @@ void sceGxmSetValidationEnable(u32, u32) {}
 // ---- Uniform buffers and textures ------------------------------------------------------------------------------
 
 // A default uniform buffer from the context's vertex or fragment ring buffer.
-i32 reserve(u32 context, bool vertex, Ptr<u32> out) {
-    if (!context || !out) return err::kInvalidPointer;
+// A deferred context's: from its vertex or fragment buffer, which the game's callback refills (called without the
+// lock held: it is guest code).
+i32 reserve_deferred(PsvContext* ctx, u32 context, bool vertex, u32 size, Ptr<u32> out) {
     State& st = state();
+    u32 callback = 0, user = 0, scratch = 0;
+    {
+        nx::scoped_lock<nx::mutex> held(st.lock);
+        Context* c = context_of(context);
+        if (!c) return err::kInvalidPointer;
+        if (!c->in_list) return err::kNotWithinCommandList;
+        Context::Buffer& b = vertex ? c->vertex_buffer : c->fragment_buffer;
+        if (b.address && b.used + size <= b.size) {
+            const u32 at = b.address + b.used;
+            b.used += size;
+            (vertex ? c->vertex_default_uniforms : c->fragment_default_uniforms) = at;
+            *out = at;
+            return 0;
+        }
+        callback = vertex ? c->deferred_params.vertex_callback : c->deferred_params.fragment_callback;
+        user = c->deferred_params.user_data;
+        scratch = c->callback_out;
+    }
+    if (!callback || !scratch) return err::kReserveFailed;
+    const u32 minimum = nx::max<u32>(size, 1024);  // (SCE_GXM_MINIMUM_DEFERRED_CONTEXT_BUFFER_SIZE)
+    *reinterpret_cast<u32*>(memory().host(scratch)) = 0;
+    const u32 args[] = {user, minimum, scratch};
+    const u32 mem = runtime::hle::call_guest(ctx, callback, args);
+    const u32 got = *reinterpret_cast<const u32*>(memory().host(scratch));
+    if (!mem || got < size || !memory().valid(mem, got, true)) return err::kReserveFailed;
     nx::scoped_lock<nx::mutex> held(st.lock);
     Context* c = context_of(context);
     if (!c) return err::kInvalidPointer;
-    const Program* program = vertex ? (c->vertex ? c->vertex->program : nullptr) : (c->fragment ? c->fragment->program : nullptr);
-    if (!program) return err::kNullProgram;
-    const u32 size = (nx::max<u32>(program->gxp.default_uniform_buffer_size, 4) + 15) & ~15u;
-    const u32 ring = vertex ? c->params.vertex_ring : c->params.fragment_ring;
-    const u32 ring_size = vertex ? c->params.vertex_ring_size : c->params.fragment_ring_size;
-    u32& used = vertex ? c->vertex_ring_used : c->fragment_ring_used;
-    if (!ring || size > ring_size) return err::kReserveFailed;
-    if (used + size > ring_size) used = 0;  // (draws copy their uniforms: the ring can wrap at once)
-    const u32 at = ring + used;
-    used += size;
-    (vertex ? c->vertex_default_uniforms : c->fragment_default_uniforms) = at;
-    *out = at;
+    (vertex ? c->vertex_buffer : c->fragment_buffer) = Context::Buffer{mem, got, size};
+    (vertex ? c->vertex_default_uniforms : c->fragment_default_uniforms) = mem;
+    *out = mem;
     return 0;
 }
-i32 sceGxmReserveVertexDefaultUniformBuffer(u32 context, Ptr<u32> out) { return reserve(context, true, out); }
-i32 sceGxmReserveFragmentDefaultUniformBuffer(u32 context, Ptr<u32> out) { return reserve(context, false, out); }
+
+i32 reserve(PsvContext* ctx, u32 context, bool vertex, Ptr<u32> out) {
+    if (!context || !out) return err::kInvalidPointer;
+    u32 size = 0;
+    {
+        nx::scoped_lock<nx::mutex> held(state().lock);
+        Context* c = context_of(context);
+        if (!c) return err::kInvalidPointer;
+        const Program* program = vertex ? (c->vertex ? c->vertex->program : nullptr) : (c->fragment ? c->fragment->program : nullptr);
+        if (!program) return err::kNullProgram;
+        size = (nx::max<u32>(program->gxp.default_uniform_buffer_size, 4) + 15) & ~15u;
+        if (!c->deferred) {
+            const u32 ring = vertex ? c->params.vertex_ring : c->params.fragment_ring;
+            const u32 ring_size = vertex ? c->params.vertex_ring_size : c->params.fragment_ring_size;
+            u32& used = vertex ? c->vertex_ring_used : c->fragment_ring_used;
+            if (!ring || size > ring_size) return err::kReserveFailed;
+            if (used + size > ring_size) used = 0;  // (draws copy their uniforms: the ring can wrap at once)
+            const u32 at = ring + used;
+            used += size;
+            (vertex ? c->vertex_default_uniforms : c->fragment_default_uniforms) = at;
+            *out = at;
+            return 0;
+        }
+    }
+    return reserve_deferred(ctx, context, vertex, size, out);
+}
+i32 sceGxmReserveVertexDefaultUniformBuffer(PsvContext* ctx, u32 context, Ptr<u32> out) { return reserve(ctx, context, true, out); }
+i32 sceGxmReserveFragmentDefaultUniformBuffer(PsvContext* ctx, u32 context, Ptr<u32> out) { return reserve(ctx, context, false, out); }
 
 i32 sceGxmSetVertexDefaultUniformBuffer(u32 context, u32 data) {
     if (!context || !data) return err::kInvalidPointer;
@@ -403,7 +447,7 @@ i32 draw(u32 context, u32 primitive, u32 index_format, u32 indices, u32 count, u
     nx::scoped_lock<nx::mutex> held(st.lock);
     Context* c = context_of(context);
     if (!c) return err::kInvalidPointer;
-    if (!c->in_scene) return err::kNotWithinScene;
+    if (c->deferred ? !c->in_list : !c->in_scene) return c->deferred ? err::kNotWithinCommandList : err::kNotWithinScene;
     if (!c->vertex || !c->fragment) return err::kNullProgram;
     if (!count) return err::kInvalidIndexCount;
     if (primitive > 0x14000000u || (primitive & 0x03FFFFFFu)) return err::kInvalidPrimitiveType;
@@ -443,6 +487,117 @@ i32 sceGxmDrawPrecomputed(u32 context, Ptr<const PrecomputedDraw> draw_object) {
     u32 streams[16] = {};
     if (pd.block && memory().valid(pd.block, kPrecomputedDrawBlock)) std::memcpy(streams, memory().host(pd.block), sizeof streams);
     return draw(context, pd.primitive, pd.index_format, pd.index_data, pd.index_count, nx::max(pd.instances, 1u), streams);
+}
+
+// ---- Deferred contexts and command lists ----------------------------------------------------------------------
+
+i32 sceGxmCreateDeferredContext(Ptr<const DeferredContextParams> p, Ptr<u32> out) {
+    if (!p || !out) return err::kInvalidPointer;
+    const DeferredContextParams params = *p;
+    if (!params.host_mem || !memory().valid(params.host_mem, nx::max<u32>(params.host_mem_size, 4), true))
+        return err::kInvalidValue;
+    State& s = state();
+    nx::scoped_lock<nx::mutex> held(s.lock);
+    if (!s.initialized) return err::kUninitialized;
+    auto c = nx::make_unique<Context>();
+    c->guest = params.host_mem;
+    c->deferred = true;
+    c->deferred_params = params;
+    c->vdm_buffer = {params.vdm_mem, params.vdm_mem_size, 0};
+    c->vertex_buffer = {params.vertex_mem, params.vertex_mem_size, 0};
+    c->fragment_buffer = {params.fragment_mem, params.fragment_mem_size, 0};
+    c->callback_out = guest_alloc(4);
+    s.contexts[c->guest] = std::move(c);
+    *out = params.host_mem;
+    return 0;
+}
+
+i32 sceGxmDestroyDeferredContext(u32 context) {
+    State& s = state();
+    nx::scoped_lock<nx::mutex> held(s.lock);
+    Context* c = context_of(context);
+    if (!c || !c->deferred) return err::kInvalidPointer;
+    if (c->in_list) return err::kWithinCommandList;
+    s.contexts.erase(context);
+    return 0;
+}
+
+// The deferred context's buffers (VDM, vertex, fragment): set (NULL: the callbacks provide the next) and read back.
+i32 set_deferred_buffer(u32 context, u32 which, u32 mem, u32 size) {
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    Context* c = context_of(context);
+    if (!c) return err::kInvalidPointer;
+    if (!c->deferred) return err::kInvalidValue;
+    if (c->in_list) return err::kWithinCommandList;
+    if (mem && size < 1024) return err::kInvalidValue;
+    Context::Buffer& b = which == 0 ? c->vdm_buffer : which == 1 ? c->vertex_buffer : c->fragment_buffer;
+    b = {mem, mem ? size : 0, 0};
+    return 0;
+}
+i32 get_deferred_buffer(u32 context, u32 which, Ptr<u32> out) {
+    if (!out) return err::kInvalidPointer;
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    Context* c = context_of(context);
+    if (!c) return err::kInvalidPointer;
+    if (!c->deferred) return err::kInvalidValue;
+    *out = (which == 0 ? c->vdm_buffer : which == 1 ? c->vertex_buffer : c->fragment_buffer).address;
+    return 0;
+}
+i32 sceGxmSetDeferredContextVdmBuffer(u32 c, u32 mem, u32 size) { return set_deferred_buffer(c, 0, mem, size); }
+i32 sceGxmSetDeferredContextVertexBuffer(u32 c, u32 mem, u32 size) { return set_deferred_buffer(c, 1, mem, size); }
+i32 sceGxmSetDeferredContextFragmentBuffer(u32 c, u32 mem, u32 size) { return set_deferred_buffer(c, 2, mem, size); }
+i32 sceGxmGetDeferredContextVdmBuffer(u32 c, Ptr<u32> out) { return get_deferred_buffer(c, 0, out); }
+i32 sceGxmGetDeferredContextVertexBuffer(u32 c, Ptr<u32> out) { return get_deferred_buffer(c, 1, out); }
+i32 sceGxmGetDeferredContextFragmentBuffer(u32 c, Ptr<u32> out) { return get_deferred_buffer(c, 2, out); }
+
+i32 sceGxmBeginCommandList(u32 context) {
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    Context* c = context_of(context);
+    if (!c) return err::kInvalidPointer;
+    if (!c->deferred) return err::kInvalidValue;
+    if (c->in_list) return err::kWithinCommandList;
+    c->scene = Scene{};
+    c->in_list = true;
+    return 0;
+}
+
+// The list's draws are kept under an id in the SceGxmCommandList (a list ended again into the same object frees
+// the draws it named).
+i32 sceGxmEndCommandList(u32 context, Ptr<u32> list) {
+    if (!list) return err::kInvalidPointer;
+    State& s = state();
+    nx::scoped_lock<nx::mutex> held(s.lock);
+    Context* c = context_of(context);
+    if (!c) return err::kInvalidPointer;
+    if (!c->deferred) return err::kInvalidValue;
+    if (!c->in_list) return err::kNotWithinCommandList;
+    if (list.get()[0] == kCommandListTag) s.command_lists.erase(list.get()[1]);
+    const u32 id = s.next_command_list++;
+    s.command_lists[id] = std::move(c->scene.draws);
+    c->scene = Scene{};
+    c->in_list = false;
+    c->vertex_default_uniforms = c->fragment_default_uniforms = 0;  // (reservations end with the list)
+    u32* words = list.get();
+    std::memset(words, 0, 8 * 4);
+    words[0] = kCommandListTag;
+    words[1] = id;
+    return 0;
+}
+
+// The list's draws join the scene (each carries its own state: the immediate context's is unchanged).
+i32 sceGxmExecuteCommandList(u32 context, Ptr<const u32> list) {
+    if (!list) return err::kInvalidPointer;
+    State& s = state();
+    nx::scoped_lock<nx::mutex> held(s.lock);
+    Context* c = context_of(context);
+    if (!c) return err::kInvalidPointer;
+    if (c->deferred) return err::kInvalidValue;
+    if (!c->in_scene) return err::kNotWithinScene;
+    if (list.get()[0] != kCommandListTag) return err::kInvalidValue;
+    auto it = s.command_lists.find(list.get()[1]);
+    if (it == s.command_lists.end()) return err::kInvalidValue;
+    for (const Draw& d : it->second) c->scene.draws.push_back(d);
+    return 0;
 }
 
 void sceGxmSetPrecomputedVertexState(u32 context, u32 precomputed) {
@@ -519,6 +674,17 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0x65DD0C84, sceGxmSetUniformDataF),
     HLE_FUNCTION(0xBC059AFC, sceGxmDraw),
     HLE_FUNCTION(0xED3F78B8, sceGxmDrawPrecomputed),
+    HLE_FUNCTION(0x249D5B00, sceGxmCreateDeferredContext),
+    HLE_FUNCTION(0xD6A2FF2F, sceGxmDestroyDeferredContext),
+    HLE_FUNCTION(0x0B9D13CE, sceGxmSetDeferredContextVdmBuffer),
+    HLE_FUNCTION(0x27CAD127, sceGxmSetDeferredContextVertexBuffer),
+    HLE_FUNCTION(0xC6B3FCD0, sceGxmSetDeferredContextFragmentBuffer),
+    HLE_FUNCTION(0xAD8C2EBA, sceGxmGetDeferredContextVdmBuffer),
+    HLE_FUNCTION(0x87632B9C, sceGxmGetDeferredContextVertexBuffer),
+    HLE_FUNCTION(0xFA081D05, sceGxmGetDeferredContextFragmentBuffer),
+    HLE_FUNCTION(0x944D3F83, sceGxmBeginCommandList),
+    HLE_FUNCTION(0x36D85916, sceGxmEndCommandList),
+    HLE_FUNCTION(0xE8E139DD, sceGxmExecuteCommandList),
     HLE_FUNCTION(0xB7626A93, sceGxmSetPrecomputedVertexState),
     HLE_FUNCTION(0xF8952750, sceGxmSetPrecomputedFragmentState),
     HLE_FUNCTION(0x14C4E7D3, sceGxmDrawInstanced),

@@ -32,7 +32,8 @@ inline constexpr i32 kUninitialized = code(0x805B0000), kAlreadyInitialized = co
                      kUniformBufferNotReserved = code(0x805B0011), kDriver = code(0x805B0017),
                      kInvalidTexture = code(0x805B0020), kOutOfHostMemory = code(0x805B0021),
                      kInvalidPrimitiveType = code(0x805B0025), kInvalidMapping = code(0x805B0026),
-                     kOutOfRenderTargets = code(0x805B0027);
+                     kOutOfRenderTargets = code(0x805B0027), kWithinCommandList = code(0x805B002C),
+                     kNotWithinCommandList = code(0x805B002D);
 }  // namespace err
 
 // ---- Guest structures --------------------------------------------------------------------------------------------
@@ -134,6 +135,18 @@ struct PrecomputedFragmentState {
 static_assert(sizeof(PrecomputedFragmentState) == 9 * 4);
 inline constexpr u32 kPrecomputedDrawBlock = 16 * 4;
 inline constexpr u32 kPrecomputedVertexBlock = 16 * 4 + 4 * 16, kPrecomputedFragmentBlock = 16 * 4 + 16 * 16;
+
+// SceGxmDeferredContextParams.
+struct DeferredContextParams {
+    u32 host_mem, host_mem_size;
+    u32 vdm_callback, vertex_callback, fragment_callback;  // void* (void* user, u32 min_size, u32* size)
+    u32 user_data;
+    u32 vdm_mem, vdm_mem_size, vertex_mem, vertex_mem_size, fragment_mem, fragment_mem_size;
+};
+static_assert(sizeof(DeferredContextParams) == 48);
+
+// SceGxmCommandList (8 words, opaque): ours holds a tag and the id of the draws State::command_lists keeps.
+inline constexpr u32 kCommandListTag = 0x4C43584Eu;  // "NXCL"
 
 struct Notification {
     u32 address, value;
@@ -276,6 +289,17 @@ struct Context {
     // uniform buffers and textures of their stage.
     u32 vertex_state = 0, fragment_state = 0;
     u32 visibility_buffer = 0;  // (for the scenes begun after it is set)
+    // A deferred context (sceGxmCreateDeferredContext) records its draws in scene.draws between
+    // sceGxmBeginCommandList and sceGxmEndCommandList. Its default uniform buffers come from its vertex and
+    // fragment buffers (bump allocated, refilled by the game's callbacks).
+    bool deferred = false;
+    bool in_list = false;
+    DeferredContextParams deferred_params{};
+    struct Buffer {
+        u32 address = 0, size = 0, used = 0;
+    };
+    Buffer vdm_buffer, vertex_buffer, fragment_buffer;
+    u32 callback_out = 0;  // (a guest word for the callbacks' size result)
 };
 
 struct DisplayEntry {
@@ -299,6 +323,8 @@ struct State {
     nx::hash_map<u32, nx::unique_ptr<VertexProgram>> vertex_programs;
     nx::hash_map<u32, nx::unique_ptr<FragmentProgram>> fragment_programs;
     nx::unique_ptr<Program> mask_update_program;  // (made on first use)
+    nx::hash_map<u32, nx::vector<Draw>> command_lists;  // (by id)
+    u32 next_command_list = 1;
     nx::vector<std::pair<u32, u32>> mappings;  // (base, size) mapped for the GPU
 
     // The display queue: entries waiting for the display thread, which calls the game's callback for each.

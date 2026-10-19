@@ -265,7 +265,10 @@ i32 sceGxmDestroyContext(u32 context) {
 
 i32 sceGxmGetContextType(u32 context, Ptr<u32> type) {
     if (!context || !type) return err::kInvalidPointer;
-    *type = 0;  // SCE_GXM_CONTEXT_TYPE_IMMEDIATE
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    auto it = state().contexts.find(context);
+    if (it == state().contexts.end()) return err::kInvalidPointer;
+    *type = it->second->deferred ? 1 : 0;  // SCE_GXM_CONTEXT_TYPE_DEFERRED, _IMMEDIATE
     return 0;
 }
 
