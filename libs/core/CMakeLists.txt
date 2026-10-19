@@ -2,6 +2,7 @@
 # command-line helpers.
 add_library(psvrecore_core STATIC
     src/io/file.cpp
+    src/io/png.cpp
 )
 add_library(psvrecore::core ALIAS psvrecore_core)
 

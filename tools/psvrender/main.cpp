@@ -22,7 +22,7 @@
 #include <cstdio>
 
 #include "gpu.hpp"
-#include "png.hpp"
+#include "psvrecore/io/png.hpp"
 #include "psvrecore/cli.hpp"
 #include "psvrecore/io/file.hpp"
 #include "psvrecore/log.hpp"
@@ -271,7 +271,7 @@ int main(int argc, char** argv) {
     if (!out_dir.empty()) {
         auto write = [&](const char* name, const nx::vector<u32>& px) {
             const nx::string p = out_dir + "/" + name;
-            if (!write_png(p.c_str(), scene->width, scene->height, reinterpret_cast<const u8*>(px.data())))
+            if (!io::write_png(p.c_str(), scene->width, scene->height, reinterpret_cast<const u8*>(px.data())))
                 nx::logw(logs::tool, "psvrender: cannot write {}", p);
         };
         write("reference.png", ref.rgba);

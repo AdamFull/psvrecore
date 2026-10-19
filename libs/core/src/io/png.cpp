@@ -1,8 +1,10 @@
 // A minimal PNG writer: 8-bit RGBA, deflate's stored blocks (no compression).
 
-#include "png.hpp"
+#include "psvrecore/io/png.hpp"
 
 #include <cstdio>
+
+namespace psvrecore::io {
 
 namespace {
 
@@ -68,3 +70,5 @@ bool write_png(const char* path, u32 width, u32 height, const u8* rgba) {
     const bool ok = std::fwrite(png.data(), 1, png.size(), f) == png.size();
     return std::fclose(f) == 0 && ok;
 }
+
+}  // namespace psvrecore::io
