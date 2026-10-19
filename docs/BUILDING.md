@@ -8,7 +8,9 @@
 | Build | CMake ≥ 3.25, Ninja (Visual Studio's bundled ones work) | CMake ≥ 3.25, Ninja | CMake ≥ 3.25, Ninja |
 
 Submodules are required: `git submodule update --init --recursive`. That checks out nx-foundation and its own
-third-party code, and vita-headers (whose NID database the tools read at run time).
+third-party code, vita-headers (whose NID database the tools read at run time), and the Vulkan side:
+Vulkan-Headers, SPIRV-Headers, volk and VulkanMemoryAllocator. Nothing links against a Vulkan SDK; the loader is
+opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used by the local checks only.
 
 ## Presets
 
@@ -101,6 +103,20 @@ python scripts/usse_exec_check.py ... --fixed        # fixed-point fragment prog
 `--special` and `--flow` limit what is generated. `--keep` keeps the programs, their inputs and their GXPs in a
 folder; they are derived from the SDK, so keep that folder outside the repository. To see a program run, use
 `psvusse --run DIR/eNNNNN.in --trace DIR/eNNNNN.gxp`.
+
+## Shader translator check (needs the PS Vita SDK and a Vulkan device)
+
+With `--gpu`, each program the interpreter check runs is also translated to SPIR-V and run on a Vulkan device
+(`psvusse --run --gpu`), and its result words are compared with the interpreter's:
+
+```
+python scripts/usse_exec_check.py ... --gpu --validate             # the default device, validation layer on
+python scripts/usse_exec_check.py ... --fragment --gpu --gpu-index 1
+psvusse --spirv out.spv shader.gxp && spirv-val --target-env vulkan1.1 out.spv
+```
+
+`--gpu-index` picks the device by its Vulkan index (by default a discrete GPU). A disagreement is reported as
+`gpu eNNNNN: word N: interpreter ..., GPU ...`.
 
 ## Test programs (needs the PS Vita SDK)
 

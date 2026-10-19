@@ -49,7 +49,7 @@ Everything generated stays on the user's machine.
 | `runtime` | Guest memory, module loader, kernel objects and threads, HLE system libraries, files and save data, timing |
 | `usse` | Shader programs: the GXP container (flags, parameters, vertex outputs, fragment inputs) and the USSE instruction set (decoding into an instruction model, listings in the reference disassembler's syntax) |
 | `gxm` | GXM API, texture formats and layouts, SPIR-V translation of shader programs |
-| `vk` | Vulkan backend (volk, VMA); knows nothing about GXM |
+| `vulkan` | Vulkan backend (volk, VMA): device, memory, buffers, dispatches; knows nothing about GXM |
 | `platform` | SDL3 window, input and events; audio output; Android integration; ImGui overlay; on-screen controls |
 | `frontend` | Program entry point, command line, settings |
 
@@ -158,6 +158,17 @@ Everything generated stays on the user's machine.
     buffer addresses with their bias, and literals (`load_secondary`). Then the secondary program runs, then the
     primary one.
   - It is the oracle for the SPIR-V translator's tests.
+- **Shader translator** (`gxm/translate.hpp`). It translates a primary program instruction by instruction, with the
+  interpreter's semantics, so what the interpreter's checks establish carries over.
+  - The banks become function-scope arrays of 32-bit words. Each lane is read and written as the interpreter does:
+    the word, its bit range, and for internal registers the f32 widening of f16 values.
+  - Results are written after an instruction's sources are read, and after both halves of a dual-issue word.
+  - An instruction under a predicate computes its result and writes it with a select, so blocks have no branches
+    inside them. Programs with branches become a loop around a switch over their blocks.
+  - Secondary programs are not translated to SPIR-V. They run once per draw on the CPU (in the tests, in the
+    interpreter; how the game runs them is decided with the GXM layer), and their results are the primary program's
+    secondary attributes.
+  - The compute form is the test form: one instance per invocation, checked on GPUs against the interpreter.
 - **Graphics.**
   - GXM scenes map to Vulkan render passes, with load/store operations chosen for tile-based GPUs.
   - Guest surfaces are written back to guest memory only when the game can observe them.

@@ -67,6 +67,23 @@
   dependent samplers) are not read yet; nothing checks their layout, and the translator will need them.
 - **`sceGxmProgramIsEquivalent` is not modelled.**
 
+## Shader translator (USSE to SPIR-V)
+
+- **Only the compute form exists.** It is the translator's test form: one instance per invocation, registers in
+  storage buffers, textures and memory in the interpreter's test model. The vertex and fragment shaders GXM draws
+  with come next, from the same instruction translation.
+- **The GPU's precision, not the interpreter's.** `log2`, `exp2`, `inversesqrt` and division are the GPU's
+  (Vulkan allows a few ULP), and f32 denormals may be flushed. Results agree within 2e-5 relative, except where an
+  expression cancels the error out of proportion: 1 of 3864 random programs on the RTX 4060 (`exp2(x) - a` near
+  zero, then `sqrt`).
+- **Where the interpreter fails, the translation clamps or reads zero:** an indexed register outside its bank is
+  clamped to the bank; a load outside the memory buffer or a sample of a missing texture gives zeros; a run of more
+  than 1,000,000 blocks stops and is reported.
+- **Not implemented** (as in the interpreter): the per-instance predicate, `rlp`, per-lane predicate tests, o8
+  packs, texture queries, depth output, stores, and loads other than absolute ones.
+- **64-bit integers.** Integer tests and 32-bit multiply-adds are computed in 64 bits, as the interpreter does;
+  the module then needs `shaderInt64`, which some mobile GPUs lack. Programs without those instructions do not.
+
 ## Shader interpreter (USSE)
 
 - **Textures are behind an interface** (`ShaderTextures`). The check uses nearest sampling of RGBA8 at texel centres;
