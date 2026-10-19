@@ -477,6 +477,15 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
     return &it->second;
 }
 
+// Whether a program stores to memory (its buffers are copied back after the scene).
+bool stores(const Program& p) {
+    for (const usse::Decoded& d : p.primary)
+        if (d.executed && d.in.op == usse::Op::Store) return true;
+    for (const usse::Decoded& d : p.secondary)
+        if (d.executed && d.in.op == usse::Op::Store) return true;
+    return false;
+}
+
 // The words of a uniform buffer a program reads (from its parameters in that buffer).
 u32 buffer_words(const usse::Gxp& g, u32 index) {
     u32 words = 0;
@@ -486,6 +495,14 @@ u32 buffer_words(const usse::Gxp& g, u32 index) {
         words = nx::max(words, p.resource + nx::max<u32>(p.array_size, 1) * nx::max<u32>(per, 1) + 4);
     }
     return words;
+}
+
+// The bytes of a uniform buffer: the size the program declares for it (its UniformBuffer parameter), else an upper
+// bound from the uniforms it reads there.
+u32 buffer_bytes(const usse::Gxp& g, u32 index) {
+    for (const usse::Parameter& p : g.parameters)
+        if (p.category == usse::ParameterCategory::UniformBuffer && p.resource == index && p.array_size) return p.array_size;
+    return buffer_words(g, index) * 4;
 }
 
 void host_copy(nx::vector<u8>& out, u32 address, u32 bytes) {
@@ -584,6 +601,36 @@ void render_scene(Context& context, Scene& scene) {
     nx::vector<u32> sa(usize{nx::max(draws, 1u)} * kDrawSecondaryWords, 0);
     constexpr u32 kMemoryBase = 0x1000;  // (the guest addresses the programs see for the memory buffer's words)
     nx::vector<u8> mem;  // (the memory buffer's words, after its two-word header)
+    // Uniform buffers: one copy each per scene, shared by the draws that use it (so that what one draw stores, a
+    // later one reads, and the copies of the buffers programs store to go back to guest memory after the scene).
+    struct BufferCopy {
+        u32 address = 0, bytes = 0, offset = 0;  // (offset: in mem)
+        bool placed = false, written = false;
+    };
+    nx::hash_map<u32, BufferCopy> buffer_copies;
+    for (const Draw& dr : scene.draws) {
+        for (u32 stage = 0; stage < 2; ++stage) {
+            const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
+            const u32* buffers = stage ? dr.fragment_buffers : dr.vertex_buffers;
+            const bool written = stores(p);
+            for (u32 b = 0; b < 14; ++b) {
+                if (!buffers[b]) continue;
+                BufferCopy& c = buffer_copies[buffers[b]];
+                c.address = buffers[b];
+                c.bytes = nx::max(c.bytes, buffer_bytes(p.gxp, b));
+                c.written |= written;
+            }
+        }
+    }
+    auto place = [&](u32 address) {
+        BufferCopy& c = buffer_copies[address];
+        if (!c.placed) {
+            c.placed = true;
+            c.offset = static_cast<u32>(mem.size());
+            host_copy(mem, address, c.bytes);
+        }
+        return kMemoryBase + c.offset;
+    };
     nx::vector<u8> vertices, indices;
     nx::vector<DrawPlan> plans;
     plans.reserve(draws);
@@ -603,13 +650,14 @@ void render_scene(Context& context, Scene& scene) {
             const usize at = mem.size();
             mem.resize(at + ((uniforms.size() * 4 + 15) & ~usize{15}), 0);
             if (!uniforms.empty()) std::memcpy(mem.data() + at, uniforms.data(), uniforms.size() * 4);
-            for (u32 b = 0; b < 14; ++b) {
-                if (!buffers[b]) continue;
-                addresses[b] = kMemoryBase + static_cast<u32>(mem.size());
-                host_copy(mem, buffers[b], buffer_words(p.gxp, b) * 4);
-            }
+            for (u32 b = 0; b < 14; ++b)
+                if (buffers[b]) addresses[b] = place(buffers[b]);
             fill_secondary(p.gxp, uniforms, addresses,
                            std::span<u32, 256>(sa.data() + usize{i} * kDrawSecondaryWords + 256 * stage, 256));
+        }
+        if ((stores(vp) || stores(fp)) && !d.caps().shader_stores) {
+            nx::logw(logs::gpu, "the device has no vertex or fragment stage stores: a draw whose program stores is skipped");
+            continue;
         }
         plan.vertex_secondary = secondary_pipeline(r, vp);
         plan.fragment_secondary = secondary_pipeline(r, fp);
@@ -1020,15 +1068,25 @@ void render_scene(Context& context, Scene& scene) {
         vkCmdCopyImageToBuffer(*cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, depth_buf->buffer, 2, depth_regions);
     }
     VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;  // (readbacks; stores)
     hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(*cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
+    vkCmdPipelineBarrier(*cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
     if (auto done = shot.submit_and_wait(); done) {
         if (color) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
             for (u32 y = 0; y < height; ++y)
                 std::memcpy(memory().host(cs.data + y * stride * cf.bytes), src + usize{y} * width * cf.bytes, usize{width} * cf.bytes);
+        }
+        // (the uniform buffers programs stored to)
+        bool invalidated = false;
+        for (const auto& [address, c] : buffer_copies) {
+            if (!c.written || !c.placed || !memory().valid(address, c.bytes, true)) continue;
+            if (!invalidated) vk::invalidate(d, *mem_buf), invalidated = true;
+            std::memcpy(memory().host(address), static_cast<const u8*>(mem_buf->mapped) + 8 + c.offset, c.bytes);
         }
         if (queries) {
             nx::vector<u64> counts(query_count, 0);

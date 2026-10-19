@@ -126,6 +126,7 @@ private:
     Id land(Id a, Id c) { return bin(SpvOpLogicalAnd, tb_, a, c); }
     Id lor(Id a, Id c) { return bin(SpvOpLogicalOr, tb_, a, c); }
     Id lnot(Id a) { return un(SpvOpLogicalNot, tb_, a); }
+    Id bnot(Id a) { return un(SpvOpNot, tu_, a); }
     // Floating point, each operation rounded on its own.
     Id exact(Id id) {
         b_.decorate(id, SpvDecorationNoContraction);
@@ -222,6 +223,7 @@ private:
     void write_sample(const Id rgba[4], u32 format, Id regs[4]);
     void tex_op(const Instruction& in);
     Id memory_read(Id address, u32 size);
+    void memory_write(Id address, Id value, u32 size);
     void memory_op(const Instruction& in);
     // Translates one instruction; a branch's target block and condition are left to the caller.
     void emit(usize i);
@@ -251,6 +253,7 @@ private:
     u32 word_ = 0;
     bool int64_ = false;
     bool image_query_ = false;  // (texture size queries: the ImageQuery capability)
+    bool stores_ = false;       // (the program stores to memory: its buffers are writable)
 
     Id tu_ = 0, ti_ = 0, tf_ = 0, tb_ = 0;
     Id tp_fu_ = 0, tp_fi_ = 0, tp_fb_ = 0, tp_su_ = 0;
@@ -1120,11 +1123,29 @@ Id Translator::memory_read(Id address, u32 size) {
     return sel(tu_, land(inside, inside_too), v, u(0));
 }
 
-void Translator::memory_op(const Instruction& in) {
-    if (in.op == Op::Store) {
-        fail("stores not implemented");
+// `size` bytes (1-4) of `value` at a guest address, under the instruction's predicate; outside the memory buffer
+// (or predicated off) they go to a scratch word past its end. A store of 1 or 2 bytes reads, modifies and writes its
+// word (not atomically: instances storing bytes of one word can race). Stores of 4 bytes are assumed aligned.
+void Translator::memory_write(Id address, Id value, u32 size) {
+    auto word = [&](Id index) { return buffer_word(mem_buf_, index); };
+    const Id base = load(tu_, word(u(0))), count = load(tu_, word(u(1)));
+    const Id offset = isub(address, base);
+    Id ok = land(bin(SpvOpULessThanEqual, tb_, iadd(offset, u(size)), imul(count, u(4))),
+                 bin(SpvOpULessThan, tb_, offset, imul(count, u(4))));
+    if (cond_) ok = land(ok, cond_);
+    const Id scratch = iadd(count, u(ComputeLayout::kMemoryHeader));
+    const Id index = sel(tu_, ok, iadd(shr(offset, u(2)), u(ComputeLayout::kMemoryHeader)), scratch);
+    const Id p = word(index);
+    if (size == 4) {
+        store(p, value);
         return;
     }
+    const Id sh = shl(band(offset, u(3)), u(3));
+    const Id m = shl(u(size == 1 ? 0xFFu : 0xFFFFu), sh);
+    store(p, bor(band(load(tu_, p), bnot(m)), band(shl(value, sh), m)));
+}
+
+void Translator::memory_op(const Instruction& in) {
     if (in.space != usse::Space::Absolute || (in.flags & (usse::kPreIncrement | usse::kPostIncrement))) {
         fail("load/store addressing mode not implemented");
         return;
@@ -1139,6 +1160,18 @@ void Translator::memory_op(const Instruction& in) {
     Id address = in.src[1].bank == Bank::Literal ? iadd(base, imul(off, u(bytes))) : iadd(base, band(off, u(0xFFFF)));
     if (in.fetch) address = iadd(address, u(bytes));
     const u32 words = in.size == 64 ? 2 : 1;
+    if (in.op == Op::Store) {
+        for (u32 i = 0; i < count; ++i) {
+            for (u32 j = 0; j < words; ++j) {
+                Operand s = in.src[2];
+                s.lanes = 0;
+                const Id p = word_ptr(s, s.number + i * words + j, false);
+                if (!p) return;
+                memory_write(iadd(address, u(i * bytes + j * 4)), load(tu_, p), nx::min<u32>(bytes, 4));
+            }
+        }
+        return;
+    }
     for (u32 i = 0; i < count; ++i) {
         for (u32 j = 0; j < words; ++j) {
             const Id at = iadd(address, u(i * bytes + j * 4));
@@ -1689,7 +1722,10 @@ Result<nx::vector<u32>> Translator::translate() {
     tp_fi_ = b_.t_pointer(SpvStorageClassFunction, ti_);
     tp_fb_ = b_.t_pointer(SpvStorageClassFunction, tb_);
     tp_su_ = b_.t_pointer(SpvStorageClassStorageBuffer, tu_);
-    for (const Decoded& d : program_) branches_ |= d.executed && d.in.op == Op::Br;
+    for (const Decoded& d : program_) {
+        branches_ |= d.executed && d.in.op == Op::Br;
+        stores_ |= d.executed && d.in.op == Op::Store;
+    }
 
     // The storage buffers: one struct of a runtime array of words.
     const Id words = b_.t_runtime_array(tu_);
@@ -1697,8 +1733,9 @@ Result<nx::vector<u32>> Translator::translate() {
     const Id block = b_.t_struct({words});
     b_.decorate(block, SpvDecorationBlock);
     b_.member_decorate(block, 0, SpvDecorationOffset, {0});
-    // (a draw's shaders only read their buffers: vertex shaders may not write them without a device feature)
-    if (form_ == Form::Vertex || form_ == Form::Fragment) b_.member_decorate(block, 0, SpvDecorationNonWritable);
+    // (a draw's shaders only read their buffers unless they store: storing needs a device feature, the vertex and
+    // fragment stages' stores)
+    if ((form_ == Form::Vertex || form_ == Form::Fragment) && !stores_) b_.member_decorate(block, 0, SpvDecorationNonWritable);
     const Id tp_block = b_.t_pointer(SpvStorageClassStorageBuffer, block);
     auto buffer = [&](u32 binding, const char* name) {
         const Id v = b_.variable(tp_block, SpvStorageClassStorageBuffer);
