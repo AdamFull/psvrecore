@@ -4,3 +4,15 @@
 [submodule "third_party/vita-headers"]
 	path = third_party/vita-headers
 	url = https://github.com/vitasdk/vita-headers
+[submodule "third_party/Vulkan-Headers"]
+	path = third_party/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers
+[submodule "third_party/SPIRV-Headers"]
+	path = third_party/SPIRV-Headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers
+[submodule "third_party/volk"]
+	path = third_party/volk
+	url = https://github.com/zeux/volk
+[submodule "third_party/VulkanMemoryAllocator"]
+	path = third_party/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
