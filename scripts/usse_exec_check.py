@@ -34,6 +34,7 @@ SWIZ = 'xyzw'
 SPECIAL = ['mul', 'index', 'half', 'int', 'int', 'sincos', 'pow']  # (--special)
 FLOW = ['branch', 'loop', 'uloop']  # (--flow)
 FRAGMENT = [False]  # (--fragment)
+TEXTURE_PROGRAMS = [0.0]  # (--textures: the share of fragment programs that sample textures)
 MAG = [0.0]  # the largest magnitude of the expression being generated (fragment programs compute in f16)
 
 
@@ -68,6 +69,7 @@ class Gen:
         self.uniforms = uniforms  # name -> value
         self.texts = {}           # name -> the float4 expression reading it (fragment inputs of other types)
         self.skip = set()         # special operations not to generate
+        self.tex_leaf = None      # a texture sample (fragment programs with textures)
         self.mats = {}            # name -> 4x4 (rows)
         self.arrays = {}          # name -> n x 4
 
@@ -155,6 +157,8 @@ class Gen:
         return Node('float4(%s)' % ', '.join(repr(float(x)) for x in v), v, True, 0.0, const=True)
 
     def leaf(self):
+        if self.tex_leaf and self.rnd.random() < 0.3:
+            return self.tex_leaf()
         k = self.rnd.random()
         if k < 0.45:
             name = self.rnd.choice(list(self.attrs))
@@ -333,7 +337,7 @@ def program(rnd):
         uniforms[name] = ('float4x4', m.reshape(-1))
     for name, a in g.arrays.items():
         uniforms[name] = ('float4[%d]' % len(a), a.reshape(-1))
-    return source(attrs, uniforms, body, len(outs)), attrs, uniforms, outs, body
+    return source(attrs, uniforms, body, len(outs)), attrs, uniforms, outs, body, {}
 
 
 VARYING_TYPES = {'float4': (4, 'f32'), 'float2': (2, 'f32'), 'float': (1, 'f32'), 'half4': (4, 'f16'),
@@ -342,17 +346,41 @@ VARYING_TYPES_FIXED = {'fixed4': (4, 'fx10')}
 SEMANTIC_BITS = dict([('TEXCOORD%d' % k, 16 << k) for k in range(10)] + [('COLOR0', 4), ('COLOR1', 8)])
 
 
+def texels(tex):
+    """RGBA8 words, row by row."""
+    t = tex.astype(np.uint32)
+    return (t[..., 0] | t[..., 1] << 8 | t[..., 2] << 16 | t[..., 3] << 24).reshape(-1)
+
+
+def sample(tex, u, v):
+    """The nearest texel (wrapping), as psvusse samples, in [0, 1]."""
+    h, w = tex.shape[:2]
+    return tex[int(np.floor(v * h)) % h, int(np.floor(u * w)) % w].astype(np.float32) / F(255)
+
+
 def fragment_program(rnd):
     """A fragment program: its source, its varyings ({name: (type, semantic, value)}), uniforms and the expected
     colour (one output, f16x4 in the primary attributes)."""
     varyings, values, uniforms = {}, {}, {}
     semantics = rnd.sample(['TEXCOORD%d' % k for k in range(8)] + ['COLOR0', 'COLOR1'], rnd.randint(1, 5))
     texts = {}
+    # textures (4x4 RGBA8) and coordinates: float4 texture coordinates at texel centres ((2m + 1) / 8) with w = 1,
+    # so that nearest sampling never falls on a texel boundary
+    textures = {}
+    if TEXTURE_PROGRAMS[0] and rnd.random() < TEXTURE_PROGRAMS[0]:
+        for unit in range(rnd.randint(1, 2)):
+            textures[unit] = np.array([[[rnd.randint(0, 255) for _ in range(4)] for _ in range(4)] for _ in range(4)])
+        semantics = ['TEXCOORD0'] + [x for x in semantics if x != 'TEXCOORD0']
     for i, sem in enumerate(semantics):
         t = rnd.choice(list(VARYING_TYPES))
+        if textures and i == 0:
+            t = 'float4'
         n, _ = VARYING_TYPES[t]
         lo, hi = (0, 8) if sem.startswith('COLOR') else (-32, 32)
         v = f4([rnd.randint(lo, hi) / 8.0 for _ in range(n)])
+        if textures and i == 0:
+            v = f4([(2 * rnd.randint(-8, 7) + 1) / 8.0, (2 * rnd.randint(-8, 7) + 1) / 8.0, rnd.randint(-8, 8) / 8.0,
+                    1.0])
         name = 'i%d' % i
         varyings[name] = (t, sem, v)
         rep = {1: 'xxxx', 2: 'xyxy', 4: 'xyzw'}[n]
@@ -364,6 +392,32 @@ def fragment_program(rnd):
         uniforms['u0'] = f4([1, 2, 3, 4])
     g = Gen(rnd, values, uniforms)
     g.texts = texts
+    if textures:
+        coord = varyings['i0'][2]
+        names = {unit: 's%d' % unit for unit in textures}
+
+        def tex_leaf():
+            unit = rnd.choice(list(textures))
+            # (u, v): the coordinate, or a transform of it that keeps it off texel boundaries
+            form = rnd.choice(['xy', 'yx', 'xy3', 'xyq', 'neg', 'proj'])
+            u, v = float(coord[0]), float(coord[1])
+            text = {'xy': 'i0.xy', 'yx': 'i0.yx', 'xy3': 'i0.xy * 3', 'xyq': 'i0.xy + 0.25', 'neg': '-i0.xy',
+                    'proj': 'i0.xyw'}[form]
+            u, v = {'xy': (u, v), 'yx': (v, u), 'xy3': (u * 3, v * 3), 'xyq': (u + 0.25, v + 0.25), 'neg': (-u, -v),
+                    'proj': (u, v)}[form]
+            value = sample(textures[unit], u, v)
+            kind = rnd.choice(['half', 'half', 'float', 'u8'])
+            if form == 'proj':
+                call = 'tex2Dproj(%s, %s)' % (names[unit], text)
+            elif kind == 'float':
+                call = 'tex2D<float4>(%s, %s)' % (names[unit], text)
+            elif kind == 'u8':
+                call = 'float4(tex2D<unsigned char4>(u%s, %s)) / 255' % (names[unit], text)
+            else:
+                call = 'tex2D(%s, %s)' % (names[unit], text)
+            return Node(call, value, False, 1e-3)
+
+        g.tex_leaf = tex_leaf
     # (psp2cgc converts only one lane of a half vector cast to int, then reads it for every lane: no integer
     # operations in programs with half inputs)
     if any(t.startswith('half') for t, _, _ in varyings.values()):
@@ -373,8 +427,10 @@ def fragment_program(rnd):
     e.mag = MAG[0]
     params = ['%s %s : %s' % (t, name, sem) for name, (t, sem, _) in varyings.items()]
     src = '\n'.join('uniform float4 %s;' % u for u in uniforms)
+    for unit in textures:  # (a texture's unsigned sampler: the same texture on unit + 4)
+        src += '\nuniform sampler2D s%d : TEXUNIT%d;\nuniform usampler2D us%d : TEXUNIT%d;' % (unit, unit, unit, unit + 4)
     src += '\nfloat4 main(%s) : COLOR\n{\n    return %s;\n}\n' % (',\n           '.join(params), e.text)
-    return src, varyings, uniforms, [e], []
+    return src, varyings, uniforms, [e], [], textures
 
 
 def fixed_program(rnd):
@@ -441,7 +497,7 @@ def fixed_program(rnd):
     e.mag = float(np.max(np.abs(value)))
     params = ['fixed4 %s : %s' % (name, sem) for name, (_, sem, _) in varyings.items()]
     src = 'fixed4 main(%s) : COLOR\n{\n    return %s;\n}\n' % (', '.join(params), text)
-    return src, varyings, {}, [e], []
+    return src, varyings, {}, [e], [], {}
 
 
 def declaration(name, u):
@@ -516,8 +572,8 @@ def check(job):
     """None if the program agrees; else (kind, index, message). A program that disagrees only while it has
     uniforms (compiled again with them as attributes, it agrees) is reported as 'uniforms': the compiler moves
     uniform-only work into the secondary program, and some of its folds there are wrong (see KNOWN_ISSUES)."""
-    i, src, attrs, uniforms, outs, body, cgc, psvusse, folder = job
-    r = run_one(os.path.join(folder, 'e%05d' % i), src, attrs, uniforms, outs, cgc, psvusse, i)
+    i, src, attrs, uniforms, outs, body, textures, cgc, psvusse, folder = job
+    r = run_one(os.path.join(folder, 'e%05d' % i), src, attrs, uniforms, outs, cgc, psvusse, i, textures)
     if r and r[0] == 'value' and FRAGMENT[0]:
         listing = subprocess.run([psvusse, os.path.join(folder, 'e%05d.gxp' % i)], capture_output=True, text=True).stdout
         if negated_subtrahend(listing):
@@ -532,7 +588,7 @@ def check(job):
     return r
 
 
-def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i):
+def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i, textures=None):
     open(base + '.cg', 'w').write(src)
     profile = 'sce_fp_psp2' if FRAGMENT[0] else 'sce_vp_psp2'
     r = subprocess.run([cgc, '-profile', profile, '-o', base + '.gxp', base + '.cg'], capture_output=True, text=True)
@@ -542,13 +598,6 @@ def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i):
     p = subprocess.run([psvusse, '--params', base + '.gxp'], capture_output=True, text=True)
     lines = ['# %s' % os.path.basename(base)]
     for line in p.stdout.splitlines():
-        if line.startswith('input '):
-            # a fragment input: the varying it interpolates, at its offset in the primary attributes
-            f = dict(kv.split('=', 1) for kv in line.split()[2:] if '=' in kv)
-            for name, (t, sem, v) in attrs.items():
-                if SEMANTIC_BITS[sem] == int(f['interpolated']):
-                    lines.append('pa %s %s' % (f['offset'], varying_words(v, int(f['format']), int(f['components']))))
-            continue
         if not line.startswith('param '):
             continue
         f = dict(kv.split('=', 1) for kv in line.split()[2:] if '=' in kv)
@@ -557,6 +606,13 @@ def run_one(base, src, attrs, uniforms, outs, cgc, psvusse, i):
             lines.append('pa %d %s' % (res, words(attrs[name])))
         elif f['category'] == '1' and name in uniforms:
             lines.append('uniform %d %s' % (res, words(flat(uniforms[name]))))
+    if FRAGMENT[0]:
+        # the varyings by semantic (psvusse places them in the primary attributes) and the textures by unit
+        for name, (t, sem, v) in attrs.items():
+            lines.append('varying %d %s' % (SEMANTIC_BITS[sem], words(list(v) + [0.0] * (4 - len(v)))))
+        for unit, tex in [(u + d, t) for u, t in (textures or {}).items() for d in (0, 4)]:
+            lines.append('texture %d %x %x %s' % (unit, tex.shape[1], tex.shape[0],
+                                                   ' '.join('%08x' % int(t) for t in texels(tex))))
     open(base + '.in', 'w').write('\n'.join(lines) + '\n')
     r = subprocess.run([psvusse, '--run', base + '.in', base + '.gxp'], capture_output=True, text=True)
     if r.returncode or not r.stdout.startswith('out'):
@@ -589,6 +645,7 @@ def main():
                     ', '.join(sorted(set(SPECIAL))))
     ap.add_argument('--fragment', action='store_true', help='generate fragment programs instead')
     ap.add_argument('--fixed', action='store_true', help='generate fixed-point fragment programs instead')
+    ap.add_argument('--textures', type=float, default=0.5, help='fragment programs: the share that sample textures')
     ap.add_argument('--flow', help='comma-separated: the flow control to generate (%s; "none")' % ', '.join(FLOW))
     args = ap.parse_args()
     if args.special:
@@ -596,6 +653,7 @@ def main():
     if args.flow:
         FLOW[:] = [] if args.flow == 'none' else args.flow.split(',')
     FRAGMENT[0] = args.fragment or args.fixed
+    TEXTURE_PROGRAMS[0] = args.textures
     cgc = os.path.join(args.sdk, 'host_tools', 'bin', 'psp2cgc.exe')
     psvusse = os.path.abspath(args.psvusse)
     folder = args.keep or tempfile.mkdtemp(prefix='usse_exec_')

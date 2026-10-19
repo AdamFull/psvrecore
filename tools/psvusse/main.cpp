@@ -4,6 +4,7 @@
 // (scripts/gxp_check.py compares them with libgxm's). With --run it runs them in the reference interpreter.
 
 #include <bit>
+#include <cmath>
 #include <cstdio>
 
 #include "psvrecore/cli.hpp"
@@ -32,9 +33,12 @@ nx::string params(const usse::Gxp& g) {
     out += '\n';
     for (usize i = 0; i < g.inputs.size(); ++i) {
         const usse::FragmentInput& in = g.inputs[i];
-        out += nx::format("input {} interpolated={} sampled={} format={} components={} offset={} raw={:08x}\n", i,
-                          in.interpolated, in.sampled, static_cast<u32>(in.format), static_cast<u32>(in.components),
-                          in.offset, in.raw[0]);
+        out += nx::format(
+            "input {} interpolated={} sampled={} format={} components={} offset={} sampler={} sample_format={} "
+            "sample_offset={} projected={} raw={:08x}\n",
+            i, in.interpolated, in.sampled, static_cast<u32>(in.format), static_cast<u32>(in.components), in.offset,
+            static_cast<u32>(in.sampler), static_cast<u32>(in.sample_format), in.sample_offset, in.projected ? 1 : 0,
+            in.raw[0]);
     }
     for (usize i = 0; i < g.parameters.size(); ++i) {
         const usse::Parameter& p = g.parameters[i];
@@ -63,6 +67,42 @@ public:
     }
     bool write(u32 address, const void* in, u32 size) override {
         for (u32 i = 0; i < size; ++i) bytes[address + i] = static_cast<const u8*>(in)[i];
+        return true;
+    }
+};
+
+// Textures for --run: RGBA8 images by unit, sampled at the nearest texel with wrapping; a sampler's state words
+// are (unit, 0, 0, 0). Cube maps pick the face of the largest coordinate (+x, -x, +y, -y, +z, -z: faces 0-5,
+// stacked vertically) and sample it at the coordinates divided by that one.
+class Textures : public usse::ShaderTextures {
+public:
+    struct Image {
+        u32 width = 0, height = 0;
+        nx::vector<u32> texels;
+    };
+    nx::hash_map<u32, Image> images;
+
+    bool sample(const usse::SamplerState& state, const usse::TextureRequest& r, f32 rgba[4]) override {
+        const auto it = images.find(state.words[0]);
+        if (it == images.end()) return false;
+        const Image& im = it->second;
+        f32 u = r.coord[0], v = r.dim == usse::TexDim::D1 ? 0.5f : r.coord[1];
+        u32 face = 0;
+        if (r.dim == usse::TexDim::Cube) {
+            const f32 ax = std::fabs(r.coord[0]), ay = std::fabs(r.coord[1]), az = std::fabs(r.coord[2]);
+            f32 m;
+            if (ax >= ay && ax >= az) face = r.coord[0] >= 0 ? 0 : 1, m = ax, u = r.coord[2], v = r.coord[1];
+            else if (ay >= az) face = r.coord[1] >= 0 ? 2 : 3, m = ay, u = r.coord[0], v = r.coord[2];
+            else face = r.coord[2] >= 0 ? 4 : 5, m = az, u = r.coord[0], v = r.coord[1];
+            u = (u / m + 1) * 0.5f, v = (v / m + 1) * 0.5f;
+        }
+        const u32 h = r.dim == usse::TexDim::Cube ? im.height / 6 : im.height;
+        auto wrap = [](f32 c, u32 n) {
+            const i64 i = static_cast<i64>(std::floor(c * static_cast<f32>(n)));
+            return static_cast<u32>(((i % n) + n) % n);
+        };
+        const u32 texel = im.texels[(face * h + wrap(v, h)) * im.width + wrap(u, im.width)];
+        for (u32 k = 0; k < 4; ++k) rgba[k] = static_cast<f32>((texel >> (8 * k)) & 0xFF) / 255.0f;
         return true;
     }
 };
@@ -104,11 +144,15 @@ void trace(void* user, const usse::Decoded& d, const usse::Machine& m) {
 // (the default uniform buffer from word <first>), mem (guest memory from address <first>), buffer (<first> is the
 // BUFFER index, one word: its address). The secondary attributes are set up as for a draw, the secondary program
 // runs, then the primary one; the output registers o0-o63 are printed as hex words on one line ("out ..."), and
-// "killed" if the instance was discarded.
+// "killed" if the instance was discarded. A fragment program's inputs are "varying <varying:: bit> <4 f32 words>"
+// and its textures "texture <unit> <width> <height> <RGBA8 texels>"; it prints its primary attributes.
 Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tracing) {
     usse::Machine m;
     MapMemory memory;
+    Textures textures;
     m.memory = &memory;
+    m.textures = &textures;
+    nx::vector<usse::VaryingValue> varyings;
     nx::vector<u32> uniforms, buffers(15, 0);  // (BUFFER 0-13, and 14: the default uniform buffer)
     nx::string error;
     for_each_line(inputs, [&](nx::string_view line) {
@@ -134,6 +178,16 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
             for (usize i = 0; i < words.size(); ++i) memory.write(static_cast<u32>(*first + 4 * i), &words[i], 4);
         } else if (f[0] == "buffer" && *first < buffers.size() && words.size() == 1) {
             buffers[*first] = words[0];
+        } else if (f[0] == "varying" && words.size() == 4) {
+            usse::VaryingValue v;
+            v.varying = static_cast<u32>(*first);
+            for (u32 k = 0; k < 4; ++k) v.value[k] = std::bit_cast<f32>(words[k]);
+            varyings.push_back(v);
+        } else if (f[0] == "texture" && words.size() >= 2 && words.size() == 2 + usize{words[0]} * words[1]) {
+            Textures::Image im;
+            im.width = words[0], im.height = words[1];
+            im.texels.assign(words.begin() + 2, words.end());
+            textures.images[static_cast<u32>(*first)] = std::move(im);
         } else {
             error = nx::format("bad input line '{}'", line);
         }
@@ -147,7 +201,11 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
         for (usize i = 0; i < uniforms.size(); ++i)
             memory.write(kDefaultBufferAddress + static_cast<u32>(4 * i), &uniforms[i], 4);
     }
-    if (const auto done = usse::load_secondary(gxp, uniforms, buffers, m); !done) return nx::err(done.error());
+    nx::vector<usse::SamplerState> samplers(16);
+    for (u32 u = 0; u < samplers.size(); ++u) samplers[u].words[0] = u;
+    if (const auto done = usse::load_secondary(gxp, uniforms, buffers, m, samplers); !done) return nx::err(done.error());
+    if (gxp.type == usse::ShaderType::Fragment)
+        if (const auto done = usse::load_fragment_inputs(gxp, varyings, samplers, m); !done) return nx::err(done.error());
     TraceState state{usse::ProgramKind::Secondary};
     usse::RunLimits limits;
     if (tracing) limits.trace = trace, limits.trace_user = &state;

@@ -185,3 +185,49 @@ TEST_CASE("usse interp: 16-bit integers in internal registers are halves of a wo
     REQUIRE(run(decode_program(secondary, ProgramKind::Secondary), ProgramKind::Secondary, m));
     CHECK(m.secondary[32] == 4u);
 }
+
+namespace {
+
+// Two textures of two texels each (left, right), sampled at the nearest texel; a state's first word is its unit.
+class TestTextures : public ShaderTextures {
+public:
+    f32 texels[2][2][4] = {{{0.25f, 0.5f, 0.75f, 1.0f}, {1.0f, 0.0f, 0.5f, 0.25f}},
+                           {{0.125f, 0.25f, 0.375f, 0.5f}, {0.5f, 0.5f, 0.5f, 0.5f}}};
+    bool sample(const SamplerState& state, const TextureRequest& r, f32 rgba[4]) override {
+        if (state.words[0] > 1) return false;
+        const int x = r.coord[0] - std::floor(r.coord[0]) < 0.5f ? 0 : 1;
+        for (int k = 0; k < 4; ++k) rgba[k] = texels[state.words[0]][x][k];
+        return true;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("usse interp: textures, sampled inputs and texture instructions") {
+    // tex2D(s0, t.xy) + tex2D(s1, t.zw): s0 is sampled with TEXCOORD0 before the program runs (an f16x4 sample in
+    // pa4-pa5, after t in pa0-pa3), s1 by an instruction with its state in sa0-sa3
+    const u64 primary[] = {0xFA44070000000000ull, 0xE0018484E0004000ull, 0xF920000000000000ull, 0x10A44786A0041002ull};
+    Gxp gxp;
+    gxp.type = ShaderType::Fragment;
+    FragmentInput in;
+    in.interpolated = in.sampled = varying::kTexCoord0;
+    in.format = 0, in.components = 4, in.offset = 0;
+    in.sampler = 0, in.sample_format = 1, in.sample_offset = 4;
+    gxp.inputs.push_back(in);
+    gxp.containers = {Container{kConstantsContainer, 0, 4}};
+    for (u16 k = 0; k < 4; ++k) gxp.sampler_slots.push_back(SamplerSlot{static_cast<u16>(4 + k), k});
+    TestTextures textures;
+    Machine m;
+    m.textures = &textures;
+    const SamplerState samplers[2] = {SamplerState{{0, 0, 0, 0}}, SamplerState{{1, 0, 0, 0}}};
+    REQUIRE(load_secondary(gxp, {}, {}, m, samplers));
+    CHECK(m.secondary[0] == 1u);
+    VaryingValue t;
+    t.varying = varying::kTexCoord0;
+    t.value[0] = 0.25f, t.value[1] = 0.5f, t.value[2] = 0.75f, t.value[3] = 0.5f;  // s0 left, s1 right
+    REQUIRE(load_fragment_inputs(gxp, std::span<const VaryingValue>(&t, 1), samplers, m));
+    CHECK(m.primary[4] == (u32{to_half(0.25f)} | u32{to_half(0.5f)} << 16));
+    REQUIRE(run(decode_program(primary, ProgramKind::Primary), ProgramKind::Primary, m));
+    const f32 want[4] = {0.75f, 1.0f, 1.25f, 1.5f};  // (0.25, 0.5, 0.75, 1) + (0.5, 0.5, 0.5, 0.5)
+    for (u32 k = 0; k < 4; ++k) CHECK(from_half(static_cast<u16>(m.primary[k / 2] >> (16 * (k % 2)))) == want[k]);
+}

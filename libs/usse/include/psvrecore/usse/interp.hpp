@@ -20,6 +20,26 @@ public:
     virtual bool write(u32 address, const void* in, u32 size) = 0;
 };
 
+// Texture sampling, as texture instructions and a fragment program's sampled inputs see it.
+struct TextureRequest {
+    TexDim dim = TexDim::D2;
+    TexKind kind = TexKind::Plain;
+    f32 coord[4] = {};
+    f32 extra[4] = {};  // the bias, level of detail or gradients (a texture instruction's third source)
+};
+
+// A sampler's four state words, as the secondary attributes hold them.
+struct SamplerState {
+    u32 words[4] = {};
+};
+
+class ShaderTextures {
+public:
+    virtual ~ShaderTextures() = default;
+    // Writes the sample's red, green, blue and alpha.
+    virtual bool sample(const SamplerState& state, const TextureRequest& request, f32 rgba[4]) = 0;
+};
+
 // The register state of one instance. Banks are arrays of 32-bit registers, numbered as the decoder numbers them.
 struct Machine {
     static constexpr u32 kBankSize = 256;
@@ -33,6 +53,7 @@ struct Machine {
     u32 link = 0;
     bool killed = false;
     ShaderMemory* memory = nullptr;
+    ShaderTextures* textures = nullptr;
 };
 
 struct RunLimits {
@@ -50,7 +71,17 @@ Result<void> run(std::span<const Decoded> program, ProgramKind kind, Machine& m,
 // uniform buffers' addresses (by BUFFER index; index kDefaultUniformContainer: the default buffer's copy in memory)
 // and the literals.
 Result<void> load_secondary(const Gxp& gxp, std::span<const u32> default_uniforms,
-                            std::span<const u32> buffer_addresses, Machine& m);
+                            std::span<const u32> buffer_addresses, Machine& m,
+                            std::span<const SamplerState> samplers = {});
+
+// A fragment program's inputs, placed in the primary attributes as its input records say: the interpolated values
+// (by varying:: bit) in their formats, and the samples taken with them (m.textures, the units' states).
+struct VaryingValue {
+    u32 varying = 0;
+    f32 value[4] = {};
+};
+Result<void> load_fragment_inputs(const Gxp& gxp, std::span<const VaryingValue> varyings,
+                                  std::span<const SamplerState> samplers, Machine& m);
 
 // IEEE half-precision conversions (round to nearest even).
 u16 to_half(f32 v);

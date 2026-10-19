@@ -732,6 +732,67 @@ void imad_op(Exec& x, const Instruction& in) {
     x.put(d, 0, Type::U32, static_cast<u32>(r));
 }
 
+// The four lanes of a sample written in a texture result format: u8x4 (one register), f16x4 (two), f32x4 (four).
+void write_sample(const f32 rgba[4], u32 format, u32* regs) {
+    if (format == 0) {
+        u32 w = 0;
+        for (u32 k = 0; k < 4; ++k)
+            w |= static_cast<u32>(std::nearbyint(nx::clamp(std::isnan(rgba[k]) ? 0.0f : rgba[k], 0.0f, 1.0f) * 255.0f))
+                 << (8 * k);
+        regs[0] = w;
+    } else if (format == 1) {
+        regs[0] = u32{to_half(rgba[0])} | u32{to_half(rgba[1])} << 16;
+        regs[1] = u32{to_half(rgba[2])} | u32{to_half(rgba[3])} << 16;
+    } else {
+        for (u32 k = 0; k < 4; ++k) regs[k] = std::bit_cast<u32>(rgba[k]);
+    }
+}
+
+u32 sample_registers(u32 format) { return format == 0 ? 1u : format == 1 ? 2u : 4u; }
+
+// Family 28: the sampler state is four registers from the second source; the coordinates are f32 lanes.
+void tex_op(Exec& x, const Instruction& in) {
+    if (!x.m_.textures) {
+        x.fail("texture sampling without textures");
+        return;
+    }
+    if (in.flags & (kTexRsd | kTexInfo | kTexMinP)) {
+        x.fail("texture queries not implemented");
+        return;
+    }
+    SamplerState state;
+    for (u32 k = 0; k < 4; ++k) {
+        u32* w = x.reg_word(in.src[1], in.src[1].number + k);
+        if (!w) return;
+        state.words[k] = *w;
+    }
+    TextureRequest r;
+    r.dim = in.tex_dim;
+    r.kind = in.tex_kind;
+    const u32 n = static_cast<u32>(in.tex_dim) + 1;
+    for (u32 k = 0; k < n; ++k) r.coord[k] = x.fval(in.src[0], k, Type::F32);
+    if (in.src_count > 2) {
+        for (u32 k = 0; k < 4; ++k) {
+            u32* w = x.reg_word(in.src[2], in.src[2].number + k);
+            if (!w) return;
+            r.extra[k] = std::bit_cast<f32>(*w);
+        }
+    }
+    f32 rgba[4];
+    if (!x.m_.textures->sample(state, r, rgba)) {
+        x.fail("texture sampling failed");
+        return;
+    }
+    const u32 format = in.type == Type::F32 ? 3 : in.type == Type::F16 ? 1 : 0;
+    u32 regs[4];
+    write_sample(rgba, format, regs);
+    for (u32 k = 0; k < sample_registers(format); ++k) {
+        Operand d = in.dest;
+        d.lanes = 0;
+        if (u32* w = x.reg_word(d, d.number + k)) x.writes.push_back(Pending{Slot{w, 0, 32}, regs[k]});
+    }
+}
+
 void memory_op(Exec& x, const Instruction& in) {
     if (!x.m_.memory) {
         x.fail("load or store without memory");
@@ -849,6 +910,7 @@ Result<void> run(std::span<const Decoded> program, ProgramKind kind, Machine& m,
                 case Op::FxMad: fxmad_op(x, in); break;
                 case Op::Load:
                 case Op::Store: memory_op(x, in); break;
+                case Op::Tex: tex_op(x, in); break;
                 case Op::Br: {
                     if (in.target < 0 || static_cast<u32>(in.target) > words)
                         return failure(nx::format("word {}: branch outside the program", dec.word));
@@ -877,7 +939,7 @@ Result<void> run(std::span<const Decoded> program, ProgramKind kind, Machine& m,
 }
 
 Result<void> load_secondary(const Gxp& gxp, std::span<const u32> default_uniforms,
-                            std::span<const u32> buffer_addresses, Machine& m) {
+                            std::span<const u32> buffer_addresses, Machine& m, std::span<const SamplerState> samplers) {
     if (const Container* c = gxp.container(kDefaultUniformContainer)) {
         for (u32 i = 0; i < c->size; ++i) {
             if (c->base + i >= Machine::kBankSize) return failure("default uniform buffer outside the bank");
@@ -898,10 +960,66 @@ Result<void> load_secondary(const Gxp& gxp, std::span<const u32> default_uniform
         if (!r) return failure("uniform buffer address outside the bank");
         *r = s.buffer < buffer_addresses.size() ? buffer_addresses[s.buffer] + static_cast<u32>(s.bias) : 0;
     }
+    for (const SamplerSlot& s : gxp.sampler_slots) {
+        u32* r = at(s.offset);
+        if (!r) return failure("sampler state outside the bank");
+        const u32 unit = s.word / 4u;
+        *r = unit < samplers.size() ? samplers[unit].words[s.word % 4u] : 0;
+    }
     for (const Literal& l : gxp.literals) {
         u32* r = at(l.offset);
         if (!r) return failure("literal outside the bank");
         *r = l.value;
+    }
+    return {};
+}
+
+Result<void> load_fragment_inputs(const Gxp& gxp, std::span<const VaryingValue> varyings,
+                                  std::span<const SamplerState> samplers, Machine& m) {
+    auto find = [&](u32 bit) -> const VaryingValue* {
+        for (const VaryingValue& v : varyings)
+            if (v.varying == bit) return &v;
+        return nullptr;
+    };
+    auto reg = [&](u32 at) -> u32* { return at < Machine::kBankSize ? &m.primary[at] : nullptr; };
+    for (const FragmentInput& in : gxp.inputs) {
+        if (in.interpolated) {
+            const VaryingValue* v = find(in.interpolated);
+            if (!v) return failure(nx::format("no value for the varying 0x{:x}", in.interpolated));
+            const u32 n = in.components;
+            if (in.format == 0) {
+                for (u32 k = 0; k < n; ++k)
+                    if (u32* r = reg(in.offset + k)) *r = std::bit_cast<u32>(v->value[k]);
+            } else if (in.format == 2) {
+                for (u32 k = 0; k < n; k += 2) {
+                    const u32 lo = to_half(v->value[k]), hi = k + 1 < n ? to_half(v->value[k + 1]) : 0u;
+                    if (u32* r = reg(in.offset + k / 2)) *r = lo | hi << 16;
+                }
+            } else {  // fx10: x, y, z in one register, w in the next (1.0 = 255)
+                u32 q[4] = {};
+                for (u32 k = 0; k < n && k < 4; ++k)
+                    q[k] = fx_raw(static_cast<i32>(std::nearbyint(nx::clamp(v->value[k] * 255.0f, -512.0f, 511.0f))),
+                                  Type::Fx10);
+                if (u32* r = reg(in.offset)) *r = q[0] | q[1] << 10 | q[2] << 20;
+                if (u32* r = reg(in.offset + 1u)) *r = q[3];
+            }
+        }
+        if (in.sampled) {
+            const VaryingValue* v = find(in.sampled);
+            if (!v) return failure(nx::format("no value for the varying 0x{:x}", in.sampled));
+            if (!m.textures) return failure("a sampled input without textures");
+            TextureRequest r;
+            for (u32 k = 0; k < 4; ++k) r.coord[k] = v->value[k];
+            if (in.projected)
+                for (u32 k = 0; k < 2; ++k) r.coord[k] /= v->value[3];
+            const SamplerState state = in.sampler < samplers.size() ? samplers[in.sampler] : SamplerState{};
+            f32 rgba[4];
+            if (!m.textures->sample(state, r, rgba)) return failure("texture sampling failed");
+            u32 regs[4];
+            write_sample(rgba, in.sample_format, regs);
+            for (u32 k = 0; k < sample_registers(in.sample_format); ++k)
+                if (u32* q = reg(in.sample_offset + k)) *q = regs[k];
+        }
     }
     return {};
 }
