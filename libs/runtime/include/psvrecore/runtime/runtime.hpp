@@ -30,6 +30,17 @@ public:
         u64 cdram_budget = 0x08000000u;        // and of CDRAM (128 MiB)
         AudioSink* audio = nullptr;            // where audio output goes (none: it is paced and dropped)
         f64 refresh_hz = 59.94005994;          // the display's vertical blanks (input is sampled at them too)
+        // The console's settings as applications read them (sceAppUtilSystemParam*), and where what survives the
+        // process is kept besides save data (savedata0:, a mount in `files`).
+        struct System {
+            i32 language = 1;           // SCE_SYSTEM_PARAM_LANG_* (English, US)
+            i32 date_format = 1;        // SCE_SYSTEM_PARAM_DATE_FORMAT_* (day, month, year)
+            i32 time_format = 1;        // SCE_SYSTEM_PARAM_TIME_FORMAT_* (24 hours)
+            i32 time_zone_minutes = 0;  // ahead of GMT
+            bool summer_time = false;
+            nx::string user_name = "User";
+            nx::string safe_memory;  // the host file of the 64 KiB of safe memory (empty: kept in memory only)
+        } system{};
     };
 
     explicit Runtime(const Config& config);

@@ -59,6 +59,7 @@ add_executable(psvrecore_runtime_tests
     runtime/audio_tests.cpp
     runtime/hle_tests.cpp
     runtime/input_tests.cpp
+    runtime/savedata_tests.cpp
     runtime/kernel_tests.cpp
 )
 target_include_directories(psvrecore_runtime_tests PRIVATE "${_nxtest_dir}" runtime)

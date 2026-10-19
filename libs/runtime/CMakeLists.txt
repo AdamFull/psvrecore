@@ -4,6 +4,7 @@ add_library(psvrecore_runtime STATIC
     src/filesystem.cpp
     src/hle.cpp
     src/input.cpp
+    src/hle/apputil.cpp
     src/hle/audioout.cpp
     src/hle/ctrl.cpp
     src/hle/fios2.cpp
@@ -21,6 +22,7 @@ add_library(psvrecore_runtime STATIC
     src/loader.cpp
     src/memory.cpp
     src/runtime.cpp
+    src/savedata.cpp
 )
 if(WIN32)
     target_sources(psvrecore_runtime PRIVATE src/host_win32.cpp)

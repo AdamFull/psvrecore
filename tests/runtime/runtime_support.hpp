@@ -26,6 +26,9 @@ struct TestRuntime {
         : rt(config(cpus, audio)) {
         if (rt.ok()) rt.kernel().adopt_host_thread("test main", priority);
     }
+    explicit TestRuntime(const Runtime::Config& c, i32 priority = kernel::kGamePriority) : rt(c) {
+        if (rt.ok()) rt.kernel().adopt_host_thread("test main", priority);
+    }
     ~TestRuntime() {
         if (rt.ok()) rt.kernel().release_host_thread();
     }

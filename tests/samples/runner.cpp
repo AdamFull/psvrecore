@@ -1,8 +1,9 @@
 // The sample runner: boots a recompiled SDK sample on the runtime with the GXM layer (as a game is booted: its
 // eboot.bin and sce_module/libc.suprx, libfios2.suprx in an application folder mounted as app0:, a writable folder
-// as ux0:). It writes each frame the sample shows to <output folder>/frame_NNN.png and what each audio port plays to
-// <output folder>/audio_port<N>.wav, and ends the sample after <frames> frames and <audio seconds> seconds of audio
-// on a port (0: not waited for), or when it exits.
+// as ux0:, and its savedata folder as savedata0:, read-only to sceIo as on the console). It writes each frame the
+// sample shows to <output folder>/frame_NNN.png and what each audio port plays to <output folder>/audio_port<N>.wav,
+// and ends the sample after <frames> frames and <audio seconds> seconds of audio on a port (0: not waited for), or
+// when it exits.
 //
 //     sample_<name> <application folder> <data folder> <output folder> <frames> [timeout seconds] [audio seconds]
 //
@@ -18,6 +19,7 @@
 #include "psvrecore/log.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "core/foundation/containers/hash_map.h"
+#include "core/foundation/platform/filesystem.h"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
 #include "core/foundation/threading/sync.h"
@@ -136,6 +138,9 @@ int main(int argc, char** argv) {
     Runtime::Config config;
     config.files.mounts.push_back({"app0", argv[1], false});
     config.files.mounts.push_back({"ux0", argv[2], true});
+    const nx::string savedata = nx::string(argv[2]) + "/savedata";
+    (void)nx::fs::create_directories(nx::fs::path_view(savedata));
+    config.files.mounts.push_back({"savedata0", savedata, false});
     config.audio = &audio;
     Runtime rt(config);
     if (!rt.ok()) return 2;
