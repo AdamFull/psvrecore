@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 
 #include "psvrecore/log.hpp"
 #include "psvrecore/recomp/support.hpp"
@@ -24,6 +25,20 @@ void on_guest_fault(u64 offset, bool write) {
         std::fprintf(stderr, " in thread '%s' (UID 0x%08x)", t->name.c_str(), static_cast<u32>(t->uid));
         std::fprintf(stderr, "\n  sp %08x lr %08x r0 %08x r1 %08x r2 %08x r3 %08x", t->ctx.r[13], t->ctx.r[14], t->ctx.r[0],
                      t->ctx.r[1], t->ctx.r[2], t->ctx.r[3]);
+        std::fprintf(stderr, "\n  r4 %08x r5 %08x r6 %08x r7 %08x r8 %08x r9 %08x r10 %08x r11 %08x r12 %08x", t->ctx.r[4],
+                     t->ctx.r[5], t->ctx.r[6], t->ctx.r[7], t->ctx.r[8], t->ctx.r[9], t->ctx.r[10], t->ctx.r[11], t->ctx.r[12]);
+        // (PSVRECORE_FAULT_DUMP: the words at the addresses the registers hold, where they are mapped; it takes the
+        // memory map's lock, so it is for debugging only)
+        if (std::getenv("PSVRECORE_FAULT_DUMP")) {
+            if (Runtime* rt = current_runtime()) {
+                for (u32 k = 0; k < 13; ++k) {
+                    const u32 at = t->ctx.r[k] & ~3u;
+                    if (!rt->memory().valid(at, 64)) continue;
+                    std::fprintf(stderr, "\n  [r%u %08x]", k, at);
+                    for (u32 i = 0; i < 16; ++i) std::fprintf(stderr, " %08x", psv_ld32(at + 4 * i));
+                }
+            }
+        }
     }
     std::fprintf(stderr, "\n");
     std::fflush(stderr);
