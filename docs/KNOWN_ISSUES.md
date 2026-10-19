@@ -261,7 +261,9 @@
 - **Some NGS defaults are assumptions.** Which modules a template voice starts with bypassed (the player, and in
   template 1 the mixer, are active; the other effects of source voices bypassed; buss effects active), the modules'
   default parameters, and the default patch volumes (each channel to the same channel, mono to and from both).
-- **Stereo VAG is assumed interleaved by block** (a block of the left channel, then one of the right).
+- **A loop starts VAG decoding again; a buffer swap does not.** A swap goes on from the samples before, so a stream
+  split over buffers (as the SDK's adpcm_stream sample streams) decodes as one. Whether the console also clears the
+  predictor's history when a buffer loops is unknown (vagconv2 did not make a file that shows it).
 - **Scream's voice definitions are stood in for** by template 1 and the ATRAC9 voice: their layout is not documented.
 - **Callbacks run on the thread that calls `sceNgsSystemUpdate`**, after it processed every voice, as documented.
   Parameter error callbacks are never raised: out-of-range parameters are refused when they are set.
