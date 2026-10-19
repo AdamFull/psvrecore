@@ -93,6 +93,9 @@ public:
     Result<nx::vector<u32>> translate();
     const VertexShader* vertex_shader = nullptr;
     const FragmentShader* fragment_shader = nullptr;
+    // The fragment form: a secondary program to run first in each instance (one that reads per-tile registers), on
+    // a private copy of the secondary attributes.
+    std::span<const Decoded> inline_secondary;
 
 private:
     // ---- Helpers -------------------------------------------------------------------------------------------------
@@ -238,6 +241,8 @@ private:
     void fragment_prologue();
     void fragment_epilogue();
     Id push_constant(u32 member, Id type);
+    Id special(i32 code);
+    Id frag_coord();
 
     Form form_;
     const usse::Gxp& gxp_;
@@ -254,6 +259,8 @@ private:
     bool int64_ = false;
     bool image_query_ = false;  // (texture size queries: the ImageQuery capability)
     bool stores_ = false;       // (the program stores to memory: its buffers are writable)
+    bool in_secondary_ = false;  // (emitting the inline secondary program: its primary bank is sa)
+    Id frag_coord_ = 0;          // (the fragment form's FragCoord input)
 
     Id tu_ = 0, ti_ = 0, tf_ = 0, tb_ = 0;
     Id tp_fu_ = 0, tp_fi_ = 0, tp_fb_ = 0, tp_su_ = 0;
@@ -310,9 +317,9 @@ Id Translator::word_ptr(const Operand& o, i64 word, bool write) {
     switch (o.bank) {
         case Bank::Temp: bank = &temp_; break;
         case Bank::Output: bank = &out_; break;
-        case Bank::Primary: bank = form_ == Form::Secondary ? &sa_ : &pa_; break;
+        case Bank::Primary: bank = form_ == Form::Secondary || in_secondary_ ? &sa_ : &pa_; break;
         case Bank::Secondary:
-            if (form_ == Form::Secondary) {
+            if (form_ == Form::Secondary || !inline_secondary.empty()) {
                 bank = &sa_;
                 break;
             }
@@ -377,7 +384,13 @@ Id Translator::raw(const Operand& o, u32 lane, Type t) {
             const u32 word = base + comp / 2;
             return u(word < 130 ? (table[word] >> ((comp & 1) * 16)) & 0xFFFF : 0);
         }
-        case Bank::Special: return u(0);
+        case Bank::Special: {
+            // (the word, then the lane's bits of it)
+            const Id w = special(o.number);
+            if (bits == 32) return comp == 0 ? w : u(0);
+            if (bits == 16) return comp < 2 ? mask(comp ? shr(w, u(16)) : w, 16) : u(0);
+            return comp < 4 ? mask(comp ? shr(w, u(8 * comp)) : w, 8) : u(0);
+        }
         case Bank::Internal:
             if (t == Type::F16) {
                 const Slot sl = slot(o, comp, 32, false);
@@ -1062,7 +1075,8 @@ void Translator::tex_op(const Instruction& in) {
         const usse::Container* k = gxp_.container(usse::kConstantsContainer);
         i32 unit = -1;
         // (a secondary program names the secondary attributes as its primary ones)
-        const bool sa_bank = state.bank == Bank::Secondary || (form_ == Form::Secondary && state.bank == Bank::Primary);
+        const bool sa_bank =
+            state.bank == Bank::Secondary || ((form_ == Form::Secondary || in_secondary_) && state.bank == Bank::Primary);
         if (k && sa_bank && !state.indexed)
             for (const usse::SamplerSlot& slot : gxp_.sampler_slots)
                 if (slot.word % 4 == 0 && static_cast<i32>(k->base + slot.offset) == state.number) unit = slot.word / 4;
@@ -1516,8 +1530,35 @@ void Translator::vertex_epilogue() {
 
 // ---- The fragment form -----------------------------------------------------------------------------------------
 
+// The fragment form's special registers: the pixel's position in its 16 x 16 tile (pixelX, pixelY) and the tile's
+// (tileXY: x in the low byte, y in the next), as the shader compiler's __pixel_x, __pixel_y and __tile_xy address a
+// linear surface (16 * tile + pixel). The others read as zero.
+Id Translator::frag_coord() {
+    if (!frag_coord_) {
+        frag_coord_ = b_.variable(b_.t_pointer(SpvStorageClassInput, tv4_), SpvStorageClassInput);
+        b_.decorate(frag_coord_, SpvDecorationBuiltIn, {SpvBuiltInFragCoord});
+        interface_.push_back(frag_coord_);
+    }
+    return frag_coord_;
+}
+
+Id Translator::special(i32 code) {
+    if (form_ != Form::Fragment || (code != 87 && code != 88 && code != 107)) return u(0);
+    const Id fc = load(tv4_, frag_coord());
+    auto coord = [&](u32 k) { return un(SpvOpConvertFToU, tu_, b_.op(SpvOpCompositeExtract, tf_, {fc, k})); };
+    if (code == 87) return band(coord(0), u(15));
+    if (code == 88) return band(coord(1), u(15));
+    return bor(band(shr(coord(0), u(4)), u(0xFF)), shl(band(shr(coord(1), u(4)), u(0xFF)), u(8)));
+}
+
 void Translator::fragment_prologue() {
     sa_base_ = iadd(imul(push_constant(0, tu_), u(kDrawSecondaryWords)), u(256));
+    if (!inline_secondary.empty()) {
+        // (the secondary attributes, privately: the inline secondary program writes them)
+        sa_.minimum = 256;
+        for (u32 k = 0; k < 256; ++k)
+            store(chain(tp_fu_, sa_.var, {u(k)}), load(tu_, buffer_word(sa_buf_, iadd(sa_base_, u(k)))));
+    }
     if (gxp_.native_color && gxp_.frag_color) {
         // The colour attachment's value, back in the output register's lanes and format.
         b_.capability(SpvCapabilityInputAttachment);
@@ -1566,9 +1607,14 @@ void Translator::fragment_prologue() {
         if (bit == usse::varying::kPosition || bit == usse::varying::kSpriteCoord) {
             const bool coord = bit == usse::varying::kSpriteCoord;
             const Id type = coord ? b_.t_vector(tf_, 2) : tv4_;
-            const Id var = b_.variable(b_.t_pointer(SpvStorageClassInput, type), SpvStorageClassInput);
-            b_.decorate(var, SpvDecorationBuiltIn, {coord ? static_cast<u32>(SpvBuiltInPointCoord) : static_cast<u32>(SpvBuiltInFragCoord)});
-            interface_.push_back(var);
+            Id var = 0;
+            if (coord) {
+                var = b_.variable(b_.t_pointer(SpvStorageClassInput, type), SpvStorageClassInput);
+                b_.decorate(var, SpvDecorationBuiltIn, {SpvBuiltInPointCoord});
+                interface_.push_back(var);
+            } else {
+                var = frag_coord();
+            }
             value = load(type, var);
             if (coord) {
                 const Id x = b_.op(SpvOpCompositeExtract, tf_, {value, 0}), y = b_.op(SpvOpCompositeExtract, tf_, {value, 1});
@@ -1726,6 +1772,7 @@ Result<nx::vector<u32>> Translator::translate() {
         branches_ |= d.executed && d.in.op == Op::Br;
         stores_ |= d.executed && d.in.op == Op::Store;
     }
+    for (const Decoded& d : inline_secondary) stores_ |= d.executed && d.in.op == Op::Store;
 
     // The storage buffers: one struct of a runtime array of words.
     const Id words = b_.t_runtime_array(tu_);
@@ -1812,6 +1859,19 @@ Result<nx::vector<u32>> Translator::translate() {
         case Form::Vertex: vertex_prologue(); break;
         case Form::Fragment: fragment_prologue(); break;
     }
+    if (form_ == Form::Fragment && !inline_secondary.empty()) {
+        // The secondary program first (its own blocks and branches), then the primary.
+        const std::span<const Decoded> primary = program_;
+        const bool primary_branches = branches_;
+        program_ = inline_secondary;
+        branches_ = false;
+        for (const Decoded& d : program_) branches_ |= d.executed && d.in.op == Op::Br;
+        in_secondary_ = true;
+        (void)body(local);
+        in_secondary_ = false;
+        program_ = primary;
+        branches_ = primary_branches;
+    }
     const Id stopped = body(local);
     switch (form_) {
         case Form::Compute: compute_epilogue(gid, stopped); break;
@@ -1878,9 +1938,10 @@ Result<nx::vector<u32>> translate_vertex(const usse::Gxp& gxp, std::span<const u
 }
 
 Result<nx::vector<u32>> translate_fragment(const usse::Gxp& gxp, std::span<const usse::Decoded> program,
-                                           const FragmentShader& shader) {
+                                           const FragmentShader& shader, std::span<const usse::Decoded> secondary) {
     Translator t(Form::Fragment, gxp, program);
     t.fragment_shader = &shader;
+    t.inline_secondary = secondary;
     return t.translate();
 }
 

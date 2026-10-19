@@ -477,6 +477,19 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
     return &it->second;
 }
 
+// Whether a fragment program's secondary program reads per-tile special registers (pixelX, pixelY, tileXY): it runs
+// in the fragment shader then, in each instance (translate_fragment).
+bool tile_secondary(const Program& p) {
+    for (const usse::Decoded& d : p.secondary) {
+        if (!d.executed) continue;
+        for (u32 k = 0; k < d.in.src_count; ++k) {
+            const usse::Operand& o = d.in.src[k];
+            if (o.bank == usse::Bank::Special && (o.number == 87 || o.number == 88 || o.number == 107)) return true;
+        }
+    }
+    return false;
+}
+
 // Whether a program stores to memory (its buffers are copied back after the scene).
 bool stores(const Program& p) {
     for (const usse::Decoded& d : p.primary)
@@ -659,8 +672,9 @@ void render_scene(Context& context, Scene& scene) {
             nx::logw(logs::gpu, "the device has no vertex or fragment stage stores: a draw whose program stores is skipped");
             continue;
         }
+        const bool inline_secondary = tile_secondary(fp);
         plan.vertex_secondary = secondary_pipeline(r, vp);
-        plan.fragment_secondary = secondary_pipeline(r, fp);
+        plan.fragment_secondary = inline_secondary ? VK_NULL_HANDLE : secondary_pipeline(r, fp);
 
         // The shaders.
         VertexShader vs;
@@ -682,7 +696,11 @@ void render_scene(Context& context, Scene& scene) {
         std::memcpy(fs.swizzle, cf.swizzle, 4);
         fs.color_output = color != nullptr;
         const u64 fkey = hash_of({reinterpret_cast<u64>(&fp), 3, fs.output_format, fs.color_output ? 1u : 0u}, fs.swizzle, 4);
-        const VkShaderModule fmod = module_for(r, fkey, [&] { return translate_fragment(fp.gxp, fp.primary, fs); });
+        const VkShaderModule fmod = module_for(r, fkey, [&] {
+            const std::span<const usse::Decoded> secondary =
+                inline_secondary ? std::span<const usse::Decoded>(fp.secondary) : std::span<const usse::Decoded>{};
+            return translate_fragment(fp.gxp, fp.primary, fs, secondary);
+        });
         if (!vmod || !fmod) continue;
 
         // Indices, and the vertices they reach (each stream from its first vertex to the last one used).

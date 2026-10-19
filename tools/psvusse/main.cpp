@@ -154,7 +154,7 @@ void trace(void* user, const usse::Decoded& d, const usse::Machine& m) {
 
 // --run: the input file's lines are "<what> <first> <hex word>...": pa, sa, r (registers from <first>), uniform
 // (the default uniform buffer from word <first>), mem (guest memory from address <first>), buffer (<first> is the
-// BUFFER index, one word: its address). The secondary attributes are set up as for a draw, the secondary program
+// BUFFER index, one word: its address), special (<first> is the code, one word: its value). The secondary attributes are set up as for a draw, the secondary program
 // runs, then the primary one; the output registers o0-o63 are printed as hex words on one line ("out ..."), and
 // "killed" if the instance was discarded. A fragment program's inputs are "varying <varying:: bit> <4 f32 words>"
 // and its textures "texture <unit> <width> <height> <RGBA8 texels>"; it prints its primary attributes.
@@ -189,6 +189,8 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
             for (usize i = 0; i < words.size(); ++i) uniforms[*first + i] = words[i];
         } else if (f[0] == "mem") {
             for (usize i = 0; i < words.size(); ++i) memory.write(static_cast<u32>(*first + 4 * i), &words[i], 4);
+        } else if (f[0] == "special" && *first >= 64 && *first < 112 && words.size() == 1) {
+            m.specials[*first - 64] = words[0];
         } else if (f[0] == "buffer" && *first < buffers.size() && words.size() == 1) {
             buffers[*first] = words[0];
         } else if (f[0] == "varying" && words.size() == 4) {

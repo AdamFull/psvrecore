@@ -52,6 +52,9 @@ struct Machine {
     bool pred[4] = {};
     u32 link = 0;
     bool killed = false;
+    // The special registers' values (codes 64-111: g0-g15 and the named ones, such as pixelX 87, pixelY 88 and
+    // tileXY 107); zero unless the caller sets them.
+    u32 specials[48] = {};
     ShaderMemory* memory = nullptr;
     ShaderTextures* textures = nullptr;
 };

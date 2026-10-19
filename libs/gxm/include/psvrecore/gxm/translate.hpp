@@ -114,8 +114,10 @@ struct FragmentShader {
 Result<nx::vector<u32>> translate_secondary(const usse::Gxp& gxp, std::span<const usse::Decoded> program);
 Result<nx::vector<u32>> translate_vertex(const usse::Gxp& gxp, std::span<const usse::Decoded> program,
                                          const VertexShader& shader);
+// `secondary`: the program's secondary program, to run in each instance first (where it reads per-tile special
+// registers, which a secondary program run once per draw cannot have).
 Result<nx::vector<u32>> translate_fragment(const usse::Gxp& gxp, std::span<const usse::Decoded> program,
-                                           const FragmentShader& shader);
+                                           const FragmentShader& shader, std::span<const usse::Decoded> secondary = {});
 
 // The secondary attributes as the driver fills them before a draw: the default uniform buffer (its first words),
 // the uniform buffers' addresses (by BUFFER index; index 14 the default buffer's copy in memory) and the literals.

@@ -183,7 +183,13 @@ public:
                 const u32 word = base + comp / 2;
                 return word < 130 ? (table[word] >> ((comp & 1) * 16)) & 0xFFFF : 0;
             }
-            case Bank::Special: return special(o.number);
+            case Bank::Special: {
+                // (a word: lanes of narrower types are its bytes or halves, as a register's)
+                const u32 w = special(o.number);
+                if (bits == 32) return comp == 0 ? w : 0;
+                if (bits == 16) return comp < 2 ? (w >> (16 * comp)) & 0xFFFF : 0;
+                return comp < 4 ? (w >> (8 * comp)) & 0xFF : 0;
+            }
             case Bank::Internal:
                 // (an internal register holds f32 values: an f16 read narrows; checked, see put)
                 if (t == Type::F16) {
@@ -248,10 +254,7 @@ public:
         return false;
     }
 
-    u32 special(i32 code) {
-        (void)code;
-        return 0;  // (assumed: the special registers read as zero in a single instance)
-    }
+    u32 special(i32 code) { return code >= 64 && code < 112 ? m_.specials[code - 64] : 0; }
 
     Machine& m_;
     ProgramKind kind_;
