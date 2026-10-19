@@ -386,7 +386,7 @@ nx::string format_listing(std::span<const Decoded> program, ProgramKind kind) {
     for (usize i = 0; i < program.size(); ++i) {
         const Decoded& d = program[i];
         if (word_line[d.word] < 0) word_line[d.word] = next;
-        if (!d.in.prints() && d.in.op != Op::Invalid) continue;
+        if ((!d.in.prints() && d.in.op != Op::Invalid) || !d.listed) continue;
         if ((d.in.flags & kCoissued) && i > 0 && numbers[i - 1] >= 0) numbers[i] = numbers[i - 1];
         else numbers[i] = next++;
     }

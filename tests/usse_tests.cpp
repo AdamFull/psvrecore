@@ -36,7 +36,7 @@ nx::vector<nx::string> lines(u64 word, ProgramKind kind = ProgramKind::Primary) 
     decode_word(word, 0, kind, state, out);
     nx::vector<nx::string> v;
     for (const Decoded& d : out)
-        if (d.in.prints() || d.in.op == Op::Invalid) v.push_back(squeeze(format(d.in, kind)));
+        if (d.listed && (d.in.prints() || d.in.op == Op::Invalid)) v.push_back(squeeze(format(d.in, kind)));
     return v;
 }
 

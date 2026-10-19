@@ -20,6 +20,11 @@ struct Decoded {
     Instruction in;
     u32 word = 0;        // the index of its word in the program
     u8 repetition = 0;   // which repetition of a repeated word
+    // The reference listing shows some families' words as written, without their repetitions or the registers the
+    // repeat increments step: such a word decodes to a listed entry that does not execute, then to the executed
+    // repetitions, which are not listed.
+    bool listed = true;
+    bool executed = true;
 };
 
 // Appends the instructions of the word at `index`: one, two (dual issue, colour and alpha), one per repetition, or

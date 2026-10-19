@@ -153,6 +153,8 @@ bool decode_dual(const Word& w, ProgramKind, nx::vector<Instruction>& out) {
         Instruction in;
         in.op = op.op;
         in.type = (!f16 || (coissued && op.op == Op::Mov)) ? Type::F32 : Type::F16;
+        // (the co-issued move of an f16 word is printed .f32 but reads f16 lanes: it widens them)
+        if (f16 && coissued && op.op == Op::Mov) in.src_type = Type::F16;
         in.dest = dest;
         in.src_count = op.reads;
         for (u8 i = 0; i < op.reads; ++i) in.src[i] = source(slots[i], op, dest);

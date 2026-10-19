@@ -20,6 +20,7 @@ struct RepeatSpec {
     u8 lo = 0, width = 0;  // the repeat count field (count - 1)
     RepeatField fields[4];
     u8 field_count = 0;
+    bool listed = true;  // false: the reference listing shows the word as written (see Decoded)
 };
 
 bool is_hex(const Word& w, const RepeatField& f) {
@@ -55,6 +56,18 @@ bool repeat_spec(const Word& w, u32 family, RepeatSpec& spec) {
         case 13:
             spec.lo = 44, spec.width = 4;
             add(21, 7, kDest), add(7, 7, kSrc1, 30, 49), add(0, 7, kSrc2, 28, 48);
+            return true;
+        case 15:
+            // (the reference disassembler does not show these repetitions, but the compiler uses them: checked
+            // by the interpreter, a repeated integer comparison feeding a repeated cmov)
+            spec.lo = 44, spec.width = 2, spec.listed = false;
+            add(21, 7, kDest), add(7, 7, kSrc1, 30, 49), add(0, 7, kSrc2, 28, 48);
+            return true;
+        case 26:
+            // (no repeat count in compiled code, but the increments' offsets apply, swizzle-mode ones to the first
+            // repetition too: checked by the interpreter, the compiler's integer absolute values)
+            spec.lo = 44, spec.width = 0, spec.listed = false;
+            add(21, 7, kDest), add(14, 7, kSrc0), add(7, 7, kSrc1, 30, 49), add(0, 7, kSrc2, 28, 48);
             return true;
         case 16:
             spec.lo = 44, spec.width = 3;
@@ -156,8 +169,13 @@ void decode_word(u64 word, u32 index, ProgramKind kind, DecodeState& state, nx::
         }
         return;
     }
-    const i32 count = w.field(spec.lo, spec.width) + 1;
+    const i32 count = spec.width ? w.field(spec.lo, spec.width) + 1 : 1;
     const u64 base = word & ~(((u64{1} << spec.width) - 1) << spec.lo);
+    if (!spec.listed) {
+        const usize first = out.size();
+        emit(Word(word), word, index, 0, kind, out);
+        for (usize i = first; i < out.size(); ++i) out[i].executed = false;
+    }
     for (i32 k = 0; k < count; ++k) {
         Word rw(base);
         for (u8 f = 0; f < spec.field_count; ++f) {
@@ -168,7 +186,10 @@ void decode_word(u64 word, u32 index, ProgramKind kind, DecodeState& state, nx::
                                      : k * state.increment[rf.role];
             if (step) rw.offset(rf.lo, rf.width, step);
         }
+        const usize first = out.size();
         emit(rw, word, index, static_cast<u8>(k), kind, out);
+        if (!spec.listed)
+            for (usize i = first; i < out.size(); ++i) out[i].listed = false;
     }
 }
 
