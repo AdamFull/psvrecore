@@ -658,15 +658,18 @@ void test_op(Exec& x, const Instruction& in) {
         x.m_.pred[in.dest.number & 3] = r;
         return;
     }
-    // Family 15: the result is all ones or zero (checked: integer conversions select with cmov8 on it), from lane x,
-    // or lane by lane for a four-lane destination.
+    // Family 15: the result is all ones or zero for integer types (checked: integer conversions select with cmov8
+    // on it), 1.0 or 0.0 for float types (checked: the compiler weighs the results of a four-lane comparison with a
+    // dot product, as in percentage-closer shadow filtering); from lane x, or lane by lane for a four-lane
+    // destination.
     const Operand& d = in.dest;
     const u32 n = d.lanes == 4 ? 4 : 1;
     for (u32 k = 0; k < n; ++k) {
         if (n == 4 && !((d.mask >> k) & 1)) continue;
         const bool r = lane_result(k);
         const u32 bits = width_of(t);
-        x.put(d, k, t, r ? (bits == 32 ? ~0u : (1u << bits) - 1) : 0u);
+        if (flt) x.putf(d, k, t, r ? 1.0f : 0.0f);
+        else x.put(d, k, t, r ? (bits == 32 ? ~0u : (1u << bits) - 1) : 0u);
     }
 }
 

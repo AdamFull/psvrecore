@@ -8,7 +8,7 @@ namespace psvrecore::usse {
 // field):
 //   0x00 "GXP\0", 0x04 version (major, minor), 0x08 size
 //   0x14 flags: bit 0 fragment program, 3 discard, 4 depth replace, 5 sprite coordinate, 6 native color,
-//        7 previous color (FRAGCOLOR) read
+//        7 previous color (FRAGCOLOR) read, 17 the vertex index read, 18 the instance index read
 //   0x24 parameter count, 0x28 self-relative offset of the parameter records (16 bytes each)
 //   0x2C self-relative offset of the varyings block
 //   0x3C/0x40, 0x44/0x48 primary and secondary programs: word count, self-relative offset
@@ -23,7 +23,8 @@ namespace psvrecore::usse {
 // The varyings block: word 2 is, for a vertex program, the mask of primary registers holding attributes read in
 // their declared format; for a fragment program, the output type (bits 16-19) and component count (24-27). A
 // vertex program's outputs are flags in word 4 (position 12, fog 9, color0 11, color1 10, point size 8, clip
-// planes 0-7) and one 3-bit group per texture coordinate in word 5 (non-zero when written). A fragment program's
+// planes 0-7) and one 3-bit group per texture coordinate in word 5 (non-zero when written); word 7 holds the
+// primary register of the vertex index (bits 0-15) and of the instance index (16-31), read where the flags say. A fragment program's
 // inputs are 16-byte records from 0x14, as many as the low half of word 3, each naming an interpolated input
 // (bits 12-15: 0-9 a texture coordinate, 0xA color0, 0xB color1, 0xC fog, 0xD window position, 0xF none; bit 30:
 // the sprite coordinate instead) and a texture coordinate sampled without a program instruction (bits 0-3, 0xF
@@ -145,6 +146,12 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
         g.vertex_outputs = out;
         g.vertex_texcoord_sizes = coords & 0x3FFFFFFFu;
         g.vertex_output_registers = flags4 >> 24;
+        if ((flags >> 17) & 3) {
+            if (!r.contains(varyings + 0x1C, 4)) return failure("GXP varyings outside the file");
+            const u32 regs = r.le<u32>(varyings + 0x1C);
+            if ((flags >> 17) & 1) g.index_register = static_cast<i32>(regs & 0xFFFF);
+            if ((flags >> 18) & 1) g.instance_register = static_cast<i32>(regs >> 16);
+        }
     } else {
         const u32 format = r.le<u32>(varyings + 0x08);
         g.output_type = static_cast<ParameterType>((format >> 16) & 0xF);

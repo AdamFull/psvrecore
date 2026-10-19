@@ -111,6 +111,9 @@ struct Gxp {
     bool discard = false, depth_replace = false, sprite_coord = false, native_color = false, frag_color = false;
     u32 default_uniform_buffer_size = 0;  // bytes
     u32 vertex_outputs = 0;  // varying:: mask (vertex programs)
+    // Vertex programs that read the vertex's index (Cg's INDEX semantic) or the instance's (INSTANCE): the primary
+    // attribute register the hardware puts it in, as a 32-bit integer (-1: not read). They are not parameters.
+    i32 index_register = -1, instance_register = -1;
     // Where a vertex program writes its outputs (vertex_output_layout()).
     u32 vertex_texcoord_sizes = 0;  // 3 bits per texture coordinate: 1 two registers, 3 three, 7 four
     u32 vertex_output_registers = 0;  // all the outputs
