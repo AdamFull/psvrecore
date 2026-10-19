@@ -1,5 +1,5 @@
-// The frontend: settings (the file's text both ways, values refused), the command line over the settings file, and
-// scripted controls.
+// The frontend: settings (the file's text both ways, values refused), the command line over the settings file,
+// scripted controls, and where a game's files are in its folder.
 
 #include <SDL3/SDL.h>
 
@@ -8,6 +8,7 @@
 
 #include "nxtest.h"
 #include "psvrecore/frontend/frontend.hpp"
+#include "psvrecore/frontend/layout.hpp"
 #include "psvrecore/frontend/script.hpp"
 #include "shader_cache.hpp"
 #include "core/foundation/platform/filesystem.h"
@@ -347,4 +348,51 @@ TEST_CASE("shader cache: kept from one run to the next; another translator's, or
         CHECK(c.graphics().empty());
     }
     (void)nx::fs::remove_all(nx::fs::path_view(folder));
+}
+
+TEST_CASE("layout: an application folder, or a copy of the console's app/, patch/ and addcont/ folders") {
+    const nx::string root = temp_file("layout");
+    (void)nx::fs::remove_all(nx::fs::path_view(root));
+    const auto write = [](const nx::string& path) {
+        (void)nx::fs::create_directories(nx::fs::path_view(nx::fs::path::parent_path(path.view())));
+        (void)nx::fs::file_write_text(nx::fs::path_view(path), "x");
+    };
+    // The application folder itself.
+    write(root + "/plain/eboot.bin");
+    auto plain = find_layout(root + "/plain", "TEST00000");
+    REQUIRE(plain.has_value());
+    CHECK(plain->app == root + "/plain");
+    CHECK(plain->update.empty());
+    CHECK(plain->addcont.empty());
+    CHECK(plain->executable_folder() == root + "/plain");
+
+    // A copy of the console's folders: the game only, then with an update and add-ons.
+    write(root + "/copy/app/TEST00000/eboot.bin");
+    auto game_only = find_layout(root + "/copy", "TEST00000");
+    REQUIRE(game_only.has_value());
+    CHECK(game_only->app == root + "/copy/app/TEST00000");
+    CHECK(game_only->update.empty());
+    CHECK(game_only->addcont.empty());
+    write(root + "/copy/patch/TEST00000/eboot.bin");
+    write(root + "/copy/addcont/TEST00000/ADDCONTDLC00001/dlc.cpk");
+    auto full = find_layout(root + "/copy", "TEST00000");
+    REQUIRE(full.has_value());
+    CHECK(full->update == root + "/copy/patch/TEST00000");
+    CHECK(full->addcont == root + "/copy/addcont/TEST00000");
+    CHECK(full->executable_folder() == full->update);
+
+    // Another title's copy, an update without an executable, a folder that is neither.
+    auto other = find_layout(root + "/copy", "OTHR00000");
+    REQUIRE_FALSE(other.has_value());
+    CHECK(other.error().message.view().find("app/OTHR00000/eboot.bin") != nx::string_view::npos);
+    write(root + "/half/app/TEST00000/eboot.bin");
+    (void)nx::fs::create_directories(nx::fs::path_view(root + "/half/patch/TEST00000"));
+    auto half = find_layout(root + "/half", "TEST00000");
+    REQUIRE(half.has_value());
+    CHECK(half->update.empty());
+    (void)nx::fs::create_directories(nx::fs::path_view(root + "/empty"));
+    auto none = find_layout(root + "/empty", "TEST00000");
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error().message.view().find("has no eboot.bin") != nx::string_view::npos);
+    (void)nx::fs::remove_all(nx::fs::path_view(root));
 }

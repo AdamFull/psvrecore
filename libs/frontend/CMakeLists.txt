@@ -3,6 +3,7 @@
 
 add_library(psvrecore_frontend STATIC
     src/frontend.cpp
+    src/layout.cpp
     src/script.cpp
     src/settings.cpp
 )

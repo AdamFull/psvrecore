@@ -11,7 +11,8 @@ namespace psvrecore::frontend {
 
 struct Settings {
     // [game]
-    nx::string game_folder;  // the game's application folder (app0:): eboot.bin, sce_module/, the game's files
+    nx::string game_folder;  // the game's application folder (eboot.bin at its top), or a copy of the console's
+                             // app/, patch/ and addcont/ folders for it (see layout.hpp)
     nx::string data_folder;  // ux0: and save data (empty: the user's data folder)
     // [display]
     bool fullscreen = false;

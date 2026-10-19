@@ -25,9 +25,9 @@ struct Game {
     std::span<const PsvModuleCode* const> code;  // its recompiled modules
     nx::string_view main = "app0:eboot.bin";
     std::span<const char* const> modules;  // started before the main thread ("app0:sce_module/libc.suprx", ...)
-    // Checks the game folder before anything starts (that it holds a version the code was generated from); an error
-    // is shown and the program ends.
-    Result<void> (*check)(const nx::string& game_folder) = nullptr;
+    // Checks the folder of the eboot.bin that runs (the update's, when there is one: see layout.hpp) before anything
+    // starts, that it holds a version the code was generated from; an error is shown and the program ends.
+    Result<void> (*check)(const nx::string& executable_folder) = nullptr;
 };
 
 // What the command line asks for besides settings.

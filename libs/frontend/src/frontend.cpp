@@ -1,4 +1,5 @@
 #include "psvrecore/frontend/frontend.hpp"
+#include "psvrecore/frontend/layout.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -7,7 +8,6 @@
 #endif
 
 #include <atomic>
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -316,19 +316,10 @@ int run(const Game& game, int argc, char** argv) {
         return fail(nx::format("No game folder. Give it with --game <folder>, or as [game] folder in {}.",
                                settings_file.empty() ? "the settings" : settings_file.c_str()),
                     cl.hidden);
-    const nx::string eboot = join(s.game_folder, "eboot.bin");
-    if (!nx::fs::exists(nx::fs::path_view(eboot))) {
-        // (what the system says: a file there that cannot be read is not the same as none)
-        errno = 0;
-        std::FILE* f = std::fopen(eboot.c_str(), "rb");
-        const int error = errno;
-        if (f) std::fclose(f);
-        return fail(nx::format("{} has no eboot.bin ({}): it is not a game's application folder.", s.game_folder,
-                               f ? "it opens, but is not found" : std::strerror(error)),
-                    cl.hidden);
-    }
+    const auto layout = find_layout(s.game_folder, game.title_id);
+    if (!layout) return fail(layout.error().message, cl.hidden);
     if (game.check) {
-        if (auto r = game.check(s.game_folder); !r) return fail(r.error().message, cl.hidden);
+        if (auto r = game.check(layout->executable_folder()); !r) return fail(r.error().message, cl.hidden);
     }
     const nx::string data = !s.data_folder.empty() ? s.data_folder : user.empty() ? nx::string("data") : join(user, "data");
     const nx::string save = join(data, nx::format("user/00/savedata/{}", game.title_id));
@@ -378,7 +369,11 @@ int run(const Game& game, int argc, char** argv) {
 
     // The runtime, the GXM layer, the game's code.
     runtime::Runtime::Config config;
-    config.files.mounts.push_back({"app0", s.game_folder, false});
+    // (the update's files over the game's; the add-ons, each opened by the game before it reads it)
+    runtime::FileSystem::Mount app0{"app0", layout->executable_folder(), false};
+    if (!layout->update.empty()) app0.under.push_back(layout->app);
+    config.files.mounts.push_back(std::move(app0));
+    config.files.mounts.push_back({"addcont0", layout->addcont, false, {}, true});
     config.files.mounts.push_back({"ux0", data, true});
     config.files.mounts.push_back({"savedata0", save, false});  // (read-only to sceIo; save data is written by SceAppUtil)
     config.audio = speaker.get();
@@ -406,7 +401,9 @@ int run(const Game& game, int argc, char** argv) {
     boot.args = {boot.main};
     auto main_thread = rt.loader().boot(boot);
     if (!main_thread) return fail(nx::format("The game could not start: {}", main_thread.error().message), cl.hidden);
-    nx::logi(logs::frontend, "{} started from {}; data in {}", game.title, s.game_folder, data);
+    nx::logi(logs::frontend, "{} started from {}{}{}; data in {}", game.title, layout->app,
+             layout->update.empty() ? nx::string() : nx::format(", update {}", layout->update),
+             layout->addcont.empty() ? nx::string() : nx::format(", add-ons {}", layout->addcont), data);
 
     Lifecycle lifecycle;
     lifecycle.rt = &rt;
