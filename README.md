@@ -22,7 +22,7 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | Folder | Contents |
 | --- | --- |
 | `libs/core` | Error handling, log categories, binary readers, file and text helpers shared by every library |
-| `libs/formats` | SELF and ELF, module information, imports/exports, relocations, SFO, NID databases |
+| `libs/formats` | SELF and ELF, module information, imports/exports, relocations, SFO, CPK archives, NID databases |
 | `libs/arm` | ARMv7-A decoder (ARM, Thumb-2, VFPv3, Advanced SIMD) and disassembler |
 | `libs/analysis` | Code discovery: functions, interworking, IT blocks, jump tables, imported variables |
 | `libs/recomp` | C code generator, the guest ABI header generated code includes, and its support library |
@@ -30,7 +30,7 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | `libs/runtime` | What recompiled programs run on: guest memory, the kernel (threads, scheduling, synchronisation), files, the module loader, and the system libraries implemented on the host |
 | `libs/nx-foundation` | [nx-foundation](https://github.com/AdamFull/nx-foundation) (submodule): containers, strings, threads, files, logging, tests |
 | `third_party/vita-headers` | [vita-headers](https://github.com/vitasdk/vita-headers) (submodule, MIT): its NID database names system library functions |
-| `tools/psvinfo` | Inspects SELF/ELF modules and SFO files |
+| `tools/psvinfo` | Inspects SELF/ELF modules, SFO files and CPK archives |
 | `tools/psvdis` | Disassembles raw ARM or Thumb code |
 | `tools/psvrecomp` | Finds a module's code and translates it to C |
 | `scripts/arm_check.py` | Checks psvdis against llvm-objdump over generated instruction corpora or a code file |
@@ -52,7 +52,7 @@ cmake --preset linux-x64-debug && cmake --build --preset linux-x64-debug && ctes
 
 ## Tools
 
-`psvinfo` inspects a module (SELF or ELF) or an SFO file:
+`psvinfo` inspects a module (SELF or ELF), an SFO file or a CPK archive:
 
 ```
 psvinfo info eboot.bin                  # container, segments, module info, imports/exports, relocations
@@ -61,6 +61,8 @@ psvinfo exports module.suprx --db my-nids.tsv
 psvinfo relocs module.suprx             # every relocation
 psvinfo elf module.suprx module.elf     # the ELF inside a SELF
 psvinfo stubs <sdk>/target/lib nids.tsv # NID database from SDK stub libraries (keep it local)
+psvinfo cpk data.cpk                    # a CPK's header, totals and files by extension and folder
+psvinfo cpk --list data.cpk             # every file: path, ID, offset, stored and extracted size
 ```
 
 Names come from vita-headers' database (`third_party/vita-headers/db/360`) unless `--no-default-db` is given;

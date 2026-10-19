@@ -1,5 +1,5 @@
-// psvinfo — inspects Vita executables and modules (SELF or ELF), SFO files and NID databases: module information,
-// imports and exports by name, relocations, and the ELF inside a SELF.
+// psvinfo — inspects Vita executables and modules (SELF or ELF), SFO files, CPK archives and NID databases: module
+// information, imports and exports by name, relocations, the ELF inside a SELF, and the files a CPK holds.
 
 #include <algorithm>
 #include <cstdio>
@@ -7,6 +7,7 @@
 
 #include "psvrecore/cli.hpp"
 #include "psvrecore/error.hpp"
+#include "psvrecore/formats/cpk.hpp"
 #include "psvrecore/formats/elf.hpp"
 #include "psvrecore/formats/module.hpp"
 #include "psvrecore/formats/nids.hpp"
@@ -297,13 +298,89 @@ Result<void> cmd_stubs(nx::fs::path_view dir, nx::fs::path_view out) {
     return {};
 }
 
+nx::string extension_of(nx::string_view name) {
+    const usize dot = name.rfind('.');
+    return dot == nx::string_view::npos ? nx::string("(none)") : nx::string(name.substr(dot + 1));
+}
+
+// A CPK's header and files: totals, by extension, and (with `list`) every file, tab-separated. Each file's first
+// bytes are read to check its offset: a compressed file starts with "CRILAYLA".
+Result<void> cmd_cpk(nx::fs::path_view path, bool list) {
+    auto opened = nx::fs::open_file(path);
+    if (!opened) return failure(nx::format("cannot open '{}': {}", path.native(), nx::fs::to_string(opened.error().kind)));
+    nx::fs::stream& s = **opened;
+    const i64 size = s.size();
+    if (size < 0) return failure(nx::format("'{}': size unknown", path.native()));
+    const auto read = [&](u64 offset, void* out, usize bytes) {
+        return s.seek(static_cast<i64>(offset)) && s.read(out, bytes) == bytes;
+    };
+    const auto archive = cpk::read_archive(static_cast<u64>(size), read);
+    if (!archive) return nx::err(archive.error());
+    const auto& a = *archive;
+
+    struct Totals {
+        usize files = 0, compressed = 0;
+        u64 stored = 0, extracted = 0;
+    };
+    Totals all;
+    nx::map<nx::string, Totals> by_extension;
+    nx::map<nx::string, usize> by_top_folder;
+    usize marker_mismatch = 0;
+    nx::vector<nx::string> rows;
+    for (const auto& f : a.files) {
+        for (Totals* t : {&all, &by_extension[extension_of(f.name)]}) {
+            ++t->files;
+            t->compressed += f.compressed();
+            t->stored += f.size;
+            t->extracted += f.extract_size;
+        }
+        const usize slash = f.folder.view().find('/');
+        ++by_top_folder[f.folder.empty() ? nx::string("(top)") : nx::string(f.folder.view().substr(0, slash))];
+        char magic[8] = {};
+        const bool marked = f.size >= 8 && read(f.offset, magic, 8) && nx::string_view(magic, 8) == "CRILAYLA";
+        marker_mismatch += marked != f.compressed();
+        if (list)
+            rows.push_back(nx::format("{}\t{}\t0x{:x}\t{}\t{}\t{}\n", f.path(), f.id ? nx::format("{}", *f.id) : nx::string("-"),
+                                      f.offset, f.size, f.extract_size, f.compressed() ? "CRILAYLA" : "stored"));
+    }
+    if (list) {
+        print("path\tid\toffset\tsize\textract_size\tstorage\n");
+        for (const auto& r : rows) print("{}", r);
+        return {};
+    }
+    print("file      {}\n", path.native());
+    print("container CPK, {} bytes, tool \"{}\", alignment {}\n", size, a.tool_version, a.align);
+    print("chunks    content 0x{:x}  TOC 0x{:x}  ITOC {}  ETOC {}  GTOC {}\n", a.content_offset, a.toc_offset,
+          hex_or_dash(static_cast<u32>(a.itoc_offset)), hex_or_dash(static_cast<u32>(a.etoc_offset)),
+          hex_or_dash(static_cast<u32>(a.gtoc_offset)));
+    print("header   ");
+    for (usize c = 0; c < a.header.columns.size(); ++c) {
+        const auto& col = a.header.columns[c];
+        if (col.storage == cpk::Storage::Zero) continue;
+        if (const auto v = a.header.integer(0, col.name)) print(" {}={}", col.name, *v);
+        else if (const auto t = a.header.text(0, col.name)) print(" {}=\"{}\"", col.name, *t);
+    }
+    print("\n");
+    print("files     {} listed ({} declared), {} compressed; {} bytes stored, {} extracted\n", all.files, a.declared_files,
+          all.compressed, all.stored, all.extracted);
+    print("check     {} files whose first bytes disagree with their stored size (CRILAYLA or not)\n", marker_mismatch);
+    print("by extension (files, compressed, stored, extracted)\n");
+    for (const auto& [ext, t] : by_extension)
+        print("  {:<12} {:>7} {:>7} {:>13} {:>13}\n", ext, t.files, t.compressed, t.stored, t.extracted);
+    print("by top folder (files)\n");
+    for (const auto& [folder, n] : by_top_folder) print("  {:<24} {}\n", folder, n);
+    return {};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     nx::string file, out;
     nx::vector<nx::string> dbs;
     bool no_default_db = false;
-    nx::cli::Parser cli("psvinfo", "Inspects Vita executables and modules (SELF or ELF), SFO files and NID databases.");
+    bool list = false;
+    nx::cli::Parser cli("psvinfo",
+                        "Inspects Vita executables and modules (SELF or ELF), SFO files, CPK archives and NID databases.");
     const auto with_db = [&](nx::cli::Command& c) -> nx::cli::Command& {
         return c.option_many("db", dbs, "NID database (.yml, .tsv, or a directory of them); repeatable", {.value_name = "PATH"})
             .flag("no-default-db", no_default_db, "do not load vita-headers' database");
@@ -312,6 +389,9 @@ int main(int argc, char** argv) {
                 .positional("file", file, "SELF, ELF or SFO file"));
     with_db(cli.command("imports", "imported functions and variables, with names (tab-separated)").positional("file", file, "SELF or ELF"));
     with_db(cli.command("exports", "exported functions and variables, with names (tab-separated)").positional("file", file, "SELF or ELF"));
+    cli.command("cpk", "a CPK archive's header and files: totals and by extension, or every file (tab-separated)")
+        .positional("file", file, "CPK archive")
+        .flag("list", list, "every file: path, ID, offset, stored and extracted size (tab-separated)");
     cli.command("relocs", "every relocation (tab-separated)").positional("file", file, "SELF or ELF");
     cli.command("elf", "write the ELF a SELF holds")
         .positional("file", file, "SELF")
@@ -327,6 +407,7 @@ int main(int argc, char** argv) {
     }
     const auto run = [&]() -> Result<void> {
         if (command == "relocs") return cmd_relocs(file);
+        if (command == "cpk") return cmd_cpk(file, list);
         if (command == "elf") return cmd_elf(file, out);
         if (command == "stubs") return cmd_stubs(file, out);
         Names names;
