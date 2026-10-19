@@ -7,6 +7,13 @@
 //
 //     sample_<name> <application folder> <data folder> <output folder> <frames> [timeout seconds] [audio seconds]
 //
+// With PSVRECORE_WINDOW=1 the sample is also shown in a window, its sound played on the audio device and the host's
+// controls given to it (psvrecore::platform); it then runs until the window is closed or the time is up, and
+// PSVRECORE_INPUT may script controls: items `<ms> <what> <args>` separated by ';', the time from the boot:
+//
+//     key <SDL key name> down|up         pad <SDL gamepad button> down|up      axis <SDL gamepad axis> <value>
+//     touch <x> <y> down|move|up (the screen's 960 x 544)                      shot <name> (the next frame to <name>.png)
+//
 // Built by tests/samples/CMakeLists.txt with the sample's and libc's generated code.
 
 #include <atomic>
@@ -14,8 +21,12 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <SDL3/SDL.h>
+
 #include "png.hpp"
 #include "psvrecore/gxm/hle.hpp"
+#include "psvrecore/platform/audio.hpp"
+#include "psvrecore/platform/window.hpp"
 #include "psvrecore/log.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "core/foundation/containers/hash_map.h"
@@ -36,24 +47,37 @@ extern const PsvModuleCode libfios2_module;
 
 namespace {
 
+void write_frame(const gxm::Frame& f, const nx::string& path) {
+    const u8* base = runtime::runtime().memory().host(f.address);
+    nx::vector<u8> rgba(usize{f.width} * f.height * 4);
+    for (u32 y = 0; y < f.height; ++y) {
+        std::memcpy(rgba.data() + usize{y} * f.width * 4, base + usize{y} * f.pitch * 4, usize{f.width} * 4);
+        for (u32 x = 0; x < f.width; ++x) rgba[(usize{y} * f.width + x) * 4 + 3] = 255;  // (the display ignores alpha)
+    }
+    if (!write_png(path.c_str(), f.width, f.height, rgba.data())) std::fprintf(stderr, "could not write %s\n", path.c_str());
+}
+
 class FrameWriter : public gxm::DisplaySink {
 public:
     nx::string folder;
     u32 wanted = 0;
     std::atomic<u32> shown{0};
+    gxm::DisplaySink* also = nullptr;  // (the window)
+    nx::mutex shot_lock;
+    nx::vector<nx::string> shots;  // (names of the next frames to write)
 
     void show(const gxm::Frame& f) override {
+        if (also) also->show(f);
+        {
+            nx::scoped_lock<nx::mutex> held(shot_lock);
+            if (!shots.empty()) {
+                write_frame(f, nx::format("{}/{}.png", folder, shots.front()));
+                shots.erase(shots.begin());
+            }
+        }
         const u32 n = shown.load();
         if (n >= wanted) return;
-        const u8* base = runtime::runtime().memory().host(f.address);
-        nx::vector<u8> rgba(usize{f.width} * f.height * 4);
-        for (u32 y = 0; y < f.height; ++y) {
-            std::memcpy(rgba.data() + usize{y} * f.width * 4, base + usize{y} * f.pitch * 4, usize{f.width} * 4);
-            for (u32 x = 0; x < f.width; ++x) rgba[(usize{y} * f.width + x) * 4 + 3] = 255;  // (the display ignores alpha)
-        }
-        const nx::string path = nx::format("{}/frame_{:03}.png", folder, n);
-        if (!write_png(path.c_str(), f.width, f.height, rgba.data()))
-            std::fprintf(stderr, "could not write %s\n", path.c_str());
+        write_frame(f, nx::format("{}/frame_{:03}.png", folder, n));
         shown.store(n + 1);
     }
 };
@@ -68,14 +92,20 @@ public:
     nx::mutex lock;
     nx::hash_map<u32, Track> tracks;
     std::atomic<u64> longest_ms{0};
+    runtime::AudioSink* also = nullptr;  // (the audio device)
 
     void play(const runtime::AudioBlock& b) override {
+        if (also) also->play(b);
         nx::scoped_lock<nx::mutex> held(lock);
         Track& t = tracks[b.port];
         t.rate = b.rate, t.channels = b.channels;
         t.samples.insert(t.samples.end(), b.samples.begin(), b.samples.end());
         const u64 ms = t.samples.size() / t.channels * 1000 / t.rate;
         if (ms > longest_ms.load()) longest_ms.store(ms);
+    }
+
+    void port_released(u32 port) override {
+        if (also) also->port_released(port);
     }
 
     void write(const nx::string& folder) {
@@ -104,6 +134,80 @@ public:
         }
     }
 };
+
+// A scripted control (PSVRECORE_INPUT), as an event the window takes like the host's.
+struct Scripted {
+    u64 at_ms = 0;
+    nx::string what, a, b, c;
+};
+
+nx::vector<Scripted> parse_script(const char* text) {
+    nx::vector<Scripted> items;
+    nx::string item;
+    auto flush = [&] {
+        char what[32] = {}, a[64] = {}, b[64] = {}, c[64] = {};
+        unsigned long long ms = 0;
+        if (std::sscanf(item.c_str(), " %llu %31s %63s %63s %63s", &ms, what, a, b, c) >= 2) {
+            Scripted s;
+            s.at_ms = ms, s.what = what, s.a = a, s.b = b, s.c = c;
+            items.push_back(s);
+        }
+        item.clear();
+    };
+    for (const char* p = text; *p; ++p) {
+        if (*p == ';') flush();
+        else item.push_back(*p);
+    }
+    flush();
+    return items;
+}
+
+void play_scripted(const Scripted& s, platform::Window& window, FrameWriter& frames) {
+    SDL_Event e{};
+    if (s.what == "key") {
+        e.type = s.b == "down" ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+        e.key.key = SDL_GetKeyFromName(s.a.c_str());
+        e.key.down = s.b == "down";
+    } else if (s.what == "pad") {
+        e.type = s.b == "down" ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+        e.gbutton.which = 0x7FFFFFFF;  // (a gamepad of the script's own)
+        e.gbutton.button = static_cast<u8>(SDL_GetGamepadButtonFromString(s.a.c_str()));
+        e.gbutton.down = s.b == "down";
+    } else if (s.what == "axis") {
+        e.type = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+        e.gaxis.which = 0x7FFFFFFF;
+        e.gaxis.axis = static_cast<u8>(SDL_GetGamepadAxisFromString(s.a.c_str()));
+        e.gaxis.value = static_cast<i16>(std::strtol(s.b.c_str(), nullptr, 10));
+    } else if (s.what == "touch") {
+        // (the screen's point in the window: where the picture is drawn)
+        int w = 0, h = 0;
+        SDL_GetWindowSize(window.sdl(), &w, &h);
+        const f32 scale =
+            std::min(static_cast<f32>(w) / platform::kScreenWidth, static_cast<f32>(h) / platform::kScreenHeight);
+        const f32 x = (static_cast<f32>(w) - platform::kScreenWidth * scale) / 2 + std::strtof(s.a.c_str(), nullptr) * scale;
+        const f32 y = (static_cast<f32>(h) - platform::kScreenHeight * scale) / 2 + std::strtof(s.b.c_str(), nullptr) * scale;
+        if (s.c == "move") {
+            e.type = SDL_EVENT_MOUSE_MOTION;
+            e.motion.which = 1;
+            e.motion.x = x, e.motion.y = y;
+        } else {
+            e.type = s.c == "up" ? SDL_EVENT_MOUSE_BUTTON_UP : SDL_EVENT_MOUSE_BUTTON_DOWN;
+            e.button.which = 1;
+            e.button.button = SDL_BUTTON_LEFT;
+            e.button.down = s.c != "up";
+            e.button.x = x, e.button.y = y;
+        }
+    } else if (s.what == "shot") {
+        nx::scoped_lock<nx::mutex> held(frames.shot_lock);
+        frames.shots.push_back(s.a);
+        return;
+    } else {
+        std::fprintf(stderr, "PSVRECORE_INPUT: what is '%s'?\n", s.what.c_str());
+        return;
+    }
+    e.common.timestamp = SDL_GetTicksNS();
+    SDL_PushEvent(&e);
+}
 
 }  // namespace
 
@@ -135,6 +239,32 @@ int main(int argc, char** argv) {
     gxm_options.display = &frames;
     gxm_options.device.validation = true;
 
+    // The window, the audio device and the controls (PSVRECORE_WINDOW=1).
+    std::unique_ptr<platform::Window> window;
+    std::unique_ptr<platform::AudioDevice> speaker;
+    nx::vector<Scripted> script;
+    if (auto w = nx::os::environment_variable("PSVRECORE_WINDOW"); w && *w == "1") {
+        platform::Window::Options options;
+        options.title = "psvrecore sample";
+        options.validation = gxm_options.device.validation;
+        if (auto title = nx::os::environment_variable("PSVRECORE_TITLE")) options.title = *title;
+        auto opened = platform::Window::open(options);
+        if (!opened) {
+            std::fprintf(stderr, "no window: %s\n", opened.error().message.c_str());
+            return 2;
+        }
+        window = std::move(*opened);
+        frames.also = window.get();
+        gxm_options.shared_device = window->device();
+        if (auto device = platform::AudioDevice::open()) {
+            speaker = std::move(*device);
+            audio.also = speaker.get();
+        } else {
+            std::fprintf(stderr, "no sound: %s\n", device.error().message.c_str());
+        }
+        if (auto text = nx::os::environment_variable("PSVRECORE_INPUT")) script = parse_script(text->c_str());
+    }
+
     Runtime::Config config;
     config.files.mounts.push_back({"app0", argv[1], false});
     config.files.mounts.push_back({"ux0", argv[2], true});
@@ -159,17 +289,36 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // Until the frames are shown and the audio played, the sample exits, or the time is up.
-    const u64 give_up = nx::os::ticks_ns() + timeout_s * 1'000'000'000ull;
+    // Until the frames are shown and the audio played, the sample exits, or the time is up (with a window: until it
+    // is closed, the sample exits, or the time is up).
+    const u64 booted = nx::os::ticks_ns();
+    const u64 give_up = booted + timeout_s * 1'000'000'000ull;
     auto done = [&] { return frames.shown.load() >= frames.wanted && audio.longest_ms.load() >= audio_ms; };
-    while (!rt.exited() && !done() && nx::os::ticks_ns() < give_up)
-        nx::this_thread::sleep_for(std::chrono::milliseconds(5));
+    usize next_scripted = 0;
+    bool closed = false;
+    while (!rt.exited() && nx::os::ticks_ns() < give_up) {
+        if (!window) {
+            if (done()) break;
+            nx::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        const u64 ms = (nx::os::ticks_ns() - booted) / 1'000'000;
+        while (next_scripted < script.size() && script[next_scripted].at_ms <= ms)
+            play_scripted(script[next_scripted++], *window, frames);
+        if (!window->pump(&rt, 5)) {
+            closed = true;
+            break;
+        }
+    }
     std::fflush(stdout);
     audio.write(frames.folder);
     const u32 shown = frames.shown.load();
     const nx::string exit_text = rt.exited() ? nx::format(", exit code {}", rt.exit_code()) : nx::string();
     std::fprintf(stderr, "%u frame(s) shown, %llu ms of audio%s\n", shown,
                  static_cast<unsigned long long>(audio.longest_ms.load()), exit_text.c_str());
+    if (window)
+        std::fprintf(stderr, "window: %llu frame(s) presented%s\n", static_cast<unsigned long long>(window->presented()),
+                     closed ? ", closed" : "");
     std::fflush(stderr);
     // (guest threads are not waited for: the process ends here)
     std::_Exit(done() || (rt.exited() && rt.exit_code() == 0) ? 0 : 3);

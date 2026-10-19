@@ -202,6 +202,10 @@ def main():
     parser.add_argument("--timeout", type=int, default=120, help="seconds a sample may take")
     parser.add_argument("--log", help="the runtime's log level (PSVRECORE_LOG: debug, info, warn, error)")
     parser.add_argument("--no-build", action="store_true", help="run what was built last time")
+    parser.add_argument("--window", action="store_true",
+                        help="also show the sample in a window, play its sound and give it the host's controls, until "
+                             "the window is closed or the timeout")
+    parser.add_argument("--input", help="scripted controls with --window (PSVRECORE_INPUT; see tests/samples/runner.cpp)")
     args = parser.parse_args()
     if not args.sdk:
         raise SystemExit("give --sdk (or set SCE_PSP2_SDK_DIR)")
@@ -261,6 +265,11 @@ def main():
         run_env = dict(os.environ)
         if args.log:
             run_env["PSVRECORE_LOG"] = args.log
+        if args.window:
+            run_env["PSVRECORE_WINDOW"] = "1"
+            run_env["PSVRECORE_TITLE"] = name
+            if args.input:
+                run_env["PSVRECORE_INPUT"] = args.input
         try:
             result = subprocess.run([runner, work / "app", data, frames, str(wanted), str(args.timeout),
                                      str(args.audio_seconds)],

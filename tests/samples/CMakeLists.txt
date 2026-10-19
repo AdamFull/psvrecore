@@ -32,7 +32,7 @@ function(psvrecore_add_sample)
 
     add_executable(sample_${P_NAME} "${_sample_src}/runner.cpp" "${_sample_src}/png.cpp")
     target_compile_definitions(sample_${P_NAME} PRIVATE PSVRECORE_SAMPLE_MODULE=sample_${P_NAME}_module)
-    target_link_libraries(sample_${P_NAME} PRIVATE psvrecore::runtime psvrecore::gxm_hle psvrecore_sample_${P_NAME}_code
+    target_link_libraries(sample_${P_NAME} PRIVATE psvrecore::runtime psvrecore::gxm_hle psvrecore::platform psvrecore_sample_${P_NAME}_code
                                                   psvrecore_sample_libc psvrecore_sample_libfios2 nx::foundation)
     psvrecore_target_defaults(sample_${P_NAME})
 endfunction()
