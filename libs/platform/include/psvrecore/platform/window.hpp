@@ -48,7 +48,7 @@ public:
         f32 controls_scale = 1.0f;
     };
 
-    static Result<std::unique_ptr<Window>> open(const Options& options);
+    static Result<nx::unique_ptr<Window>> open(const Options& options);
     ~Window() override;
     Window(const Window&) = delete;
     Window& operator=(const Window&) = delete;
@@ -90,6 +90,8 @@ public:
 
 private:
     struct Presenter;
+    template <typename T, typename... Args>
+    friend nx::unique_ptr<T> nx::make_unique(Args&&...);
     Window() = default;
     void update_view();
     void update_overlay();
@@ -98,7 +100,7 @@ private:
     Options options_;
     InputMapper input_;
     nx::vector<SDL_Gamepad*> gamepads_;
-    std::unique_ptr<Presenter> presenter_;
+    nx::unique_ptr<Presenter> presenter_;
     std::atomic<u64> presented_{0};
     bool closed_ = false;
     u64 overlay_version_ = 0;

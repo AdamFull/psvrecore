@@ -52,7 +52,6 @@ struct Capabilities {
 class Device {
 public:
     static Result<nx::unique_ptr<Device>> create(const DeviceOptions& options = {});
-    Device() = default;  // (empty: create() makes them)
     ~Device();
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
@@ -88,6 +87,9 @@ public:
     static Result<nx::vector<nx::string>> list();
 
 private:
+    template <typename T, typename... Args>
+    friend nx::unique_ptr<T> nx::make_unique(Args&&...);
+    Device() = default;  // (empty: create() makes them)
     static VKAPI_ATTR VkBool32 VKAPI_CALL on_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                      VkDebugUtilsMessageTypeFlagsEXT types,
                                                      const VkDebugUtilsMessengerCallbackDataEXT* data, void* user);

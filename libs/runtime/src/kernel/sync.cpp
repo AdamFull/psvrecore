@@ -36,7 +36,7 @@ Uid Kernel::create_semaphore(nx::string_view name, u32 attr, i32 init, i32 max) 
     Lock guard(impl_->lock);
     if (max <= 0 || init < 0 || init > max) return err::kIllegalCount;
     if (impl_->sync_count >= kMaxSyncObjects) return err::kUidOverflow;
-    auto s = std::make_unique<Semaphore>();
+    auto s = nx::make_unique<Semaphore>();
     s->count = s->init = init;
     s->max = max;
     s->waiters.by_priority = attr & kAttrThreadPriority;
@@ -143,7 +143,7 @@ i32 Kernel::semaphore_info(Uid uid, Semaphore* out, u32* waiting) {
 Uid Kernel::create_event_flag(nx::string_view name, u32 attr, u32 pattern) {
     Lock guard(impl_->lock);
     if (impl_->sync_count >= kMaxSyncObjects) return err::kUidOverflow;
-    auto e = std::make_unique<EventFlag>();
+    auto e = nx::make_unique<EventFlag>();
     e->pattern = e->init = pattern;
     e->waiters.by_priority = attr & kAttrThreadPriority;
     ++impl_->sync_count;
@@ -305,7 +305,7 @@ Uid Kernel::create_mutex(nx::string_view name, u32 attr, i32 init, ObjectClass c
     Lock guard(impl_->lock);
     if (init < 0 || (init > 1 && !(attr & 0x2))) return cls == ObjectClass::LwMutex ? err::kIllegalCount : err::kIllegalCount;
     if (impl_->sync_count >= kMaxSyncObjects) return err::kUidOverflow;
-    auto m = std::make_unique<Mutex>(cls);
+    auto m = nx::make_unique<Mutex>(cls);
     m->init = init;
     m->waiters.by_priority = attr & kAttrThreadPriority;
     m->work = work;
@@ -453,7 +453,7 @@ Uid Kernel::create_cond(nx::string_view name, u32 attr, Uid mutex, ObjectClass c
     const ObjectClass mutex_cls = cls == ObjectClass::LwCond ? ObjectClass::LwMutex : ObjectClass::Mutex;
     if (!impl_->get<Mutex>(mutex, mutex_cls)) return unknown_mutex(mutex_cls);
     if (impl_->sync_count >= kMaxSyncObjects) return err::kUidOverflow;
-    auto c = std::make_unique<Cond>(cls);
+    auto c = nx::make_unique<Cond>(cls);
     c->mutex = mutex;
     c->waiters.by_priority = attr & kAttrThreadPriority;
     c->work = work;
@@ -556,7 +556,7 @@ Uid Kernel::create_callback(nx::string_view name, u32 attr, u32 function, u32 co
     if (!self) return err::kIllegalContext;
     if (!function) return err::kInvalidArgument;
     if (impl_->sync_count >= kMaxSyncObjects) return err::kUidOverflow;
-    auto cb = std::make_unique<Callback>();
+    auto cb = nx::make_unique<Callback>();
     cb->thread = self;
     cb->function = function;
     cb->common = common;

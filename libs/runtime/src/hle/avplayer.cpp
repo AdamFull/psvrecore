@@ -105,7 +105,7 @@ struct Player {
     u64 file_size = 0;
     u32 bounce = 0, bounce_size = 0;  // (guest memory for the replacement's reads)
     PsvContext* ctx = nullptr;        // (the calling thread, for the guest's callbacks)
-    std::unique_ptr<media::Movie> movie;
+    nx::unique_ptr<media::Movie> movie;
     nx::vector<bool> enabled;
     i32 video = -1, audio = -1;  // (the enabled streams played)
 
@@ -219,7 +219,7 @@ i32 open_source(Player& p, const nx::string& path) {
         close_source(p);
         return kNotSupported;
     }
-    p.movie = std::make_unique<media::Movie>(std::move(*movie));
+    p.movie = nx::make_unique<media::Movie>(std::move(*movie));
     p.enabled.assign(p.movie->tracks.size(), false);
     p.video = p.audio = -1;
     return 0;

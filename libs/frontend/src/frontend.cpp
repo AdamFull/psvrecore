@@ -359,7 +359,7 @@ int run(const Game& game, int argc, char** argv) {
     window_options.controls_scale = s.controls_scale;
     auto window = platform::Window::open(window_options);
     if (!window) return fail(window.error().message, cl.hidden);
-    std::unique_ptr<platform::AudioDevice> speaker;
+    nx::unique_ptr<platform::AudioDevice> speaker;
     if (s.audio) {
         platform::AudioDevice::Options audio_options;
         audio_options.max_latency_ms = s.audio_latency_ms;

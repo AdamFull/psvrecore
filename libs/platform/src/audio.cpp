@@ -7,9 +7,9 @@
 
 namespace psvrecore::platform {
 
-Result<std::unique_ptr<AudioDevice>> AudioDevice::open(const Options& options) {
+Result<nx::unique_ptr<AudioDevice>> AudioDevice::open(const Options& options) {
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) return failure(nx::format("audio: SDL: {}", SDL_GetError()));
-    std::unique_ptr<AudioDevice> d(new AudioDevice());
+    nx::unique_ptr<AudioDevice> d = nx::make_unique<AudioDevice>();
     d->options_ = options;
     const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, static_cast<int>(options.rate)};
     d->device_ = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec);

@@ -24,8 +24,8 @@ public:
     };
 
     // Opens the default playback device (initializing SDL's audio).
-    static Result<std::unique_ptr<AudioDevice>> open(const Options& options);
-    static Result<std::unique_ptr<AudioDevice>> open() { return open(Options{}); }
+    static Result<nx::unique_ptr<AudioDevice>> open(const Options& options);
+    static Result<nx::unique_ptr<AudioDevice>> open() { return open(Options{}); }
     ~AudioDevice() override;
     AudioDevice(const AudioDevice&) = delete;
     AudioDevice& operator=(const AudioDevice&) = delete;
@@ -39,6 +39,8 @@ public:
     u32 queued(u32 port);
 
 private:
+    template <typename T, typename... Args>
+    friend nx::unique_ptr<T> nx::make_unique(Args&&...);
     AudioDevice() = default;
     struct Port {
         SDL_AudioStream* stream = nullptr;

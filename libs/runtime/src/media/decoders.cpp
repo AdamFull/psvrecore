@@ -81,7 +81,7 @@ struct H264Decoder::State {
     }
 };
 
-H264Decoder::H264Decoder() : s_(std::make_unique<State>()) {}
+H264Decoder::H264Decoder() : s_(nx::make_unique<State>()) {}
 H264Decoder::~H264Decoder() = default;
 
 bool H264Decoder::open(std::span<const u8> avcc) {
@@ -187,7 +187,7 @@ struct AacDecoder::State {
     }
 };
 
-AacDecoder::AacDecoder() : s_(std::make_unique<State>()) {}
+AacDecoder::AacDecoder() : s_(nx::make_unique<State>()) {}
 AacDecoder::~AacDecoder() = default;
 
 bool AacDecoder::open(std::span<const u8> config) {

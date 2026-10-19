@@ -251,7 +251,7 @@ i32 resolve_priority(i32 priority) {
 // ---- Kernel
 
 Kernel::Kernel(GuestMemory& memory, const Config& config)
-    : impl_(std::make_unique<Impl>(*this, memory, config)), memory_(memory) {
+    : impl_(nx::make_unique<Impl>(*this, memory, config)), memory_(memory) {
     Lock guard(impl_->lock);
     for (u32 i = 0; i < 4; ++i) impl_->spawn_worker();
     // (until they run: the first guest threads should not wait for OS threads to start either)
@@ -369,7 +369,7 @@ bool Kernel::shutdown_complete() const {
 
 Uid Kernel::adopt_host_thread(nx::string_view name, i32 priority, u32 stack_size) {
     Lock guard(impl_->lock);
-    auto t = std::make_unique<Thread>();
+    auto t = nx::make_unique<Thread>();
     t->init_priority = t->priority = priority;
     t->stack_size = stack_size;
     t->stack = memory_.map_anywhere(impl_->config.stack_region, stack_size, GuestMemory::kPageSize, Access::ReadWrite,

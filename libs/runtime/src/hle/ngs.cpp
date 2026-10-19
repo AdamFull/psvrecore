@@ -131,7 +131,7 @@ struct Voice {
     u32 handle = 0;
     Rack* rack = nullptr;
     u32 index = 0;
-    std::vector<std::unique_ptr<Module>> modules;
+    std::vector<nx::unique_ptr<Module>> modules;
     std::vector<u32> areas;       // guest parameter area of each module
     std::vector<u32> area_iface;  // the interface each area is in
     std::vector<bool> locked;
@@ -164,7 +164,7 @@ struct Rack {
     i32 channels = 1, max_patches_per_input = 1, patches_per_output = 1;
     u32 user_release_data = 0;
     u32 error_callback = 0;
-    std::vector<std::unique_ptr<Voice>> voices;
+    std::vector<nx::unique_ptr<Voice>> voices;
     bool releasing = false;
     u32 release_callback = 0;
 };
@@ -192,9 +192,9 @@ struct Ngs {
     u32 error_callback = 0;
     bool user_locked = false;
     u32 voice_count = 0;
-    std::vector<std::unique_ptr<Rack>> racks;
+    std::vector<nx::unique_ptr<Rack>> racks;
     nx::flat_hash_map<u32, Voice*> voices;
-    nx::flat_hash_map<u32, std::unique_ptr<Patch>> patches;
+    nx::flat_hash_map<u32, nx::unique_ptr<Patch>> patches;
     u32 definitions[kDefinitionCount] = {};
 };
 
@@ -321,7 +321,7 @@ void reset_modules(Ngs& n, Voice& v) {
 // The parameters the guest wrote in a module's area take effect at the next update.
 i32 queue_change(Ngs& n, Voice& v, u32 m) {
     Module& mod = *v.modules[m];
-    std::unique_ptr<Module> probe = make_module(mod.type(), static_cast<u32>(v.rack->channels));
+    nx::unique_ptr<Module> probe = make_module(mod.type(), static_cast<u32>(v.rack->channels));
     probe->load(memory().host(v.areas[m]), v.area_iface[m]);
     const u32 stride = probe->interface_size();
     if (n.flags & 1) {
@@ -347,7 +347,7 @@ i32 queue_change(Ngs& n, Voice& v, u32 m) {
 bool switch_area(Voice& v, u32 m, u32 iface) {
     if (v.area_iface[m] == iface) return true;
     Module& mod = *v.modules[m];
-    std::unique_ptr<Module> probe = make_module(mod.type(), static_cast<u32>(v.rack->channels));
+    nx::unique_ptr<Module> probe = make_module(mod.type(), static_cast<u32>(v.rack->channels));
     probe->load(memory().host(v.areas[m]), v.area_iface[m]);
     if (!probe->select_interface(iface)) return false;
     std::memcpy(memory().host(v.areas[m]), probe->params(), probe->params_bytes());
@@ -377,7 +377,7 @@ i32 apply_block(Ngs& n, Voice& v, u32 address, u32 size, i32* errors) {
         else if (!switch_area(v, m, desc[0])) r = nerr::kParamTypeMismatch;
         if (r == 0) {
             Module& mod = *v.modules[m];
-            std::unique_ptr<Module> probe = make_module(mod.type(), static_cast<u32>(v.rack->channels));
+            nx::unique_ptr<Module> probe = make_module(mod.type(), static_cast<u32>(v.rack->channels));
             probe->load(memory().host(v.areas[m]), v.area_iface[m]);
             const u32 stride = probe->interface_size();
             if (desc[1] != stride) {
@@ -837,7 +837,7 @@ i32 sceNgsRackInit(u32 system, Ptr<const BufferInfo> buffer, Ptr<const RackDescr
         n.voice_count + static_cast<u32>(d.voices) > static_cast<u32>(n.params.max_voices))
         return nerr::kOutOfAssets;
 
-    auto rack = std::make_unique<Rack>();
+    auto rack = nx::make_unique<Rack>();
     Rack& r = *rack;
     r.handle = b.data;
     r.size = need;
@@ -850,7 +850,7 @@ i32 sceNgsRackInit(u32 system, Ptr<const BufferInfo> buffer, Ptr<const RackDescr
     const u32 g = static_cast<u32>(n.params.granularity);
     u32 at = b.data + kRackHeader;
     for (i32 i = 0; i < d.voices; ++i) {
-        auto voice = std::make_unique<Voice>();
+        auto voice = nx::make_unique<Voice>();
         Voice& v = *voice;
         v.handle = at;
         v.rack = &r;
@@ -1125,7 +1125,7 @@ i32 sceNgsPatchCreateRouting(Ptr<const PatchSetup> setup, Ptr<u32> handle) {
     if (dst->rack->max_patches_per_input > 0 && into >= static_cast<u32>(dst->rack->max_patches_per_input))
         return nerr::kPatchNotAvail;
 
-    auto patch = std::make_unique<Patch>();
+    auto patch = nx::make_unique<Patch>();
     Patch& p = *patch;
     // (the patch's slot: after the voice's parameter areas)
     u32 slots = src->handle + kVoiceHeader;

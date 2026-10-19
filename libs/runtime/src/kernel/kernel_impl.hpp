@@ -28,7 +28,7 @@ struct Kernel::Impl {
     Config config;
 
     nx::mutex lock;
-    nx::flat_hash_map<Uid, std::unique_ptr<kernel::Object>> objects;  // (std: one owner type for every class)
+    nx::flat_hash_map<Uid, nx::unique_ptr<kernel::Object>> objects;
     nx::flat_hash_map<u32, Uid> lw_objects;  // lightweight mutexes and condition variables by work area
     u32 uid_counter = 0;
     u32 thread_count = 0;
@@ -71,7 +71,7 @@ struct Kernel::Impl {
     }
     kernel::Thread* thread(Uid uid);  // 0: the calling thread
     template <class T>
-    T* add(std::unique_ptr<T> object, nx::string_view name, u32 attr) {
+    T* add(nx::unique_ptr<T> object, nx::string_view name, u32 attr) {
         T* raw = object.get();
         raw->uid = new_uid();
         raw->name = nx::string(name);

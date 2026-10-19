@@ -154,7 +154,7 @@ protected:
 u32 preset_count(u32 type);
 bool preset(u32 type, u32 index, u8* out, u32 size);
 
-std::unique_ptr<Module> make_module(u32 type, u32 channels);
+nx::unique_ptr<Module> make_module(u32 type, u32 channels);
 
 // ---- what the voice graph calls on particular modules
 

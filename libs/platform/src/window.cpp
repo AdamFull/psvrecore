@@ -102,7 +102,7 @@ struct Window::Presenter {
 
     // The drawing (made with the device), the overlay's quads and its sprites (set from the thread pumping events,
     // under `lock`), and the atlas as an image (the presenting thread's).
-    std::unique_ptr<QuadRenderer> quads;
+    nx::unique_ptr<QuadRenderer> quads;
     nx::vector<Quad> overlay, overlay_drawn;
     nx::vector<u8> atlas_upload;  // (taken from atlas_pixels by the presenting thread)
     u32 atlas_upload_w = 0, atlas_upload_h = 0;
@@ -166,7 +166,7 @@ struct Window::Presenter {
             if (VkResult r = vkCreateSemaphore(d, &si, nullptr, &f.acquired); r != VK_SUCCESS)
                 return nx::err(vulkan::vk_error("vkCreateSemaphore", r));
         }
-        quads = std::make_unique<QuadRenderer>(*device);
+        quads = nx::make_unique<QuadRenderer>(*device);
         thread = nx::thread([this] { run(); });
         return {};
     }
@@ -534,10 +534,10 @@ struct Window::Presenter {
     }
 };
 
-Result<std::unique_ptr<Window>> Window::open(const Options& options) {
+Result<nx::unique_ptr<Window>> Window::open(const Options& options) {
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
         return failure(nx::format("display: SDL: {}", SDL_GetError()));
-    std::unique_ptr<Window> w(new Window());
+    nx::unique_ptr<Window> w = nx::make_unique<Window>();
     w->options_ = options;
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (options.fullscreen) flags |= SDL_WINDOW_FULLSCREEN;
@@ -564,7 +564,7 @@ Result<std::unique_ptr<Window>> Window::open(const Options& options) {
     device_options.surface_user = w->window_;
     auto device = vulkan::Device::create(device_options);
     if (!device) return failure(nx::format("display: {}", device.error().message));  // (the destructor closes it)
-    w->presenter_ = std::make_unique<Presenter>(*w);
+    w->presenter_ = nx::make_unique<Presenter>(*w);
     w->presenter_->device = std::move(*device);
     w->presenter_->vsync = options.vsync;
     w->presenter_->smooth = options.smooth;

@@ -155,7 +155,7 @@ Uid Kernel::create_thread(nx::string_view name, u32 entry, i32 priority, u32 sta
     if (!entry) return err::kInvalidArgument;
     if (impl_->thread_count >= kMaxThreads) return err::kUidOverflow;
 
-    auto t = std::make_unique<Thread>();
+    auto t = nx::make_unique<Thread>();
     t->entry = entry;
     t->init_priority = t->priority = resolved;
     t->init_affinity = t->affinity = affinity;

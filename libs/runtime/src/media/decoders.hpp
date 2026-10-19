@@ -42,7 +42,7 @@ public:
 
 private:
     struct State;
-    std::unique_ptr<State> s_;
+    nx::unique_ptr<State> s_;
 };
 
 class AacDecoder {
@@ -61,7 +61,7 @@ public:
 
 private:
     struct State;
-    std::unique_ptr<State> s_;
+    nx::unique_ptr<State> s_;
 };
 
 }  // namespace psvrecore::runtime::media

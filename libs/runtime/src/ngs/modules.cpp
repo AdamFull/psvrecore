@@ -1568,7 +1568,7 @@ bool preset(u32 type, u32 index, u8* out, u32 size) {
         std::memcpy(out, &q, sizeof q);
         return true;
     }
-    std::unique_ptr<Module> m = make_module(type, 1);
+    nx::unique_ptr<Module> m = make_module(type, 1);
     m->defaults();
     std::memcpy(out, m->params(), need);
     if (type == kDelay && index > 0) {
@@ -1586,23 +1586,23 @@ bool preset(u32 type, u32 index, u8* out, u32 size) {
     return true;
 }
 
-std::unique_ptr<Module> make_module(u32 type, u32 channels) {
-    std::unique_ptr<Module> m;
+nx::unique_ptr<Module> make_module(u32 type, u32 channels) {
+    nx::unique_ptr<Module> m;
     switch (type) {
-        case kPlayer: m = std::make_unique<Player>(type, channels); break;
-        case kAt9Player: m = std::make_unique<At9Player>(type, channels); break;
-        case kGenerator: m = std::make_unique<Generator>(type, channels); break;
-        case kMixer: m = std::make_unique<Mixer>(type, channels); break;
-        case kPauser: m = std::make_unique<Pauser>(type, channels); break;
-        case kEnvelope: m = std::make_unique<Envelope>(type, channels); break;
-        case kFilter: m = std::make_unique<Filter>(type, channels); break;
-        case kParamEq: m = std::make_unique<ParamEq>(type, channels); break;
-        case kDistortion: m = std::make_unique<Distortion>(type, channels); break;
-        case kCompressor: m = std::make_unique<Compressor>(type, channels); break;
-        case kDelay: m = std::make_unique<Delay>(type, channels); break;
-        case kPitchShift: m = std::make_unique<PitchShift>(type, channels); break;
-        case kReverb: m = std::make_unique<Reverb>(type, channels); break;
-        default: m = std::make_unique<Module>(type, channels); break;  // (input mixer, output)
+        case kPlayer: m = nx::make_unique<Player>(type, channels); break;
+        case kAt9Player: m = nx::make_unique<At9Player>(type, channels); break;
+        case kGenerator: m = nx::make_unique<Generator>(type, channels); break;
+        case kMixer: m = nx::make_unique<Mixer>(type, channels); break;
+        case kPauser: m = nx::make_unique<Pauser>(type, channels); break;
+        case kEnvelope: m = nx::make_unique<Envelope>(type, channels); break;
+        case kFilter: m = nx::make_unique<Filter>(type, channels); break;
+        case kParamEq: m = nx::make_unique<ParamEq>(type, channels); break;
+        case kDistortion: m = nx::make_unique<Distortion>(type, channels); break;
+        case kCompressor: m = nx::make_unique<Compressor>(type, channels); break;
+        case kDelay: m = nx::make_unique<Delay>(type, channels); break;
+        case kPitchShift: m = nx::make_unique<PitchShift>(type, channels); break;
+        case kReverb: m = nx::make_unique<Reverb>(type, channels); break;
+        default: m = nx::make_unique<Module>(type, channels); break;  // (input mixer, output)
     }
     m->defaults();
     return m;
