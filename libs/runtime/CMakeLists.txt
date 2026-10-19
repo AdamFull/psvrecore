@@ -34,4 +34,13 @@ endif()
 add_library(psvrecore::runtime ALIAS psvrecore_runtime)
 target_include_directories(psvrecore_runtime PUBLIC include)
 target_link_libraries(psvrecore_runtime PUBLIC psvrecore::recomp_support psvrecore::analysis)
+
+# LibAtrac9 (github.com/Thealexbarney/LibAtrac9, MIT, submodule in third_party/LibAtrac9): the ATRAC9 decoder of
+# NGS's ATRAC9 player.
+file(GLOB PSVRECORE_LIBATRAC9_SOURCES CONFIGURE_DEPENDS "${PSVRECORE_DIR}/third_party/LibAtrac9/C/src/*.c")
+add_library(psvrecore_libatrac9 STATIC ${PSVRECORE_LIBATRAC9_SOURCES})
+target_include_directories(psvrecore_libatrac9 SYSTEM PUBLIC "${PSVRECORE_DIR}/third_party/LibAtrac9/C/src")
+# (its header declares the functions for a DLL under MSVC-style compilers; as a static library they are defined here)
+target_compile_definitions(psvrecore_libatrac9 PUBLIC COMPILING_DLL)
+target_link_libraries(psvrecore_runtime PRIVATE psvrecore_libatrac9)
 psvrecore_target_defaults(psvrecore_runtime)

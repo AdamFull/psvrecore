@@ -7,6 +7,8 @@
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
+#include "core/foundation/platform/filesystem.h"
+#include "core/foundation/platform/os.h"
 
 using namespace psvrecore;
 using namespace psvrecore::runtime;
@@ -527,4 +529,133 @@ TEST_CASE("ngs: a generated tone, and a low-pass EQ on the send taking it away")
     REQUIRE(call32(ctx, kSceNgs, kBypass, {voice, 6, 0}) == 0);
     const f64 filtered = rms();
     CHECK(filtered < open / 100);
+}
+
+namespace {
+
+// A RIFF chunk's data in a file, or empty.
+std::span<const u8> riff_chunk(const nx::vector<u8>& file, const char* id) {
+    for (usize at = 12; at + 8 <= file.size();) {
+        u32 size;
+        std::memcpy(&size, file.data() + at + 4, 4);
+        if (std::memcmp(file.data() + at, id, 4) == 0 && at + 8 + size <= file.size())
+            return std::span<const u8>(file.data() + at + 8, size);
+        at += 8 + size + (size & 1);
+    }
+    return {};
+}
+
+nx::vector<u8> read_file(const nx::string& path) {
+    nx::vector<u8> out;
+    if (auto data = nx::fs::file_read(nx::fs::path_view(path))) out.assign(data->data(), data->data() + data->size());
+    return out;
+}
+
+}  // namespace
+
+// ATRAC9 data made by the SDK's at9tool (an encoding of a test signal, and at9tool's own decoding of it as the
+// reference) is SDK output: it is made locally by scripts/at9_check.py, which runs this test with
+// PSVRECORE_AT9_DIR naming its folder. Without it there is nothing to check.
+TEST_CASE("ngs: ATRAC9 voices play what at9tool decodes, from the start and from a seek") {
+    const auto dir = nx::os::environment_variable("PSVRECORE_AT9_DIR");
+    if (!dir) {
+        std::printf("(PSVRECORE_AT9_DIR not set: no ATRAC9 data to check)\n");
+        return;
+    }
+    auto entries = nx::fs::directory_entries(nx::fs::path_view(*dir));
+    REQUIRE(entries.has_value());
+    u32 checked = 0;
+    for (const auto& e : *entries) {
+        const nx::string path(e.path);
+        if (path.size() < 4 || path.substr(path.size() - 4) != ".at9") continue;
+        const nx::vector<u8> at9 = read_file(path);
+        const nx::vector<u8> wav = read_file(path.substr(0, path.size() - 4) + ".wav");
+        const auto fmt = riff_chunk(at9, "fmt "), fact = riff_chunk(at9, "fact"), data = riff_chunk(at9, "data");
+        const auto ref_fmt = riff_chunk(wav, "fmt "), ref = riff_chunk(wav, "data");
+        REQUIRE(fmt.size() >= 48);
+        REQUIRE(fact.size() >= 4);
+        REQUIRE(!ref.empty());
+        u16 channels;
+        i32 config, total;
+        std::memcpy(&channels, fmt.data() + 2, 2);
+        std::memcpy(&config, fmt.data() + 44, 4);
+        std::memcpy(&total, fact.data(), 4);
+        u16 ref_channels;
+        std::memcpy(&ref_channels, ref_fmt.data() + 2, 2);
+        REQUIRE(ref_channels == channels);
+        const u32 ref_frames = static_cast<u32>(ref.size() / (2 * channels));
+
+        for (const i32 seek : {0, 48000}) {
+            TestRuntime t;
+            PsvContext* ctx = t.ctx();
+            Ngs ngs(ctx);
+            const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+            const u32 voice = ngs.rack(0x14EF65A0 /* sceNgsVoiceDefGetAtrac9Voice */, 1, channels)[0];
+            REQUIRE(ngs.patch(voice, master) == 0);
+            const i32 count = nx::min<i32>(total - seek, 96000);
+            const u32 skip = scratch(16);
+            REQUIRE(call32(ctx, kSceNgs, 0x2A9FA501, {u(seek), u(count), u(config), skip}) == 0);
+            i32 offset, bytes;
+            i16 start_skip, end_skip;
+            std::memcpy(&offset, t.rt.memory().host(skip), 4);
+            std::memcpy(&bytes, t.rt.memory().host(skip + 4), 4);
+            std::memcpy(&start_skip, t.rt.memory().host(skip + 8), 2);
+            std::memcpy(&end_skip, t.rt.memory().host(skip + 10), 2);
+            REQUIRE(offset + bytes <= static_cast<i32>(data.size()));
+            const u32 buffer = aligned(static_cast<u32>(bytes));
+            std::memcpy(t.rt.memory().host(buffer), data.data() + offset, static_cast<usize>(bytes));
+            struct At9Params {
+                u32 id, size;
+                struct {
+                    u32 buffer;
+                    i32 bytes;
+                    i16 loop_count, next, discard_start, discard_end;
+                } buffs[4];
+                f32 frequency, scalar;
+                i32 lead_in, limit;
+                i8 channels;
+                i8 map[2];
+                i8 reserved;
+                i32 config;
+            } p{};
+            static_assert(sizeof(At9Params) == 96);
+            p.id = 0x01015CAA;
+            p.size = sizeof p;
+            for (auto& b : p.buffs) b = {0, 0, 0, -1, 0, 0};
+            p.buffs[0] = {buffer, bytes, 0, -1, start_skip, end_skip};
+            p.frequency = 48000.0f;
+            p.scalar = 1.0f;
+            p.channels = static_cast<i8>(channels);
+            p.map[0] = 0;
+            p.map[1] = channels == 2 ? 1 : 0;
+            p.config = config;
+            REQUIRE(set_params(ctx, voice, 0, p) == 0);
+            REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+            REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+            nx::vector<i16> got;
+            while (got.size() < static_cast<usize>(count + kG) * 2) {
+                ngs.update();
+                const nx::vector<i16> out = ngs.output(master);
+                got.insert(got.end(), out.begin(), out.end());
+            }
+            u32 differ = 0, max_diff = 0, compared = 0;
+            for (i32 i = 0; i < count && static_cast<u32>(seek + i) < ref_frames; ++i, ++compared)
+                for (u32 c = 0; c < 2; ++c) {
+                    i16 want;
+                    std::memcpy(&want, ref.data() + (static_cast<usize>(seek + i) * channels + nx::min<u32>(c, channels - 1u)) * 2, 2);
+                    const u32 d = static_cast<u32>(std::abs(static_cast<i32>(got[2 * static_cast<usize>(i) + c]) - want));
+                    differ += d != 0;
+                    max_diff = nx::max(max_diff, d);
+                }
+            bool silent_after = true;
+            for (usize i = static_cast<usize>(count) * 2; i < got.size(); ++i) silent_after &= got[i] == 0;
+            std::printf("%s from %d: %u frames compared, %u samples differ, at most by %u\n", path.c_str(), seek,
+                        compared, differ, max_diff);
+            CHECK(compared > 0);
+            CHECK(differ == 0);
+            CHECK(silent_after);
+            ++checked;
+        }
+    }
+    CHECK(checked > 0);
 }

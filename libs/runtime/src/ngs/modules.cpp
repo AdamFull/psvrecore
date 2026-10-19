@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "libatrac9.h"
 #include "psvrecore/log.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "core/foundation/strings/format.h"
@@ -208,7 +209,7 @@ constexpr TypeInfo kTypes[] = {
     info(kCompressor, kCompressorIf, false, sizeof(CompressorStates)),
     info(kDelay, kDelayIf, true, 0),
     info(kPitchShift, kPitchShiftIf, true, 0),
-    info(kReverb, kReverbIf, true, 0),
+    info(kReverb, kReverbIf, false, 0),  // (one set for both channels: eEarlyReflectionPattern is per channel)
     {kInputMixer, nullptr, 0, false, 0},
     {kOutput, nullptr, 0, false, 0},
 };
@@ -313,11 +314,18 @@ struct Biquad {
 
 // ---- player (PCM and VAG ADPCM)
 
-std::atomic<bool> warned_hevag{false}, warned_at9{false};
+std::atomic<bool> warned_hevag{false};
 
-struct Player : Module {
+// What both players do: up to four buffers (loops, swaps, the end), lead-in, the sample limit, resampling to the
+// system's rate, and the counters. Reading frames out of a buffer is the format's (PCM and VAG, or ATRAC9).
+struct Streamer : Module {
     using Module::Module;
 
+    struct Buffer {
+        u32 address;
+        i32 bytes;
+        i16 loop_count, next;
+    };
     // A frame read from the data: one sample per source channel, where it ends in which buffer, the bytes it took.
     struct Frame {
         f32 s[2] = {};
@@ -326,6 +334,23 @@ struct Player : Module {
         u32 bytes = 0;
         bool real = false;
     };
+    struct Settings {
+        f32 frequency, scalar;
+        i32 lead_in, limit, start_byte;
+        i8 channels;
+        i8 map[2];
+        i8 start_buffer;
+    };
+
+    virtual Buffer buffer_at(i32 index) = 0;
+    virtual Settings settings() = 0;
+    virtual i32 looped_code() const = 0;
+    // The next frame of buffer `b` at the read position (advancing it), or false at the buffer's end.
+    virtual bool read(const Buffer& b, u32 channels, Frame& f) = 0;
+    // A buffer starts (at its start or again for a loop).
+    virtual void buffer_started(bool looped) { (void)looped; }
+    // The voice starts.
+    virtual void started() {}
 
     // (the read side: where the next frame comes from)
     i32 buffer = -1;
@@ -334,14 +359,142 @@ struct Player : Module {
     // (the play side: the frame being played and the next, for interpolation)
     Frame x0, x1;
     f64 frac = 0;
-    bool started = false, ended = true;
+    bool began = false, ended = true;
     i64 lead_in = 0;
     // (the counters: samples generated, and the bytes of the frames played through)
     i64 generated = 0;
     i32 samples_total = 0, bytes_total = 0, bytes_since_key_on = 0;
     i32 played_buffer = 0;
     u32 played_end = 0;
-    // VAG decoding: 28 samples a block, per channel
+
+    void reset(const Context&) override {
+        const Settings s = settings();
+        buffer = s.start_buffer;
+        byte_pos = static_cast<u32>(s.start_byte);
+        loops_done = 0;
+        x0 = x1 = Frame{};
+        frac = 0;
+        began = false;
+        ended = false;
+        lead_in = s.lead_in;
+        generated = 0;
+        bytes_since_key_on = 0;
+        played_buffer = buffer;
+        played_end = byte_pos;
+        started();
+        buffer_started(false);
+    }
+    bool state(void* out, u32 size) const override {
+        if (size < sizeof(PlayerStates)) return false;
+        PlayerStates s{static_cast<i32>(played_end), played_buffer, static_cast<i32>(generated), bytes_since_key_on,
+                       samples_total, bytes_total};
+        std::memcpy(out, &s, sizeof s);
+        return true;
+    }
+
+    void raise(i32 data, i32 data2, u32 ptr) {
+        event.raised = true;
+        event.data = data, event.data2 = data2, event.ptr = ptr;
+    }
+
+    // The end of the current buffer: loop it, go to the next, or end (false).
+    bool next_buffer() {
+        const Buffer b = buffer_at(buffer);
+        if (b.loop_count == -1 || loops_done < b.loop_count) {
+            ++loops_done;
+            byte_pos = 0;
+            raise(looped_code(), loops_done, b.address);
+            buffer_started(true);
+            return b.bytes > 0;
+        }
+        const i32 previous = buffer;
+        buffer = b.next;
+        loops_done = 0;
+        byte_pos = 0;
+        if (buffer < 0 || buffer > 3) {
+            buffer = previous;
+            raise(0, 0, 0);  // SCE_NGS_PLAYER_END_OF_DATA, SCE_NGS_AT9_END_OF_DATA
+            return false;
+        }
+        raise(1, previous, buffer_at(buffer).address);  // SCE_NGS_PLAYER_SWAPPED_BUFFER, SCE_NGS_AT9_SWAPPED_BUFFER
+        buffer_started(false);
+        return true;
+    }
+
+    // The next frame of the data; not real at its end.
+    Frame fetch() {
+        Frame f;
+        const u32 nch = settings().channels == 2 ? 2 : 1;
+        for (u32 guard = 0; guard < 16; ++guard) {
+            if (ended || buffer < 0 || buffer > 3) return f;
+            if (read(buffer_at(buffer), nch, f)) {
+                f.buffer = buffer, f.end = byte_pos, f.real = true;
+                return f;
+            }
+            if (ended || !next_buffer()) return Frame{};
+        }
+        return Frame{};  // (a chain of empty buffers)
+    }
+
+    // The frame being played is played through: count it, move to the next.
+    void advance() {
+        bytes_since_key_on += static_cast<i32>(x0.bytes);
+        bytes_total += static_cast<i32>(x0.bytes);
+        played_buffer = x0.buffer;
+        played_end = x0.end;
+        x0 = x1;
+        if (x0.real) x1 = fetch();
+    }
+
+    void render(const Context& c, Packet& out, bool* end) {
+        const u32 g = c.granularity;
+        out.clear(g);
+        if (ended) {
+            *end = true;
+            return;
+        }
+        const Settings s = settings();
+        u32 i = 0;
+        if (lead_in > 0) {
+            const u32 skip = static_cast<u32>(nx::min<i64>(lead_in, g));
+            lead_in -= skip;
+            i = skip;
+        }
+        if (i < g && !began) {
+            began = true;
+            x0 = fetch();
+            if (x0.real) x1 = fetch();
+        }
+        const f64 step = std::fmin(std::fmax(static_cast<f64>(s.frequency) * s.scalar / c.sample_rate, 0.0), 4.0);
+        const u32 nch = s.channels == 2 ? 2 : 1;
+        for (; i < g; ++i) {
+            if (!x0.real || (s.limit > 0 && generated >= s.limit)) {
+                if (x0.real) raise(0, 0, 0);  // (the limit reached)
+                ended = true;
+                break;
+            }
+            for (u32 ch = 0; ch < c.channels; ++ch) {
+                const i32 src = s.map[ch];
+                if (src < 0 || static_cast<u32>(src) >= nch) continue;
+                const f32 a = x0.s[src], b = x1.real ? x1.s[src] : 0.0f;
+                out.s[ch][i] = frac == 0 ? a : static_cast<f32>(a + (b - a) * frac);
+            }
+            ++generated;
+            ++samples_total;
+            frac += step;
+            while (frac >= 1.0 && x0.real) {
+                frac -= 1.0;
+                advance();
+            }
+        }
+        *end = ended;
+    }
+};
+
+// The player: 16-bit PCM, or VAG ADPCM (16-byte blocks of 28 samples, a block per channel in turn).
+struct Player : Streamer {
+    using Streamer::Streamer;
+
     i32 hist1[2] = {}, hist2[2] = {};
     i16 decoded[2][28] = {};
     u32 decoded_index = 28;
@@ -377,60 +530,20 @@ struct Player : Module {
         if (q.start_buffer < 0 || q.start_buffer > 3) return fail(m, "nStartBuffer {} out of range", q.start_buffer);
         return true;
     }
-    void reset(const Context&) override {
+
+    Buffer buffer_at(i32 index) override {
+        const PlayerBuffer& b = p().buffs[index];
+        return Buffer{b.buffer, b.bytes, b.loop_count, b.next};
+    }
+    Settings settings() override {
         const PlayerParams& q = p();
-        buffer = q.start_buffer;
-        byte_pos = static_cast<u32>(q.start_byte);
-        loops_done = 0;
-        x0 = x1 = Frame{};
-        frac = 0;
-        started = false;
-        ended = false;
-        lead_in = q.lead_in;
-        generated = 0;
-        bytes_since_key_on = 0;
-        played_buffer = buffer;
-        played_end = byte_pos;
+        return Settings{q.frequency, q.scalar, q.lead_in, q.limit, q.start_byte, q.channels, {q.map[0], q.map[1]}, q.start_buffer};
+    }
+    i32 looped_code() const override { return 2; }  // SCE_NGS_PLAYER_LOOPED_BUFFER
+    void buffer_started(bool) override {
         hist1[0] = hist1[1] = hist2[0] = hist2[1] = 0;
         decoded_index = 28;
         block_bytes = 0;
-    }
-    bool state(void* out, u32 size) const override {
-        if (size < sizeof(PlayerStates)) return false;
-        PlayerStates s{static_cast<i32>(played_end), played_buffer, static_cast<i32>(generated), bytes_since_key_on,
-                       samples_total, bytes_total};
-        std::memcpy(out, &s, sizeof s);
-        return true;
-    }
-
-    void raise(i32 data, i32 data2, u32 ptr) {
-        event.raised = true;
-        event.data = data, event.data2 = data2, event.ptr = ptr;
-    }
-
-    // The end of the current buffer: loop it, go to the next, or end (false).
-    bool next_buffer() {
-        PlayerParams& q = p();
-        const PlayerBuffer& b = q.buffs[buffer];
-        hist1[0] = hist1[1] = hist2[0] = hist2[1] = 0;
-        decoded_index = 28;
-        if (b.loop_count == -1 || loops_done < b.loop_count) {
-            ++loops_done;
-            byte_pos = 0;
-            raise(2, loops_done, b.buffer);  // SCE_NGS_PLAYER_LOOPED_BUFFER
-            return b.bytes > 0;
-        }
-        const i32 previous = buffer;
-        buffer = b.next;
-        loops_done = 0;
-        byte_pos = 0;
-        if (buffer < 0 || buffer > 3) {
-            buffer = previous;
-            raise(0, 0, 0);  // SCE_NGS_PLAYER_END_OF_DATA
-            return false;
-        }
-        raise(1, previous, q.buffs[buffer].buffer);  // SCE_NGS_PLAYER_SWAPPED_BUFFER
-        return true;
     }
 
     void decode_block(const u8* block, u32 ch) {
@@ -455,129 +568,166 @@ struct Player : Module {
         }
     }
 
-    // The next frame of the data; not real at its end.
-    Frame fetch() {
-        Frame f;
-        PlayerParams& q = p();
-        const u32 nch = static_cast<u32>(q.channels == 2 ? 2 : 1);
+    bool read(const Buffer& b, u32 nch, Frame& f) override {
         GuestMemory& mem = runtime().memory();
-        for (u32 guard = 0; guard < 16; ++guard) {
-            if (buffer < 0 || buffer > 3) return f;
-            const PlayerBuffer& b = q.buffs[buffer];
-            const u32 size = b.bytes > 0 ? static_cast<u32>(b.bytes) : 0;
-            if (q.type == 0) {
-                const u32 frame = 2 * nch;
-                if (byte_pos + frame <= size && b.buffer && mem.valid(b.buffer + byte_pos, frame)) {
-                    const u8* src = mem.host(b.buffer + byte_pos);
-                    for (u32 c = 0; c < nch; ++c) {
-                        i16 s;
-                        std::memcpy(&s, src + 2 * c, 2);
-                        f.s[c] = static_cast<f32>(s) / 32768.0f;
-                    }
-                    byte_pos += frame;
-                    f.bytes = frame;
-                    f.buffer = buffer, f.end = byte_pos, f.real = true;
-                    return f;
-                }
-            } else {
-                if (decoded_index < 28) {
-                    for (u32 c = 0; c < nch; ++c) f.s[c] = static_cast<f32>(decoded[c][decoded_index]) / 32768.0f;
-                    ++decoded_index;
-                    f.bytes = block_bytes;
-                    block_bytes = 0;
-                    f.buffer = buffer, f.end = byte_pos, f.real = true;
-                    return f;
-                }
-                const u32 block = 16 * nch;
-                if (byte_pos + block <= size && b.buffer && mem.valid(b.buffer + byte_pos, block)) {
-                    const u8* src = mem.host(b.buffer + byte_pos);
-                    for (u32 c = 0; c < nch; ++c) decode_block(src + 16 * c, c);
-                    byte_pos += block;
-                    block_bytes = block;
-                    decoded_index = 0;
-                    continue;
-                }
+        const u32 size = b.bytes > 0 ? static_cast<u32>(b.bytes) : 0;
+        if (p().type == 0) {
+            const u32 frame = 2 * nch;
+            if (byte_pos + frame > size || !b.address || !mem.valid(b.address + byte_pos, frame)) return false;
+            const u8* src = mem.host(b.address + byte_pos);
+            for (u32 c = 0; c < nch; ++c) {
+                i16 s;
+                std::memcpy(&s, src + 2 * c, 2);
+                f.s[c] = static_cast<f32>(s) / 32768.0f;
             }
-            if (!next_buffer()) return f;
+            byte_pos += frame;
+            f.bytes = frame;
+            return true;
         }
-        return f;  // (a chain of empty buffers)
-    }
-
-    // The frame being played is played through: count it, move to the next.
-    void advance() {
-        bytes_since_key_on += static_cast<i32>(x0.bytes);
-        bytes_total += static_cast<i32>(x0.bytes);
-        played_buffer = x0.buffer;
-        played_end = x0.end;
-        x0 = x1;
-        if (x0.real) x1 = fetch();
-    }
-
-    void render(const Context& c, Packet& out, bool* end) {
-        const u32 g = c.granularity;
-        out.clear(g);
-        if (ended) {
-            *end = true;
-            return;
+        if (decoded_index >= 28) {
+            const u32 block = 16 * nch;
+            if (byte_pos + block > size || !b.address || !mem.valid(b.address + byte_pos, block)) return false;
+            const u8* src = mem.host(b.address + byte_pos);
+            for (u32 c = 0; c < nch; ++c) decode_block(src + 16 * c, c);
+            byte_pos += block;
+            block_bytes = block;
+            decoded_index = 0;
         }
-        PlayerParams& q = p();
-        u32 i = 0;
-        if (lead_in > 0) {
-            const u32 skip = static_cast<u32>(nx::min<i64>(lead_in, g));
-            lead_in -= skip;
-            i = skip;
-        }
-        if (i < g && !started) {
-            started = true;
-            x0 = fetch();
-            if (x0.real) x1 = fetch();
-        }
-        const f64 step = std::fmin(std::fmax(static_cast<f64>(q.frequency) * q.scalar / c.sample_rate, 0.0), 4.0);
-        const u32 nch = static_cast<u32>(q.channels == 2 ? 2 : 1);
-        for (; i < g; ++i) {
-            if (!x0.real || (q.limit > 0 && generated >= q.limit)) {
-                if (x0.real) raise(0, 0, 0);  // (the limit reached)
-                ended = true;
-                break;
-            }
-            for (u32 ch = 0; ch < c.channels; ++ch) {
-                const i32 src = q.map[ch];
-                if (src < 0 || static_cast<u32>(src) >= nch) continue;
-                const f32 a = x0.s[src], b = x1.real ? x1.s[src] : 0.0f;
-                out.s[ch][i] = frac == 0 ? a : static_cast<f32>(a + (b - a) * frac);
-            }
-            ++generated;
-            ++samples_total;
-            frac += step;
-            while (frac >= 1.0 && x0.real) {
-                frac -= 1.0;
-                advance();
-            }
-        }
-        *end = ended;
+        for (u32 c = 0; c < nch; ++c) f.s[c] = static_cast<f32>(decoded[c][decoded_index]) / 32768.0f;
+        ++decoded_index;
+        f.bytes = block_bytes;
+        block_bytes = 0;
+        return true;
     }
 };
 
-// The ATRAC9 player keeps its parameters; decoding waits for an ATRAC9 decoder (silence until then).
-struct At9Player : Module {
-    using Module::Module;
+// The ATRAC9 player: superframes of 1 or 4 frames decoded by LibAtrac9; each buffer can drop samples at its start
+// and end (sceNgsAT9GetSectionDetails says how many, for seeking and looping on any sample).
+struct At9Player : Streamer {
+    using Streamer::Streamer;
+
+    struct Decoder {
+        void* handle = nullptr;
+        ~Decoder() {
+            if (handle) Atrac9ReleaseHandle(handle);
+        }
+    } decoder;
+    u32 config = 0;  // (the configuration the decoder has)
+    bool config_ok = false;
+    Atrac9CodecInfo codec{};
+    nx::vector<i16> pcm;  // (the superframe decoded)
+    u32 pcm_index = 0, pcm_count = 0;
+    u32 superframe_bytes_owed = 0;
+    i64 sample_in_buffer = 0;  // (decoded samples of this buffer handed out or dropped)
+
+    At9Params& p() { return *param<At9Params>(); }
+
     void defaults() override {
         write_header(kAt9If[0].id, sizeof(At9Params));
-        At9Params& q = *param<At9Params>();
+        At9Params& q = p();
         for (auto& b : q.buffs) b = At9Buffer{0, 0, 0, -1, 0, 0};
         q.frequency = 48000.0f;
         q.scalar = 1.0f;
         q.channels = 1;
     }
-    bool state(void* out, u32 size) const override {
-        if (size < sizeof(PlayerStates)) return false;
-        std::memset(out, 0, sizeof(PlayerStates));
+    bool check(const u8* raw, nx::string* m) const override {
+        At9Params q;
+        std::memcpy(&q, raw, sizeof q);
+        for (u32 i = 0; i < 4; ++i) {
+            const At9Buffer& b = q.buffs[i];
+            if (b.bytes < 0) return fail(m, "buffs[{}].nNumBytes {} < 0", i, b.bytes);
+            if (b.loop_count < -1) return fail(m, "buffs[{}].nLoopCount {} < -1", i, b.loop_count);
+            if (b.next < -1 || b.next > 3) return fail(m, "buffs[{}].nNextBuff {} out of range", i, b.next);
+            if (b.discard_start < 0 || b.discard_start > 2048 || b.discard_end < 0 || b.discard_end > 2048)
+                return fail(m, "buffs[{}] samples to discard out of range", i);
+        }
+        if (!(q.frequency >= 0 && q.frequency <= 192000)) return fail(m, "fPlaybackFrequency {} out of range", q.frequency);
+        if (!(q.scalar >= 0 && q.scalar <= 10)) return fail(m, "fPlaybackScalar {} out of range", q.scalar);
+        if (q.lead_in < 0 || q.limit < 0) return fail(m, "negative sample count");
+        if (q.channels < 1 || q.channels > 2) return fail(m, "nChannels {} out of range", q.channels);
+        for (i8 c : q.map)
+            if (c < -1 || c > 1) return fail(m, "nChannelMap {} out of range", c);
         return true;
     }
-    void render(Packet& out, u32 g, bool* end) {
-        warn_once(warned_at9, "ATRAC9 voices are not decoded yet: played as silence");
-        out.clear(g);
-        *end = false;
+
+    Buffer buffer_at(i32 index) override {
+        const At9Buffer& b = p().buffs[index];
+        return Buffer{b.buffer, b.bytes, b.loop_count, b.next};
+    }
+    Settings settings() override {
+        const At9Params& q = p();
+        return Settings{q.frequency, q.scalar, q.lead_in, q.limit, 0, q.channels, {q.map[0], q.map[1]}, 0};
+    }
+    i32 looped_code() const override { return 4; }  // SCE_NGS_AT9_LOOPED_BUFFER
+
+    void started() override {
+        const u32 cfg = static_cast<u32>(p().config);
+        if (!decoder.handle || cfg != config) {
+            if (decoder.handle) Atrac9ReleaseHandle(decoder.handle);
+            decoder.handle = Atrac9GetHandle();
+            config = cfg;
+            u8 bytes[4];
+            std::memcpy(bytes, &cfg, 4);
+            config_ok = decoder.handle && Atrac9InitDecoder(decoder.handle, bytes) == 0 &&
+                        Atrac9GetCodecInfo(decoder.handle, &codec) == 0;
+            if (config_ok) pcm.assign(static_cast<usize>(codec.frameSamples) * codec.framesInSuperframe * codec.channels, 0);
+        }
+        if (!config_ok) {
+            raise(2, 0, 0);  // SCE_NGS_AT9_HEADER_ERROR
+            ended = true;
+        }
+    }
+    void buffer_started(bool) override {
+        pcm_index = pcm_count = 0;
+        superframe_bytes_owed = 0;
+        sample_in_buffer = 0;
+    }
+
+    // Decodes the superframe at the read position; false at the buffer's end (or on an error, which ends the voice).
+    bool decode(const Buffer& b) {
+        GuestMemory& mem = runtime().memory();
+        const u32 size = b.bytes > 0 ? static_cast<u32>(b.bytes) : 0;
+        const u32 sf = static_cast<u32>(codec.superframeSize);
+        if (byte_pos + sf > size || !b.address || !mem.valid(b.address + byte_pos, sf)) return false;
+        const u8* src = mem.host(b.address + byte_pos);
+        u32 used_total = 0;
+        for (i32 k = 0; k < codec.framesInSuperframe; ++k) {
+            int used = 0;
+            if (used_total >= sf || Atrac9Decode(decoder.handle, src + used_total,
+                                                 pcm.data() + static_cast<usize>(k) * codec.frameSamples * codec.channels,
+                                                 &used) != 0) {
+                raise(3, static_cast<i32>(byte_pos + used_total), b.address);  // SCE_NGS_AT9_DECODE_ERROR
+                ended = true;
+                return false;
+            }
+            used_total += static_cast<u32>(used);
+        }
+        byte_pos += sf;
+        superframe_bytes_owed += sf;
+        pcm_index = 0;
+        pcm_count = static_cast<u32>(codec.frameSamples * codec.framesInSuperframe);
+        return true;
+    }
+
+    bool read(const Buffer& b, u32 nch, Frame& f) override {
+        if (!config_ok) return false;
+        const At9Buffer& raw = p().buffs[buffer];
+        const u32 sf = static_cast<u32>(codec.superframeSize);
+        const i64 total = sf ? static_cast<i64>(b.bytes > 0 ? b.bytes : 0) / sf * codec.frameSamples * codec.framesInSuperframe : 0;
+        const i64 last = total - raw.discard_end;
+        for (;;) {
+            if (sample_in_buffer >= last) return false;
+            if (pcm_index >= pcm_count && !decode(b)) return false;
+            const i16* s = pcm.data() + static_cast<usize>(pcm_index) * codec.channels;
+            ++pcm_index;
+            const bool keep = sample_in_buffer >= raw.discard_start;
+            ++sample_in_buffer;
+            if (!keep) continue;
+            for (u32 c = 0; c < nch; ++c) f.s[c] = static_cast<f32>(s[nx::min<u32>(c, static_cast<u32>(codec.channels) - 1)]) / 32768.0f;
+            f.bytes = superframe_bytes_owed;
+            superframe_bytes_owed = 0;
+            return true;
+        }
     }
 };
 
@@ -1423,8 +1573,7 @@ std::unique_ptr<Module> make_module(u32 type, u32 channels) {
 }
 
 void render_player(Module& m, const Context& c, Packet& out, bool* ended) {
-    if (m.type() == kAt9Player) static_cast<At9Player&>(m).render(out, c.granularity, ended);
-    else static_cast<Player&>(m).render(c, out, ended);
+    static_cast<Streamer&>(m).render(c, out, ended);
 }
 
 void render_generator(Module& m, const Context& c, Packet& out) { static_cast<Generator&>(m).render(c, out); }

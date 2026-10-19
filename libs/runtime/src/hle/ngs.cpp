@@ -13,6 +13,7 @@
 #include <memory>
 
 #include "../ngs/modules.hpp"
+#include "libatrac9.h"
 #include "hle_common.hpp"
 #include "core/foundation/containers/hash_map.h"
 #include "core/foundation/threading/thread.h"
@@ -1265,6 +1266,43 @@ u32 sceNgsVoiceDefGetScreamAtrac9Voice() {
     return definition(kAt9Voice);
 }
 
+// ---- ATRAC9 sections
+
+struct SkipBufferInfo {
+    i32 start_byte_offset, bytes;
+    i16 start_skip, end_skip;
+    i32 is_super_packet;
+};
+
+// Where a section of an ATRAC9 stream (in samples of the original, before encoding) lies in the data: whole
+// superframes from the one before the section's first (whose overlap the first needs), and the samples to drop at
+// both ends. Decoded data runs one frame behind the original (the overlap delay, as the file's fact chunk says),
+// which positions taken from the file's header (its loop points) already include.
+i32 sceNgsAT9GetSectionDetails(i32 start, i32 count, i32 config, Ptr<SkipBufferInfo> out) {
+    if (count < 0 || !writable(out.address, sizeof(SkipBufferInfo))) return nerr::kInvalidParam;
+    void* handle = Atrac9GetHandle();
+    u8 bytes[4];
+    std::memcpy(bytes, &config, 4);
+    Atrac9CodecInfo info{};
+    const bool ok = handle && Atrac9InitDecoder(handle, bytes) == 0 && Atrac9GetCodecInfo(handle, &info) == 0;
+    if (handle) Atrac9ReleaseHandle(handle);
+    if (!ok) return nerr::kInvalidParam;
+    const bool from_header = (static_cast<u32>(start) & 0x80000000u) != 0;
+    const i64 offset = static_cast<i64>(static_cast<u32>(start) & 0x7FFFFFFFu);
+    const i64 unit = static_cast<i64>(info.frameSamples) * info.framesInSuperframe;
+    const i64 first_sample = offset + (from_header ? 0 : info.frameSamples);
+    const i64 end_sample = first_sample + count;
+    i64 first = first_sample / unit;
+    if (first > 0) --first;
+    const i64 last = (end_sample + unit - 1) / unit;
+    out->start_byte_offset = static_cast<i32>(first * info.superframeSize);
+    out->bytes = static_cast<i32>((last - first) * info.superframeSize);
+    out->start_skip = static_cast<i16>(first_sample - first * unit);
+    out->end_skip = static_cast<i16>(last * unit - end_sample);
+    out->is_super_packet = info.framesInSuperframe > 1 ? 1 : 0;
+    return 0;
+}
+
 // ---- Sulpha (the debugger's agent): nothing to connect to
 
 i32 sceSulphaNgsGetDefaultConfig(Ptr<u32> config) {
@@ -1342,6 +1380,7 @@ const Function kFunctions[] = {
     HLE_FUNCTION(0x14EF65A0, sceNgsVoiceDefGetAtrac9Voice),
     HLE_FUNCTION(0xCE53BC33, sceNgsVoiceDefGetScreamVoice),
     HLE_FUNCTION(0xCD63A2BF, sceNgsVoiceDefGetScreamAtrac9Voice),
+    HLE_FUNCTION(0x2A9FA501, sceNgsAT9GetSectionDetails),
     HLE_FUNCTION(0x5FD8AEDB, sceSulphaNgsGetDefaultConfig),
     HLE_FUNCTION(0x793E3E8C, sceSulphaNgsGetNeededMemory),
     HLE_FUNCTION(0xAFCD824F, sceSulphaNgsInit),
