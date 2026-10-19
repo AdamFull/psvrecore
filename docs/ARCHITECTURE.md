@@ -51,7 +51,7 @@ Everything generated stays on the user's machine.
 | `gxm` | GXM API, texture formats and layouts, SPIR-V translation of shader programs |
 | `vulkan` | Vulkan backend (volk, VMA): device, memory, buffers, dispatches; knows nothing about GXM |
 | `platform` | SDL3: a window and its Vulkan swapchain (the frames a game displays, scaled to fit), the audio device (a stream per port), and gamepads, keyboard, mouse and touch for the runtime's input; later Android integration, an ImGui overlay and on-screen controls |
-| `frontend` | Program entry point, command line, settings |
+| `frontend` | The program a game becomes: the game's description (`frontend::Game`), the settings file and the command line over it, scripted controls for smoke tests, and the run loop (window, sound, runtime, GXM) |
 
 ## Key design points
 

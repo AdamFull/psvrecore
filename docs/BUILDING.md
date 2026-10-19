@@ -155,16 +155,30 @@ output to `build/samples/<sample>/run.log`; compare the frames with the screensh
 `--audio-seconds N` ends a sample once a port has played N seconds. Everything there is derived from the SDK: never
 commit it.
 
-`--window` also shows the sample in a window, plays its sound on the audio device and gives it the host's controls,
-until the window is closed or `--timeout` seconds have passed. `--input` scripts controls, as items
-`<ms> <what> <args>` separated by `;` (the time from the boot): `key <SDL key name> down|up`,
-`pad <SDL gamepad button> down|up`, `axis <SDL gamepad axis> <value>`, `touch <x> <y> down|move|up` (in the
-screen's 960x544) and `shot <name>` (the next frame shown is saved as `<name>.png`):
+`--window` runs the sample as a game, through the frontend (below): in a window with its sound and the host's
+controls, until the window is closed or `--timeout` seconds have passed. `--input` scripts controls, as items
+`<ms> <what> <args>` separated by `;` or new lines (the time from the boot): `key <SDL key name> down|up`,
+`pad <button> down|up` (the console's names: cross, circle, square, triangle, up, down, left, right, l, r, start,
+select, l3, r3), `axis <SDL gamepad axis> <value>`, `touch <x> <y> down|move|up` (in the screen's 960x544),
+`shot <name>` (the next frame shown is saved as `<name>.png`) and `quit`. The shots go to the frames folder; `--frames`
+counts them:
 
 ```
 python scripts/sample_check.py --sdk C:/path/to/sdk input_output_devices/api_ctrl/analog_stick --frames 1 \
     --timeout 7 --window --input "1500 shot centre; 2000 axis leftx 32767; 3200 shot moved"
 ```
+
+## Running a game (the frontend)
+
+A game's program is psvrecore's frontend with the game's recompiled code. `--help` lists its options. Settings come
+from `settings.ini` in the user's data folder (`%APPDATA%\psvrecore\<program>\` on Windows,
+`~/.local/share/psvrecore/<program>/` on Linux), written with the defaults and a comment on every key the first time;
+the command line goes over them (`--set section.key=value`, or the options that stand for one). The game's
+application folder is `--game <folder>` or `[game] folder`; ux0: and save data are in `data/` beside the settings
+unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title ID>`.
+
+Keys while playing: arrows (the d-pad), Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
+Select, F11 full screen. Gamepads work as they are plugged in; the mouse touches the front panel.
 
 ## ATRAC9 check (needs the PS Vita SDK)
 

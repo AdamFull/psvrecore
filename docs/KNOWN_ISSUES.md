@@ -307,6 +307,19 @@
   for 256 bytes and run on the console); one that is not a power of two is refused. Inferred from the samples, not
   measured.
 
+## Frontend
+
+- **The process ends with `_Exit`** when the window is closed or the game exits: guest threads cannot be stopped and
+  joined, so nothing is torn down (the window, the audio device, the log are flushed first). A game's own save data
+  is written by the time its calls return, so nothing is lost that the game wrote.
+- **Settings changed while playing are not saved** (F11's full screen lasts for the run). There is no settings
+  screen yet; the file is edited by hand.
+- **Not run on Android.** `libmain.so` builds with `SDL_main`, but the application project (SDL's Java activity,
+  the game's files on the device) is not there yet.
+- **The command line is the frontend's** on every platform; Android passes none.
+- **nx-foundation warns on Android** (`platform/process.cpp`: an unused function `keep`) since the frontend links it
+  whole; it is nx-foundation's to fix.
+
 ## Save data and the application utility
 
 - **The save data dialog is not implemented**, so the SDK's save data samples cannot run.
