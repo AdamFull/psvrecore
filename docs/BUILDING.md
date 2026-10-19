@@ -258,3 +258,17 @@ it as a game is booted: `app0:` is the application folder, `ux0:` an empty writa
 match `tests/programs/<name>.expected`, and it must exit with 0. The runner logs to stderr; set `PSVRECORE_LOG=debug`
 (or `info`) to see more. Everything goes to `build/programs` (`--out`), which is derived from the SDK: never commit
 it.
+
+## Debugging switches
+
+Environment variables the runtime reads, for finding what a game does; they cost nothing while unset.
+
+| Variable | What it does |
+|---|---|
+| `PSVRECORE_FAULT_DUMP=1` | A guest memory fault also prints the 64 bytes at each register's address. |
+| `PSVRECORE_WATCH=<address>[:<size>],<function>,...` | Up to four hardware watchpoints (Windows, x86-64): a write to a guest address (1, 2, 4 or 8 bytes, 4 by default) prints the value now there, the host function that wrote, the guest thread's registers, the text registers point at, and the words at its stack pointer; a call of a host function by name (a generated `f_<address>`, called through a pointer: one called directly may be inlined) prints the guest registers it gets. |
+| `PSVRECORE_THREADS=<seconds>` | Every so many seconds, each guest thread's state, priority, link register and what it waits for. |
+| `PSVRECORE_HLE_COUNTS=<seconds>` | Every so many seconds, the HLE functions called since the last report and how often. |
+| `PSVRECORE_DUMP=<address>:<bytes>,...` | Guest memory, in words, with each report (every 10 seconds without the two above). |
+| `PSVRECORE_GXM_TRACE=<first>[-<last>]` (or `1`: all) | Each scene in that range logged before it renders: its surfaces, and each draw's programs, primitive and textures. |
+| `PSVRECORE_RENDER_SCALE=<1-4>` | The SDK sample runner's internal resolution. |

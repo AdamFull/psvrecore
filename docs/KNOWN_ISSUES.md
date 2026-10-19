@@ -127,14 +127,15 @@
   the entry that lets it go, would wait for ever; GXM's display buffering does not do that.
 - **Scenes render synchronously** when they end (one submission and wait each): simple and ordered with transfers and
   the CPU, but slow (multithreaded_rendering: about 40 ms a frame).
-- **Not implemented:** tiled and swizzled colour surfaces (the scene is not rendered), multisampling, the DF32M_S8
+- **Not implemented:** multisampling, the DF32M_S8
   mask bit (DF32M's is the depth image's stencil aspect), YUV transfers, the VDM buffer and region clip checks of
   command lists.
 - **Uniform data is copied when a draw is made** (the hardware reads it when the scene runs). A game that writes a
   buffer between the draw and the end of the scene would see a difference; that is a race on the hardware too.
 - **Assumed, unverified:** the cull winding (CW culls Vulkan's back faces), the background mask set by default,
   F32M textures without their mask bit, the level-of-detail bias in eighths, the transfer layouts of tiled surfaces
-  (as tiled textures), the downscale's rounding.
+  (as tiled textures), tiled and swizzled colour surfaces laid out as textures of those types are (a tiled surface's
+  tiles in rows of its stride; a swizzled one in Morton order over its power-of-two size), the downscale's rounding.
 - **Visibility testing** uses the front face's settings for both faces, writes every count to core 0's buffer (the
   game sums the cores'), and counts samples exactly only where the device has `occlusionQueryPrecise`.
 - **Uniform buffers** are copied once per scene and shared by the draws that use them; buffers at different
