@@ -56,10 +56,16 @@ Result<i32> Loader::load(nx::string_view host_path, nx::string_view guest_path) 
         for (const PsvModuleCode* c : code_)
             if (std::memcmp(c->fingerprint, probe->fingerprint().data(), 32) == 0) code = c;
     }
-    if (!code)
+    if (!code) {
+        nx::string known;
+        {
+            nx::scoped_lock<nx::mutex> guard(lock_);
+            for (const PsvModuleCode* c : code_) known += nx::format(" {} {}...", c->name, hex_fingerprint(c->fingerprint));
+        }
         return failure(nx::format("{}: no recompiled code for this module (fingerprint {}...): it is not the file the "
-                                  "program was generated from",
-                                  guest_path, hex_fingerprint(probe->fingerprint().data())));
+                                  "program was generated from (the program has:{})",
+                                  guest_path, hex_fingerprint(probe->fingerprint().data()), known));
+    }
     if (probe->segments().size() != code->segment_count)
         return failure(nx::format("{}: {} segments, the generated code has {}", guest_path, probe->segments().size(),
                                   code->segment_count));
