@@ -55,8 +55,9 @@ Result<nx::vector<u32>> translate_compute(const usse::Gxp& gxp, std::span<const 
 // - the secondary attributes: 512 words per draw (the vertex program's 256, then the fragment program's);
 // - guest memory the programs read (uniform buffers), as the compute form's memory buffer;
 // - combined image samplers: the fragment program's units 0-15, the vertex program's units 0-3.
+// - the colour attachment as an input attachment (fragment programs that read the colour, FRAGCOLOR).
 inline constexpr u32 kDrawBindingSecondary = 0, kDrawBindingMemory = 1, kDrawBindingFragmentTextures = 2,
-                     kDrawBindingVertexTextures = 18, kDrawBindings = 22;
+                     kDrawBindingVertexTextures = 18, kDrawBindingColor = 22, kDrawBindings = 23;
 inline constexpr u32 kDrawSecondaryWords = 512;
 
 // The push constants of a draw (both stages, and the secondary dispatches).
@@ -104,6 +105,8 @@ struct FragmentShader {
     // attachment's red, green, blue, alpha order.
     u8 swizzle[4] = {0, 1, 2, 3};
     bool fragment_program_enabled = true;
+    // Programs that read the colour (FRAGCOLOR, with __nativecolor) find it in their output register before they
+    // run: from the colour attachment (input attachment kDrawBindingColor), in the output register's format.
 };
 
 Result<nx::vector<u32>> translate_secondary(const usse::Gxp& gxp, std::span<const usse::Decoded> program);

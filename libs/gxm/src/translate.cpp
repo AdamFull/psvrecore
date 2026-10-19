@@ -1423,6 +1423,43 @@ void Translator::vertex_epilogue() {
 
 void Translator::fragment_prologue() {
     sa_base_ = iadd(imul(push_constant(0, tu_), u(kDrawSecondaryWords)), u(256));
+    if (gxp_.native_color && gxp_.frag_color) {
+        // The colour attachment's value, back in the output register's lanes and format.
+        b_.capability(SpvCapabilityInputAttachment);
+        const Id image = b_.t_image(tf_, SpvDimSubpassData, 0, 0, 0, 2, SpvImageFormatUnknown);
+        const Id var = b_.variable(b_.t_pointer(SpvStorageClassUniformConstant, image), SpvStorageClassUniformConstant);
+        b_.decorate(var, SpvDecorationDescriptorSet, {0});
+        b_.decorate(var, SpvDecorationBinding, {kDrawBindingColor});
+        b_.decorate(var, SpvDecorationInputAttachmentIndex, {0});
+        const Id v2i = b_.t_vector(ti_, 2);
+        const Id texel = b_.op(SpvOpImageRead, tv4_, {load(image, var), b_.c_composite(v2i, {s(0), s(0)})});
+        Id lane[4] = {f(0.0f), f(0.0f), f(0.0f), f(1.0f)};
+        for (u32 c = 0; c < 4; ++c) {
+            const u8 k = fragment_shader->swizzle[c];
+            if (k < 4) lane[k] = b_.op(SpvOpCompositeExtract, tf_, {texel, c});
+        }
+        auto o = [&](u32 r, Id v) {
+            out_.used = nx::max(out_.used, r + 1);
+            store(chain(tp_fu_, out_.var, {u(r)}), v);
+        };
+        auto unorm8 = [&](Id x) {
+            const Id c = ext(tf_, GLSLstd450FClamp, {x, f(0.0f), f(1.0f)});
+            return cast(tu_, un(SpvOpConvertFToS, ti_, ext(tf_, GLSLstd450RoundEven, {fmul(c, f(255.0f))})));
+        };
+        switch (gxp_.output_type) {
+            case usse::ParameterType::U8:
+                o(0, bor(bor(unorm8(lane[0]), shl(unorm8(lane[1]), u(8))), bor(shl(unorm8(lane[2]), u(16)), shl(unorm8(lane[3]), u(24)))));
+                break;
+            case usse::ParameterType::F16:
+                o(0, bor(to_half(cast(tu_, lane[0])), shl(to_half(cast(tu_, lane[1])), u(16))));
+                o(1, bor(to_half(cast(tu_, lane[2])), shl(to_half(cast(tu_, lane[3])), u(16))));
+                break;
+            case usse::ParameterType::F32:
+                for (u32 k = 0; k < nx::max<u32>(gxp_.output_components, 1); ++k) o(k, cast(tu_, lane[k]));
+                break;
+            default: fail("a colour read in this output format not implemented"); break;
+        }
+    }
     auto pa = [&](u32 r, Id v) {
         pa_.used = nx::max(pa_.used, r + 1);
         store(chain(tp_fu_, pa_.var, {u(r)}), v);
@@ -1515,9 +1552,12 @@ void Translator::fragment_epilogue() {
             default: format = gxp_.output_components <= 2 ? 6 : 5; break;  // F16
         }
     }
+    // (programs with __nativecolor leave their colour in the output registers, the others in the primary
+    // attributes: checked in the shader compiler's programs)
+    BankVar& bank = gxp_.native_color ? out_ : pa_;
     auto p = [&](u32 r) {
-        pa_.used = nx::max(pa_.used, r + 1);
-        return load(tu_, chain(tp_fu_, pa_.var, {u(r)}));
+        bank.used = nx::max(bank.used, r + 1);
+        return load(tu_, chain(tp_fu_, bank.var, {u(r)}));
     };
     Id lane[6] = {f(0.0f), f(0.0f), f(0.0f), f(1.0f), f(0.0f), f(1.0f)};
     auto half = [&](Id w, u32 k) { return from_half(mask(k ? shr(w, u(16)) : w, 16)); };

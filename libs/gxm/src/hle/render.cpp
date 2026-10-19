@@ -163,9 +163,12 @@ bool ensure(Renderer& r) {
     for (u32 i = 0; i < kDrawBindings; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = i < kDrawBindingFragmentTextures ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                                                                      : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                                     : i == kDrawBindingColor           ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT
+                                                                        : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[i].stageFlags = i == kDrawBindingColor ? VK_SHADER_STAGE_FRAGMENT_BIT
+                                                        : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                                              VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     si.bindingCount = kDrawBindings;
@@ -437,6 +440,10 @@ void render_scene(Context& context, Scene& scene) {
 
     // ---- What the draws need: secondary attributes, memory, vertices and indices -----------------------------
     const u32 draws = static_cast<u32>(scene.draws.size());
+    // (a pass with a draw that reads the colour reads it as an input attachment: every pipeline of the pass is
+    // made for that render pass)
+    bool reads_color = false;
+    for (const Draw& dr : scene.draws) reads_color |= dr.fragment->program->gxp.native_color && dr.fragment->program->gxp.frag_color;
     nx::vector<u32> sa(usize{nx::max(draws, 1u)} * kDrawSecondaryWords, 0);
     constexpr u32 kMemoryBase = 0x1000;  // (the guest addresses the programs see for the memory buffer's words)
     nx::vector<u8> mem;  // (the memory buffer's words, after its two-word header)
@@ -585,6 +592,7 @@ void render_scene(Context& context, Scene& scene) {
         }
         vk::Pass pass_formats;
         pass_formats.color.image = color;
+        pass_formats.color_input = reads_color;
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
         auto pipeline = r.pipelines->graphics(desc);
@@ -654,10 +662,11 @@ void render_scene(Context& context, Scene& scene) {
     VkDescriptorPool pool = VK_NULL_HANDLE;
     const u32 sets = nx::max<u32>(static_cast<u32>(plans.size()), 1);
     const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * sets},
-                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (kDrawBindings - 2) * sets}};
+                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (kDrawBindings - 3) * sets},
+                                          {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, sets}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = sets;
-    pi.poolSizeCount = 2;
+    pi.poolSizeCount = 3;
     pi.pPoolSizes = sizes;
     vkCreateDescriptorPool(d.device(), &pi, nullptr, &pool);
     nx::vector<VkDescriptorSet> descriptor_sets(plans.size(), VK_NULL_HANDLE);
@@ -672,6 +681,7 @@ void render_scene(Context& context, Scene& scene) {
         VkDescriptorImageInfo ii[kDrawBindings];
         for (u32 b = kDrawBindingFragmentTextures; b < kDrawBindings; ++b)
             ii[b] = {r.sampler, r.white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        ii[kDrawBindingColor] = {VK_NULL_HANDLE, color->view, VK_IMAGE_LAYOUT_GENERAL};
         for (u32 stage = 0; stage < 2; ++stage) {
             const Draw& dr = *plans[i].draw;
             const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
@@ -689,7 +699,8 @@ void render_scene(Context& context, Scene& scene) {
             }
         }
         VkWriteDescriptorSet w[kDrawBindings]{};
-        for (u32 b = 0; b < kDrawBindings; ++b) {
+        const u32 writes = reads_color ? kDrawBindings : kDrawBindingColor;  // (no input attachment outside such passes)
+        for (u32 b = 0; b < writes; ++b) {
             w[b] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w[b].dstSet = descriptor_sets[i];
             w[b].dstBinding = b;
@@ -697,12 +708,15 @@ void render_scene(Context& context, Scene& scene) {
             if (b < kDrawBindingFragmentTextures) {
                 w[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 w[b].pBufferInfo = &bi[b];
+            } else if (b == kDrawBindingColor) {
+                w[b].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+                w[b].pImageInfo = &ii[b];
             } else {
                 w[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 w[b].pImageInfo = &ii[b];
             }
         }
-        vkUpdateDescriptorSets(d.device(), kDrawBindings, w, 0, nullptr);
+        vkUpdateDescriptorSets(d.device(), writes, w, 0, nullptr);
     }
 
     // ---- Commands --------------------------------------------------------------------------------------------
@@ -738,6 +752,7 @@ void render_scene(Context& context, Scene& scene) {
     }
     vk::Pass pass;
     pass.color = {color, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {}};
+    pass.color_input = reads_color;
     if (has_depth && depth.image) {
         pass.depth.image = &depth;
         pass.depth.clear_depth = scene.depth.background_depth;
@@ -751,6 +766,15 @@ void render_scene(Context& context, Scene& scene) {
         for (usize i = 0; i < plans.size(); ++i) {
             const DrawPlan& p = plans[i];
             const DrawState& st = p.draw->state;
+            const usse::Gxp& fg = p.draw->fragment->program->gxp;
+            if (fg.native_color && fg.frag_color && i > 0 && !d.caps().raster_order_attachment) {
+                // (what the draws before wrote, for this one to read: the render pass's self-dependency)
+                VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+                vkCmdPipelineBarrier(*cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                     VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0, nullptr, 0, nullptr);
+            }
             vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
             vkCmdSetScissor(*cmd, 0, 1, &p.scissor);
             vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_FRONT_BIT, st.stencil[0].ref);
