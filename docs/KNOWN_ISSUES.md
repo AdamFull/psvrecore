@@ -317,8 +317,13 @@
 - **The process ends with `_Exit`** when the window is closed or the game exits: guest threads cannot be stopped and
   joined, so nothing is torn down (the window, the audio device, the log are flushed first). A game's own save data
   is written by the time its calls return, so nothing is lost that the game wrote.
-- **Settings changed while playing are not saved** (F11's full screen lasts for the run). There is no settings
-  screen yet; the file is edited by hand.
+- **The settings screen is Android's only.** On desktops the file is edited by hand (or the command line used), and
+  F11's full screen lasts for the run.
+- **Some settings apply only at the next start** (marked so on the screen while playing): the display's vsync, the
+  sound's latency, the console's settings (the game reads them once), the log file. Sound switched on while playing
+  plays only if it was on when the game started (the device is opened then).
+- **Android's Back opens the settings** over the game; the game ends from there ("Quit the game") or from the
+  system's recent apps.
 - **Android: the game's files are copied in.** The application may read only files it made: what adb or a computer
   puts in its folder (`Android/data/<package>/files`) belongs to someone else and cannot be read (it was refused). So
   the launcher copies the folder the user picks (the system's folder picker) into `game/` there, which needs the space
