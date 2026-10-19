@@ -37,5 +37,6 @@ void register_libkernel();
 void register_modulemgr();
 void register_rtc();
 void register_fios2();
+void register_ctrl();
 
 }  // namespace psvrecore::runtime::hle

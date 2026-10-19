@@ -304,6 +304,7 @@ void register_system_libraries() {
     register_modulemgr();
     register_rtc();
     register_fios2();
+    register_ctrl();
 }
 
 }  // namespace psvrecore::runtime::hle
