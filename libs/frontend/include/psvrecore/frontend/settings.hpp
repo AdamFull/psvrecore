@@ -23,6 +23,10 @@ struct Settings {
     // [audio]
     bool audio = true;
     u32 audio_latency_ms = 200;  // the most a port may fall behind before what it holds is dropped
+    // [controls] (on a touch screen)
+    i32 on_screen = 0;          // 0 auto (once the screen is touched, until a gamepad or a key is used), 1 always, 2 never
+    f32 controls_opacity = 0.5f;
+    f32 controls_scale = 1.0f;
     // [system] (what the game reads as the console's settings)
     i32 language = 1;  // SCE_SYSTEM_PARAM_LANG_* (English, US)
     nx::string user_name = "User";

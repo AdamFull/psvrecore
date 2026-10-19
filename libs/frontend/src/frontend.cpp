@@ -323,6 +323,9 @@ int run(const Game& game, int argc, char** argv) {
     window_options.gpu = s.gpu;
     window_options.validation = s.validation;
     window_options.hidden = cl.hidden;
+    window_options.controls = static_cast<platform::TouchControls::Mode>(s.on_screen);
+    window_options.controls_opacity = s.controls_opacity;
+    window_options.controls_scale = s.controls_scale;
     auto window = platform::Window::open(window_options);
     if (!window) return fail(window.error().message, cl.hidden);
     std::unique_ptr<platform::AudioDevice> speaker;

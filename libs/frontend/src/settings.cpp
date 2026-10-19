@@ -18,11 +18,20 @@ constexpr const char* kLanguages[] = {"japanese",   "english_us", "french",     
 constexpr const char* kDateFormats[] = {"yyyy/mm/dd", "dd/mm/yyyy", "mm/dd/yyyy"};  // SCE_SYSTEM_PARAM_DATE_FORMAT_*
 constexpr const char* kTimeFormats[] = {"12h", "24h"};                             // SCE_SYSTEM_PARAM_TIME_FORMAT_*
 constexpr const char* kLogLevels[] = {"debug", "info", "warn", "error"};
+constexpr const char* kOnScreen[] = {"auto", "always", "never"};
 
 bool parse_bool(nx::string_view v, bool* out) {
     if (v == "true" || v == "on" || v == "yes" || v == "1") return *out = true, true;
     if (v == "false" || v == "off" || v == "no" || v == "0") return *out = false, true;
     return false;
+}
+
+bool parse_float(nx::string_view v, f32* out, f32 lo, f32 hi) {
+    f32 parsed = 0;
+    const auto [end, error] = std::from_chars(v.data(), v.data() + v.size(), parsed);
+    if (error != std::errc{} || end != v.data() + v.size() || parsed < lo || parsed > hi) return false;
+    *out = parsed;
+    return true;
 }
 
 template <typename T>
@@ -100,6 +109,20 @@ const Key kKeys[] = {
      },
      [](const Settings& s) { return nx::format("{}", s.audio_latency_ms); }, "20 to 2000"},
 
+    {"controls", "on_screen",
+     "The controls drawn on a touch screen: auto shows them once it is touched, until a gamepad or a key is used.",
+     [](Settings& s, nx::string_view v) {
+         const i32 i = index_of(kOnScreen, v);
+         return i >= 0 && (s.on_screen = i, true);
+     },
+     [](const Settings& s) { return nx::string(kOnScreen[s.on_screen]); }, nullptr},
+    {"controls", "opacity", "How solid they are drawn.",
+     [](Settings& s, nx::string_view v) { return parse_float(v, &s.controls_opacity, 0.0f, 1.0f); },
+     [](const Settings& s) { return nx::format("{}", s.controls_opacity); }, "0 to 1"},
+    {"controls", "scale", "Their size.",
+     [](Settings& s, nx::string_view v) { return parse_float(v, &s.controls_scale, 0.5f, 2.0f); },
+     [](const Settings& s) { return nx::format("{}", s.controls_scale); }, "0.5 to 2"},
+
     {"system", "language", "The console's language.",
      [](Settings& s, nx::string_view v) {
          const i32 i = index_of(kLanguages, v);
@@ -154,6 +177,7 @@ nx::string expected(const Key& k) {
     if (nx::string_view(k.key) == "language") return "one of " + choices(kLanguages);
     if (nx::string_view(k.key) == "date_format") return "one of " + choices(kDateFormats);
     if (nx::string_view(k.key) == "time_format") return "one of " + choices(kTimeFormats);
+    if (nx::string_view(k.key) == "on_screen") return "one of " + choices(kOnScreen);
     return "one of " + choices(kLogLevels);
 }
 
