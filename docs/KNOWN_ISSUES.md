@@ -80,9 +80,10 @@
 
 ## Shader translator (USSE to SPIR-V)
 
-- **Only the compute form exists.** It is the translator's test form: one instance per invocation, registers in
-  storage buffers, textures and memory in the interpreter's test model. The vertex and fragment shaders GXM draws
-  with come next, from the same instruction translation.
+- **Four forms.** Compute is the test form (one instance per invocation, registers in storage buffers, textures and
+  memory in the interpreter's test model). Secondary programs run as a compute dispatch per draw, except a fragment
+  program's secondary that reads the per-tile special registers, which runs at the start of the fragment shader.
+  Vertex and fragment forms are what the GXM layer draws with.
 - **The GPU's precision, not the interpreter's.** `log2`, `exp2`, `inversesqrt` and division are the GPU's
   (Vulkan allows a few ULP), and f32 denormals may be flushed. Results agree within 2e-5 relative, except where an
   expression cancels the error out of proportion: 1 of 3864 random programs on the RTX 4060 (`exp2(x) - a` near
@@ -91,9 +92,33 @@
   clamped to the bank; a load outside the memory buffer or a sample of a missing texture gives zeros; a run of more
   than 1,000,000 blocks stops and is reported.
 - **Not implemented** (as in the interpreter): the per-instance predicate, `rlp`, per-lane predicate tests, o8
-  packs, texture queries, depth output, stores, and loads other than absolute ones.
+  packs, depth output, loads and stores other than absolute ones, texture queries other than `.irsd` of a 2D texture
+  with an f32 result (and that one has no oracle: see below).
+- **Stores** of 1 or 2 bytes read, modify and write their word, not atomically: instances storing bytes of one word
+  can race. Stores of 4 bytes are assumed aligned. A store outside the memory buffer is dropped.
+- **Implicit levels of detail** need derivatives, which fragment shaders have only outside non-uniform control
+  flow: a program with branches samples at level 0.
 - **64-bit integers.** Integer tests and 32-bit multiply-adds are computed in 64 bits, as the interpreter does;
   the module then needs `shaderInt64`, which some mobile GPUs lack. Programs without those instructions do not.
+
+## GXM layer (HLE)
+
+- **Scenes render synchronously** when they end (one submission and wait each): simple and ordered with transfers and
+  the CPU, but slow (multithreaded_rendering: about 40 ms a frame).
+- **Not implemented:** tiled and swizzled colour surfaces (the scene is not rendered), multisampling, the DF32M_S8
+  mask bit (DF32M's is the depth image's stencil aspect), YUV transfers, the VDM buffer and region clip checks of
+  command lists.
+- **Uniform data is copied when a draw is made** (the hardware reads it when the scene runs). A game that writes a
+  buffer between the draw and the end of the scene would see a difference; that is a race on the hardware too.
+- **Assumed, unverified:** the cull winding (CW culls Vulkan's back faces), the background mask set by default,
+  F32M textures without their mask bit, the level-of-detail bias in eighths, the transfer layouts of tiled surfaces
+  (as tiled textures), the downscale's rounding.
+- **Visibility testing** uses the front face's settings for both faces, writes every count to core 0's buffer (the
+  game sums the cores'), and counts samples exactly only where the device has `occlusionQueryPrecise`.
+- **Uniform buffers** are copied once per scene and shared by the draws that use them; buffers at different
+  addresses that overlap get separate copies.
+- **The mask update program** has no `SceGxmProgram`: `sceGxmFragmentProgramGetProgram` returns 0 for it.
+- **Texture formats not done:** PVRTC, BC4/5, YUV, X8U24, F11F11F10. The mirror-clamp addressing modes clamp.
 
 ## Shader interpreter (USSE)
 
@@ -101,15 +126,33 @@
   filtering, mipmaps, bias and level of detail are the texture model's, not the interpreter's. Texture queries (`.rsd`,
   `.info`, `.minp`) are not implemented.
 - **Not implemented:** the per-instance predicate, `rlp`, per-lane predicate tests, o8 packs,
-  loads and stores other than absolute ones, depth output. These fail with "not implemented". Derivatives and the
-  special registers read as zero (one instance, no neighbours).
+  loads and stores other than absolute ones, depth output. These fail with "not implemented". Derivatives read as zero
+  (one instance, no neighbours); special registers read what `Machine::specials` holds (zero by default).
 - **Fixed point is the least certain part.** fx10 is a signed 10-bit value with 1.0 = 255. x, y and z are in bits
   0-9, 10-19 and 20-29 of a register, w in the next one; this layout is read from the compiler's literals, and an fx10
   varying takes two registers. Products round to nearest (assumed). 7 of 600 random fixed-point programs disagree,
   unexplained.
 - **Semantics marked "(assumed)" in `interp.cpp` are not covered by the same-source check.** These are the
-  index-register destination numbering, the 16-bit integer multiply-add without a byte part, rounding in scaled
-  (normalized) conversions, and unfused multiply-add rounding.
+  index-register destination numbering, the 16-bit integer multiply-add without a byte part, and unfused
+  multiply-add rounding.
+- **Inferred from compiled programs, without an oracle** (each consistent with every compiled program examined, but
+  not measured on hardware):
+  - Loads and stores: an immediate offset counts elements, a register offset's low half is bytes (its high half, 1 in
+    every program, does not move the address), a burst (`.fetchN`) starts one element further. The element size of
+    16- and 64-bit bursts is assumed.
+  - A float test with a register destination writes all ones or zero for a single lane (every one in the corpora
+    feeds a `cmov8`), 1.0 or 0.0 per lane for a four-lane destination.
+  - Scaled conversions to integers truncate.
+  - GXP header flags 17 and 18 mark the vertex and instance indices, varyings word 7 their registers.
+  - `.irsd`: four texels (f32) then four f16 weights, texel k's at index 3 - k.
+  - `pixelX`, `pixelY` and `tileXY` describe 16 x 16 tiles.
+- **auxiliary_surface's export programs** write a pixel index computed with `mad.i16` into an internal register, then
+  read the whole word with `mad.u32`. With 16-bit lanes as halves of a word (what a unit test, checked on compiled
+  code, establishes for a lane-x write), lane y lands in the high half and every tile row but the first is lost; the
+  hardware must lay out or read these lanes differently. Not resolved.
+- **2 of 293 random vertex programs (seed 11) disagree with the host**, interpreter and GPU agreeing: loops over
+  float-to-int conversions of negative values (an off-by-one through the compiler's 16-bit conversion sequence).
+  Unexplained.
 - **8 of 981 random vertex programs disagree, unexplained.** Most involve integers that go through the compiler's
   16-bit conversion shortcuts, or integer arithmetic on indexed array elements. It is not known whether the
   interpreter or the compiler is wrong there.

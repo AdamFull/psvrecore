@@ -122,6 +122,32 @@ psvusse --spirv out.spv shader.gxp && spirv-val --target-env vulkan1.1 out.spv
 `--gpu-index` picks the device by its Vulkan index (by default a discrete GPU). A disagreement is reported as
 `gpu eNNNNN: word N: interpreter ..., GPU ...`.
 
+## Rendering tests (needs the PS Vita SDK and a Vulkan device)
+
+`scripts/render_check.py` compiles each `tests/render/<test>` folder's Cg programs (`v*.cg` vertex, `f*.cg` fragment)
+with the SDK's compiler and draws its `scene.txt` with `psvrender` twice: with the reference renderer (the USSE
+reference interpreter, rasterized on the CPU) and with the Vulkan backend. It compares the images pixel by pixel:
+
+```
+python scripts/render_check.py --sdk C:/path/to/sdk                   # every test, validation layer on
+python scripts/render_check.py --sdk C:/path/to/sdk depth blend --gpu-index 0
+```
+
+The programs and the images (`reference.png`, `gpu.png`, `diff.png`: red where they differ) go to `build/render`.
+They are derived from the SDK: never commit them. The scene format is described in `tools/psvrender/main.cpp`.
+
+## SDK samples (needs the PS Vita SDK and a Vulkan device)
+
+`scripts/sample_check.py` builds the SDK's api_libgxm samples with the SDK (the custom build steps of their
+projects included), recompiles them and runs them on the runtime with the GXM layer, saving the frames they show:
+
+```
+python scripts/sample_check.py --sdk C:/path/to/sdk basic shadow_mapping --frames 60
+```
+
+Name the samples to run. The frames go to `build/samples/<sample>/frames`; compare them with the screenshot next to
+each sample's sources. Everything there is derived from the SDK: never commit it.
+
 ## Test programs (needs the PS Vita SDK)
 
 `scripts/program_check.py` runs whole SDK-built programs on the runtime:

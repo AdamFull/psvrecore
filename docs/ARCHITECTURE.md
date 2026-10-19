@@ -165,10 +165,15 @@ Everything generated stays on the user's machine.
   - Results are written after an instruction's sources are read, and after both halves of a dual-issue word.
   - An instruction under a predicate computes its result and writes it with a select, so blocks have no branches
     inside them. Programs with branches become a loop around a switch over their blocks.
-  - Secondary programs are not translated to SPIR-V. They run once per draw on the CPU (in the tests, in the
-    interpreter; how the game runs them is decided with the GXM layer), and their results are the primary program's
-    secondary attributes.
-  - The compute form is the test form: one instance per invocation, checked on GPUs against the interpreter.
+  - Four forms. The compute form is the test form: one instance per invocation, checked on GPUs against the
+    interpreter. The secondary form runs a secondary program once per draw as a compute dispatch, on the draw's
+    secondary attributes in a storage buffer. The vertex and fragment forms are the draw's shaders: attributes in
+    their formats, outputs and varyings at fixed locations, the GXM viewport applied in the vertex shader, textures
+    as combined image samplers found through the program's sampler slots, the colour read in the program's declared
+    output type (the attachment quantizes it). A fragment program whose secondary program reads per-tile registers
+    runs that secondary first, in the fragment shader.
+  - Guest memory the programs read (uniform buffers) is copied into one storage buffer per scene; the addresses in
+    the secondary attributes point into it. Stores go to it and are copied back.
 - **Vulkan backend** (`vulkan/`). It knows nothing about GXM.
   - Vulkan 1.1 is the minimum and 1.3 is used where the driver has it. Dynamic rendering comes from core 1.3 or
     `VK_KHR_dynamic_rendering`; without it, drawing goes through render passes and framebuffers, made once and
@@ -181,6 +186,18 @@ Everything generated stays on the user's machine.
     and a list of objects to release once the GPU is done with them.
   - Every use of the queue holds one lock, since the GXM layer and the display may use it from different
     threads.
+- **GXM layer** (`gxm/src/hle`). The GXM API on the runtime: its objects live on the host, the guest sees handles
+  (the memory it gave for them).
+  - A scene is recorded as draws (each with a copy of the state and uniform data it used) and rendered when it
+    ends: the colour surface is loaded from guest memory and written back, depth and stencil are loaded or stored
+    when the surface asks, and the draws go into one render pass. sceGxmEndScene returns with the results in guest
+    memory, so transfers, the display and the CPU see them in order.
+  - Textures are decoded on the CPU from their control words and cached by those words and a hash of their data.
+  - Deferred contexts record draws the same way; a command list is those draws, appended to the scene that executes
+    it. Precomputed draws and states are records in the game's memory, read when a draw is made. Transfers run on the
+    CPU when called. Visibility tests are occlusion queries.
+- **Reference renderer** (`gxm/reference.hpp`). Draws with the interpreter and a CPU rasterizer: the rendering tests'
+  oracle against the Vulkan backend (`psvrender`). Never linked into a game.
 - **Graphics.**
   - GXM scenes map to Vulkan render passes, with load/store operations chosen for tile-based GPUs.
   - Guest surfaces are written back to guest memory only when the game can observe them.
