@@ -77,6 +77,8 @@ struct ArrayPicture {
 struct Decoder {
     media::H264Decoder h264;
     std::deque<media::Picture> waiting;  // (decoded, not handed out yet)
+    bool reported = false;               // (the first picture handed out is logged)
+    u32 units = 0, failed = 0;           // (access units given, and those that did not decode)
 };
 
 struct Videodec {
@@ -156,6 +158,12 @@ i32 hand_out(Decoder& d, Ptr<ArrayPicture> array) {
     Picture* pic = memory().host_as<Picture>(at);
     const media::Picture p = std::move(d.waiting.front());
     d.waiting.pop_front();
+    if (!d.reported) {
+        d.reported = true;
+        nx::logi(logs::hle, "H.264: first picture {} x {}, into a frame of type 0x{:x}, pitch {}, {} x {} at 0x{:08x}",
+                 p.width, p.height, pic->frame.pixel_type, pic->frame.pitch, pic->frame.width, pic->frame.height,
+                 pic->frame.picture[0]);
+    }
     if (!write_picture(p, pic->frame)) return kInvalidParam;
     std::memset(&pic->info, 0, sizeof pic->info);
     pic->info.output_pts = {static_cast<u32>(static_cast<u64>(p.time) >> 32), static_cast<u32>(p.time)};
@@ -234,6 +242,9 @@ i32 sceAvcdecDecode(Ptr<const Ctrl> ctrl, Ptr<const Au> au, Ptr<ArrayPicture> ar
     nx::vector<media::Picture> decoded;
     const bool ok = d->h264.decode_annexb({memory().host(a.es.address), a.es.size}, pts, decoded);
     for (auto& p : decoded) d->waiting.push_back(std::move(p));
+    ++d->units;
+    if (!ok && d->failed++ == 0)
+        nx::logw(logs::hle, "H.264: access unit {} ({} bytes) did not decode", d->units, a.es.size);
     const i32 r = hand_out(*d, array);
     if (!ok && r == 0 && array->outputs == 0) return kInvalidStream;
     return r;
