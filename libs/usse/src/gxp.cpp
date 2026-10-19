@@ -27,7 +27,8 @@ namespace psvrecore::usse {
 // inputs are 16-byte records from 0x14, as many as the low half of word 3, each naming an interpolated input
 // (bits 12-15: 0-9 a texture coordinate, 0xA color0, 0xB color1, 0xC fog, 0xD window position, 0xF none; bit 30:
 // the sprite coordinate instead) and a texture coordinate sampled without a program instruction (bits 0-3, 0xF
-// none; bit 10: the sprite coordinate instead).
+// none; bit 10: the sprite coordinate instead), the interpolated value's format (bits 28-29: 0 f32, 1 fx10,
+// 2 f16) and component count less one (bits 22-23); bit 25 marks the last record.
 
 namespace {
 
@@ -121,9 +122,22 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
         g.output_components = static_cast<u8>((format >> 24) & 0xF);
         const u32 count = r.le<u32>(varyings + 0x0C) & 0xFFFF;
         if (!r.contains(varyings + 0x14, usize{count} * 16)) return failure("GXP fragment inputs outside the file");
+        u32 offset = 0;
         for (u32 i = 0; i < count; ++i) {
-            const u32 record = r.le<u32>(varyings + 0x14 + 16 * i);
+            const usize at = varyings + 0x14 + 16 * usize{i};
+            const u32 record = r.le<u32>(at);
             g.fragment_inputs |= interpolated(record) | sampled(record);
+            FragmentInput in;
+            for (u32 j = 0; j < 4; ++j) in.raw[j] = r.le<u32>(at + 4 * j);
+            in.interpolated = interpolated(record);
+            in.sampled = sampled(record);
+            in.format = static_cast<u8>((record >> 28) & 3);
+            in.components = static_cast<u8>(((record >> 22) & 3) + 1);
+            in.offset = static_cast<u16>(offset);
+            // (packed in record order without alignment: f32 a register per component, f16 two components per
+            // register, fx10 always two registers; checked by the interpreter on compiled shaders)
+            offset += in.format == 0 ? in.components : in.format == 1 ? 2u : (in.components + 1u) / 2;
+            g.inputs.push_back(in);
         }
     }
     const u32 reg_formats = g.type == ShaderType::Vertex ? r.le<u32>(varyings + 0x08) : 0;

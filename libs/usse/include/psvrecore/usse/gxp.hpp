@@ -86,6 +86,17 @@ struct SamplerSlot {
     u16 offset = 0;
 };
 
+// A fragment program input: an interpolated value (and/or a texture sampled with an interpolated coordinate
+// before the program runs), placed in the primary attributes.
+struct FragmentInput {
+    u32 interpolated = 0;  // varying:: bit, 0 for none
+    u32 sampled = 0;       // varying:: bit of the coordinate sampled with, 0 for none
+    u8 format = 0;         // 0 f32, 1 fx10, 2 f16 (of the interpolated value)
+    u8 components = 0;
+    u16 offset = 0;        // the first primary attribute (32-bit register)
+    u32 raw[4] = {};
+};
+
 struct Gxp {
     ShaderType type = ShaderType::Vertex;
     u8 version_major = 0, version_minor = 0;
@@ -94,6 +105,7 @@ struct Gxp {
     u32 default_uniform_buffer_size = 0;  // bytes
     u32 vertex_outputs = 0;  // varying:: mask (vertex programs)
     u32 fragment_inputs = 0;  // varying:: mask (fragment programs)
+    nx::vector<FragmentInput> inputs;  // (fragment programs, in their order in the primary attributes)
     // The fragment program's output register format (fragment programs only).
     ParameterType output_type = ParameterType::F32;
     u8 output_components = 0;

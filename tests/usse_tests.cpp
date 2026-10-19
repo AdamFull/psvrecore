@@ -227,10 +227,36 @@ TEST_CASE("usse: GXP container") {
     REQUIRE(p->primary.size() == 2);
     CHECK(p->primary[1] == w1);
     CHECK(p->secondary.empty());
+    REQUIRE(p->inputs.size() == 1);
+    CHECK(p->inputs[0].interpolated == varying::kColor0);
+    CHECK(p->inputs[0].sampled == varying::kTexCoord0);
     g.data[5] = 6;
     CHECK(!gxp_valid(g.data));
     g.data[0] = 'X';
     CHECK(!parse_gxp(g.data));
+}
+
+TEST_CASE("usse: GXP fragment inputs in the primary attributes") {
+    // f32x4 TEXCOORD0, fx10x2 COLOR0, f16x2 TEXCOORD1: packed in record order, fx10 taking two registers
+    GxpImage g;
+    g.put32(0x14, 1);
+    g.offset(0x2C, 0xA0);
+    g.put32(0xA0 + 0x0C, 3);
+    g.put32(0xA0 + 0x14, 0x00C0000F);
+    g.put32(0xA0 + 0x24, 0x1040A00F);
+    g.put32(0xA0 + 0x34, 0x2240100F);
+    const auto p = parse_gxp(g.data);
+    REQUIRE(p);
+    REQUIRE(p->inputs.size() == 3);
+    CHECK(p->inputs[0].format == 0);
+    CHECK(p->inputs[0].components == 4);
+    CHECK(p->inputs[0].offset == 0);
+    CHECK(p->inputs[1].interpolated == varying::kColor0);
+    CHECK(p->inputs[1].format == 1);
+    CHECK(p->inputs[1].offset == 4);
+    CHECK(p->inputs[2].interpolated == (varying::kTexCoord0 << 1));
+    CHECK(p->inputs[2].offset == 6);
+    CHECK(p->fragment_inputs == (varying::kTexCoord0 | varying::kColor0 | (varying::kTexCoord0 << 1)));
 }
 
 TEST_CASE("usse: GXP vertex outputs and attributes") {

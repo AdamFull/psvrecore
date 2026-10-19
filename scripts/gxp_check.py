@@ -124,7 +124,7 @@ def main():
         if ref is None:
             rejected += 1
             continue
-        mine = got.get(f, [])
+        mine = [l for l in got.get(f, []) if not l.startswith('input ')]  # (libgxm has no function for these)
         if ref == mine:
             same += 1
         elif shown < args.show:

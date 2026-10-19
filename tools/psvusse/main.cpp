@@ -30,6 +30,12 @@ nx::string params(const usse::Gxp& g) {
     if (g.type == usse::ShaderType::Fragment)
         out += nx::format(" output={},{}", static_cast<u32>(g.output_type), static_cast<u32>(g.output_components));
     out += '\n';
+    for (usize i = 0; i < g.inputs.size(); ++i) {
+        const usse::FragmentInput& in = g.inputs[i];
+        out += nx::format("input {} interpolated={} sampled={} format={} components={} offset={} raw={:08x}\n", i,
+                          in.interpolated, in.sampled, static_cast<u32>(in.format), static_cast<u32>(in.components),
+                          in.offset, in.raw[0]);
+    }
     for (usize i = 0; i < g.parameters.size(); ++i) {
         const usse::Parameter& p = g.parameters[i];
         out += nx::format(
@@ -152,8 +158,10 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
     const auto primary = usse::decode_program(gxp.primary, usse::ProgramKind::Primary);
     if (const auto done = usse::run(primary, usse::ProgramKind::Primary, m, limits); !done)
         return failure(nx::format("primary program: {}", done.error().message));
+    // (a vertex program's results are its output registers; a fragment program's, its primary attributes)
+    const u32* results = gxp.type == usse::ShaderType::Fragment ? m.primary : m.output;
     nx::string out = "out";
-    for (u32 i = 0; i < 64; ++i) out += nx::format(" {:08x}", m.output[i]);
+    for (u32 i = 0; i < 64; ++i) out += nx::format(" {:08x}", results[i]);
     out += m.killed ? "\nkilled\n" : "\n";
     return out;
 }
