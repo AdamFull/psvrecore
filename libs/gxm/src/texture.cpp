@@ -201,7 +201,53 @@ void decode_bc(u32 code, const u8* block, f32 out[16][4]) {
     }
 }
 
-u64 morton(u32 x, u32 y, u32 w, u32 h) { return swizzled_index(x, y, w, h); }
+
+// A BC1-BC3 block as 8-bit RGBA: decode_bc's palette and alphas (the same arithmetic), each rounded once as the
+// general path rounds each texel's.
+void decode_bc8(u32 code, const u8* block, u8 out[16][4]) {
+    auto to8 = [](f32 v) { return static_cast<u8>(std::lround(nx::clamp(std::isnan(v) ? 0.0f : v, 0.0f, 1.0f) * 255.0f)); };
+    const u8* color = code == kUBC1 ? block : block + 8;
+    const u16 c0 = static_cast<u16>(color[0] | color[1] << 8), c1 = static_cast<u16>(color[2] | color[3] << 8);
+    f32 pal[4][4];
+    auto rgb565 = [](u16 v, f32* o) { o[0] = unorm(v >> 11, 5), o[1] = unorm((v >> 5) & 63, 6), o[2] = unorm(v & 31, 5), o[3] = 1; };
+    rgb565(c0, pal[0]);
+    rgb565(c1, pal[1]);
+    const bool four = code != kUBC1 || c0 > c1;
+    for (u32 k = 0; k < 3; ++k) {
+        pal[2][k] = four ? (2 * pal[0][k] + pal[1][k]) / 3 : (pal[0][k] + pal[1][k]) / 2;
+        pal[3][k] = four ? (pal[0][k] + 2 * pal[1][k]) / 3 : 0;
+    }
+    pal[2][3] = 1;
+    pal[3][3] = four ? 1.0f : 0.0f;
+    u8 pal8[4][4];
+    for (u32 i = 0; i < 4; ++i)
+        for (u32 k = 0; k < 4; ++k) pal8[i][k] = to8(pal[i][k]);
+    const u32 bits = static_cast<u32>(color[4] | color[5] << 8 | color[6] << 16 | color[7] << 24);
+    for (u32 i = 0; i < 16; ++i) std::memcpy(out[i], pal8[(bits >> (2 * i)) & 3], 4);
+    if (code == kUBC2) {
+        for (u32 i = 0; i < 16; ++i) out[i][3] = to8(unorm((block[i / 2] >> (4 * (i & 1))) & 15, 4));
+    } else if (code == kUBC3) {
+        const f32 a0 = unorm(block[0], 8), a1 = unorm(block[1], 8);
+        f32 a[8] = {a0, a1};
+        for (u32 k = 2; k < 8; ++k)
+            a[k] = block[0] > block[1] ? ((8 - k) * a0 + (k - 1) * a1) / 7 : k < 6 ? ((6 - k) * a0 + (k - 1) * a1) / 5 : (k == 6 ? 0.0f : 1.0f);
+        u8 a8[8];
+        for (u32 k = 0; k < 8; ++k) a8[k] = to8(a[k]);
+        u64 abits = 0;
+        for (u32 k = 0; k < 6; ++k) abits |= u64{block[2 + k]} << (8 * k);
+        for (u32 i = 0; i < 16; ++i) out[i][3] = a8[(abits >> (3 * i)) & 7];
+    }
+}
+
+// Swizzled addressing as two tables: swizzled_index(x, y, w, h) is a part from x's bits and a part from y's that do
+// not overlap, so the index of (x, y) is xs[x] + ys[y].
+struct SwizzleTables {
+    nx::vector<u64> xs, ys;
+    SwizzleTables(u32 width, u32 height, u32 w, u32 h) : xs(width), ys(height) {
+        for (u32 x = 0; x < width; ++x) xs[x] = swizzled_index(x, 0, w, h);
+        for (u32 y = 0; y < height; ++y) ys[y] = swizzled_index(0, y, w, h);
+    }
+};
 
 }  // namespace
 
@@ -409,6 +455,43 @@ Result<Texels> read_yuv(const TextureInfo& t, u32 code, ReadGuest read) {
     out.height = h;
     out.bytes = 4;
     out.data.resize(usize{w} * h * 4);
+    if (code != kYUV422) {
+        // (the planar layouts, as below a row at a time, in fixed point: each byte's term of yuv_to_rgba, times 255,
+        // from a table in 16.16, the three summed and rounded: within one of the exact value, as the floats are)
+        const bool full = profile >= 2, bt709 = profile & 1, swapped = t.swizzle & 1;
+        const f64 rv = bt709 ? 1.5748 : 1.402, gu = bt709 ? 0.187324 : 0.344136, gv = bt709 ? 0.468124 : 0.714136,
+                  bu = bt709 ? 1.8556 : 1.772;
+        i32 ys[256], rvs[256], gus[256], gvs[256], bus[256];
+        for (u32 i = 0; i < 256; ++i) {
+            const f64 y = full ? i / 255.0 : (static_cast<f64>(i) - 16.0) / 219.0;
+            const f64 c = full ? (static_cast<f64>(i) - 128.0) / 255.0 : (static_cast<f64>(i) - 128.0) / 224.0;
+            auto fixed = [](f64 v) { return static_cast<i32>(std::lround(v * 255.0 * 65536.0)); };
+            ys[i] = fixed(y) + 32768;  // (the rounding)
+            rvs[i] = fixed(rv * c), gus[i] = fixed(-gu * c), gvs[i] = fixed(-gv * c), bus[i] = fixed(bu * c);
+        }
+        auto byte = [](i32 v) { return static_cast<u8>(nx::clamp(v >> 16, 0, 255)); };
+        for (u32 row = 0; row < h; ++row) {
+            const u8* yrow = raw.data() + usize{row} * align8(w);
+            const usize crow = usize{row / 2} * align8(cw);
+            u8* dst = out.data.data() + usize{row} * w * 4;
+            for (u32 x = 0; x < w; ++x) {
+                u8 u, v;
+                if (code == kYUV420P2) {
+                    const u8* p = raw.data() + second + (crow + x / 2) * 2;
+                    u = swapped ? p[0] : p[1], v = swapped ? p[1] : p[0];
+                } else {
+                    const u8 first = raw[second + crow + x / 2], last = raw[third + crow + x / 2];
+                    u = swapped ? last : first, v = swapped ? first : last;
+                }
+                const i32 yv = ys[yrow[x]];
+                dst[x * 4 + 0] = byte(yv + rvs[v]);
+                dst[x * 4 + 1] = byte(yv + gus[u] + gvs[v]);
+                dst[x * 4 + 2] = byte(yv + bus[u]);
+                dst[x * 4 + 3] = 255;
+            }
+        }
+        return out;
+    }
     for (u32 yy = 0; yy < h; ++yy) {
         for (u32 x = 0; x < w; ++x) {
             u8 y, u, v;
@@ -454,7 +537,12 @@ void set_yuv_profile(u32 csc, u32 profile) {
     if (csc < 2 && profile < 4) yuv_profiles[csc].store(profile);
 }
 
-Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
+Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) { return detail::read_texels(t, read, false); }
+Result<Texels> read_texels(const TextureInfo& t, ReadGuest read, bool native_bc) {
+    return detail::read_texels(t, read, false, native_bc);
+}
+
+Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool reference, bool native_bc) {
     const u32 code = code_of(t.base_format);
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
@@ -532,6 +620,24 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
         }
     };
 
+    // P4 and P8 to 8-bit components: each texel its palette entry's bytes, as put() writes them (not with `reference`,
+    // which the tests compare with).
+    const bool paletted = !reference && (code == kP4 || code == kP8) && out_bytes == 4;
+    // BC1-BC3 without gamma: the blocks as they are for a device that samples them, else 8-bit texels a block at a time
+    const bool bc_plain = (code == kUBC1 || code == kUBC2 || code == kUBC3) && t.gamma == 0 && out_bytes == 4;
+    const bool keep_blocks = native_bc && bc_plain;
+    const bool bc_bytes = !reference && bc_plain && !keep_blocks;
+    if (keep_blocks) {
+        out.bc = code == kUBC1 ? 1 : code == kUBC2 ? 2 : 3;
+        out.bytes = 0;
+        usize blocks_total = 0;
+        for (const Level& l : levels) blocks_total += usize{(l.width + 3) / 4} * ((l.height + 3) / 4);
+        out.data.assign(blocks_total * (code == kUBC1 ? 8 : 16) * out.faces, 0);
+    }
+    u32 palette8[256] = {};
+    if (paletted)
+        for (u32 i = 0; i < 256; ++i) put(reinterpret_cast<u8*>(&palette8[i]), palette[i]);
+
     usize at = 0;
     for (u32 face = 0; face < out.faces; ++face) {
         for (const Level& lv : levels) {
@@ -543,11 +649,25 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
                 const u32 bx = (lv.width + 3) / 4, by = (lv.height + 3) / 4;
                 const u32 block_bytes = code == kUBC1 ? 8 : 16;
                 const u32 pbx = nx::max(pw / 4, 1u), pby = nx::max(ph / 4, 1u);
+                const SwizzleTables sw(is_swizzled(t.type) ? bx : 0, is_swizzled(t.type) ? by : 0, pbx, pby);
                 for (u32 y = 0; y < by; ++y) {
                     for (u32 x = 0; x < bx; ++x) {
-                        const u64 index = is_swizzled(t.type) ? morton(x, y, pbx, pby) : u64{y} * bx + x;
+                        const u64 index = is_swizzled(t.type) ? sw.xs[x] + sw.ys[y] : u64{y} * bx + x;
                         const u8* block = base + index * block_bytes;
                         if (block + block_bytes > raw.data() + raw.size()) continue;
+                        if (keep_blocks) {
+                            std::memcpy(out.data.data() + at + (usize{y} * bx + x) * block_bytes, block, block_bytes);
+                            continue;
+                        }
+                        if (bc_bytes) {
+                            u8 texels[16][4];
+                            decode_bc8(code, block, texels);
+                            for (u32 i = 0; i < 16; ++i) {
+                                const u32 tx = x * 4 + (i & 3), ty = y * 4 + i / 4;
+                                if (tx < lv.width && ty < lv.height) std::memcpy(dst + (usize{ty} * lv.width + tx) * 4, texels[i], 4);
+                            }
+                            continue;
+                        }
                         f32 texels[16][4];
                         decode_bc(code, block, texels);
                         for (u32 i = 0; i < 16; ++i) {
@@ -562,11 +682,12 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
                 const u32 row = lv.offset == 0 && is_linear(t.type) ? t.stride : ((lv.width + 7) & ~7u) * bits / 8;
                 const u32 texel_bytes = bits / 8, tiles_w = (lv.width + 31) / 32;
                 const u8* end = raw.data() + raw.size();
+                const SwizzleTables sw(is_swizzled(t.type) ? lv.width : 0, is_swizzled(t.type) ? lv.height : 0, pw, ph);
                 for (u32 y = 0; y < lv.height; ++y) {
                     u8* out_row = dst + usize{y} * lv.width * 4;
                     for (u32 x = 0; x < lv.width; ++x) {
                         u64 index;
-                        if (is_swizzled(t.type)) index = morton(x, y, pw, ph) * texel_bytes;
+                        if (is_swizzled(t.type)) index = (sw.xs[x] + sw.ys[y]) * texel_bytes;
                         else if (t.type == texture_type::kTiled)
                             index = ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * texel_bytes;
                         else index = u64{y} * row + u64{x} * texel_bytes;
@@ -576,12 +697,34 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
                         for (u32 k = 0; k < 4; ++k) o[k] = byte_of[k] >= 0 ? p[byte_of[k]] : static_cast<u8>(-byte_of[k] - 1);
                     }
                 }
+            } else if (paletted) {
+                // (a texel's 4 or 8 bits, its entry's bytes: a table lookup a texel)
+                const u32 row = lv.offset == 0 && is_linear(t.type) ? t.stride : ((lv.width + 7) & ~7u) * bits / 8;
+                const u32 tiles_w = (lv.width + 31) / 32;
+                const usize limit = raw.size() - 8 - static_cast<usize>(base - raw.data());
+                const SwizzleTables sw(is_swizzled(t.type) ? lv.width : 0, is_swizzled(t.type) ? lv.height : 0, pw, ph);
+                u32* out_texels = reinterpret_cast<u32*>(dst);
+                for (u32 y = 0; y < lv.height; ++y) {
+                    u32* out_row = out_texels + usize{y} * lv.width;
+                    const u64 row_bit = u64{y} * row * 8;
+                    for (u32 x = 0; x < lv.width; ++x) {
+                        u64 bit;
+                        if (is_swizzled(t.type)) bit = (sw.xs[x] + sw.ys[y]) * bits;
+                        else if (t.type == texture_type::kTiled)
+                            bit = ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * bits;
+                        else bit = row_bit + u64{x} * bits;
+                        if (bit / 8 > limit) continue;  // (as the general path: 8 bytes from the texel within the data and its padding)
+                        const u32 index = bits == 8 ? base[bit / 8] : (base[bit / 8] >> (bit % 8)) & 15;
+                        std::memcpy(out_row + x, &palette8[index], 4);
+                    }
+                }
             } else {
                 const u32 row = lv.offset == 0 && is_linear(t.type) ? t.stride : ((lv.width + 7) & ~7u) * bits / 8;
+                const SwizzleTables sw(is_swizzled(t.type) ? lv.width : 0, is_swizzled(t.type) ? lv.height : 0, pw, ph);
                 for (u32 y = 0; y < lv.height; ++y) {
                     for (u32 x = 0; x < lv.width; ++x) {
                         u64 bit;
-                        if (is_swizzled(t.type)) bit = morton(x, y, pw, ph) * bits;
+                        if (is_swizzled(t.type)) bit = (sw.xs[x] + sw.ys[y]) * bits;
                         else if (t.type == texture_type::kTiled) {
                             const u32 tiles_w = (lv.width + 31) / 32;
                             const u64 tile = u64{y / 32} * tiles_w + x / 32;
@@ -607,7 +750,8 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
                     }
                 }
             }
-            at += usize{lv.width} * lv.height * out_bytes;
+            at += keep_blocks ? usize{(lv.width + 3) / 4} * ((lv.height + 3) / 4) * (code == kUBC1 ? 8 : 16)
+                              : usize{lv.width} * lv.height * out_bytes;
         }
     }
     return out;

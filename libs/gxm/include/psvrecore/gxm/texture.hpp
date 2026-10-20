@@ -57,6 +57,8 @@ u32 texel_bits(u32 base_format);
 // The decoded texels: faces of mip levels, each level's texels as 16-bit floats or 8-bit unorm RGBA.
 struct Texels {
     u32 bytes = 4;  // per texel: 4 (RGBA8), 8 (RGBA16F) or 16 (RGBA32F: formats with 32-bit float components)
+    // 1-3: BC1-BC3 blocks as they are (native_bc), each level's 4x4 blocks in rows (8 or 16 bytes each); 0: texels
+    u32 bc = 0;
     u32 width = 0, height = 0, levels = 1, faces = 1;
     nx::vector<u8> data;  // face 0's levels, then face 1's, ...: each level width x height of its own, rows packed
 };
@@ -65,6 +67,12 @@ using ReadGuest = nx::function_ref<bool(u32 address, void* out, u32 size)>;
 
 // Reads and decodes a texture's texels. Fails on formats and layouts not implemented yet.
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read);
+// With `native_bc` (a device that samples BC1-BC3): those formats' blocks as they are (Texels::bc), not decoded.
+Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool native_bc);
+namespace detail {
+// (`reference`: without the fast paths that give the same texels, for the tests to compare them with)
+Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool reference, bool native_bc = false);
+}  // namespace detail
 
 // The colour space conversion of YUV textures' two slots (CSC0, CSC1): SCE_GXM_YUV_PROFILE_* (BT.601 or BT.709,
 // standard or full range). By default CSC0 is BT.601 and CSC1 BT.709, both of standard range.

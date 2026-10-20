@@ -359,6 +359,14 @@ struct Renderer {
         u32 strip_x = 0, strip_w = 0;
     };
     nx::vector<TargetCopy> target_copies;
+    // New textures' texels (texture_for), uploaded by the scene's commands before its draws: not waited for, as a
+    // copy submitted alone would be (behind the scenes the GPU still has). Their buffers go when the scene is done.
+    struct TextureUpload {
+        u64 key;  // (the texture's in `textures`)
+        vk::Buffer staging;
+        nx::vector<VkBufferImageCopy> regions;
+    };
+    nx::vector<TextureUpload> texture_uploads;
     // Scenes submitted to the GPU whose results are not in guest memory yet, oldest first: what each writes there,
     // the surface whose image it draws, and what finishes it (the write-back, the notifications, the clean-up) once
     // the GPU is done. A scene is finished when a later one has been submitted (the GPU runs it while the CPU
@@ -736,8 +744,33 @@ VkSamplerAddressMode address_mode(u32 m) {
     }
 }
 
-// Uploads decoded texels: each face's levels.
-Result<void> upload_texels(vk::Device& d, vk::Image& image, const Texels& t) {
+// Decoded texels into a staging buffer, to be uploaded into the texture `key` by the scene's commands (each face's
+// levels).
+Result<void> queue_texels(Renderer& r, u64 key, const Texels& t) {
+    vk::Device& d = *r.device;
+    auto staging = vk::create_host_buffer(d, t.data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!staging) return nx::err(staging.error());
+    std::memcpy(staging->mapped, t.data.data(), t.data.size());
+    vk::flush(d, *staging);
+    Renderer::TextureUpload u{key, *staging, {}};
+    VkDeviceSize at = 0;
+    for (u32 face = 0; face < t.faces; ++face) {
+        for (u32 l = 0; l < t.levels; ++l) {
+            const u32 w = nx::max(1u, t.width >> l), h = nx::max(1u, t.height >> l);
+            VkBufferImageCopy c{};
+            c.bufferOffset = at;
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, face, 1};
+            c.imageExtent = {w, h, 1};
+            u.regions.push_back(c);
+            at += t.bc ? VkDeviceSize{(w + 3) / 4} * ((h + 3) / 4) * (t.bc == 1 ? 8 : 16) : VkDeviceSize{w} * h * t.bytes;
+        }
+    }
+    r.texture_uploads.push_back(std::move(u));
+    return {};
+}
+
+// Uploads decoded texels and waits: each face's levels.
+[[maybe_unused]] Result<void> upload_texels(vk::Device& d, vk::Image& image, const Texels& t) {
     auto staging = vk::create_host_buffer(d, t.data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     if (!staging) return nx::err(staging.error());
     std::memcpy(staging->mapped, t.data.data(), t.data.size());
@@ -1046,6 +1079,8 @@ struct SceneProfile {
                                                     "colour uploaded"};
     static constexpr u32 kOrder[kParts] = {8, 9, 10, 0, 1, 2, 3, 4, 6, 5, 7};
     u64 colour_uploads = 0;
+    u64 began = 0, ns_before[kParts] = {}, misses_before = 0, miss_ns_before = 0;  // (this scene's start)
+    u64 pipelines_made = 0, pipeline_ns = 0, pipelines_before = 0, pipeline_ns_before = 0;  // (made while drawing)
     u64 buffer_wait_ns = 0;  // (sceGxmEndScene's wait for the display to let the scene's buffer go)
     bool on = false;
     bool read = false;  // (the switch, read at the first scene: --env sets it after the program starts)
@@ -1076,6 +1111,11 @@ struct SceneProfile {
         }
         part = 0;
         at = nx::os::ticks_ns();
+        if (on) {
+            began = at;
+            std::memcpy(ns_before, ns, sizeof ns);
+            misses_before = misses, miss_ns_before = miss_ns, pipelines_before = pipelines_made, pipeline_ns_before = pipeline_ns;
+        }
     }
     void mark(u32 i) {
         if (!on) return;
@@ -1084,7 +1124,18 @@ struct SceneProfile {
         at = now;
     }
     void done() {
-        if (!on || ++scenes < 200) return;
+        if (!on) return;
+        // (a scene that took longer than a frame at 60 frames a second: what took the time, at once)
+        if (const u64 took = nx::os::ticks_ns() - began; took > 16'000'000) {
+            nx::string parts;
+            for (u32 i : kOrder)
+                if (ns[i] - ns_before[i] >= 1'000'000)
+                    parts += nx::format(" {} {:.1f};", kNames[i], static_cast<f64>(ns[i] - ns_before[i]) / 1e6);
+            nx::logi(logs::gpu, "gxm profile: a slow scene, {:.1f} ms:{} {} new textures ({:.1f} ms), {} pipelines made ({:.1f} ms)",
+                     static_cast<f64>(took) / 1e6, parts, misses - misses_before, static_cast<f64>(miss_ns - miss_ns_before) / 1e6,
+                     pipelines_made - pipelines_before, static_cast<f64>(pipeline_ns - pipeline_ns_before) / 1e6);
+        }
+        if (++scenes < 200) return;
         u64 all = 0;
         for (u64 n : ns) all += n;
         std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each:", scenes, static_cast<f64>(all) / 1e6 / scenes);
@@ -1252,8 +1303,17 @@ CachedTexture* texture_from_pending_target(Renderer& r, const TextureInfo& info,
     return nullptr;
 }
 
-// The copies texture_from_target asked for, recorded before the scene's draws.
+// The copies texture_from_target asked for, and the new textures' uploads, recorded before the scene's draws.
 void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
+    for (Renderer::TextureUpload& u : r.texture_uploads) {
+        auto it = r.textures.find(u.key);
+        if (it == r.textures.end()) continue;
+        vk::Image& to = it->second.image;
+        vk::transition(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyBufferToImage(cmd, u.staging.buffer, to.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<u32>(u.regions.size()), u.regions.data());
+        vk::transition(cmd, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
     for (Renderer::TargetCopy& c : r.target_copies) {
         auto it = r.textures.find(c.key);
         if (it == r.textures.end()) continue;
@@ -1279,6 +1339,17 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
 // The copies' buffers given back once the scene is done; `recorded` false (the scene ended before its commands):
 // the textures they were to fill are dropped from the cache, never sampled.
 void finish_target_copies(Renderer& r, bool recorded) {
+    if (!recorded) {
+        for (Renderer::TextureUpload& u : r.texture_uploads) {
+            vk::destroy_buffer(*r.device, u.staging);
+            if (auto it = r.textures.find(u.key); it != r.textures.end()) {
+                r.texture_bytes -= it->second.bytes;
+                vk::destroy_image(*r.device, it->second.image);
+                r.textures.erase(it);
+            }
+        }
+        r.texture_uploads.clear();
+    }
     for (Renderer::TargetCopy& c : r.target_copies) {
         if (c.strip.buffer) vk::destroy_buffer(*r.device, c.strip);
         if (recorded) continue;
@@ -1335,10 +1406,20 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     struct MissTime {
         u64 start;
         u32 bytes;
+        const TextureInfo& info;
+        u64 decoded = 0;
         ~MissTime() {
-            if (g_profile.on) ++g_profile.misses, g_profile.miss_bytes += bytes, g_profile.miss_ns += nx::os::ticks_ns() - start;
+            if (!g_profile.on) return;
+            const u64 took = nx::os::ticks_ns() - start;
+            ++g_profile.misses, g_profile.miss_bytes += bytes, g_profile.miss_ns += took;
+            // (a texture that took a while: which)
+            if (took >= 2'000'000)
+                std::fprintf(stderr, "gxm profile: a slow new texture, %.1f ms (%.1f decoding): format %08x type %u, %u x %u, "
+                             "%u levels, %u bytes\n", static_cast<f64>(took) / 1e6,
+                             decoded ? static_cast<f64>(decoded - start) / 1e6 : 0.0, info.base_format, info.type, info.width,
+                             info.height, info.levels, bytes);
         }
-    } miss_time{miss_start, size};
+    } miss_time{miss_start, size, info};
     if (g_profile.on && g_profile.misses % 50 == 0)
         std::fprintf(stderr, "gxm profile: new texture at %08x: format %08x type %u, %u x %u, %u levels, %u bytes\n",
                      info.address, info.base_format, info.type, info.width, info.height, info.levels, size);
@@ -1346,14 +1427,17 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         if (!memory().valid(address, bytes)) return false;
         std::memcpy(out, memory().host(address), bytes);
         return true;
-    });
+    }, r.device->caps().texture_bc);
     if (!texels) {
         nx::logw(logs::gxm, "{} (format 0x{:08x}, type {})", texels.error().message, info.base_format, info.type);
         r.failed_textures[key] = texels.error().message;
         return nullptr;
     }
     vk::ImageDesc d;
-    d.format = texels->bytes == 16 ? VK_FORMAT_R32G32B32A32_SFLOAT
+    d.format = texels->bc == 1   ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+               : texels->bc == 2 ? VK_FORMAT_BC2_UNORM_BLOCK
+               : texels->bc == 3 ? VK_FORMAT_BC3_UNORM_BLOCK
+               : texels->bytes == 16 ? VK_FORMAT_R32G32B32A32_SFLOAT
                : texels->bytes == 8 ? VK_FORMAT_R16G16B16A16_SFLOAT
                                     : VK_FORMAT_R8G8B8A8_UNORM;
     d.width = texels->width;
@@ -1362,7 +1446,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     d.layers = texels->faces;
     d.cube = texels->faces == 6;
     const u64 decoded_at = g_profile.on ? nx::os::ticks_ns() : 0;
-    if (g_profile.on) g_profile.decode_ns += decoded_at - miss_start;
+    if (g_profile.on) g_profile.decode_ns += decoded_at - miss_start, miss_time.decoded = decoded_at;
     // (the image these words showed before, when no draw of this scene samples it and it has this size and format)
     if (auto was = r.by_words.find(wh.value()); was != r.by_words.end()) {
         auto old = r.textures.find(was->second);
@@ -1372,7 +1456,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
                 od.layers == d.layers && od.cube == d.cube) {
                 CachedTexture c = old->second;
                 r.textures.erase(old);
-                if (!upload_texels(*r.device, c.image, *texels)) {
+                if (!queue_texels(r, key, *texels)) {
                     r.texture_bytes -= c.bytes;
                     vk::destroy_image(*r.device, c.image);
                     r.by_words.erase(wh.value());
@@ -1390,7 +1474,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     const u64 created_at = g_profile.on ? nx::os::ticks_ns() : 0;
     if (g_profile.on) g_profile.create_ns += created_at - decoded_at;
     if (!image) return nullptr;
-    if (!upload_texels(*r.device, *image, *texels)) {
+    if (!queue_texels(r, key, *texels)) {
         vk::destroy_image(*r.device, *image);
         return nullptr;
     }
@@ -2121,7 +2205,10 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
         const usize before = r.pipelines->count();
+        const u64 pipeline_from = g_profile.on ? nx::os::ticks_ns() : 0;
         auto pipeline = r.pipelines->graphics(desc);
+        if (g_profile.on && r.pipelines->count() != before)
+            ++g_profile.pipelines_made, g_profile.pipeline_ns += nx::os::ticks_ns() - pipeline_from;
         if (!pipeline) {
             nx::logw(logs::gpu, "{}", pipeline.error().message);
             continue;
@@ -2551,7 +2638,8 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
                       layout, data = cs.data, width, height, bytes = cf.bytes, target,
                       buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
                       stores_depth, ds, dl, unorm24, samples, depth_target, kept_depth, depth, pool,
-                      notifications = std::move(notifications), copies = std::move(r.target_copies)](bool ok) mutable {
+                      notifications = std::move(notifications), copies = std::move(r.target_copies),
+                      uploads = std::move(r.texture_uploads)](bool ok) mutable {
         if (ok && stamps) {
             u64 ts[4] = {};
             if (vkGetQueryPoolResults(d.device(), stamps, 0, 4, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -2628,8 +2716,10 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         }
         for (Renderer::TargetCopy& c : copies)
             if (c.strip.buffer) vk::destroy_buffer(d, c.strip);
+        for (Renderer::TextureUpload& u : uploads) vk::destroy_buffer(d, u.staging);
     };
     r.target_copies.clear();  // (moved into the scene's finish: the guard finds none)
+    r.texture_uploads.clear();
     if (auto submitted = shot->submit(); !submitted) {
         nx::loge(logs::gpu, "scene: {}", submitted.error().message);
         finish_pending(r, true);
