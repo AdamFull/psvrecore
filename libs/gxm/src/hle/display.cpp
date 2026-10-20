@@ -45,8 +45,11 @@ u64 vcount_at(u64 t) { return static_cast<u64>(static_cast<f64>(t) / period_ns()
 void show(DisplaySink* sink, const DisplayFrameBuf& f, u64 vcount) {
     Frame frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount};
     nx::vector<u8> scaled;
-    if (state().options->render_scale > 1 && scaled_frame(f, scaled, &frame.scaled_width, &frame.scaled_height))
-        frame.scaled = scaled.data();
+    if (state().options->render_scale > 1) {
+        // (on the GPU when the sink takes it so: no readback, nor the CPU's copies)
+        if (scaled_frame_to(f, *sink, &frame.scaled_width, &frame.scaled_height)) frame.gpu = true;
+        else if (scaled_frame(f, scaled, &frame.scaled_width, &frame.scaled_height)) frame.scaled = scaled.data();
+    }
     sink->show(frame);
 }
 

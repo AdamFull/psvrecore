@@ -62,6 +62,8 @@ public:
 
     // From the game's thread.
     void show(const gxm::Frame& frame) override;
+    // The image frames drawn at an internal resolution are copied into on the GPU (one: the latest frame wins).
+    vulkan::Image* gpu_frame(u32 width, u32 height) override;
     // A frame from host memory (`pitch` in pixels; `pixel_format` as gxm::Frame's), as show() takes it.
     void show_pixels(const u8* pixels, u32 width, u32 height, u32 pitch, u32 pixel_format);
 

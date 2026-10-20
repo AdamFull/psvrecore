@@ -376,6 +376,8 @@ void profile_buffer_wait(u64 ns);
 // At an internal resolution above 1: the frame buffer's pixels as drawn (tightly packed, at the internal
 // resolution), if a scene drew it and guest memory still holds what that scene wrote there.
 bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height);
+// The same, copied on the GPU into the sink's image (DisplaySink::gpu_frame) instead; false if it cannot be.
+bool scaled_frame_to(const DisplayFrameBuf& f, DisplaySink& sink, u32* width, u32* height);
 
 // The display (display.cpp): what the display queue thread needs.
 void start_display_queue();

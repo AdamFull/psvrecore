@@ -444,6 +444,7 @@ struct Renderer {
     };
     nx::vector<Pending> pending;
     std::atomic<u32> pending_count{0};
+    nx::vector<nx::unique_ptr<vk::OneShot>> display_copies;  // (the frames copied to the sink's image, in flight)
     u64 submitted = 0, finished = 0;  // (the numbers of the last scene submitted and the last finished)
     bool flusher = false;
     nx::hash_map<u64, nx::string> failed_textures;
@@ -458,6 +459,27 @@ Renderer& renderer() {
 
 // (PSVRECORE_GXM_PROFILE: why the next scenes are finished)
 u32 g_finish_why = 0;
+
+// The renderer's lock, held: a guest thread waiting for it (another renders a scene, or writes one back: milliseconds)
+// gives up its CPU meanwhile, for the game's other threads, instead of keeping it idle.
+struct TargetsHeld {
+    nx::mutex& m;
+    explicit TargetsHeld(Renderer& r) : m(r.targets_lock) {
+        if (m.try_lock()) return;
+        std::optional<runtime::Kernel::Blocking> blocking;
+        if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+        m.lock();
+        try {
+            blocking.reset();  // (a CPU again; a thread ending meanwhile unwinds from here)
+        } catch (...) {
+            m.unlock();
+            throw;
+        }
+    }
+    ~TargetsHeld() { m.unlock(); }
+    TargetsHeld(const TargetsHeld&) = delete;
+    TargetsHeld& operator=(const TargetsHeld&) = delete;
+};
 
 // The pending scenes finished, oldest first: all of them but the newest `keep`, or only those the GPU is done with
 // (`all` false). Under targets_lock.
@@ -1074,7 +1096,9 @@ void give_host_buffer(Renderer& r, vk::Buffer& b) {
     r.free_buffers.push_back(b);
     r.free_buffer_bytes += b.size;
     b = {};
-    while (r.free_buffer_bytes > kFreeBufferBytes && !r.free_buffers.empty()) {
+    // (more at an internal resolution: its scenes' buffers are larger)
+    const u64 cap = kFreeBufferBytes * nx::max<u32>(state().options ? state().options->render_scale : 1, 1);
+    while (r.free_buffer_bytes > cap && !r.free_buffers.empty()) {
         r.free_buffer_bytes -= r.free_buffers.front().size;
         vk::destroy_buffer(*r.device, r.free_buffers.front());
         r.free_buffers.erase(r.free_buffers.begin());
@@ -1756,26 +1780,30 @@ void host_copy(nx::vector<u8>& out, u32 address, u32 bytes) {
 
 // Depth and stencil samples (the depth words, then the stencil bytes) of a w x h surface at the internal
 // resolution: each repeated over a scale x scale block; and back, the middle sample of each block.
+// (a row of samples for each row of the surface, each sample s times, depth words then stencil bytes: the copy into
+// the image repeats each row s times)
 nx::vector<u8> scale_up_samples(const nx::vector<u8>& in, u32 w, u32 h, u32 s) {
-    const usize n = usize{w} * h, sn = n * s * s;
-    nx::vector<u8> out(sn * 5);
-    for (u32 y = 0; y < h * s; ++y)
+    const usize n = usize{w} * h, rows = n * s;
+    nx::vector<u8> out(rows * 5);
+    for (u32 y = 0; y < h; ++y)
         for (u32 x = 0; x < w * s; ++x) {
-            const usize from = usize{y / s} * w + x / s, to = usize{y} * w * s + x;
+            const usize from = usize{y} * w + x / s, to = usize{y} * w * s + x;
             std::memcpy(out.data() + to * 4, in.data() + from * 4, 4);
-            out[sn * 4 + to] = in[n * 4 + from];
+            out[rows * 4 + to] = in[n * 4 + from];
         }
     return out;
 }
 
+// (from the rows the scene stored: row y*s + s/2 of the samples for each row of the surface, depth words then
+// stencil bytes; the middle sample of each s x s block)
 nx::vector<u8> scale_down_samples(const u8* in, u32 w, u32 h, u32 s) {
-    const usize n = usize{w} * h, sn = n * s * s;
+    const usize n = usize{w} * h, rows = n * s;
     nx::vector<u8> out(n * 5);
     for (u32 y = 0; y < h; ++y)
         for (u32 x = 0; x < w; ++x) {
-            const usize from = usize{y * s + s / 2} * w * s + x * s + s / 2, to = usize{y} * w + x;
+            const usize from = usize{y} * w * s + x * s + s / 2, to = usize{y} * w + x;
             std::memcpy(out.data() + to * 4, in + from * 4, 4);
-            out[n * 4 + to] = in[sn * 4 + from];
+            out[n * 4 + to] = in[rows * 4 + from];
         }
     return out;
 }
@@ -2022,7 +2050,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     g_profile.start();
     Renderer& r = renderer();
     if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return false;
-    nx::scoped_lock<nx::mutex> targets_held(r.targets_lock);
+    TargetsHeld targets_held(r);
     ++r.scenes;
     evict_textures(r);
     g_profile.mark(8);
@@ -2529,7 +2557,9 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
             read_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<u32*>(init.data()), init.data() + n * 4);
             if (scale > 1) init = scale_up_samples(init, width, height, scale);
         }
-        depth_buf = make(!init.empty() ? init.data() : nullptr, samples * 5,
+        // (at the internal resolution, a row of samples for each of the surface's rows: scale_up_samples,
+        // scale_down_samples)
+        depth_buf = make(!init.empty() ? init.data() : nullptr, VkDeviceSize{draw_w} * height * 5,
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
     auto cleanup = [&] {
@@ -2717,11 +2747,23 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         {samples * 4, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {draw_w, draw_h, 1}}};
     if (load_depth && !depth_kept && depth.image) {
         vk::transition(*cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkBufferImageCopy from_memory[2];
-        u32 count = 0;
-        for (u32 a = 0; a < 2; ++a)
-            if (!aspect_from[a]) from_memory[count++] = depth_regions[a];
-        if (count) vkCmdCopyBufferToImage(*cmd, depth_buf->buffer, depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, count, from_memory);
+        nx::vector<VkBufferImageCopy> from_memory;
+        for (u32 a = 0; a < 2; ++a) {
+            if (aspect_from[a]) continue;
+            if (scale == 1) {
+                from_memory.push_back(depth_regions[a]);
+                continue;
+            }
+            // (each row of the buffer into scale rows of samples)
+            const VkDeviceSize base = a ? VkDeviceSize{draw_w} * height * 4 : 0, bytes = a ? 1 : 4;
+            const VkImageAspectFlags aspect = a ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+            for (u32 y = 0; y < draw_h; ++y)
+                from_memory.push_back({base + VkDeviceSize{y / scale} * draw_w * bytes, 0, 0, {aspect, 0, 0, 1},
+                                       {0, static_cast<i32>(y), 0}, {draw_w, 1, 1}});
+        }
+        if (!from_memory.empty())
+            vkCmdCopyBufferToImage(*cmd, depth_buf->buffer, depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   static_cast<u32>(from_memory.size()), from_memory.data());
         for (u32 a = 0; a < 2; ++a) {
             if (!aspect_from[a]) continue;
             const VkImageAspectFlags aspect = a ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -2822,7 +2864,22 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     }
     if (store_depth && depth.image) {
         vk::transition(*cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        vkCmdCopyImageToBuffer(*cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, depth_buf->buffer, 2, depth_regions);
+        if (scale > 1) {
+            // (at the internal resolution, only the rows of samples guest memory gets one of: scale times less)
+            nx::vector<VkBufferImageCopy> rows(usize{height} * 2);
+            const VkDeviceSize stencil = VkDeviceSize{draw_w} * height * 4;
+            for (u32 y = 0; y < height; ++y) {
+                const i32 at = static_cast<i32>(y * scale + scale / 2);
+                rows[y] = {VkDeviceSize{y} * draw_w * 4, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, at, 0}, {draw_w, 1, 1}};
+                rows[height + y] = {stencil + VkDeviceSize{y} * draw_w, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                                    {0, at, 0}, {draw_w, 1, 1}};
+            }
+            vkCmdCopyImageToBuffer(*cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, depth_buf->buffer,
+                                   static_cast<u32>(rows.size()), rows.data());
+        } else {
+            vkCmdCopyImageToBuffer(*cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, depth_buf->buffer, 2,
+                                   depth_regions);
+        }
     }
     VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;  // (readbacks; stores)
@@ -3019,7 +3076,7 @@ void profile_buffer_wait(u64 ns) {
 
 u64 scenes_submitted() {
     Renderer& r = renderer();
-    nx::scoped_lock<nx::mutex> held(r.targets_lock);
+    TargetsHeld held(r);
     return r.submitted;
 }
 
@@ -3031,7 +3088,7 @@ void finish_scenes(u64 limit) {
     // with it.
     u64 upto;
     {
-        nx::scoped_lock<nx::mutex> held(r.targets_lock);
+        TargetsHeld held(r);
         if (r.pending.empty()) return;
         upto = nx::min(limit, r.pending.back().number);
         if (r.finished >= upto) return;
@@ -3049,10 +3106,53 @@ void finish_scenes(u64 limit) {
     }
 }
 
+bool scaled_frame_to(const DisplayFrameBuf& f, DisplaySink& sink, u32* width, u32* height) {
+    Renderer& r = renderer();
+    if (!r.device || f.pixel_format != 0 || r.device != state().options->shared_device) return false;
+    TargetsHeld held(r);
+    for (auto& t : r.targets) {
+        if (t->address != f.base || t->width != f.width || t->height != f.height || t->scale <= 1) continue;
+        ColorFormat cf;
+        if (!color_format(t->format, cf) || cf.bytes != 4) return false;
+        if (t->layout.kind != SurfaceLayout::kLinear || t->layout.stride != f.pitch) return false;
+        // (only as the scene left it: what the CPU drew over it since is in guest memory, scaled_frame's)
+        const Changes changes = surface_changes(*t);
+        if (changes.all || changes.pixels) return false;
+        vk::Image* out = sink.gpu_frame(t->scaled.desc.width, t->scaled.desc.height);
+        if (!out || out->desc.width != t->scaled.desc.width || out->desc.height != t->scaled.desc.height ||
+            vk::texel_size(out->desc.format) != 4)
+            return false;
+        // (the copies the GPU is done with let go; the frame's after the scenes drawing it, on the same queue)
+        for (usize i = 0; i < r.display_copies.size();) {
+            if (r.display_copies[i]->done()) r.display_copies.erase(r.display_copies.begin() + static_cast<isize>(i));
+            else ++i;
+        }
+        auto shot = nx::make_unique<vk::OneShot>(*r.device);
+        auto cmd = shot->begin();
+        if (!cmd) return false;
+        vk::transition(*cmd, t->scaled, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vk::transition(*cmd, *out, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy copy{};
+        copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.extent = {t->scaled.desc.width, t->scaled.desc.height, 1};
+        vkCmdCopyImage(*cmd, t->scaled.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out->image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vk::transition(*cmd, *out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (auto submitted = shot->submit(); !submitted) {
+            nx::logw(logs::gpu, "the scaled frame: {}", submitted.error().message);
+            return false;
+        }
+        r.display_copies.push_back(std::move(shot));
+        *width = t->scaled.desc.width, *height = t->scaled.desc.height;
+        return true;
+    }
+    return false;
+}
+
 bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height) {
     Renderer& r = renderer();
     if (!r.device) return false;
-    nx::scoped_lock<nx::mutex> held(r.targets_lock);
+    TargetsHeld held(r);
     for (auto& t : r.targets) {
         if (t->address != f.base || t->width != f.width || t->height != f.height || t->scale <= 1) continue;
         ColorFormat cf;

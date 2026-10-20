@@ -42,13 +42,28 @@ public:
     nx::vector<std::pair<f32, f32>> probes;
     nx::vector<std::optional<u32>> probed;
 
-    void show(const gxm::Frame& f) override {
-        // (PSVRECORE_SHOTS_FROM_WINDOW=1: shots of what the window presented, the overlays over the picture, at the
-        // window's size)
+    // (on the GPU to the window, unless a shot of the frame is to be taken from its pixels)
+    vulkan::Image* gpu_frame(u32 width, u32 height) override {
+        if (!window) return nullptr;
+        {
+            nx::scoped_lock<nx::mutex> held(lock);
+            if (!shots.empty() && !shots_from_window()) return nullptr;
+        }
+        return window->gpu_frame(width, height);
+    }
+
+    static bool shots_from_window() {
         static const bool from_window = [] {
             const char* v = std::getenv("PSVRECORE_SHOTS_FROM_WINDOW");
             return v && *v && *v != '0';
         }();
+        return from_window;
+    }
+
+    void show(const gxm::Frame& f) override {
+        // (PSVRECORE_SHOTS_FROM_WINDOW=1: shots of what the window presented, the overlays over the picture, at the
+        // window's size)
+        const bool from_window = shots_from_window();
         if (from_window && window) window->keep_last(true);
         const u64 presented_before = window ? window->presented() : 0;
         if (window) window->show(f);

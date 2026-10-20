@@ -7,6 +7,10 @@
 #include "psvrecore/vulkan/device.hpp"
 #include "core/foundation/core/foundation.h"
 
+namespace psvrecore::vulkan {
+struct Image;
+}
+
 namespace psvrecore::gxm {
 
 // A frame the game shows: its frame buffer in guest memory, as sceDisplaySetFrameBuf gave it.
@@ -21,6 +25,10 @@ struct Frame {
     // it since. Readable until show() returns.
     const u8* scaled = nullptr;
     u32 scaled_width = 0, scaled_height = 0;
+    // Instead: the frame (scaled_width x scaled_height) copied on the GPU into the image the sink's gpu_frame()
+    // gave, by commands submitted to the shared device's queue before show(); in the image's layout then, for
+    // sampling (VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).
+    bool gpu = false;
 };
 
 class DisplaySink {
@@ -30,6 +38,14 @@ public:
     // come, the next one to wait for a blank or set a frame buffer. The frame's memory is readable until the call
     // returns.
     virtual void show(const Frame& frame) = 0;
+    // At an internal resolution above 1, with the shared device: an image of it (width x height, four bytes a pixel,
+    // sampled and copied into) for the frame shown next, copied there on the GPU instead of read back (show() then
+    // has Frame::gpu); null to take the frame's pixels instead. The renderer records into it, and keeps its
+    // layout, from the thread that calls show() next.
+    virtual vulkan::Image* gpu_frame(u32 width, u32 height) {
+        (void)width, (void)height;
+        return nullptr;
+    }
 };
 
 struct Options {

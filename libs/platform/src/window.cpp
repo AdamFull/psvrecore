@@ -76,6 +76,7 @@ struct Window::Presenter {
     nx::vector<u8> pending;
     u32 pending_w = 0, pending_h = 0;
     bool has_pending = false, redraw = true, stop = false;
+    bool pending_gpu = false;  // (the frame pending is gpu_image's)
     std::atomic<u32> pixel_w{0}, pixel_h{0};
     // In the background (set_background): nothing is drawn, and there is no surface until the window is back.
     nx::mutex draw_lock;  // (held while drawing)
@@ -86,6 +87,11 @@ struct Window::Presenter {
     // The presenting thread's.
     nx::vector<u8> current;  // RGBA
     u32 current_w = 0, current_h = 0;
+    bool current_gpu = false;
+    // The frame copied in by the renderer on the GPU (gpu_frame; it records into it and keeps its layout, sampled
+    // here as it leaves it), and the format the textures drawn from are made in (for the swapchain's).
+    vulkan::Image gpu_image;
+    std::atomic<VkFormat> texture_format{VK_FORMAT_R8G8B8A8_UNORM};
     VkCommandPool pool = VK_NULL_HANDLE;
     struct InFlight {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -150,6 +156,7 @@ struct Window::Presenter {
             if (f.acquired) vkDestroySemaphore(d, f.acquired, nullptr);
         }
         vulkan::destroy_buffer(*device, readback);
+        vulkan::destroy_image(*device, gpu_image);
         vulkan::destroy_image(*device, atlas);
         vulkan::destroy_image(*device, stats_atlas);
         quads.reset();
@@ -199,7 +206,8 @@ struct Window::Presenter {
                 wake.wait(lock, [&] { return has_pending || redraw || stop; });
                 if (stop) return;
                 if (has_pending) {
-                    std::swap(pending, current);
+                    if (!pending_gpu) std::swap(pending, current);
+                    current_gpu = pending_gpu;
                     current_w = pending_w, current_h = pending_h;
                     has_pending = false;
                 }
@@ -340,6 +348,7 @@ struct Window::Presenter {
             nx::logi(logs::display, "display: {} x {}, format {}, {} images, {}", e.width, e.height,
                      static_cast<i32>(chosen.format), n, mode_name(mode));
         format = chosen.format;
+        texture_format.store(is_srgb(format) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
         extent = e;
         made_w = w, made_h = h;
         out_of_date = false;
@@ -425,9 +434,10 @@ struct Window::Presenter {
             }
         }
 
-        // The frame into this slot's image.
-        const bool have = current_w && current_h;
-        if (have) {
+        // The frame into this slot's image (unless the renderer copied it into gpu_image).
+        const bool gpu = current_gpu && gpu_image.image;
+        const bool have = current_w && current_h && (gpu || !current_gpu);
+        if (have && !gpu) {
             const VkDeviceSize bytes = VkDeviceSize{current_w} * current_h * 4;
             if (f.staging.size < bytes) {
                 vulkan::destroy_buffer(*device, f.staging);
@@ -471,7 +481,7 @@ struct Window::Presenter {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(f.cmd, &bi);
-        if (have) {
+        if (have && !gpu) {
             vulkan::transition(f.cmd, f.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -489,7 +499,8 @@ struct Window::Presenter {
             q.x0 = std::round(v.x), q.y0 = std::round(v.y);
             q.x1 = std::round(v.x + v.w), q.y1 = std::round(v.y + v.h);
             const bool exact = q.x1 - q.x0 == static_cast<f32>(current_w) && q.y1 - q.y0 == static_cast<f32>(current_h);
-            quads->draw(f.cmd, quads->texture(slot * 3, f.image.view, smooth && !exact), q, false);
+            quads->draw(f.cmd, quads->texture(slot * 3, gpu ? gpu_image.view : f.image.view, smooth && !exact), q,
+                        false);
         }
         if (atlas.image && !overlay_drawn.empty()) {
             const VkDescriptorSet sprites = quads->texture(slot * 3 + 1, atlas.view, true);
@@ -716,11 +727,45 @@ void Window::handle(const SDL_Event& e, runtime::Runtime* rt) {
 }
 
 void Window::show(const gxm::Frame& f) {
-    // (drawn at a higher internal resolution: that picture)
+    // (drawn at a higher internal resolution: that picture, on the GPU or from memory)
+    if (f.gpu && presenter_) {
+        Presenter& p = *presenter_;
+        {
+            nx::scoped_lock<nx::mutex> held(p.lock);
+            p.pending_w = f.scaled_width, p.pending_h = f.scaled_height;
+            p.pending_gpu = p.has_pending = true;
+            p.stats.record(nx::os::ticks_ns());
+        }
+        p.wake.notify_one();
+        return;
+    }
     if (f.scaled) return show_pixels(f.scaled, f.scaled_width, f.scaled_height, f.scaled_width, f.pixel_format);
     const u8* base = runtime::runtime().memory().host(f.address);
     if (!base) return;
     show_pixels(base, f.width, f.height, f.pitch, f.pixel_format);
+}
+
+vulkan::Image* Window::gpu_frame(u32 width, u32 height) {
+    if (!presenter_ || !presenter_->device || !width || !height) return nullptr;
+    Presenter& p = *presenter_;
+    vulkan::Image& g = p.gpu_image;
+    const VkFormat format = p.texture_format.load();
+    if (!g.image || g.desc.width != width || g.desc.height != height || g.desc.format != format) {
+        // (made again, rarely: the presenting thread, and the GPU, done with the old one first)
+        nx::scoped_lock<nx::mutex> drawing(p.draw_lock);
+        p.device->wait_idle();
+        vulkan::destroy_image(*p.device, g);
+        vulkan::ImageDesc desc;
+        desc.format = format;
+        desc.width = width, desc.height = height;
+        auto image = vulkan::create_image(*p.device, desc);
+        if (!image) {
+            nx::loge(logs::display, "display: {}", image.error().message);
+            return nullptr;
+        }
+        g = *image;
+    }
+    return &g;
 }
 
 void Window::show_pixels(const u8* pixels, u32 width, u32 height, u32 pitch, u32 pixel_format) {
@@ -749,6 +794,7 @@ void Window::show_pixels(const u8* pixels, u32 width, u32 height, u32 pitch, u32
         }
         p.pending_w = width, p.pending_h = height;
         p.has_pending = true;
+        p.pending_gpu = false;
         p.stats.record(nx::os::ticks_ns());
     }
     p.wake.notify_one();
