@@ -269,7 +269,9 @@ it.
 
 ## Debugging switches
 
-Environment variables the runtime reads, for finding what a game does; they cost nothing while unset.
+Environment variables the runtime reads, for finding what a game does; they cost nothing while unset. Where the
+environment cannot be given (an Android activity, started with `am start ... --esa args ...`), the frontend's
+`--env NAME=VALUE` sets one before the runtime starts.
 
 | Variable | What it does |
 |---|---|
@@ -278,7 +280,7 @@ Environment variables the runtime reads, for finding what a game does; they cost
 | `PSVRECORE_WATCH_SHOTS=1` | Each press of an input script's `watch` also saves a shot (`w<ms>_<button>.png`), to see what the watch saw. |
 | `PSVRECORE_THREADS=<seconds>` | Every so many seconds, each guest thread's state, priority, link register and what it waits for. |
 | `PSVRECORE_HLE_COUNTS=<seconds>` | Every so many seconds, the HLE functions called since the last report, how often and the time spent in them (waits included: what blocks shows where the game waits), and the CPU time each host thread used meanwhile (Windows). |
-| `PSVRECORE_GXM_PROFILE=1` | Every 200 scenes, the time each part of rendering a scene took (loading the colour surface, the draws, the textures, recording, the GPU, writing back) and the textures' lookups, hashes and new ones; every 50th new texture described. |
+| `PSVRECORE_GXM_PROFILE=1` | Every 200 scenes, the time each part of rendering a scene took (loading the colour surface, the draws, the textures, recording, the GPU, writing back), the GPU's own time on the scene's commands (timestamps), the texture cache's size, and the textures' lookups, hashes, copies from surfaces and new ones; every 50th new texture described. |
 | `PSVRECORE_DUMP=<address>:<bytes>,...` | Guest memory, in words, with each report (every 10 seconds without the two above). |
 | `PSVRECORE_GXM_TRACE=<first>[-<last>]` (or `1`: all) | Each scene in that range logged before it renders: its surfaces, and each draw's programs, primitive and textures. |
 | `PSVRECORE_RENDER_SCALE=<1-4>` | The SDK sample runner's internal resolution. |

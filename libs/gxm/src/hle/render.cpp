@@ -323,6 +323,7 @@ struct Renderer {
         u32 strip_x = 0, strip_w = 0;
     };
     nx::vector<TargetCopy> target_copies;
+    VkQueryPool timestamps = VK_NULL_HANDLE;  // (PSVRECORE_GXM_PROFILE: the start and end of a scene's commands)
     nx::hash_map<u64, nx::string> failed_textures;
     u64 scenes = 0;
 };
@@ -837,6 +838,7 @@ struct SceneProfile {
     bool on = false;
     bool read = false;  // (the switch, read at the first scene: --env sets it after the program starts)
     u64 ns[kParts] = {};
+    u64 gpu_busy_ns = 0, gpu_measured = 0;  // (the scenes' commands on the GPU, by timestamps)
     u64 from_targets = 0, lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
     u64 at = 0;
     u32 part = 0, scenes = 0;
@@ -861,6 +863,8 @@ struct SceneProfile {
         for (u64 n : ns) all += n;
         std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each:", scenes, static_cast<f64>(all) / 1e6 / scenes);
         for (u32 i = 0; i < kParts; ++i) std::fprintf(stderr, " %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
+        if (gpu_measured)
+            std::fprintf(stderr, " GPU busy %.2f ms a scene;", static_cast<f64>(gpu_busy_ns) / 1e6 / gpu_measured);
         std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene;",
                      static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
                      static_cast<f64>(from_targets) / scenes);
@@ -1811,6 +1815,19 @@ void render_scene(Context& context, Scene& scene) {
     // ---- Commands --------------------------------------------------------------------------------------------
     vk::OneShot shot(d);
     auto cmd = shot.begin();
+    const bool timed = g_profile.on && cmd && d.caps().timestamp_period > 0;
+    if (timed) {
+        if (!r.timestamps) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 2;
+            vkCreateQueryPool(d.device(), &qi, nullptr, &r.timestamps);
+        }
+        if (r.timestamps) {
+            vkCmdResetQueryPool(*cmd, r.timestamps, 0, 2);
+            vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, r.timestamps, 0);
+        }
+    }
     if (!cmd) {
         if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
         vkDestroyDescriptorPool(d.device(), pool, nullptr);
@@ -1967,9 +1984,17 @@ void render_scene(Context& context, Scene& scene) {
                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
+    if (timed && r.timestamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r.timestamps, 1);
     g_profile.mark(4);
     if (auto done = shot.submit_and_wait(); done) {
         g_profile.mark(5);
+        if (timed && r.timestamps) {
+            u64 ts[2] = {};
+            if (vkGetQueryPoolResults(d.device(), r.timestamps, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                g_profile.gpu_busy_ns += static_cast<u64>(static_cast<f64>(ts[1] - ts[0]) * d.caps().timestamp_period);
+                ++g_profile.gpu_measured;
+            }
+        }
         if (color) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
