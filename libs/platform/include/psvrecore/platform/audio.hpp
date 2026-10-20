@@ -2,8 +2,10 @@
 
 // The guest's audio ports played on the host's audio device (SDL3): one audio stream per port, all bound to one
 // device that mixes them. The runtime paces the ports (each block arrives as the one before it starts), so a port's
-// stream holds about a block; a stream that has gathered more than `max_latency_ms` (the device running slower than
-// the kernel's clock, or a stall) drops what it holds, so sound never falls behind the game.
+// stream holds about a block. The device's clock is not the kernel's: one running slower gathers sound in the
+// stream, so a stream holding more than a quarter of `max_latency_ms` is played up to 0.5% faster until it holds
+// less (a pitch change too small to hear); one that has gathered more than `max_latency_ms` all the same (a stall)
+// drops what it holds, so sound never falls behind the game.
 
 #include <memory>
 
@@ -45,6 +47,8 @@ private:
     struct Port {
         SDL_AudioStream* stream = nullptr;
         u32 rate = 0, channels = 0;
+        f32 queued_ms = 0;  // (what it held as the blocks came, smoothed)
+        f32 ratio = 1;      // (how much faster than its rate it plays)
     };
     nx::mutex lock_;
     u32 device_ = 0;

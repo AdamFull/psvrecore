@@ -43,6 +43,8 @@ void AudioDevice::play(const runtime::AudioBlock& block) {
         p.stream = SDL_CreateAudioStream(&from, &to);
         p.rate = block.rate;
         p.channels = block.channels;
+        p.queued_ms = 0;
+        p.ratio = 1;
         if (!p.stream || !SDL_BindAudioStream(device_, p.stream)) {
             nx::logw(logs::audio, "audio: port {}: {}", block.port, SDL_GetError());
             if (p.stream) SDL_DestroyAudioStream(p.stream);
@@ -51,10 +53,18 @@ void AudioDevice::play(const runtime::AudioBlock& block) {
         }
     }
     const u64 bytes_per_ms = u64{block.rate} * block.channels * 2 / 1000;
-    if (bytes_per_ms && static_cast<u64>(SDL_GetAudioStreamQueued(p.stream)) > bytes_per_ms * options_.max_latency_ms) {
+    const u64 queued = static_cast<u64>(nx::max(SDL_GetAudioStreamQueued(p.stream), 0));
+    if (bytes_per_ms && queued > bytes_per_ms * options_.max_latency_ms) {
         nx::logw(logs::audio, "audio: port {} is more than {} ms behind: dropping what it holds", block.port,
                  options_.max_latency_ms);
         SDL_ClearAudioStream(p.stream);
+        p.queued_ms = 0;
+    } else if (bytes_per_ms) {
+        // (the drift between the device's clock and the kernel's: played a little faster while too much is held)
+        p.queued_ms += (static_cast<f32>(queued) / static_cast<f32>(bytes_per_ms) - p.queued_ms) * 0.05f;
+        const f32 target = static_cast<f32>(options_.max_latency_ms) / 4;
+        const f32 ratio = 1.0f + nx::clamp((p.queued_ms - target) / target * 0.005f, 0.0f, 0.005f);
+        if (ratio != p.ratio && SDL_SetAudioStreamFrequencyRatio(p.stream, ratio)) p.ratio = ratio;
     }
     SDL_PutAudioStreamData(p.stream, block.samples.data(), static_cast<int>(block.samples.size_bytes()));
 }
