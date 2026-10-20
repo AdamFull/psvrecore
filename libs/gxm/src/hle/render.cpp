@@ -312,6 +312,17 @@ struct Renderer {
     // (by a hash of the control words: the content key last cached for them, whose image the next content those
     // words show is uploaded into: a render target read as a texture is one image, not one a frame)
     nx::hash_map<u64, u64> by_words;
+    // Textures made on the GPU from a surface's image (texture_from_target), to be recorded at the start of the
+    // scene's commands: the cached texture's key, the surface, and the columns past the surface's width (from guest
+    // memory, in a buffer) when the texture is wider.
+    struct TargetCopy {
+        u64 key = 0;
+        Target* from = nullptr;
+        u32 width = 0, height = 0;
+        vk::Buffer strip{};
+        u32 strip_x = 0, strip_w = 0;
+    };
+    nx::vector<TargetCopy> target_copies;
     nx::hash_map<u64, nx::string> failed_textures;
     u64 scenes = 0;
 };
@@ -675,6 +686,7 @@ bool texels_as_image(const TextureInfo& info, VkFormat format) {
     one.width = one.height = 1;
     one.levels = 1;
     one.stride = 4;
+    one.type = texture_type::kLinear;  // (the order of the bytes, whatever the layout: a tiled texel would read a tile)
     const u8 probe[4] = {0x11, 0x55, 0x99, 0xDD};
     auto texels = read_texels(one, [&](u32, void* out, u32 bytes) {
         if (bytes > 4) return false;
@@ -822,15 +834,18 @@ struct SceneProfile {
     static constexpr u32 kParts = 8;
     static constexpr const char* kNames[kParts] = {"colour in", "draws", "buffers", "descriptors and textures",
                                                     "commands", "GPU", "back to memory", "cleanup"};
-    bool on = [] {
-        const char* v = std::getenv("PSVRECORE_GXM_PROFILE");
-        return v && *v && *v != '0';
-    }();
+    bool on = false;
+    bool read = false;  // (the switch, read at the first scene: --env sets it after the program starts)
     u64 ns[kParts] = {};
-    u64 lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
+    u64 from_targets = 0, lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
     u64 at = 0;
     u32 part = 0, scenes = 0;
     void start() {
+        if (!read) {
+            const char* v = std::getenv("PSVRECORE_GXM_PROFILE");
+            on = v && *v && *v != '0';
+            read = true;
+        }
         part = 0;
         at = nx::os::ticks_ns();
     }
@@ -846,8 +861,9 @@ struct SceneProfile {
         for (u64 n : ns) all += n;
         std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each:", scenes, static_cast<f64>(all) / 1e6 / scenes);
         for (u32 i = 0; i < kParts; ++i) std::fprintf(stderr, " %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
-        std::fprintf(stderr, " cached %u textures, %.0f MiB;", static_cast<u32>(renderer().textures.size()),
-                     static_cast<f64>(renderer().texture_bytes) / 1048576.0);
+        std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene;",
+                     static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
+                     static_cast<f64>(from_targets) / scenes);
         std::fprintf(stderr,
                      " textures: %.1f lookups, %.1f hashed (%.2f ms), %.2f new (%.0f KiB, %.2f ms: decoded %.2f, made "
                      "%.2f, uploaded %.2f) a scene\n",
@@ -856,7 +872,7 @@ struct SceneProfile {
                      static_cast<f64>(miss_ns) / 1e6 / scenes, static_cast<f64>(decode_ns) / 1e6 / scenes,
                      static_cast<f64>(create_ns) / 1e6 / scenes, static_cast<f64>(upload_ns) / 1e6 / scenes);
         *this = SceneProfile{};
-        on = true;
+        on = read = true;
     }
 };
 SceneProfile g_profile;
@@ -890,6 +906,121 @@ u64 content_hash(const u8* p, usize n, u64 seed) {
     return h ^ (h >> 33);
 }
 
+// A texture that reads a colour surface whose image holds what guest memory does (the surface drawn and written
+// back, nothing else written there since): made on the GPU from that image instead of being read back, decoded and
+// uploaded (a render target read as a texture each frame). One level, texels as the image holds them, the surface's
+// layout, as tall; wider for a linear surface (its stride's columns past the width come from guest memory).
+CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key, u64 words_key) {
+    if (info.levels != 1 || !info.address) return nullptr;  // (cube types: texture_reads_layout refuses them)
+    for (auto& t : r.targets) {
+        // (the surface this scene draws into too: the copy is recorded before the draws, so it holds what the scene
+        // starts from, as the console's texture unit reads it)
+        if (t->address != info.address || t->written.empty()) continue;
+        if (info.height != t->height || info.width < t->width) continue;
+        if (info.width != t->width && t->layout.kind != SurfaceLayout::kLinear) continue;
+        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) continue;
+        const Changes changes = surface_changes(*t);
+        if (changes.all || changes.pixels) continue;
+        vk::ImageDesc d;
+        d.format = t->image.desc.format;
+        d.width = info.width;
+        d.height = info.height;
+        CachedTexture c;
+        bool reused = false;
+        if (auto was = r.by_words.find(words_key); was != r.by_words.end()) {
+            auto old = r.textures.find(was->second);
+            if (old != r.textures.end() && old->second.used != r.scenes) {
+                const vk::ImageDesc& od = old->second.image.desc;
+                if (od.format == d.format && od.width == d.width && od.height == d.height && od.mips == 1 &&
+                    od.layers == 1 && !od.cube) {
+                    c = old->second;
+                    r.textures.erase(old);
+                    reused = true;
+                }
+            }
+        }
+        if (!reused) {
+            auto image = vk::create_image(*r.device, d);
+            if (!image) return nullptr;
+            c.image = *image;
+            c.sampler = texture_sampler(r, info, d.format, 1);
+            c.bytes = usize{d.width} * d.height * 4;
+            r.texture_bytes += c.bytes;
+        }
+        Renderer::TargetCopy copy;
+        copy.key = key;
+        copy.from = t.get();
+        copy.width = t->width, copy.height = t->height;
+        if (info.width > t->width) {
+            // (the columns past the surface's width: as they are in guest memory)
+            TextureInfo strip = info;
+            strip.address = info.address + t->width * 4;
+            strip.width = info.width - t->width;
+            auto texels = read_texels(strip, [](u32 address, void* out, u32 bytes) {
+                if (!memory().valid(address, bytes)) return false;
+                std::memcpy(out, memory().host(address), bytes);
+                return true;
+            });
+            auto buffer = texels ? vk::create_host_buffer(*r.device, texels->data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+                                 : Result<vk::Buffer>(failure("texture: the columns past the surface"));
+            if (!buffer) {
+                vk::destroy_image(*r.device, c.image);
+                r.texture_bytes -= c.bytes;
+                return nullptr;
+            }
+            std::memcpy(buffer->mapped, texels->data.data(), texels->data.size());
+            vk::flush(*r.device, *buffer);
+            copy.strip = *buffer;
+            copy.strip_x = t->width, copy.strip_w = strip.width;
+        }
+        r.target_copies.push_back(copy);
+        c.used = r.scenes;
+        r.by_words[words_key] = key;
+        auto [it, added] = r.textures.emplace(key, c);
+        return &it->second;
+    }
+    return nullptr;
+}
+
+// The copies texture_from_target asked for, recorded before the scene's draws.
+void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
+    for (Renderer::TargetCopy& c : r.target_copies) {
+        auto it = r.textures.find(c.key);
+        if (it == r.textures.end()) continue;
+        vk::Image& to = it->second.image;
+        vk::transition(cmd, c.from->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vk::transition(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {c.width, c.height, 1};
+        vkCmdCopyImage(cmd, c.from->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        if (c.strip_w) {
+            VkBufferImageCopy b{};
+            b.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            b.imageOffset = {static_cast<i32>(c.strip_x), 0, 0};
+            b.imageExtent = {c.strip_w, c.height, 1};
+            vkCmdCopyBufferToImage(cmd, c.strip.buffer, to.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b);
+        }
+        vk::transition(cmd, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+}
+
+// The copies' buffers given back once the scene is done; `recorded` false (the scene ended before its commands):
+// the textures they were to fill are dropped from the cache, never sampled.
+void finish_target_copies(Renderer& r, bool recorded) {
+    for (Renderer::TargetCopy& c : r.target_copies) {
+        if (c.strip.buffer) vk::destroy_buffer(*r.device, c.strip);
+        if (recorded) continue;
+        if (auto it = r.textures.find(c.key); it != r.textures.end()) {
+            r.texture_bytes -= it->second.bytes;
+            vk::destroy_image(*r.device, it->second.image);
+            r.textures.erase(it);
+        }
+    }
+    r.target_copies.clear();
+}
+
 // The texture whose control words these are, decoded and uploaded once per content (cached by the words and a hash
 // of the texels and palette). `seen` remembers, for a scene, each set of words' content key: a texture used by many
 // draws is hashed once a scene.
@@ -917,6 +1048,10 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         return &it->second;
     }
     if (r.failed_textures.contains(key)) return nullptr;
+    if (CachedTexture* c = texture_from_target(r, info, key, wh.value())) {
+        if (g_profile.on) ++g_profile.from_targets;
+        return c;
+    }
     const u64 miss_start = g_profile.on ? nx::os::ticks_ns() : 0;
     struct MissTime {
         u64 start;
@@ -1146,6 +1281,13 @@ void render_scene(Context& context, Scene& scene) {
     nx::scoped_lock<nx::mutex> targets_held(r.targets_lock);
     ++r.scenes;
     evict_textures(r);
+    // (the copies this scene's textures ask for: recorded with its commands, their buffers given back when it ends)
+    bool copies_recorded = false;
+    struct Copies {
+        Renderer& r;
+        bool& recorded;
+        ~Copies() { finish_target_copies(r, recorded); }
+    } copies{r, copies_recorded};
     if (const Trace& t = trace(); t.on && r.scenes >= t.first && r.scenes <= t.last) trace_scene(r.scenes, scene);
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
@@ -1699,6 +1841,8 @@ void render_scene(Context& context, Scene& scene) {
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &b, 0,
                              nullptr, 0, nullptr);
     }
+    record_target_copies(r, *cmd);
+    copies_recorded = true;
     // (the scaled surfaces the draws read, as textures)
     for (Target* t : sampled) vk::transition(*cmd, t->scaled, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     for (DepthTarget* t : sampled_depth) vk::transition(*cmd, t->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
