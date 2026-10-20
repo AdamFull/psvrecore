@@ -126,15 +126,22 @@ i32 sceGxmEndScene(u32 context, Ptr<const Notification> vertex_notification, Ptr
         nx::scoped_lock<nx::mutex> held(st.queue_lock);
         st.queue_changed.wait(st.queue_lock, [&] { return st.stopping || !st.display_holds.contains(scene.fragment_sync); });
     }
-    render_scene(*c, scene);
-    notify(vertex_notification);
-    notify(fragment_notification);
+    // (the notifications as they are now: written once the scene is done, after the game may have reused them)
+    nx::vector<Notification> notes;
+    if (vertex_notification && memory().valid(vertex_notification.address, sizeof(Notification))) notes.push_back(*vertex_notification);
+    if (fragment_notification && memory().valid(fragment_notification.address, sizeof(Notification)))
+        notes.push_back(*fragment_notification);
+    if (!render_scene(*c, scene, notes)) {
+        finish_scenes();  // (the scenes before it first: notifications are written in order)
+        for (const Notification& n : notes) notify(n);
+    }
     return 0;
 }
 
 i32 sceGxmMidSceneFlush(u32 context, u32 flags, u32 sync, Ptr<const Notification> notification) {
     (void)flags, (void)sync;
     if (!context) return err::kInvalidPointer;
+    finish_scenes();
     notify(notification);
     return 0;
 }
@@ -708,6 +715,10 @@ const runtime::hle::Function kFunctions[] = {
 
 void notify(Ptr<const Notification> n) {
     if (n && memory().valid(n->address, 4, true)) *reinterpret_cast<u32*>(memory().host(n->address)) = n->value;
+}
+
+void notify(const Notification& n) {
+    if (n.address && memory().valid(n.address, 4, true)) *reinterpret_cast<u32*>(memory().host(n.address)) = n.value;
 }
 
 void register_context() { runtime::hle::register_library({"SceGxm", kSceGxm, kFunctions}); }

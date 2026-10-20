@@ -92,6 +92,7 @@ i32 sceGxmMapMemory(u32 base, u32 size, u32 attribs) {
 }
 
 i32 sceGxmUnmapMemory(u32 base) {
+    finish_scenes();
     State& s = state();
     nx::scoped_lock<nx::mutex> held(s.lock);
     for (usize i = 0; i < s.mappings.size(); ++i) {
@@ -146,11 +147,13 @@ i32 sceGxmSyncObjectDestroy(u32 sync) {
 // Scenes are rendered when they end, and their notifications written then: a wait finds them written.
 i32 sceGxmNotificationWait(Ptr<const Notification> n) {
     if (!n || !valid(n->address, 4)) return err::kInvalidPointer;
+    finish_scenes();
     return 0;
 }
 
 i32 sceGxmFinish(u32 context) {
     if (!context) return err::kInvalidPointer;
+    finish_scenes();
     return 0;
 }
 
@@ -160,6 +163,8 @@ i32 sceGxmDisplayQueueAddEntry(u32 old_buffer, u32 new_buffer, u32 data) {
     if (!old_buffer || !new_buffer) return err::kInvalidPointer;
     if (s.init.display_queue_callback_data_size && !valid(data, s.init.display_queue_callback_data_size))
         return err::kInvalidPointer;
+    // (the frame's scenes are not waited for here: the display queue's thread shows it after their time, and the
+    // frame buffer it sets finishes them first; the game goes on to its next frame meanwhile)
     runtime::Runtime& rt = runtime::runtime();
     u32 slot = 0;
     {
@@ -188,6 +193,7 @@ i32 sceGxmDisplayQueueAddEntry(u32 old_buffer, u32 new_buffer, u32 data) {
 i32 sceGxmDisplayQueueFinish() {
     State& s = state();
     if (!s.initialized) return err::kUninitialized;
+    finish_scenes();
     runtime::Kernel::Blocking blocking(runtime::runtime().kernel());
     nx::scoped_lock<nx::mutex> held(s.queue_lock);
     s.queue_changed.wait(s.queue_lock, [&] { return s.stopping || (s.queue.empty() && !s.queue_busy); });
@@ -236,6 +242,7 @@ i32 sceGxmCreateRenderTarget(Ptr<const RenderTargetParams> p, Ptr<u32> out) {
 }
 
 i32 sceGxmDestroyRenderTarget(u32 target) {
+    finish_scenes();
     State& s = state();
     nx::scoped_lock<nx::mutex> held(s.lock);
     if (!s.render_targets.erase(target)) return err::kInvalidPointer;
@@ -267,6 +274,7 @@ i32 sceGxmCreateContext(Ptr<const ContextParams> p, Ptr<u32> out) {
 }
 
 i32 sceGxmDestroyContext(u32 context) {
+    finish_scenes();
     State& s = state();
     nx::scoped_lock<nx::mutex> held(s.lock);
     if (!s.contexts.erase(context)) return err::kInvalidPointer;

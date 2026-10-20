@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "psvrecore/gxm/surface.hpp"
 #include "psvrecore/gxm/texture.hpp"
@@ -257,6 +258,7 @@ struct Target {
     // The surface's bytes as last written back. While guest memory still holds them, `image` (and `scaled`) is the
     // surface and is not loaded again; once anything else wrote there, it is loaded from guest memory.
     nx::vector<u8> written;
+    u64 generation = 0;  // (a scene drawing it submitted: +1)
 };
 
 // A depth surface a depth-only scene stores (a shadow map), at the internal resolution: its depth image, kept from
@@ -323,14 +325,61 @@ struct Renderer {
         u32 strip_x = 0, strip_w = 0;
     };
     nx::vector<TargetCopy> target_copies;
-    VkQueryPool timestamps = VK_NULL_HANDLE;  // (PSVRECORE_GXM_PROFILE: the start and end of a scene's commands)
+    // Scenes submitted to the GPU whose results are not in guest memory yet, oldest first: what each writes there,
+    // the surface whose image it draws, and what finishes it (the write-back, the notifications, the clean-up) once
+    // the GPU is done. A scene is finished when a later one has been submitted (the GPU runs it while the CPU
+    // prepares the next), when something reads what it writes, at the library's points of synchronisation, or by
+    // the flusher thread as soon as the GPU is done with it.
+    struct Pending {
+        u64 number = 0;  // (in submission order, from 1)
+        nx::unique_ptr<vk::OneShot> shot;
+        nx::vector<std::pair<u32, u32>> writes;  // (address, bytes)
+        Target* target = nullptr;
+        nx::unique_function<void(bool ok)> finish;
+    };
+    nx::vector<Pending> pending;
+    std::atomic<u32> pending_count{0};
+    u64 submitted = 0, finished = 0;  // (the numbers of the last scene submitted and the last finished)
+    bool flusher = false;
     nx::hash_map<u64, nx::string> failed_textures;
     u64 scenes = 0;
 };
 
 Renderer& renderer() {
-    static Renderer r;
-    return r;
+    // (never destroyed: the flusher thread may look at it until the process ends)
+    static Renderer* r = new Renderer;
+    return *r;
+}
+
+// (PSVRECORE_GXM_PROFILE: why the next scenes are finished)
+u32 g_finish_why = 0;
+
+// The pending scenes finished, oldest first: all of them but the newest `keep`, or only those the GPU is done with
+// (`all` false). Under targets_lock.
+void finish_pending(Renderer& r, bool all, usize keep = 0);
+
+// How many scenes the GPU may have in flight (a frame's worth: the CPU prepares a frame's scenes while the GPU draws
+// them one after another; a scene is waited for only when the GPU is that far behind).
+constexpr usize kScenesInFlight = 4;
+
+// Whether a pending scene writes any of [address, address + bytes) in guest memory.
+bool pending_writes(const Renderer& r, u32 address, u32 bytes) {
+    for (const Renderer::Pending& p : r.pending)
+        for (const auto& [at, n] : p.writes)
+            if (address < at + n && at < address + bytes) return true;
+    return false;
+}
+
+bool pending_target(const Renderer& r, const Target* t) {
+    for (const Renderer::Pending& p : r.pending)
+        if (p.target == t) return true;
+    return false;
+}
+
+// Before reading guest memory a pending scene writes: that scene (and those before it) finished.
+void depend(u32 address, u32 bytes) {
+    Renderer& r = renderer();
+    if (!r.pending.empty() && pending_writes(r, address, bytes)) g_finish_why = 1, finish_pending(r, true);
 }
 
 bool ensure(Renderer& r) {
@@ -348,6 +397,36 @@ bool ensure(Renderer& r) {
         r.device = r.owned.get();
     }
     vk::Device& d = *r.device;
+    if (!r.flusher) {
+        // (the scenes the GPU is done with finished when nothing else has a while after: their notifications written
+        // for a game that polls them. Not at once: the game's next scene or frame finishes them, and this, finishing
+        // under the renderer's lock, would hold up that scene)
+        r.flusher = true;
+        nx::thread_options options;
+        options.name = "gxm scenes";
+        nx::thread flusher(
+            [&r] {
+                constexpr u64 kAfter = 4'000'000;  // (ns)
+                u64 seen = 0, since = 0;  // (the oldest scene pending found done, and when)
+                for (;;) {
+                    nx::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (!r.pending_count.load(std::memory_order_acquire) || !r.targets_lock.try_lock()) continue;
+                    if (!r.pending.empty() && r.pending.front().shot->done()) {
+                        const u64 now = nx::os::ticks_ns();
+                        if (r.pending.front().number != seen) {
+                            seen = r.pending.front().number;
+                            since = now;
+                        } else if (now - since >= kAfter) {
+                            g_finish_why = 3;
+                            finish_pending(r, false);
+                        }
+                    }
+                    r.targets_lock.unlock();
+                }
+            },
+            options);
+        flusher.detach();
+    }
     r.passes = nx::make_unique<vk::RenderPasses>(d);
     r.pipelines = nx::make_unique<vk::Pipelines>(d, *r.passes);
     // (what an earlier run made, before anything is made now)
@@ -834,11 +913,23 @@ DepthTarget* scaled_depth_texture(Renderer& r, const TextureInfo& info, const De
 struct SceneProfile {
     static constexpr u32 kParts = 8;
     static constexpr const char* kNames[kParts] = {"colour in", "draws", "buffers", "descriptors and textures",
-                                                    "commands", "GPU", "back to memory", "cleanup"};
+                                                    "commands", "earlier scenes finished (GPU, memory)", "submit",
+                                                    "queued"};
     bool on = false;
     bool read = false;  // (the switch, read at the first scene: --env sets it after the program starts)
     u64 ns[kParts] = {};
-    u64 gpu_busy_ns = 0, gpu_measured = 0;  // (the scenes' commands on the GPU, by timestamps)
+    // (the scenes' commands on the GPU, by timestamps: before the render pass (from the start of the scene's
+    // commands, which may include waiting for the scene before), the pass, and what follows it (the readbacks))
+    u64 gpu_before_ns = 0, gpu_pass_ns = 0, gpu_after_ns = 0, gpu_measured = 0;
+    u64 draws = 0, colour_reads = 0, barriers = 0;  // (draws, those reading the colour, barriers between them)
+    // (the GPU's timeline: idle between one scene's end and the next one's start, and the scenes' own spans from
+    // the later of their start and the scene before's end)
+    u64 gpu_idle_ns = 0, gpu_span_ns = 0, gpu_last_end = 0;
+    u64 finished = 0, finish_wait_ns = 0, finish_work_ns = 0;  // (scenes finished: waiting for the GPU, the rest)
+    // (by why they were: at a submission, read by a later scene, a point of synchronisation, the flusher)
+    static constexpr const char* kWhy[4] = {"submit", "read", "sync", "flusher"};
+    u64 why_count[4] = {}, why_wait_ns[4] = {};
+
     u64 from_targets = 0, lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
     u64 at = 0;
     u32 part = 0, scenes = 0;
@@ -863,8 +954,23 @@ struct SceneProfile {
         for (u64 n : ns) all += n;
         std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each:", scenes, static_cast<f64>(all) / 1e6 / scenes);
         for (u32 i = 0; i < kParts; ++i) std::fprintf(stderr, " %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
+        if (finished)
+            std::fprintf(stderr, " finishing a scene: %.2f ms waiting, %.2f ms the rest;",
+                         static_cast<f64>(finish_wait_ns) / 1e6 / finished, static_cast<f64>(finish_work_ns) / 1e6 / finished);
+        for (u32 i = 0; i < 4; ++i)
+            if (why_count[i])
+                std::fprintf(stderr, " %s %.2f a scene (%.2f ms waiting);", kWhy[i], static_cast<f64>(why_count[i]) / scenes,
+                             static_cast<f64>(why_wait_ns[i]) / 1e6 / scenes);
+        std::fprintf(stderr, " %.1f draws (%.1f reading the colour, %.1f barriers) a scene;",
+                     static_cast<f64>(draws) / scenes, static_cast<f64>(colour_reads) / scenes,
+                     static_cast<f64>(barriers) / scenes);
         if (gpu_measured)
-            std::fprintf(stderr, " GPU busy %.2f ms a scene;", static_cast<f64>(gpu_busy_ns) / 1e6 / gpu_measured);
+            std::fprintf(stderr, " GPU: idle %.2f ms, busy %.2f ms a scene;", static_cast<f64>(gpu_idle_ns) / 1e6 / gpu_measured,
+                         static_cast<f64>(gpu_span_ns) / 1e6 / gpu_measured);
+        if (gpu_measured)
+            std::fprintf(stderr, " GPU: %.2f ms before the pass, %.2f the pass, %.2f after it a scene;",
+                         static_cast<f64>(gpu_before_ns) / 1e6 / gpu_measured, static_cast<f64>(gpu_pass_ns) / 1e6 / gpu_measured,
+                         static_cast<f64>(gpu_after_ns) / 1e6 / gpu_measured);
         std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene;",
                      static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
                      static_cast<f64>(from_targets) / scenes);
@@ -875,8 +981,10 @@ struct SceneProfile {
                      static_cast<f64>(misses) / scenes, static_cast<f64>(miss_bytes) / 1024.0 / scenes,
                      static_cast<f64>(miss_ns) / 1e6 / scenes, static_cast<f64>(decode_ns) / 1e6 / scenes,
                      static_cast<f64>(create_ns) / 1e6 / scenes, static_cast<f64>(upload_ns) / 1e6 / scenes);
+        const u64 last_end = gpu_last_end;
         *this = SceneProfile{};
         on = read = true;
+        gpu_last_end = last_end;
     }
 };
 SceneProfile g_profile;
@@ -914,17 +1022,22 @@ u64 content_hash(const u8* p, usize n, u64 seed) {
 // back, nothing else written there since): made on the GPU from that image instead of being read back, decoded and
 // uploaded (a render target read as a texture each frame). One level, texels as the image holds them, the surface's
 // layout, as tall; wider for a linear surface (its stride's columns past the width come from guest memory).
-CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key, u64 words_key) {
+//
+// `only`: that surface, which a pending scene draws (its image will hold what guest memory will: not compared).
+CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key, u64 words_key, Target* only = nullptr) {
     if (info.levels != 1 || !info.address) return nullptr;  // (cube types: texture_reads_layout refuses them)
     for (auto& t : r.targets) {
+        if (only && t.get() != only) continue;
         // (the surface this scene draws into too: the copy is recorded before the draws, so it holds what the scene
         // starts from, as the console's texture unit reads it)
-        if (t->address != info.address || t->written.empty()) continue;
+        if (t->address != info.address || (!only && t->written.empty())) continue;
         if (info.height != t->height || info.width < t->width) continue;
         if (info.width != t->width && t->layout.kind != SurfaceLayout::kLinear) continue;
         if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) continue;
-        const Changes changes = surface_changes(*t);
-        if (changes.all || changes.pixels) continue;
+        if (!only) {
+            const Changes changes = surface_changes(*t);
+            if (changes.all || changes.pixels) continue;
+        }
         vk::ImageDesc d;
         d.format = t->image.desc.format;
         d.width = info.width;
@@ -986,6 +1099,22 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
     return nullptr;
 }
 
+// A texture over the surface a pending scene draws: made from its image (the GPU runs the scenes in order), keyed
+// by the surface's generation (guest memory does not hold that scene's pixels yet).
+CachedTexture* texture_from_pending_target(Renderer& r, const TextureInfo& info, u64 words_key, u64* key) {
+    for (const Renderer::Pending& p : r.pending) {
+        Target* t = p.target;
+        if (!t || t->address != info.address) continue;
+        *key = (words_key * 0x9E3779B97F4A7C15ull) ^ (t->generation * 0xC2B2AE3D27D4EB4Full) ^ 0x70656E64696E67ull;
+        if (auto it = r.textures.find(*key); it != r.textures.end()) {
+            it->second.used = r.scenes;
+            return &it->second;
+        }
+        return texture_from_target(r, info, *key, words_key, t);
+    }
+    return nullptr;
+}
+
 // The copies texture_from_target asked for, recorded before the scene's draws.
 void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
     for (Renderer::TargetCopy& c : r.target_copies) {
@@ -1040,6 +1169,15 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     if (!info.address) return nullptr;
     const u32 size = texture_size(info);
     if (!size || !memory().valid(info.address, size)) return nullptr;
+    if (pending_writes(r, info.address, size)) {
+        u64 pending_key = 0;
+        if (CachedTexture* c = texture_from_pending_target(r, info, wh.value(), &pending_key)) {
+            seen[wh.value()] = pending_key;
+            if (g_profile.on) ++g_profile.from_targets;
+            return c;
+        }
+        g_finish_why = 1, finish_pending(r, true);
+    }
     const u64 hash_start = g_profile.on ? nx::os::ticks_ns() : 0;
     u64 key = content_hash(reinterpret_cast<const u8*>(words.words), sizeof words.words, 0);
     key = content_hash(static_cast<const u8*>(memory().host(info.address)), size, key);
@@ -1189,6 +1327,7 @@ u32 buffer_bytes(const usse::Gxp& g, u32 index) {
 }
 
 void host_copy(nx::vector<u8>& out, u32 address, u32 bytes) {
+    depend(address, bytes);
     const usize at = out.size();
     out.resize(at + ((bytes + 15) & ~15u), 0);
     if (address && bytes && memory().valid(address, bytes)) std::memcpy(out.data() + at, memory().host(address), bytes);
@@ -1277,11 +1416,11 @@ void trace_scene(u64 number, const Scene& scene) {
 }  // namespace
 
 
-void render_scene(Context& context, Scene& scene) {
+bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notifications) {
     (void)context;
     g_profile.start();
     Renderer& r = renderer();
-    if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return;
+    if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return false;
     nx::scoped_lock<nx::mutex> targets_held(r.targets_lock);
     ++r.scenes;
     evict_textures(r);
@@ -1309,19 +1448,19 @@ void render_scene(Context& context, Scene& scene) {
     if (scene.has_color) {
         if (!color_format(cs.format, cf)) {
             nx::logw(logs::gxm, "colour surface format 0x{:08x} not implemented: scene not rendered", cs.format);
-            return;
+            return false;
         }
         width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
         layout.kind = cs.modes & 3;
         if (layout.kind > SurfaceLayout::kSwizzled) {
             nx::logw(logs::gxm, "colour surface type {} not implemented: scene not rendered", layout.kind);
-            return;
+            return false;
         }
         layout.stride = stride, layout.bytes = cf.bytes, layout.width = width, layout.height = height;
         if (!width || !height || layout.span() > 0xFFFFFFFFu || !memory().valid(cs.data, static_cast<u32>(layout.span()), true))
-            return;
+            return false;
         target = color_target(r, cs.data, cs.format, cf.format, layout);
-        if (!target) return;
+        if (!target) return false;
         color = &target->image;
         if (const u32 s = surface_scale(r, cf.format); s > 1 && ensure_scaled(r, *target, s)) {
             scale = s;
@@ -1335,9 +1474,14 @@ void render_scene(Context& context, Scene& scene) {
         // surface's own size, the image is kept as it is while guest memory still holds what the last scene wrote
         // back (a surface drawn scene after scene, or drawn and then read as a texture).
         bool kept = false;
-        if (scale == 1 && !target->written.empty()) {
-            const Changes now = surface_changes(*target);
-            kept = !now.all && now.pixels == 0;
+        if (pending_target(r, target)) {
+            kept = true;  // (its image holds, or will when the GPU gets to this scene, what a pending scene leaves)
+        } else {
+            depend(cs.data, static_cast<u32>(layout.span()));  // (the same memory as another surface's)
+            if (scale == 1 && !target->written.empty()) {
+                const Changes now = surface_changes(*target);
+                kept = !now.all && now.pixels == 0;
+            }
         }
         if ((scale == 1 && !kept) || (scale > 1 && !changes.tiles.empty())) {
             nx::vector<u8> texels(usize{width} * height * cf.bytes);
@@ -1345,13 +1489,15 @@ void render_scene(Context& context, Scene& scene) {
             const VkImageLayout layout = scale > 1 ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             if (auto done = vk::upload_image(d, target->image, texels, 0, layout); !done) {
                 nx::logw(logs::gpu, "{}", done.error().message);
-                return;
+                return false;
             }
         }
     }
     const u32 target_w = nx::min(width, scene.target->width), target_h = nx::min(height, scene.target->height);
     // A depth-only scene whose depth is stored (a shadow map): at the internal resolution too, in a depth image kept
     // for the surface, which the textures reading that surface then sample.
+    // (depth loaded or stored: read from guest memory, so what pending scenes write there written first)
+    if (scene.has_depth && (ds.control & (kDsForceLoad | kDsForceStore)) && !r.pending.empty()) g_finish_why = 1, finish_pending(r, true);
     DepthTarget* depth_target = nullptr;
     bool depth_kept = false;  // (its image still holds the surface: nothing to load)
     if (!scene.has_color && scene.has_depth && (ds.control & kDsForceStore) &&
@@ -1401,7 +1547,7 @@ void render_scene(Context& context, Scene& scene) {
         dd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (auto img = vk::create_image(d, dd)) depth = *img;
     }
-    if (!color && !depth.image) return;
+    if (!color && !depth.image) return false;
     g_profile.mark(0);
 
     // ---- What the draws need: secondary attributes, memory, vertices and indices -----------------------------
@@ -1504,6 +1650,7 @@ void render_scene(Context& context, Scene& scene) {
         // Indices, and the vertices they reach (each stream from its first vertex to the last one used).
         const u32 index_size = dr.index_format ? 4 : 2;
         if (!memory().valid(dr.index_address, dr.index_count * index_size)) continue;
+        depend(dr.index_address, dr.index_count * index_size);
         u32 max_index = 0;
         for (u32 k = 0; k < dr.index_count; ++k) {
             const u8* p = memory().host(dr.index_address + k * index_size);
@@ -1708,7 +1855,7 @@ void render_scene(Context& context, Scene& scene) {
     };
     if (!sa_buf || !mem_buf || !vb || !ib || !readback || ((load_depth || store_depth) && !depth_buf)) {
         cleanup();
-        return;
+        return false;
     }
 
     g_profile.mark(2);
@@ -1813,26 +1960,25 @@ void render_scene(Context& context, Scene& scene) {
     }
 
     // ---- Commands --------------------------------------------------------------------------------------------
-    vk::OneShot shot(d);
-    auto cmd = shot.begin();
-    const bool timed = g_profile.on && cmd && d.caps().timestamp_period > 0;
-    if (timed) {
-        if (!r.timestamps) {
-            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qi.queryCount = 2;
-            vkCreateQueryPool(d.device(), &qi, nullptr, &r.timestamps);
-        }
-        if (r.timestamps) {
-            vkCmdResetQueryPool(*cmd, r.timestamps, 0, 2);
-            vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, r.timestamps, 0);
+    auto shot = nx::make_unique<vk::OneShot>(d);
+    auto cmd = shot->begin();
+    // (PSVRECORE_GXM_PROFILE: the start and end of the scene's commands on the GPU)
+    VkQueryPool stamps = VK_NULL_HANDLE;
+    if (g_profile.on && cmd && d.caps().timestamp_period > 0) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 4;
+        if (vkCreateQueryPool(d.device(), &qi, nullptr, &stamps) != VK_SUCCESS) stamps = VK_NULL_HANDLE;
+        if (stamps) {
+            vkCmdResetQueryPool(*cmd, stamps, 0, 4);
+            vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stamps, 0);
         }
     }
     if (!cmd) {
         if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
         vkDestroyDescriptorPool(d.device(), pool, nullptr);
         cleanup();
-        return;
+        return false;
     }
     if (queries) vkCmdResetQueryPool(*cmd, queries, 0, query_count);
     const VkShaderStageFlags push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1908,6 +2054,7 @@ void render_scene(Context& context, Scene& scene) {
         if (store_depth) pass.depth.store = pass.depth.stencil_store = VK_ATTACHMENT_STORE_OP_STORE;
     }
     pass.area = {{0, 0}, {target_w * scale, target_h * scale}};
+    if (stamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 1);
     if (auto begun = r.passes->begin(*cmd, pass); begun) {
         const VkViewport viewport{0, 0, static_cast<f32>(target_w * scale), static_cast<f32>(target_h * scale), 0, 1};
         vkCmdSetViewport(*cmd, 0, 1, &viewport);
@@ -1916,7 +2063,9 @@ void render_scene(Context& context, Scene& scene) {
             const DrawPlan& p = plans[i];
             const DrawState& st = p.draw->state;
             const usse::Gxp& fg = p.draw->fragment->program->gxp;
+            if (g_profile.on) ++g_profile.draws, g_profile.colour_reads += fg.native_color && fg.frag_color;
             if (fg.native_color && fg.frag_color && i > 0 && !d.caps().raster_order_attachment) {
+                if (g_profile.on) ++g_profile.barriers;
                 // (what the draws before wrote, for this one to read: the render pass's self-dependency)
                 VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                 b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1957,6 +2106,7 @@ void render_scene(Context& context, Scene& scene) {
             if (query) vkCmdEndQuery(*cmd, queries, query_of[i]);
         }
         r.passes->end(*cmd);
+        if (stamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 2);
     } else {
         nx::logw(logs::gpu, "{}", begun.error().message);
     }
@@ -1984,50 +2134,87 @@ void render_scene(Context& context, Scene& scene) {
                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
-    if (timed && r.timestamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r.timestamps, 1);
+    if (stamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 3);
     g_profile.mark(4);
-    if (auto done = shot.submit_and_wait(); done) {
-        g_profile.mark(5);
-        if (timed && r.timestamps) {
-            u64 ts[2] = {};
-            if (vkGetQueryPoolResults(d.device(), r.timestamps, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-                g_profile.gpu_busy_ns += static_cast<u64>(static_cast<f64>(ts[1] - ts[0]) * d.caps().timestamp_period);
+    // (the layouts as recorded: the kept depth image's goes with its surface)
+    if (depth_target) depth_target->image.layout = depth.layout;
+    if (color) ++target->generation;
+    // What the scene leaves in guest memory, and the visibility counters it adds to or sets.
+    Renderer::Pending pending;
+    if (color) pending.writes.push_back({cs.data, static_cast<u32>(layout.span())});
+    if (store_depth && depth.image) {
+        const u32 n = depth_samples(ds, width, height);
+        pending.writes.push_back({ds.depth_data, n * 4});
+        if (ds.stencil_data) pending.writes.push_back({ds.stencil_data, n});
+    }
+    for (const auto& [address, c] : buffer_copies)
+        if (c.written && c.placed) pending.writes.push_back({address, c.bytes});
+    struct Counter {
+        u32 at, query;
+        bool set;
+    };
+    nx::vector<Counter> counters;
+    for (usize i = 0; i < plans.size(); ++i) {
+        if (query_of[i] == ~0u) continue;
+        const DrawState& st = plans[i].draw->state;
+        const u32 at = scene.visibility_buffer + st.visibility_index[0] * 4;
+        counters.push_back({at, query_of[i], st.visibility_set[0] != 0});
+        pending.writes.push_back({at, 4});
+    }
+    pending.target = color ? target : nullptr;
+    const bool stores_depth = store_depth && depth.image;
+    pending.finish = [&r, &d, stamps, color = color != nullptr, readback, mem_buf, depth_buf, buffers = std::move(buffers),
+                      layout, data = cs.data, width, height, bytes = cf.bytes, target,
+                      buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
+                      stores_depth, ds, dl, unorm24, samples, depth_target, depth, pool,
+                      notifications = std::move(notifications), copies = std::move(r.target_copies)](bool ok) mutable {
+        if (ok && stamps) {
+            u64 ts[4] = {};
+            if (vkGetQueryPoolResults(d.device(), stamps, 0, 4, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                const f64 period = d.caps().timestamp_period;
+                g_profile.gpu_before_ns += static_cast<u64>(static_cast<f64>(ts[1] - ts[0]) * period);
+                g_profile.gpu_pass_ns += static_cast<u64>(static_cast<f64>(ts[2] - ts[1]) * period);
+                g_profile.gpu_after_ns += static_cast<u64>(static_cast<f64>(ts[3] - ts[2]) * period);
+                const u64 last = g_profile.gpu_last_end;
+                if (last && ts[0] > last) g_profile.gpu_idle_ns += static_cast<u64>(static_cast<f64>(ts[0] - last) * period);
+                const u64 from = last && last > ts[0] ? last : ts[0];
+                if (ts[3] > from) g_profile.gpu_span_ns += static_cast<u64>(static_cast<f64>(ts[3] - from) * period);
+                g_profile.gpu_last_end = ts[3];
                 ++g_profile.gpu_measured;
             }
         }
-        if (color) {
+        if (ok && color) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
-            scatter(layout, cs.data, src);
+            scatter(layout, data, src);
             // (what guest memory holds now, to know whether the image (or the scaled one) is still the surface)
-            target->written.assign(src, src + usize{width} * height * cf.bytes);
+            target->written.assign(src, src + usize{width} * height * bytes);
+        } else if (!ok && target) {
+            target->written.clear();  // (the image may hold what guest memory does not)
         }
         // (the uniform buffers programs stored to)
         bool invalidated = false;
         for (const auto& [address, c] : buffer_copies) {
-            if (!c.written || !c.placed || !memory().valid(address, c.bytes, true)) continue;
+            if (!ok || !c.written || !c.placed || !memory().valid(address, c.bytes, true)) continue;
             if (!invalidated) vk::invalidate(d, *mem_buf), invalidated = true;
             std::memcpy(memory().host(address), static_cast<const u8*>(mem_buf->mapped) + 8 + c.offset, c.bytes);
         }
-        if (queries) {
+        if (ok && queries) {
             nx::vector<u64> counts(query_count, 0);
             if (vkGetQueryPoolResults(d.device(), queries, 0, query_count, query_count * 8, counts.data(), 8,
                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-                for (usize i = 0; i < plans.size(); ++i) {
-                    if (query_of[i] == ~0u) continue;
-                    const DrawState& st = plans[i].draw->state;
-                    const u32 at = scene.visibility_buffer + st.visibility_index[0] * 4;
-                    if (!memory().valid(at, 4, true)) continue;
+                for (const Counter& c : counters) {
+                    if (!memory().valid(c.at, 4, true)) continue;
                     u32 v;
-                    std::memcpy(&v, memory().host(at), 4);
+                    std::memcpy(&v, memory().host(c.at), 4);
                     // (samples at the internal resolution counted as the surface's: scale squared of them each)
-                    const u64 drawn = counts[query_of[i]], n = drawn ? nx::max<u64>(1, drawn / (u64{scale} * scale)) : 0;
-                    v = st.visibility_set[0] ? (n ? 1u : v) : v + static_cast<u32>(n);
-                    std::memcpy(memory().host(at), &v, 4);
+                    const u64 drawn = counts[c.query], n = drawn ? nx::max<u64>(1, drawn / (u64{scale} * scale)) : 0;
+                    v = c.set ? (n ? 1u : v) : v + static_cast<u32>(n);
+                    std::memcpy(memory().host(c.at), &v, 4);
                 }
             }
         }
-        if (store_depth && depth.image) {
+        if (ok && stores_depth) {
             vk::invalidate(d, *depth_buf);
             const u8* src = static_cast<const u8*>(depth_buf->mapped);
             if (scale > 1) {
@@ -2043,17 +2230,98 @@ void render_scene(Context& context, Scene& scene) {
                 depth_target->written.assign(now.begin(), now.end());
             }
         }
-    } else {
-        nx::loge(logs::gpu, "scene: {}", done.error().message);
-        if (target) target->written.clear();  // (the image may hold what guest memory does not)
+        // (the scene's notifications, now that guest memory holds what it drew)
+        for (const Notification& n : notifications) notify(n);
+        if (stamps) vkDestroyQueryPool(d.device(), stamps, nullptr);
+        if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
+        vkDestroyDescriptorPool(d.device(), pool, nullptr);
+        for (vk::Buffer& b : buffers) vk::destroy_buffer(d, b);
+        if (!depth_target && depth.image) {
+            r.passes->forget(depth.view);
+            vk::destroy_image(d, depth);
+        }
+        for (Renderer::TargetCopy& c : copies)
+            if (c.strip.buffer) vk::destroy_buffer(d, c.strip);
+    };
+    r.target_copies.clear();  // (moved into the scene's finish: the guard finds none)
+    if (auto submitted = shot->submit(); !submitted) {
+        nx::loge(logs::gpu, "scene: {}", submitted.error().message);
+        finish_pending(r, true);
+        pending.finish(false);
+        return true;
     }
+    pending.shot = std::move(shot);
+    pending.number = ++r.submitted;
     g_profile.mark(6);
-    if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
-    vkDestroyDescriptorPool(d.device(), pool, nullptr);
-    cleanup();
+    // (the scenes the GPU is done with; and the oldest, waited for, when it has kScenesInFlight with this one)
+    g_finish_why = 0;
+    finish_pending(r, false);
+    finish_pending(r, true, kScenesInFlight - 1);
+    g_profile.mark(5);
+    r.pending.push_back(std::move(pending));
+    r.pending_count.store(static_cast<u32>(r.pending.size()), std::memory_order_release);
     g_profile.mark(7);
     g_profile.done();
     if (d.validation_errors()) nx::logw(logs::gpu, "{} validation errors so far", d.validation_errors());
+    return true;
+}
+
+namespace {
+
+void finish_pending(Renderer& r, bool all, usize keep) {
+    while (r.pending.size() > (all ? keep : 0)) {
+        Renderer::Pending& p = r.pending.front();
+        if (!all && !p.shot->done()) break;
+        const u64 t0 = g_profile.on ? nx::os::ticks_ns() : 0;
+        Result<void> waited;
+        if (p.shot->done()) {
+            waited = p.shot->wait();
+        } else {
+            // (a guest thread waiting for the GPU gives up its CPU meanwhile)
+            std::optional<runtime::Kernel::Blocking> blocking;
+            if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+            waited = p.shot->wait();
+        }
+        if (!waited) nx::loge(logs::gpu, "scene: {}", waited.error().message);
+        const u64 t1 = g_profile.on ? nx::os::ticks_ns() : 0;
+        p.finish(static_cast<bool>(waited));
+        r.finished = p.number;
+        if (g_profile.on) {
+            ++g_profile.finished;
+            g_profile.finish_wait_ns += t1 - t0;
+            ++g_profile.why_count[g_finish_why];
+            g_profile.why_wait_ns[g_finish_why] += t1 - t0;
+            g_profile.finish_work_ns += nx::os::ticks_ns() - t1;
+        }
+        r.pending.erase(r.pending.begin());
+    }
+    r.pending_count.store(static_cast<u32>(r.pending.size()), std::memory_order_release);
+}
+
+}  // namespace
+
+void finish_scenes() {
+    Renderer& r = renderer();
+    if (!r.pending_count.load(std::memory_order_acquire)) return;
+    // The scenes pending now (not those submitted while this waits), waited for without the renderer's lock: the
+    // game's thread prepares its next scene meanwhile; each finished, under the lock, once the GPU is done with it.
+    u64 upto;
+    {
+        nx::scoped_lock<nx::mutex> held(r.targets_lock);
+        if (r.pending.empty()) return;
+        upto = r.pending.back().number;
+    }
+    std::optional<runtime::Kernel::Blocking> blocking;
+    if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+    for (;;) {
+        {
+            nx::scoped_lock<nx::mutex> held(r.targets_lock);
+            g_finish_why = 2;
+            finish_pending(r, false);
+            if (r.finished >= upto || r.pending.empty()) return;
+        }
+        nx::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height) {

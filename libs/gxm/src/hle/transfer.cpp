@@ -118,6 +118,7 @@ i32 sceGxmTransferCopy(u32 width, u32 height, u32 key_value, u32 key_mask, u32 k
                        u32 src_address, u32 src_x, u32 src_y, i32 src_stride, u32 dst_format, u32 dst_type,
                        u32 dst_address, u32 dst_x, u32 dst_y, i32 dst_stride, u32 sync, u32 sync_flags,
                        Ptr<const Notification> notification) {
+    finish_scenes();  // (the CPU reads and writes what scenes drew)
     (void)sync, (void)sync_flags;
     if (!src_address || !dst_address) return err::kInvalidPointer;
     if (!width || !height || width > 1024 || height > 1024 || key_mode > kKeyReject) return err::kInvalidValue;
@@ -154,6 +155,7 @@ i32 sceGxmTransferCopy(u32 width, u32 height, u32 key_value, u32 key_mask, u32 k
 i32 sceGxmTransferDownscale(u32 src_format, u32 src_address, u32 src_x, u32 src_y, u32 src_width, u32 src_height,
                             i32 src_stride, u32 dst_format, u32 dst_address, u32 dst_x, u32 dst_y, i32 dst_stride,
                             u32 sync, u32 sync_flags, Ptr<const Notification> notification) {
+    finish_scenes();  // (the CPU reads and writes what scenes drew)
     (void)sync, (void)sync_flags;
     if (!src_address || !dst_address) return err::kInvalidPointer;
     if (src_width < 2 || src_height < 2 || src_width > 1024 || src_height > 1024 || (src_width & 1) || (src_height & 1))
@@ -182,6 +184,7 @@ i32 sceGxmTransferDownscale(u32 src_format, u32 src_address, u32 src_x, u32 src_
 
 i32 sceGxmTransferFill(u32 color, u32 dst_format, u32 dst_address, u32 dst_x, u32 dst_y, u32 width, u32 height,
                        i32 dst_stride, u32 sync, u32 sync_flags, Ptr<const Notification> notification) {
+    finish_scenes();  // (the CPU reads and writes what scenes drew)
     (void)sync, (void)sync_flags;
     if (!dst_address) return err::kInvalidPointer;
     if (!width || !height || width > 1024 || height > 1024) return err::kInvalidValue;
@@ -199,7 +202,10 @@ i32 sceGxmTransferFill(u32 color, u32 dst_format, u32 dst_address, u32 dst_x, u3
     return 0;
 }
 
-i32 sceGxmTransferFinish() { return 0; }
+i32 sceGxmTransferFinish() {
+    finish_scenes();
+    return 0;
+}
 
 const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0x62312BF8, sceGxmTransferCopy),

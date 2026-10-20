@@ -353,8 +353,15 @@ State& state();
 // A guest block of `size` bytes (16-byte aligned) for the library's own use; 0 if guest memory is exhausted.
 u32 guest_alloc(u32 size);
 
-// Renders a scene (render.cpp) and writes its colour surface to guest memory.
-void render_scene(Context& context, Scene& scene);
+// Renders a scene (render.cpp): submitted to the GPU, its colour surface (and stored depth, visibility counters,
+// stored uniform buffers) written to guest memory and its notifications written once the GPU is done, while the
+// game goes on (see finish_scenes). False when it was not rendered (nothing to draw into, no device): its
+// notifications are the caller's to write.
+bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notifications);
+// The scenes rendered so far finished: their results in guest memory, their notifications written. At the
+// library's points of synchronisation (a notification waited for, sceGxmFinish, the display queue, transfers, a
+// frame buffer set, memory unmapped), before anything reads what the GPU draws.
+void finish_scenes();
 // At an internal resolution above 1: the frame buffer's pixels as drawn (tightly packed, at the internal
 // resolution), if a scene drew it and guest memory still holds what that scene wrote there.
 bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height);
@@ -374,5 +381,6 @@ void register_precomputed();
 
 // Writes a notification's value to its address (if any).
 void notify(Ptr<const Notification> n);
+void notify(const Notification& n);
 
 }  // namespace psvrecore::gxm::hle

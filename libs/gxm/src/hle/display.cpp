@@ -85,6 +85,7 @@ void wait_vblanks(u32 count, bool callbacks) {
 }
 
 i32 set_frame_buf(Ptr<const DisplayFrameBuf> p, i32 sync) {
+    finish_scenes();  // (the frame drawn into guest memory before it is shown)
     if (sync != 0 && sync != 1) return kErrorInvalidUpdateTiming;  // (immediate, next frame)
     Display& d = display();
     latch();  // (one set before, whose blank has come)
@@ -205,7 +206,9 @@ void display_queue_main() {
             s.queue.erase(s.queue.begin());
             s.queue_busy = 1;
         }
-        // (scenes are rendered when they end, so the new buffer is complete: the callback can run at once)
+        // (the new buffer complete in guest memory: the scenes the GPU still has finished, here rather than on the
+        // game's thread, which goes on meanwhile)
+        finish_scenes();
         if (s.init.display_queue_callback) {
             const u32 args[] = {entry.data};
             runtime::hle::call_guest(&runtime::Kernel::current()->ctx, s.init.display_queue_callback, args);
