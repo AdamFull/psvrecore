@@ -432,6 +432,19 @@ u32 Kernel::tls_address(u32 key) {
     return t->tls + 4 * key;
 }
 
+nx::vector<Kernel::CpuUse> Kernel::cpu_use() {
+    Lock guard(impl_->lock);
+    const u64 n = impl_->now_ns();
+    nx::vector<CpuUse> out;
+    for (const auto& [uid, object] : impl_->objects) {
+        if (object->cls != ObjectClass::Thread) continue;
+        const auto* t = static_cast<const Thread*>(object.get());
+        out.push_back({uid, t->name, t->priority, t->held_ns + (t->held_since ? n - t->held_since : 0),
+                       t->ready_ns + (t->ready_since ? n - t->ready_since : 0)});
+    }
+    return out;
+}
+
 nx::string Kernel::describe_threads() {
     Lock guard(impl_->lock);
     nx::string out;

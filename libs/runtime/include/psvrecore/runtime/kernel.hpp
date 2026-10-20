@@ -138,6 +138,8 @@ struct Thread : Object {
     i32 last_cpu = -1;
     u64 ready_order = 0;  // FIFO position among ready threads of its priority
     std::atomic<bool> lost_cpu{false};  // set when its CPU was taken while it runs guest code
+    // (the time it has held a CPU, and been ready without one: host clock, ns)
+    u64 held_ns = 0, held_since = 0, ready_ns = 0, ready_since = 0;
     nx::thread_parker parker;  // its host thread waits here (to the microsecond, which a futex timeout is not)
 
     Wait wait;
@@ -322,6 +324,14 @@ public:
     // Every thread: its state, priority, what it waits for, and its link register (where its last call returns to),
     // one line each. For debugging (PSVRECORE_THREADS).
     nx::string describe_threads();
+    // Each thread's time so far holding a CPU and ready without one (host clock, ns): what the scheduler gave it.
+    struct CpuUse {
+        Uid uid;
+        nx::string name;
+        i32 priority;
+        u64 held_ns, ready_ns;
+    };
+    nx::vector<CpuUse> cpu_use();
     // Called on a host thread that runs no guest thread (a test, the process start-up): adopt it as a guest thread
     // with this name, priority and stack, holding a CPU, so it can make kernel calls. Ended by release_host_thread().
     Uid adopt_host_thread(nx::string_view name, i32 priority = kernel::kGamePriority, u32 stack_size = kernel::kMainStackSize);

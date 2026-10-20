@@ -180,6 +180,10 @@ const Function* find_function(u32 library_nid, nx::string_view library, u32 nid)
 PsvFunction bind(const Function& f);
 bool counting_calls();
 nx::string describe_calls();
+// PSVRECORE_HITCH_TRACE=1: what each guest thread did from `from` to `to` (host clock, ns): its calls, the long ones,
+// and the long stretches of its own code between them (empty when not tracing).
+nx::string describe_window(u64 from, u64 to);
+bool tracing();  // (PSVRECORE_HITCH_TRACE)
 const Variable* find_variable(u32 library_nid, nx::string_view library, u32 nid, u32* guest_address);
 
 // Calls a guest function from host code (a thread's entry, a callback): `args` in r0-r3 and on the stack, LR the

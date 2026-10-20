@@ -66,6 +66,7 @@ bool Kernel::Impl::allowed(const Thread* t, i32 cpu) {
 
 void Kernel::Impl::make_ready(Thread* t, bool front) {
     t->state = ThreadState::Ready;
+    if (!t->ready_since) t->ready_since = now_ns();
     t->ready_order = static_cast<u64>(front ? --front_order : ++back_order);
     if (std::find(ready.begin(), ready.end(), t) == ready.end()) ready.push_back(t);
     dispatch();
@@ -73,6 +74,7 @@ void Kernel::Impl::make_ready(Thread* t, bool front) {
 
 void Kernel::Impl::release_cpu(Thread* t) {
     if (t->cpu < 0) return;
+    if (t->held_since) t->held_ns += now_ns() - t->held_since, t->held_since = 0;
     cpus[static_cast<usize>(t->cpu)] = nullptr;
     t->last_cpu = t->cpu;
     t->cpu = -1;
@@ -112,6 +114,7 @@ void Kernel::Impl::dispatch() {
             if (victim) {
                 release_cpu(victim);
                 victim->state = ThreadState::Ready;
+                victim->ready_since = now_ns();
                 victim->ready_order = static_cast<u64>(--front_order);
                 victim->lost_cpu.store(true, std::memory_order_release);
                 ready.push_back(victim);
@@ -119,6 +122,11 @@ void Kernel::Impl::dispatch() {
             cpus[static_cast<usize>(cpu)] = t;
             t->cpu = cpu;
             t->state = ThreadState::Running;
+            {
+                const u64 n = now_ns();
+                if (t->ready_since) t->ready_ns += n - t->ready_since, t->ready_since = 0;
+                t->held_since = n;
+            }
             t->lost_cpu.store(false, std::memory_order_relaxed);
             wake(t);
             changed = true;

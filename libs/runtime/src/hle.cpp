@@ -56,12 +56,56 @@ struct CountedSlot {
 CountedSlot g_counted[kCountedSlots];
 std::atomic<u32> g_counted_used{0};
 
+// Traced calls (PSVRECORE_HITCH_TRACE): each guest thread's last calls, when each began and ended, for what the threads
+// did while a frame came late (describe_window). A ring a thread, written by its thread only.
+constexpr usize kTraceEvents = 4096;
+struct TraceEvent {
+    u32 slot = 0;
+    u64 start = 0, end = 0;
+};
+struct ThreadTrace {
+    nx::string name;
+    std::atomic<u64> next{0};
+    TraceEvent events[kTraceEvents];
+};
+nx::vector<ThreadTrace*> g_traces;  // (under g_lock; never freed: a thread's may be read after it ends)
+thread_local ThreadTrace* t_trace = nullptr;
+
+}  // namespace
+
+bool tracing() {
+    static const bool on = [] {
+        const char* spec = std::getenv("PSVRECORE_HITCH_TRACE");
+        return spec && *spec && *spec != '0';
+    }();
+    return on;
+}
+
+namespace {
+
+bool tracing_calls() { return tracing(); }
+
+void trace_call(u32 slot, u64 start, u64 end) {
+    if (!t_trace) {
+        auto* t = new ThreadTrace;
+        if (kernel::Thread* k = Kernel::current()) t->name = k->name;
+        nx::scoped_lock<nx::mutex> held(g_lock);
+        g_traces.push_back(t);
+        t_trace = t;
+    }
+    const u64 n = t_trace->next.load(std::memory_order_relaxed);
+    t_trace->events[n % kTraceEvents] = TraceEvent{slot, start, end};
+    t_trace->next.store(n + 1, std::memory_order_release);
+}
+
 template <u32 I>
 void counted_entry(PsvContext* ctx, uint32_t ret) {
     g_counted[I].calls.fetch_add(1, std::memory_order_relaxed);
     const u64 start = nx::os::ticks_ns();
     g_counted[I].function(ctx, ret);
-    g_counted[I].ns.fetch_add(nx::os::ticks_ns() - start, std::memory_order_relaxed);
+    const u64 end = nx::os::ticks_ns();
+    g_counted[I].ns.fetch_add(end - start, std::memory_order_relaxed);
+    if (tracing_calls()) trace_call(I, start, end);
 }
 template <u32... I>
 constexpr std::array<PsvFunction, sizeof...(I)> counted_entries(std::integer_sequence<u32, I...>) {
@@ -80,7 +124,7 @@ bool counting_calls() {
 }
 
 PsvFunction bind(const Function& f) {
-    if (!counting_calls()) return f.function;
+    if (!counting_calls() && !tracing_calls()) return f.function;
     nx::scoped_lock<nx::mutex> held(g_lock);
     const u32 used = g_counted_used.load(std::memory_order_relaxed);
     for (u32 i = 0; i < used; ++i)
@@ -111,6 +155,57 @@ nx::string describe_calls() {
     nx::string out;
     for (const Called& c : called)
         out += nx::format("  {:>8} {:>9.1f} ms {}\n", c.calls, static_cast<f64>(c.ns) / 1e6, c.name);
+    return out;
+}
+
+nx::string describe_window(u64 from, u64 to) {
+    if (!tracing_calls()) return {};
+    nx::vector<ThreadTrace*> traces;
+    {
+        nx::scoped_lock<nx::mutex> held(g_lock);
+        traces = g_traces;
+    }
+    const auto ms = [](u64 ns) { return static_cast<f64>(ns) / 1e6; };
+    nx::string out;
+    for (ThreadTrace* t : traces) {
+        const u64 next = t->next.load(std::memory_order_acquire);
+        nx::vector<TraceEvent> in;
+        u64 last_end = 0;  // (the last call's end before the window)
+        for (u64 k = next > kTraceEvents ? next - kTraceEvents : 0; k < next; ++k) {
+            const TraceEvent& e = t->events[k % kTraceEvents];
+            if (e.end >= from && e.start <= to) in.push_back(e);
+            else if (e.end < from) last_end = nx::max(last_end, e.end);
+        }
+        if (in.empty()) {
+            // (no call in the window: in its own code all along, if it called within the second before)
+            if (last_end && from - last_end < 1'000'000'000)
+                out += nx::format("  {}: no calls; [its own code] since {:.1f} ms before\n",
+                                  t->name.empty() ? "(host)" : t->name.c_str(), ms(from - last_end));
+            continue;
+        }
+        std::sort(in.begin(), in.end(), [](const TraceEvent& a, const TraceEvent& b) { return a.start < b.start; });
+        // (the long calls, and the long stretches of the game's own code between calls: 2 ms or more)
+        struct Part {
+            u64 at, ns;
+            const char* what;
+        };
+        nx::vector<Part> parts;
+        u64 in_calls = 0;
+        for (usize i = 0; i < in.size(); ++i) {
+            const u64 s = nx::max(in[i].start, from), e = nx::min(in[i].end, to);
+            in_calls += e > s ? e - s : 0;
+            if (e > s && e - s >= 2'000'000) parts.push_back({s, e - s, g_counted[in[i].slot].name});
+            const u64 gap_from = i ? in[i - 1].end : from;
+            if (in[i].start > gap_from && in[i].start - gap_from >= 2'000'000)
+                parts.push_back({nx::max(gap_from, from), in[i].start - nx::max(gap_from, from), nullptr});
+        }
+        if (in.back().end < to && to - in.back().end >= 2'000'000) parts.push_back({in.back().end, to - in.back().end, nullptr});
+        out += nx::format("  {}: {} calls, {:.1f} ms in them;", t->name.empty() ? "(host)" : t->name.c_str(), in.size(),
+                          ms(in_calls));
+        for (const Part& p : parts)
+            out += nx::format(" {} {:.1f} at +{:.1f};", p.what ? p.what : "[its own code]", ms(p.ns), ms(p.at - from));
+        out += "\n";
+    }
     return out;
 }
 
