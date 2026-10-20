@@ -121,15 +121,16 @@ void emit(const Word& w, u64 raw, u32 index, u8 repetition, ProgramKind kind, nx
     }
 }
 
-// Family 3 repeats ignore the increment state: bits 47-48 choose what steps (source 0 by a vec4 of two register
-// pairs, by one pair or not at all; and/or the internal-register sources by one). A dot product writes the next
+// Family 3 repeats ignore the increment state: bits 47-48 choose what steps (source 0 on by a vec4 of two register
+// pairs, not at all, or back by a vec4; and/or the internal-register sources by one). A dot product writes the next
 // destination lane; a multiply-add's destination, as the reference prints it, is two registers on (an internal
 // register: one).
 void repeat_fam3(u64 word, u32 index, ProgramKind kind, nx::vector<Decoded>& out) {
     const Word base_word(word);
     const i32 count = base_word.field(44, 2) + 1;
     const u32 mode = base_word.bit(47) | (base_word.bit(48) << 1);
-    static constexpr i32 s0_steps[4] = {2, 0, 2, 1};
+    // (3: back, as the reference prints it, a game's skinning dot products of rows the compiler put in o8, o4 and o0)
+    static constexpr i32 s0_steps[4] = {2, 0, 2, -2};
     const i32 s0_step = s0_steps[mode];
     const bool gpi_step = mode == 1 || mode == 2;
     for (i32 k = 0; k < count; ++k) {

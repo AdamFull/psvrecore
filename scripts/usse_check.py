@@ -30,8 +30,10 @@ def sections(text):
     out, cur = {}, None
     for line in text.splitlines():
         if line.startswith('Primary program') or line.startswith('Secondary program'):
-            cur = line.strip().rstrip(':')
-            out[cur] = []
+            # (the reference lists a fragment program's instructions run at the selective rate, its blending, under
+            # a heading of their own: the primary program's still, as psvusse lists them)
+            cur = 'Primary program' if line.startswith('Primary program at selective rate') else line.strip().rstrip(':')
+            out.setdefault(cur, [])
             continue
         if cur is None:
             continue
