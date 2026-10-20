@@ -10,6 +10,7 @@
 //   indices <index>...                      a triangle list
 //   uniform vertex|fragment <name> <f32>... a default uniform buffer parameter (f32 or f16, by its type)
 //   buffer vertex|fragment <n> <f32>...     uniform buffer BUFFER[n]'s words
+//   words vertex|fragment uniforms|<n> <hex>...  the default uniform buffer's or BUFFER[n]'s words as they are
 //   texture <unit> <width> <height> nearest|linear checker|gradient|noise
 //   depth, blend                            a LESS_EQUAL depth test with writes; source-alpha blending
 //   tolerance <n>                           the largest difference of a channel that matches (default 1)
@@ -174,6 +175,25 @@ Result<Scene> load_scene(const nx::string& path) {
             auto& buffers = f[1] == "vertex" ? current.vertex_buffers : current.fragment_buffers;
             if (buffers.size() <= n) buffers.resize(n + 1);
             for (f32 x : v) buffers[n].push_back(std::bit_cast<u32>(x));
+        } else if (op == "words" && f.size() >= 4) {
+            // (words vertex|fragment uniforms|<n> <hex>...: the default uniform buffer's or BUFFER[n]'s words as they
+            // are, a draw captured from a game: PSVRECORE_GXM_CAPTURE)
+            const bool v = f[1] == "vertex";
+            nx::vector<u32>* words = nullptr;
+            if (f[2] == "uniforms") {
+                words = v ? &current.vertex_uniforms : &current.fragment_uniforms;
+            } else {
+                const u32 n = static_cast<u32>(parse_u64(f[2]).value_or(99));
+                if (n >= 14) return bad("bad buffer index");
+                auto& buffers = v ? current.vertex_buffers : current.fragment_buffers;
+                if (buffers.size() <= n) buffers.resize(n + 1);
+                words = &buffers[n];
+            }
+            for (usize i = 3; i < f.size(); ++i) {
+                const auto w = parse_u64(f[i], 16);
+                if (!w) return bad("bad word");
+                words->push_back(static_cast<u32>(*w));
+            }
         } else if (op == "texture" && f.size() == 6) {
             const u32 unit = static_cast<u32>(parse_u64(f[1]).value_or(99));
             const u32 w = static_cast<u32>(parse_u64(f[2]).value_or(0)), h = static_cast<u32>(parse_u64(f[3]).value_or(0));

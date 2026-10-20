@@ -212,7 +212,9 @@ Result<void> render(const Draw& d, Image& t) {
         if (slot_of[i] >= 0) continue;
         Vertex v;
         if (auto r = run_vertex(d, vsetup, i, v); !r) return r;
-        if (!(v.position[3] > 0.0f)) return failure("a vertex behind the eye (no clipping)");
+        if (!(v.position[3] > 0.0f))
+            return failure(nx::format("a vertex behind the eye (no clipping): vertex {} at ({}, {}, {}, {})", i, v.position[0],
+                                      v.position[1], v.position[2], v.position[3]));
         const f64 inv_w = 1.0 / v.position[3];
         screen.push_back(Screen{(v.position[0] * inv_w + 1.0) * 0.5 * t.width, (1.0 - v.position[1] * inv_w) * 0.5 * t.height,
                                 0.5 * v.position[2] * inv_w + 0.5, inv_w});

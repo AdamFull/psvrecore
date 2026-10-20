@@ -38,6 +38,7 @@
 #include "psvrecore/gxm/surface.hpp"
 #include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/gxm/translate.hpp"
+#include "psvrecore/io/file.hpp"
 #include "psvrecore/log.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
 #include "shader_cache.hpp"
@@ -1546,11 +1547,191 @@ void trace_scene(u64 number, const Scene& scene) {
                  "{} indices x {}{}", i, d.vertex ? d.vertex->guest : 0, d.fragment ? d.fragment->guest : 0,
                  d.fragment && d.fragment->blend_enabled, d.fragment && d.fragment->mask_update, d.primitive,
                  d.index_count, d.instances, textures);
+        // (each vertex program's attributes, the first time it is seen: its parameters' names, and the formats the
+        // program was made with)
+        static nx::hash_map<u32, bool> described;
+        if (d.vertex && d.vertex->program && described.emplace(d.vertex->guest, true).second) {
+            nx::string attributes;
+            for (const VertexAttribute& a : d.vertex->attributes) {
+                nx::string name;
+                for (const usse::Parameter& p : d.vertex->program->gxp.parameters)
+                    if (p.category == usse::ParameterCategory::Attribute && p.resource == a.reg) name = p.name;
+                const u32 stride = a.stream < d.vertex->streams.size() ? d.vertex->streams[a.stream].stride : 0;
+                attributes += nx::format(" {}(reg {}, stream {} stride {}, offset {}, format {}, {} components)", name, a.reg,
+                                         a.stream, stride, a.offset, a.format, a.components);
+            }
+            nx::logi(logs::gxm, "trace:     vertex program 0x{:08x} (GXP at 0x{:08x}; fragment 0x{:08x}):{}", d.vertex->guest,
+                     d.vertex->program->gxp_address, d.fragment && d.fragment->program ? d.fragment->program->gxp_address : 0, attributes);
+            nx::string uniforms;
+            for (const usse::Parameter& p : d.vertex->program->gxp.parameters)
+                if (p.category != usse::ParameterCategory::Attribute)
+                    uniforms += nx::format(" {}(category {}, type {}, {} components, array {}, resource {}, container {})", p.name,
+                                           static_cast<u32>(p.category), static_cast<u32>(p.type), p.components, p.array_size,
+                                           p.resource, p.container);
+            nx::logi(logs::gxm, "trace:     its uniforms:{}", uniforms);
+            // (PSVRECORE_GXM_TRACE_PROGRAMS=<folder>: the program's GXP written there, for psvusse)
+            if (const char* folder = std::getenv("PSVRECORE_GXM_TRACE_PROGRAMS"); folder && *folder) {
+                for (const Program* p : {d.vertex->program, d.fragment ? d.fragment->program : nullptr}) {
+                    if (!p || !p->gxp.size || !memory().valid(p->gxp_address, p->gxp.size)) continue;
+                    const nx::string path = nx::format("{}/{:08x}.gxp", folder, p->gxp_address);
+                    (void)io::write_file(nx::fs::path_view(path), {memory().host(p->gxp_address), p->gxp.size});
+                }
+            }
+        }
     }
 }
 
 }  // namespace
 
+
+namespace {
+
+// PSVRECORE_GXM_SKIP=<address>[,<address>...]: the draws whose vertex or fragment program is at one of these guest
+// addresses (as PSVRECORE_GXM_TRACE gives them) left out, for finding which draw makes what.
+const nx::vector<u32>& skipped_programs() {
+    static const nx::vector<u32> list = [] {
+        nx::vector<u32> out;
+        const char* spec = std::getenv("PSVRECORE_GXM_SKIP");
+        for (const char* p = spec; p && *p;) {
+            char* end = nullptr;
+            const u32 v = static_cast<u32>(std::strtoul(p, &end, 0));
+            if (end == p) break;
+            out.push_back(v);
+            p = *end == ',' ? end + 1 : end;
+        }
+        return out;
+    }();
+    return list;
+}
+
+// PSVRECORE_GXM_CAPTURE=<scene>:<draw>:<folder>: that draw (by its index; or, an address, the first whose vertex
+// program is there, in that scene or a later one) written to the folder as a psvrender scene (scene.txt, its
+// programs' GXP files, its vertices decoded as the programs get them, its indices, uniforms and uniform buffers), for
+// comparing the translation's drawing with the reference renderer's (tools/psvrender). A triangle list, without its
+// textures or states.
+struct CaptureAt {
+    u64 scene = 0;
+    u32 draw = 0;
+    nx::string folder;
+};
+
+void capture_draw(u64 number, const Scene& scene) {
+    static const CaptureAt at = [] {
+        CaptureAt out;
+        const char* spec = std::getenv("PSVRECORE_GXM_CAPTURE");
+        if (!spec || !*spec) return out;
+        char* end = nullptr;
+        out.scene = std::strtoull(spec, &end, 0);
+        if (*end == ':') out.draw = static_cast<u32>(std::strtoul(end + 1, &end, 0));
+        if (*end == ':') out.folder = nx::string(end + 1);
+        return out;
+    }();
+    static bool done = false;
+    if (done || !at.scene || number < at.scene || at.folder.empty()) return;
+    usize which = at.draw;
+    if (at.draw >= 0x10000) {
+        which = scene.draws.size();
+        for (usize i = 0; i < scene.draws.size(); ++i)
+            if (scene.draws[i].vertex && scene.draws[i].vertex->guest == at.draw) {
+                which = i;
+                break;
+            }
+    } else if (number != at.scene) {
+        return;
+    }
+    if (which >= scene.draws.size()) return;
+    done = true;
+    const Draw& d = scene.draws[which];
+    if (!d.vertex || !d.vertex->program || !d.fragment || !d.fragment->program) return;
+    auto write_gxp = [&](const Program& p, const char* name) {
+        if (memory().valid(p.gxp_address, p.gxp.size))
+            (void)io::write_file(nx::fs::path_view(nx::format("{}/{}", at.folder, name)), {memory().host(p.gxp_address), p.gxp.size});
+    };
+    write_gxp(*d.vertex->program, "vertex.gxp");
+    write_gxp(*d.fragment->program, "fragment.gxp");
+    const u32 index_size = d.index_format ? 4 : 2;
+    if (!memory().valid(d.index_address, d.index_count * index_size)) return;
+    nx::vector<u32> indices(d.index_count);
+    u32 count = 0;
+    for (u32 k = 0; k < d.index_count; ++k) {
+        u32 v = 0;
+        std::memcpy(&v, memory().host(d.index_address + k * index_size), index_size);
+        indices[k] = v;
+        count = nx::max(count, v + 1);
+    }
+    auto half = [](u16 h) {
+        const u32 sign = (h >> 15) & 1, exp = (h >> 10) & 31, mant = h & 1023;
+        f32 v = exp == 0 ? std::ldexp(static_cast<f32>(mant), -24)
+                : exp == 31 ? (mant ? NAN : INFINITY)
+                            : std::ldexp(static_cast<f32>(mant | 1024), static_cast<i32>(exp) - 25);
+        return sign ? -v : v;
+    };
+    nx::string text = nx::format("# scene {} draw {} (PSVRECORE_GXM_CAPTURE)\ntarget {} {} ff404040\nvertex vertex.gxp\n"
+                                 "fragment fragment.gxp\n", number, which, nx::min(scene.color.size & 0xFFFFu, 1024u),
+                                 nx::min(scene.color.size >> 16, 1024u));
+    for (const VertexAttribute& a : d.vertex->attributes) {
+        nx::string name;
+        for (const usse::Parameter& p : d.vertex->program->gxp.parameters)
+            if (p.category == usse::ParameterCategory::Attribute && p.resource == a.reg) name = p.name;
+        if (name.empty() || a.stream >= d.vertex->streams.size()) continue;
+        const u32 stride = d.vertex->streams[a.stream].stride, n = nx::clamp<u32>(a.components, 1, 4);
+        static constexpr u32 kBytes[10] = {1, 1, 2, 2, 1, 1, 2, 2, 2, 4};
+        const u32 size = a.format < 10 ? kBytes[a.format] : 4;
+        text += nx::format("attribute {} {}", name, n);
+        for (u32 v = 0; v < count; ++v)
+            for (u32 c = 0; c < n; ++c) {
+                const u32 addr = d.streams[a.stream] + v * stride + a.offset + c * size;
+                f32 x = 0;
+                if (memory().valid(addr, size)) {
+                    const u8* p = memory().host(addr);
+                    u16 h;
+                    std::memcpy(&h, p, 2);
+                    switch (a.format) {
+                        case 0: x = p[0]; break;
+                        case 1: x = static_cast<i8>(p[0]); break;
+                        case 2: x = h; break;
+                        case 3: x = static_cast<i16>(h); break;
+                        case 4: x = p[0] / 255.0f; break;
+                        case 5: x = nx::max(-1.0f, static_cast<i8>(p[0]) / 127.0f); break;
+                        case 6: x = h / 65535.0f; break;
+                        case 7: x = nx::max(-1.0f, static_cast<i16>(h) / 32767.0f); break;
+                        case 8: x = half(h); break;
+                        default: std::memcpy(&x, p, 4); break;
+                    }
+                }
+                text += nx::format(" {:.9g}", x);
+            }
+        text += "\n";
+    }
+    text += "indices";
+    for (u32 i : indices) text += nx::format(" {}", i);
+    text += "\n";
+    auto words = [&](const char* stage, const char* which, const u32* w, usize n) {
+        if (!n) return;
+        text += nx::format("words {} {}", stage, which);
+        for (usize i = 0; i < n; ++i) text += nx::format(" {:x}", w[i]);
+        text += "\n";
+    };
+    words("vertex", "uniforms", d.vertex_uniforms.data(), d.vertex_uniforms.size());
+    words("fragment", "uniforms", d.fragment_uniforms.data(), d.fragment_uniforms.size());
+    for (u32 stage = 0; stage < 2; ++stage) {
+        const usse::Gxp& g = stage ? d.fragment->program->gxp : d.vertex->program->gxp;
+        const u32* buffers = stage ? d.fragment_buffers : d.vertex_buffers;
+        for (u32 b = 0; b < 14; ++b) {
+            const u32 bytes = buffer_bytes(g, b);
+            if (!buffers[b] || !bytes || !memory().valid(buffers[b], bytes)) continue;
+            words(stage ? "fragment" : "vertex", nx::format("{}", b).c_str(),
+                  reinterpret_cast<const u32*>(memory().host(buffers[b])), bytes / 4);
+        }
+    }
+    text += "draw\n";
+    (void)io::write_file(nx::fs::path_view(nx::format("{}/scene.txt", at.folder)),
+                         {reinterpret_cast<const u8*>(text.data()), text.size()});
+    nx::logi(logs::gxm, "capture: scene {} draw {} written to {} ({} vertices, {} indices)", number, which, at.folder,
+             count, d.index_count);
+}
+
+}  // namespace
 
 bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notifications) {
     (void)context;
@@ -1569,6 +1750,12 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         ~Copies() { finish_target_copies(r, recorded); }
     } copies{r, copies_recorded};
     if (const Trace& t = trace(); t.on && r.scenes >= t.first && r.scenes <= t.last) trace_scene(r.scenes, scene);
+    if (const auto& skip = skipped_programs(); !skip.empty())
+        std::erase_if(scene.draws, [&](const Draw& dr) {
+            return std::find(skip.begin(), skip.end(), dr.vertex ? dr.vertex->guest : 0) != skip.end() ||
+                   std::find(skip.begin(), skip.end(), dr.fragment ? dr.fragment->guest : 0) != skip.end();
+        });
+    capture_draw(r.scenes, scene);
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
     const DepthStencilSurface& ds = scene.depth;
