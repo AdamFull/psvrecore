@@ -185,6 +185,9 @@ struct Program {
     usse::Gxp gxp;
     nx::vector<usse::Decoded> primary, secondary;
     u32 references = 1;
+    // (found once, by the renderer: whether it stores to memory, whether its secondary program reads per-tile
+    // registers; -1 not yet)
+    i8 stores = -1, tile_secondary = -1;
 };
 
 struct VertexProgram {

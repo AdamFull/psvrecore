@@ -374,6 +374,10 @@ struct Renderer {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     nx::hash_map<u64, VkShaderModule> modules;      // (by shader key)
+    // The modules and secondary pipelines again by a quick hash of the program's content and what else the shader
+    // key takes: found without a SHA-256 for each draw.
+    nx::hash_map<u64, VkShaderModule> quick_modules;
+    nx::hash_map<u64, VkPipeline> quick_compute;
     nx::hash_map<u64, ShaderKey> module_keys;       // (by module: a pipeline's shaders, to record it)
     nx::hash_map<u64, VkPipeline> compute;          // secondary programs (by shader key)
     nx::hash_map<u64, nx::string> failed_programs;  // (reported once)
@@ -418,6 +422,11 @@ struct Renderer {
     // Depth/stencil images a scene drew with and no longer needs, for the next scene of their size: destroying one
     // (its memory freed, its framebuffers forgotten) took 3-25 ms on a desktop's driver, scene after scene.
     nx::vector<vk::Image> free_depths;
+    // Host buffers scenes are done with (their vertices, indices, uniforms, secondary attributes, readbacks; new
+    // textures' texels), for the next scenes: not made and freed six times or more a scene.
+    nx::vector<vk::Buffer> free_buffers;
+    u64 free_buffer_bytes = 0;
+    nx::vector<VkDescriptorPool> free_pools;  // (of kPoolSets sets, reset: for the next scenes)
     // Scenes submitted to the GPU whose results are not in guest memory yet, oldest first: what each writes there,
     // the surface whose image it draws, and what finishes it (the write-back, the notifications, the clean-up) once
     // the GPU is done. A scene is finished when a later one has been submitted (the GPU runs it while the CPU
@@ -586,9 +595,12 @@ VkShaderModule module_for(Renderer& r, const ShaderKey& full, auto&& translate) 
     if (auto it = r.modules.find(key); it != r.modules.end()) return it->second;
     if (r.failed_programs.contains(key)) return VK_NULL_HANDLE;
     nx::vector<u32> words;
+    const u64 t0 = nx::os::ticks_ns();
+    bool translated = false;
     if (const nx::vector<u32>* cached = r.cache.spirv(full)) {
         words = *cached;
     } else {
+        translated = true;
         auto spirv = translate();
         if (!spirv) {
             nx::logw(logs::gxm, "program not translated: {}", spirv.error().message);
@@ -599,11 +611,17 @@ VkShaderModule module_for(Renderer& r, const ShaderKey& full, auto&& translate) 
         r.cache.add_spirv(full, words);
         if (!r.warming) r.translated.fetch_add(1);
     }
+    const u64 t1 = nx::os::ticks_ns();
     auto m = vk::create_shader(*r.device, words);
     if (!m) {
         r.failed_programs[key] = m.error().message;
         return VK_NULL_HANDLE;
     }
+    // (PSVRECORE_GXM_PROFILE: a shader that took a while to make)
+    if (const u64 t2 = nx::os::ticks_ns(); t2 - t0 >= 5'000'000 && std::getenv("PSVRECORE_GXM_PROFILE"))
+        nx::logi(logs::gpu, "gxm profile: a slow shader, {:.1f} ms: {} {:.1f}, the module {:.1f}; {} words of SPIR-V",
+                 static_cast<f64>(t2 - t0) / 1e6, translated ? "translated" : "from the cache", static_cast<f64>(t1 - t0) / 1e6,
+                 static_cast<f64>(t2 - t1) / 1e6, words.size());
     r.modules[key] = *m;
     r.module_keys[reinterpret_cast<u64>(*m)] = full;
     return *m;
@@ -648,8 +666,16 @@ VkPipeline make_compute(Renderer& r, VkShaderModule m) {
 }
 
 // The compute pipeline of a secondary program (VK_NULL_HANDLE: none to run, or not translated).
+VkPipeline secondary_pipeline_keyed(Renderer& r, const Program& p);
 VkPipeline secondary_pipeline(Renderer& r, const Program& p) {
     if (p.secondary.empty()) return VK_NULL_HANDLE;
+    const u64 quick = nx::fnv1a64().combine_bytes(reinterpret_cast<const char*>(p.content.data()), p.content.size()).value();
+    if (auto it = r.quick_compute.find(quick); it != r.quick_compute.end()) return it->second;
+    const VkPipeline pipeline = secondary_pipeline_keyed(r, p);
+    r.quick_compute[quick] = pipeline;
+    return pipeline;
+}
+VkPipeline secondary_pipeline_keyed(Renderer& r, const Program& p) {
     const ShaderKey full = secondary_key(p);
     const u64 key = short_key(full);
     if (auto it = r.compute.find(key); it != r.compute.end()) return it->second;
@@ -795,11 +821,14 @@ VkSamplerAddressMode address_mode(u32 m) {
     }
 }
 
+Result<vk::Buffer> take_host_buffer(Renderer& r, VkDeviceSize bytes);
+void give_host_buffer(Renderer& r, vk::Buffer& b);
+
 // Decoded texels into a staging buffer, to be uploaded into the texture `key` by the scene's commands (each face's
 // levels).
 Result<void> queue_texels(Renderer& r, u64 key, const Texels& t) {
     vk::Device& d = *r.device;
-    auto staging = vk::create_host_buffer(d, t.data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto staging = take_host_buffer(r, t.data.size());
     if (!staging) return nx::err(staging.error());
     std::memcpy(staging->mapped, t.data.data(), t.data.size());
     vk::flush(d, *staging);
@@ -985,6 +1014,72 @@ DepthTarget* depth_target_for(Renderer& r, const DepthStencilSurface& s, const D
 }
 
 constexpr usize kFreeDepths = 6;  // (kept for reuse; more are destroyed)
+constexpr u64 kFreeBufferBytes = 64ull << 20;  // (host buffers kept for reuse at most)
+constexpr VkBufferUsageFlags kHostBufferUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+// A mapped host buffer of at least `bytes`, for any of a scene's uses: one given back (no more than four times as
+// large), else a new one (of a power of two, 64 KiB or more).
+Result<vk::Buffer> take_host_buffer(Renderer& r, VkDeviceSize bytes) {
+    usize best = r.free_buffers.size();
+    for (usize i = 0; i < r.free_buffers.size(); ++i) {
+        const VkDeviceSize s = r.free_buffers[i].size;
+        if (s >= bytes && s <= nx::max<VkDeviceSize>(bytes * 4, 65536) &&
+            (best == r.free_buffers.size() || s < r.free_buffers[best].size))
+            best = i;
+    }
+    if (best < r.free_buffers.size()) {
+        vk::Buffer b = r.free_buffers[best];
+        r.free_buffers.erase(r.free_buffers.begin() + static_cast<std::ptrdiff_t>(best));
+        r.free_buffer_bytes -= b.size;
+        return b;
+    }
+    return vk::create_host_buffer(*r.device, std::bit_ceil(nx::max<VkDeviceSize>(bytes, 65536)), kHostBufferUsage);
+}
+
+// A scene's descriptor pool: of kPoolSets sets (one given back, else new) for up to as many draws, else its own.
+constexpr u32 kPoolSets = 128, kFreePools = 16;
+VkDescriptorPool take_descriptor_pool(Renderer& r, u32 sets) {
+    if (sets <= kPoolSets && !r.free_pools.empty()) {
+        const VkDescriptorPool p = r.free_pools.back();
+        r.free_pools.pop_back();
+        return p;
+    }
+    const u32 n = nx::max(sets, kPoolSets);
+    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * n},
+                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (kDrawBindings - 3) * n},
+                                          {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, n}};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = n;
+    pi.poolSizeCount = 3;
+    pi.pPoolSizes = sizes;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    vkCreateDescriptorPool(r.device->device(), &pi, nullptr, &pool);
+    return pool;
+}
+void give_descriptor_pool(Renderer& r, VkDescriptorPool pool, u32 sets) {
+    if (!pool) return;
+    if (sets <= kPoolSets && r.free_pools.size() < kFreePools) {
+        vkResetDescriptorPool(r.device->device(), pool, 0);
+        r.free_pools.push_back(pool);
+    } else {
+        vkDestroyDescriptorPool(r.device->device(), pool, nullptr);
+    }
+}
+
+// And back, once the GPU is done with it.
+void give_host_buffer(Renderer& r, vk::Buffer& b) {
+    if (!b.buffer) return;
+    r.free_buffers.push_back(b);
+    r.free_buffer_bytes += b.size;
+    b = {};
+    while (r.free_buffer_bytes > kFreeBufferBytes && !r.free_buffers.empty()) {
+        r.free_buffer_bytes -= r.free_buffers.front().size;
+        vk::destroy_buffer(*r.device, r.free_buffers.front());
+        r.free_buffers.erase(r.free_buffers.begin());
+    }
+}
 
 // A depth/stencil image of this size: one a scene gave back, else a new one.
 Result<vk::Image> take_depth_image(Renderer& r, VkFormat format, u32 width, u32 height) {
@@ -1437,7 +1532,7 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
 void finish_target_copies(Renderer& r, bool recorded) {
     if (!recorded) {
         for (Renderer::TextureUpload& u : r.texture_uploads) {
-            vk::destroy_buffer(*r.device, u.staging);
+            give_host_buffer(r, u.staging);
             if (auto it = r.textures.find(u.key); it != r.textures.end()) {
                 r.texture_bytes -= it->second.bytes;
                 vk::destroy_image(*r.device, it->second.image);
@@ -1604,7 +1699,7 @@ void evict_textures(Renderer& r) {
 
 // Whether a fragment program's secondary program reads per-tile special registers (pixelX, pixelY, tileXY): it runs
 // in the fragment shader then, in each instance (translate_fragment).
-bool tile_secondary(const Program& p) {
+bool tile_secondary_scan(const Program& p) {
     for (const usse::Decoded& d : p.secondary) {
         if (!d.executed) continue;
         for (u32 k = 0; k < d.in.src_count; ++k) {
@@ -1616,12 +1711,21 @@ bool tile_secondary(const Program& p) {
 }
 
 // Whether a program stores to memory (its buffers are copied back after the scene).
-bool stores(const Program& p) {
+bool stores_scan(const Program& p) {
     for (const usse::Decoded& d : p.primary)
         if (d.executed && d.in.op == usse::Op::Store) return true;
     for (const usse::Decoded& d : p.secondary)
         if (d.executed && d.in.op == usse::Op::Store) return true;
     return false;
+}
+// (both scans once a program: draws ask for every draw)
+bool stores(const Program& p) {
+    if (p.stores < 0) const_cast<Program&>(p).stores = stores_scan(p) ? 1 : 0;
+    return p.stores == 1;
+}
+bool tile_secondary(const Program& p) {
+    if (p.tile_secondary < 0) const_cast<Program&>(p).tile_secondary = tile_secondary_scan(p) ? 1 : 0;
+    return p.tile_secondary == 1;
 }
 
 // The words of a uniform buffer a program reads (from its parameters in that buffer).
@@ -2170,16 +2274,36 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
                 if (p.category == usse::ParameterCategory::Attribute && p.resource == attr.reg) in.raw = p.reg_format;
             vs.inputs.push_back(in);
         }
-        const VkShaderModule vmod = module_for(r, vertex_key(vp, vs), [&] { return translate_vertex(vp.gxp, vp.primary, vs); });
+        // (by a quick key first: the program's content and the inputs, as vertex_key takes them)
+        nx::fnv1a64 vq;
+        vq.combine_bytes(reinterpret_cast<const char*>(vp.content.data()), vp.content.size()).combine('v');
+        for (const VertexInput& in : vs.inputs) vq.combine_all(in.location, in.reg, in.format, in.components, in.raw);
+        VkShaderModule vmod = VK_NULL_HANDLE;
+        if (auto it = r.quick_modules.find(vq.value()); it != r.quick_modules.end()) {
+            vmod = it->second;
+        } else {
+            vmod = module_for(r, vertex_key(vp, vs), [&] { return translate_vertex(vp.gxp, vp.primary, vs); });
+            if (vmod) r.quick_modules[vq.value()] = vmod;
+        }
         FragmentShader fs;
         fs.output_format = dr.fragment->output_format;
         std::memcpy(fs.swizzle, cf.swizzle, 4);
         fs.color_output = color != nullptr;
-        const VkShaderModule fmod = module_for(r, fragment_key(fp, fs, inline_secondary), [&] {
-            const std::span<const usse::Decoded> secondary =
-                inline_secondary ? std::span<const usse::Decoded>(fp.secondary) : std::span<const usse::Decoded>{};
-            return translate_fragment(fp.gxp, fp.primary, fs, secondary);
-        });
+        nx::fnv1a64 fq;
+        fq.combine_bytes(reinterpret_cast<const char*>(fp.content.data()), fp.content.size()).combine('f');
+        fq.combine_all(fs.output_format, fs.swizzle[0], fs.swizzle[1], fs.swizzle[2], fs.swizzle[3], fs.color_output,
+                       fs.fragment_program_enabled, inline_secondary);
+        VkShaderModule fmod = VK_NULL_HANDLE;
+        if (auto it = r.quick_modules.find(fq.value()); it != r.quick_modules.end()) {
+            fmod = it->second;
+        } else {
+            fmod = module_for(r, fragment_key(fp, fs, inline_secondary), [&] {
+                const std::span<const usse::Decoded> secondary =
+                    inline_secondary ? std::span<const usse::Decoded>(fp.secondary) : std::span<const usse::Decoded>{};
+                return translate_fragment(fp.gxp, fp.primary, fs, secondary);
+            });
+            if (fmod) r.quick_modules[fq.value()] = fmod;
+        }
         if (!vmod || !fmod) continue;
 
         // Indices, and the vertices they reach (each stream from its first vertex to the last one used).
@@ -2353,7 +2477,8 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     if (!mem.empty()) std::memcpy(mem_words.data() + 2, mem.data(), mem.size());
     nx::vector<vk::Buffer> buffers;
     auto make = [&](const void* data, usize bytes, VkBufferUsageFlags usage) -> vk::Buffer* {
-        auto b = vk::create_host_buffer(d, nx::max<usize>(bytes, 16), usage);
+        (void)usage;
+        auto b = take_host_buffer(r, nx::max<usize>(bytes, 16));
         if (!b) return nullptr;
         if (data && bytes) std::memcpy(b->mapped, data, bytes);
         vk::flush(d, *b);
@@ -2361,6 +2486,31 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         return &buffers.back();
     };
     buffers.reserve(6);
+    // The secondary programs, a dispatch for each program (and stage) the scene's draws run, a workgroup a draw: the
+    // draws' indices in a table after their secondary attributes (a dispatch a draw took 3 ms of a phone's GPU a scene)
+    struct SecondaryBatch {
+        VkPipeline pipeline;
+        u32 stage, table, count;
+        usize first;  // (a draw of the batch: its descriptor set binds the scene's buffers)
+    };
+    nx::vector<SecondaryBatch> secondary_batches;
+    {
+        nx::vector<u32> table;
+        for (u32 stage = 0; stage < 2; ++stage)
+            for (usize i = 0; i < plans.size(); ++i) {
+                const VkPipeline p = stage ? plans[i].fragment_secondary : plans[i].vertex_secondary;
+                if (!p) continue;
+                bool found = false;
+                for (const SecondaryBatch& b : secondary_batches) found |= b.pipeline == p && b.stage == stage;
+                if (found) continue;
+                SecondaryBatch b{p, stage, static_cast<u32>(sa.size() + table.size()), 0, i};
+                for (usize j = i; j < plans.size(); ++j)
+                    if ((stage ? plans[j].fragment_secondary : plans[j].vertex_secondary) == p)
+                        table.push_back(static_cast<u32>(plans[j].constants.draw)), ++b.count;
+                secondary_batches.push_back(b);
+            }
+        sa.insert(sa.end(), table.begin(), table.end());
+    }
     vk::Buffer* sa_buf = make(sa.data(), sa.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     vk::Buffer* mem_buf = make(mem_words.data(), mem_words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     vk::Buffer* vb = make(vertices.data(), vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -2383,7 +2533,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
     auto cleanup = [&] {
-        for (vk::Buffer& b : buffers) vk::destroy_buffer(d, b);
+        for (vk::Buffer& b : buffers) give_host_buffer(r, b);
         if (depth_keeper) {
             depth_keeper->image.layout = depth.layout;  // (kept)
         } else if (depth.image) {
@@ -2398,16 +2548,8 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     g_profile.mark(2);
     nx::hash_map<u64, u64> seen_textures;  // (texture_for's, for this scene)
     // ---- Descriptor sets (one per draw: the same buffers, the textures to come) ------------------------------
-    VkDescriptorPool pool = VK_NULL_HANDLE;
     const u32 sets = nx::max<u32>(static_cast<u32>(plans.size()), 1);
-    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * sets},
-                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (kDrawBindings - 3) * sets},
-                                          {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, sets}};
-    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pi.maxSets = sets;
-    pi.poolSizeCount = 3;
-    pi.pPoolSizes = sizes;
-    vkCreateDescriptorPool(d.device(), &pi, nullptr, &pool);
+    const VkDescriptorPool pool = take_descriptor_pool(r, sets);
     nx::vector<VkDescriptorSet> descriptor_sets(plans.size(), VK_NULL_HANDLE);
     nx::vector<Target*> sampled;  // (surfaces drawn at the internal resolution the draws read as textures)
     nx::vector<DepthTarget*> sampled_depth;
@@ -2513,25 +2655,22 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     }
     if (!cmd) {
         if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
-        vkDestroyDescriptorPool(d.device(), pool, nullptr);
+        give_descriptor_pool(r, pool, sets);
         cleanup();
         return false;
     }
     if (queries) vkCmdResetQueryPool(*cmd, queries, 0, query_count);
     const VkShaderStageFlags push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     bool computed = false;
-    for (usize i = 0; i < plans.size(); ++i) {
-        for (u32 stage = 0; stage < 2; ++stage) {
-            const VkPipeline p = stage ? plans[i].fragment_secondary : plans[i].vertex_secondary;
-            if (!p) continue;
-            DrawConstants c = plans[i].constants;
-            c.stage = stage;
-            vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p);
-            vkCmdBindDescriptorSets(*cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.layout, 0, 1, &descriptor_sets[i], 0, nullptr);
-            vkCmdPushConstants(*cmd, r.layout, push_stages, 0, sizeof c, &c);
-            vkCmdDispatch(*cmd, 1, 1, 1);
-            computed = true;
-        }
+    for (const SecondaryBatch& b : secondary_batches) {
+        DrawConstants c = plans[b.first].constants;
+        c.draw = b.table;
+        c.stage = b.stage;
+        vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_COMPUTE, b.pipeline);
+        vkCmdBindDescriptorSets(*cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.layout, 0, 1, &descriptor_sets[b.first], 0, nullptr);
+        vkCmdPushConstants(*cmd, r.layout, push_stages, 0, sizeof c, &c);
+        vkCmdDispatch(*cmd, b.count, 1, 1);
+        computed = true;
     }
     if (computed) {
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -2727,7 +2866,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     pending.finish = [&r, &d, stamps, color = color != nullptr, readback, mem_buf, depth_buf, buffers = std::move(buffers),
                       layout, data = cs.data, width, height, bytes = cf.bytes, target,
                       buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
-                      stores_depth, ds, dl, unorm24, samples, depth_target, kept_depth, depth, pool,
+                      stores_depth, ds, dl, unorm24, samples, depth_target, kept_depth, depth, pool, sets,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
                       uploads = std::move(r.texture_uploads)](bool ok) mutable {
         if (ok && stamps) {
@@ -2808,12 +2947,12 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         for (const Notification& n : notifications) notify(n);
         if (stamps) vkDestroyQueryPool(d.device(), stamps, nullptr);
         if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
-        vkDestroyDescriptorPool(d.device(), pool, nullptr);
-        for (vk::Buffer& b : buffers) vk::destroy_buffer(d, b);
+        give_descriptor_pool(r, pool, sets);
+        for (vk::Buffer& b : buffers) give_host_buffer(r, b);
         if (!depth_target && !kept_depth && depth.image) free_depth_image(r, depth);
         for (Renderer::TargetCopy& c : copies)
             if (c.strip.buffer) vk::destroy_buffer(d, c.strip);
-        for (Renderer::TextureUpload& u : uploads) vk::destroy_buffer(d, u.staging);
+        for (Renderer::TextureUpload& u : uploads) give_host_buffer(r, u.staging);
         back_mark(3);
     };
     r.target_copies.clear();  // (moved into the scene's finish: the guard finds none)

@@ -235,7 +235,7 @@ private:
     Id body(auto&& local);
     void compute_prologue(Id gid);
     void compute_epilogue(Id gid, Id stopped);
-    void secondary_prologue();
+    void secondary_prologue(Id workgroup);
     void secondary_epilogue();
     void vertex_prologue();
     void vertex_epilogue();
@@ -1368,8 +1368,11 @@ void Translator::compute_epilogue(Id gid, Id stopped) {
 // ---- The secondary form ----------------------------------------------------------------------------------------
 
 // The draw's secondary attributes (of the stage the push constants name), into the program's registers and back.
-void Translator::secondary_prologue() {
-    sa_base_ = iadd(imul(push_constant(0, tu_), u(kDrawSecondaryWords)), imul(push_constant(5, tu_), u(256)));
+// (a dispatch runs the program for the draws of a table in the secondary attributes' buffer: push constant 0 is
+// where the table starts, a workgroup a draw)
+void Translator::secondary_prologue(Id workgroup) {
+    const Id draw = load(tu_, buffer_word(sa_buf_, iadd(push_constant(0, tu_), workgroup)));
+    sa_base_ = iadd(imul(draw, u(kDrawSecondaryWords)), imul(push_constant(5, tu_), u(256)));
     sa_.minimum = 256;
     for (u32 k = 0; k < 256; ++k)
         store(chain(tp_fu_, sa_.var, {u(k)}), load(tu_, buffer_word(sa_buf_, iadd(sa_base_, u(k)))));
@@ -1814,6 +1817,11 @@ Result<nx::vector<u32>> Translator::translate() {
     } else {
         sa_buf_ = buffer(kDrawBindingSecondary, "sa");
         mem_buf_ = buffer(kDrawBindingMemory, "memory");
+        if (form_ == Form::Secondary) {
+            gid_var = b_.variable(b_.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+            b_.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInWorkgroupId});
+            interface_.push_back(gid_var);
+        }
         // The draw's push constants (DrawConstants).
         const Id f2 = b_.t_array(tf_, 2), f6 = b_.t_array(tf_, 6);
         b_.decorate(f2, SpvDecorationArrayStride, {4});
@@ -1864,7 +1872,7 @@ Result<nx::vector<u32>> Translator::translate() {
             gid = b_.op(SpvOpCompositeExtract, tu_, {load(tv3, gid_var), 0});
             compute_prologue(gid);
             break;
-        case Form::Secondary: secondary_prologue(); break;
+        case Form::Secondary: secondary_prologue(b_.op(SpvOpCompositeExtract, tu_, {load(tv3, gid_var), 0})); break;
         case Form::Vertex: vertex_prologue(); break;
         case Form::Fragment: fragment_prologue(); break;
     }
