@@ -184,7 +184,7 @@ i32 sceGxmDisplayQueueAddEntry(u32 old_buffer, u32 new_buffer, u32 data) {
         // (the new buffer's sync object held until a later entry replaces it; the old one released after this flip)
         nx::scoped_lock<nx::mutex> held(s.queue_lock);
         ++s.display_holds[new_buffer];
-        s.queue.push_back(DisplayEntry{old_buffer, new_buffer, slot});
+        s.queue.push_back(DisplayEntry{old_buffer, new_buffer, slot, scenes_submitted()});
     }
     s.queue_changed.notify_all();
     return 0;

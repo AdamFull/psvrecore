@@ -8,6 +8,7 @@
 #include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/log.hpp"
 #include "state.hpp"
+#include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
 
 namespace psvrecore::gxm::hle {
@@ -122,9 +123,11 @@ i32 sceGxmEndScene(u32 context, Ptr<const Notification> vertex_notification, Ptr
     }
     // (the GPU's wait for the fragment sync object: its buffer drawn only once the display has let it go)
     if (scene.fragment_sync) {
+        const u64 t0 = nx::os::ticks_ns();
         runtime::Kernel::Blocking blocking(runtime::runtime().kernel());
         nx::scoped_lock<nx::mutex> held(st.queue_lock);
         st.queue_changed.wait(st.queue_lock, [&] { return st.stopping || !st.display_holds.contains(scene.fragment_sync); });
+        profile_buffer_wait(nx::os::ticks_ns() - t0);
     }
     // (the notifications as they are now: written once the scene is done, after the game may have reused them)
     nx::vector<Notification> notes;

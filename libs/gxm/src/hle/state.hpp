@@ -308,7 +308,8 @@ struct Context {
 
 struct DisplayEntry {
     u32 old_buffer = 0, new_buffer = 0;
-    u32 data = 0;  // a copy of the callback data, in guest memory
+    u32 data = 0;     // a copy of the callback data, in guest memory
+    u64 scenes = 0;  // the last scene submitted before it: the frame's (scenes_submitted)
 };
 
 // The library's state (one per process).
@@ -361,7 +362,14 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
 // The scenes rendered so far finished: their results in guest memory, their notifications written. At the
 // library's points of synchronisation (a notification waited for, sceGxmFinish, the display queue, transfers, a
 // frame buffer set, memory unmapped), before anything reads what the GPU draws.
-void finish_scenes();
+void finish_scenes(u64 upto = ~0ull);  // (the scenes submitted up to this one, in submission order from 1)
+// The number of the last scene submitted (0: none yet).
+u64 scenes_submitted();
+// (on the display queue's thread, while it shows a frame: the last of that frame's scenes, which the frame buffer
+// set from its callback waits for, not the next frame's)
+inline thread_local u64 t_frame_scenes = ~0ull;
+// (PSVRECORE_GXM_PROFILE: the time a scene's end waited for the display to let its buffer go)
+void profile_buffer_wait(u64 ns);
 // At an internal resolution above 1: the frame buffer's pixels as drawn (tightly packed, at the internal
 // resolution), if a scene drew it and guest memory still holds what that scene wrote there.
 bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height);
