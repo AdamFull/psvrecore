@@ -498,6 +498,16 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
     const bool full = code == kF32 || code == kF32M || code == kF32F32;
     out.bytes = full ? 16 : wide ? 8 : 4;
     const u32 out_bytes = out.bytes;
+    // 8-bit unsigned components without gamma: where each output byte comes from (a component's byte, or -1 for 0
+    // and -256 for 255), found by putting markers through the swizzle.
+    const bool bytes8 = out_bytes == 4 && t.gamma == 0 && (code == kU8 || code == kU8U8 || code == kU8U8U8 || code == kU8U8U8U8);
+    i32 byte_of[4] = {};
+    if (bytes8) {
+        const f32 marks[4] = {10, 11, 12, 13};
+        f32 m[4];
+        swizzle(marks, bits / 8, t.swizzle, m);
+        for (u32 k = 0; k < 4; ++k) byte_of[k] = m[k] >= 10 ? static_cast<i32>(m[k]) - 10 : m[k] >= 1 ? -256 : -1;
+    }
     usize total = 0;
     for (const Level& l : levels) total += usize{l.width} * l.height * out_bytes;
     out.data.resize(total * out.faces);
@@ -544,6 +554,26 @@ Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) {
                             const u32 tx = x * 4 + (i & 3), ty = y * 4 + i / 4;
                             if (tx < lv.width && ty < lv.height) put(dst + (usize{ty} * lv.width + tx) * out_bytes, texels[i]);
                         }
+                    }
+                }
+            } else if (bytes8) {
+                // (8-bit unsigned components without gamma: each output byte is a component's byte, or 0 or 255, as
+                // the general path's floats would round to; a texel at a time, without them)
+                const u32 row = lv.offset == 0 && is_linear(t.type) ? t.stride : ((lv.width + 7) & ~7u) * bits / 8;
+                const u32 texel_bytes = bits / 8, tiles_w = (lv.width + 31) / 32;
+                const u8* end = raw.data() + raw.size();
+                for (u32 y = 0; y < lv.height; ++y) {
+                    u8* out_row = dst + usize{y} * lv.width * 4;
+                    for (u32 x = 0; x < lv.width; ++x) {
+                        u64 index;
+                        if (is_swizzled(t.type)) index = morton(x, y, pw, ph) * texel_bytes;
+                        else if (t.type == texture_type::kTiled)
+                            index = ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * texel_bytes;
+                        else index = u64{y} * row + u64{x} * texel_bytes;
+                        const u8* p = base + index;
+                        if (p + 4 > end) continue;
+                        u8* o = out_row + usize{x} * 4;
+                        for (u32 k = 0; k < 4; ++k) o[k] = byte_of[k] >= 0 ? p[byte_of[k]] : static_cast<u8>(-byte_of[k] - 1);
                     }
                 }
             } else {

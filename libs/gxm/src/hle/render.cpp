@@ -29,6 +29,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -804,22 +805,116 @@ DepthTarget* scaled_depth_texture(Renderer& r, const TextureInfo& info, const De
 }
 
 // A texture as the draw's control words describe it (cached), or none if it cannot be read.
-CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
+// PSVRECORE_GXM_PROFILE=1: every 200 scenes, the time the scenes spent in each part of render_scene and in the
+// textures (looked up, hashed, new ones decoded and uploaded), and every 50th new texture's description (to stderr).
+struct SceneProfile {
+    static constexpr u32 kParts = 8;
+    static constexpr const char* kNames[kParts] = {"colour in", "draws", "buffers", "descriptors and textures",
+                                                    "commands", "GPU", "back to memory", "cleanup"};
+    bool on = [] {
+        const char* v = std::getenv("PSVRECORE_GXM_PROFILE");
+        return v && *v && *v != '0';
+    }();
+    u64 ns[kParts] = {};
+    u64 lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
+    u64 at = 0;
+    u32 part = 0, scenes = 0;
+    void start() {
+        part = 0;
+        at = nx::os::ticks_ns();
+    }
+    void mark(u32 i) {
+        if (!on) return;
+        const u64 now = nx::os::ticks_ns();
+        ns[i] += now - at;
+        at = now;
+    }
+    void done() {
+        if (!on || ++scenes < 200) return;
+        u64 all = 0;
+        for (u64 n : ns) all += n;
+        std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each:", scenes, static_cast<f64>(all) / 1e6 / scenes);
+        for (u32 i = 0; i < kParts; ++i) std::fprintf(stderr, " %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
+        std::fprintf(stderr,
+                     " textures: %.1f lookups, %.1f hashed (%.2f ms), %.2f new (%.0f KiB, %.2f ms: decoded %.2f, made "
+                     "%.2f, uploaded %.2f) a scene\n",
+                     static_cast<f64>(lookups) / scenes, static_cast<f64>(hashed) / scenes, static_cast<f64>(hash_ns) / 1e6 / scenes,
+                     static_cast<f64>(misses) / scenes, static_cast<f64>(miss_bytes) / 1024.0 / scenes,
+                     static_cast<f64>(miss_ns) / 1e6 / scenes, static_cast<f64>(decode_ns) / 1e6 / scenes,
+                     static_cast<f64>(create_ns) / 1e6 / scenes, static_cast<f64>(upload_ns) / 1e6 / scenes);
+        *this = SceneProfile{};
+        on = true;
+    }
+};
+SceneProfile g_profile;
+
+// A 64-bit hash of bytes, for knowing whether a texture's data changed: four lanes of 64-bit words at a time (a
+// texture of megabytes in a fraction of a millisecond), then the rest, then a final mix. Not for anything an
+// adversary chooses.
+u64 content_hash(const u8* p, usize n, u64 seed) {
+    constexpr u64 k1 = 0x9E3779B97F4A7C15ull, k2 = 0xC2B2AE3D27D4EB4Full;
+    u64 a = seed ^ k1, b = seed + k2, c = ~seed, e = seed * k1;
+    usize i = 0;
+    for (; i + 32 <= n; i += 32) {
+        u64 w[4];
+        std::memcpy(w, p + i, 32);
+        a = std::rotl(a ^ (w[0] * k2), 31) * k1;
+        b = std::rotl(b ^ (w[1] * k2), 31) * k1;
+        c = std::rotl(c ^ (w[2] * k2), 31) * k1;
+        e = std::rotl(e ^ (w[3] * k2), 31) * k1;
+    }
+    u64 h = std::rotl(a, 1) + std::rotl(b, 7) + std::rotl(c, 12) + std::rotl(e, 18) + n;
+    for (; i + 8 <= n; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = std::rotl(h ^ (w * k2), 27) * k1;
+    }
+    for (; i < n; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    h ^= h >> 33;
+    h *= 0xFF51AFD7ED558CCDull;
+    h ^= h >> 33;
+    h *= 0xC4CEB9FE1A85EC53ull;
+    return h ^ (h >> 33);
+}
+
+// The texture whose control words these are, decoded and uploaded once per content (cached by the words and a hash
+// of the texels and palette). `seen` remembers, for a scene, each set of words' content key: a texture used by many
+// draws is hashed once a scene.
+CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<u64, u64>& seen) {
+    ++g_profile.lookups;
+    nx::fnv1a64 wh;
+    for (u32 w : words.words) wh.combine(w);
+    if (auto it = seen.find(wh.value()); it != seen.end()) {
+        auto found = r.textures.find(it->second);
+        return found != r.textures.end() ? &found->second : nullptr;
+    }
     const TextureInfo info = decode_texture(words.words);
     if (!info.address) return nullptr;
     const u32 size = texture_size(info);
     if (!size || !memory().valid(info.address, size)) return nullptr;
-    nx::fnv1a64 h;
-    h.combine_bytes(reinterpret_cast<const char*>(words.words), sizeof words.words);
-    h.combine_bytes(reinterpret_cast<const char*>(memory().host(info.address)), size);
+    const u64 hash_start = g_profile.on ? nx::os::ticks_ns() : 0;
+    u64 key = content_hash(reinterpret_cast<const u8*>(words.words), sizeof words.words, 0);
+    key = content_hash(static_cast<const u8*>(memory().host(info.address)), size, key);
     if (info.palette && memory().valid(info.palette, 1024))
-        h.combine_bytes(reinterpret_cast<const char*>(memory().host(info.palette)), 1024);
-    const u64 key = h.value();
+        key = content_hash(static_cast<const u8*>(memory().host(info.palette)), 1024, key);
+    seen[wh.value()] = key;
+    if (g_profile.on) ++g_profile.hashed, g_profile.hash_ns += nx::os::ticks_ns() - hash_start;
     if (auto it = r.textures.find(key); it != r.textures.end()) {
         it->second.used = r.scenes;
         return &it->second;
     }
     if (r.failed_textures.contains(key)) return nullptr;
+    const u64 miss_start = g_profile.on ? nx::os::ticks_ns() : 0;
+    struct MissTime {
+        u64 start;
+        u32 bytes;
+        ~MissTime() {
+            if (g_profile.on) ++g_profile.misses, g_profile.miss_bytes += bytes, g_profile.miss_ns += nx::os::ticks_ns() - start;
+        }
+    } miss_time{miss_start, size};
+    if (g_profile.on && g_profile.misses % 50 == 0)
+        std::fprintf(stderr, "gxm profile: new texture at %08x: format %08x type %u, %u x %u, %u levels, %u bytes\n",
+                     info.address, info.base_format, info.type, info.width, info.height, info.levels, size);
     auto texels = read_texels(info, [](u32 address, void* out, u32 bytes) {
         if (!memory().valid(address, bytes)) return false;
         std::memcpy(out, memory().host(address), bytes);
@@ -839,12 +934,17 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words) {
     d.mips = texels->levels;
     d.layers = texels->faces;
     d.cube = texels->faces == 6;
+    const u64 decoded_at = g_profile.on ? nx::os::ticks_ns() : 0;
+    if (g_profile.on) g_profile.decode_ns += decoded_at - miss_start;
     auto image = vk::create_image(*r.device, d);
+    const u64 created_at = g_profile.on ? nx::os::ticks_ns() : 0;
+    if (g_profile.on) g_profile.create_ns += created_at - decoded_at;
     if (!image) return nullptr;
     if (!upload_texels(*r.device, *image, *texels)) {
         vk::destroy_image(*r.device, *image);
         return nullptr;
     }
+    if (g_profile.on) g_profile.upload_ns += nx::os::ticks_ns() - created_at;
     CachedTexture c;
     c.image = *image;
     c.sampler = texture_sampler(r, info, d.format, texels->levels);
@@ -982,8 +1082,10 @@ void trace_scene(u64 number, const Scene& scene) {
 
 }  // namespace
 
+
 void render_scene(Context& context, Scene& scene) {
     (void)context;
+    g_profile.start();
     Renderer& r = renderer();
     if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return;
     nx::scoped_lock<nx::mutex> targets_held(r.targets_lock);
@@ -1091,6 +1193,7 @@ void render_scene(Context& context, Scene& scene) {
         if (auto img = vk::create_image(d, dd)) depth = *img;
     }
     if (!color && !depth.image) return;
+    g_profile.mark(0);
 
     // ---- What the draws need: secondary attributes, memory, vertices and indices -----------------------------
     const u32 draws = static_cast<u32>(scene.draws.size());
@@ -1348,6 +1451,7 @@ void render_scene(Context& context, Scene& scene) {
         plans.push_back(std::move(plan));
     }
 
+    g_profile.mark(1);
     // ---- Buffers ---------------------------------------------------------------------------------------------
     nx::vector<u32> mem_words(2 + mem.size() / 4 + 2, 0);
     mem_words[0] = kMemoryBase;
@@ -1398,6 +1502,8 @@ void render_scene(Context& context, Scene& scene) {
         return;
     }
 
+    g_profile.mark(2);
+    nx::hash_map<u64, u64> seen_textures;  // (texture_for's, for this scene)
     // ---- Descriptor sets (one per draw: the same buffers, the textures to come) ------------------------------
     VkDescriptorPool pool = VK_NULL_HANDLE;
     const u32 sets = nx::max<u32>(static_cast<u32>(plans.size()), 1);
@@ -1452,7 +1558,7 @@ void render_scene(Context& context, Scene& scene) {
                     if (std::find(sampled.begin(), sampled.end(), st) == sampled.end()) sampled.push_back(st);
                     continue;
                 }
-                if (CachedTexture* t = texture_for(r, words); t && t->image.desc.cube == q.sampler_cube) {
+                if (CachedTexture* t = texture_for(r, words, seen_textures); t && t->image.desc.cube == q.sampler_cube) {
                     ii[binding].imageView = t->image.view;
                     ii[binding].sampler = t->sampler ? t->sampler : r.sampler;
                 }
@@ -1479,6 +1585,7 @@ void render_scene(Context& context, Scene& scene) {
         vkUpdateDescriptorSets(d.device(), writes, w, 0, nullptr);
     }
 
+    g_profile.mark(3);
     // ---- Visibility queries ----------------------------------------------------------------------------------
     VkQueryPool queries = VK_NULL_HANDLE;
     nx::vector<u32> query_of(plans.size(), ~0u);
@@ -1653,7 +1760,9 @@ void render_scene(Context& context, Scene& scene) {
                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
+    g_profile.mark(4);
     if (auto done = shot.submit_and_wait(); done) {
+        g_profile.mark(5);
         if (color) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
@@ -1705,9 +1814,12 @@ void render_scene(Context& context, Scene& scene) {
     } else {
         nx::loge(logs::gpu, "scene: {}", done.error().message);
     }
+    g_profile.mark(6);
     if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
     vkDestroyDescriptorPool(d.device(), pool, nullptr);
     cleanup();
+    g_profile.mark(7);
+    g_profile.done();
     if (d.validation_errors()) nx::logw(logs::gpu, "{} validation errors so far", d.validation_errors());
 }
 

@@ -1,6 +1,7 @@
 #include "psvrecore/runtime/runtime.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -224,7 +225,35 @@ void report_threads_from_environment() {
             }
             if (hle::counting_calls()) {
                 const nx::string calls = hle::describe_calls();
-                std::fprintf(stderr, "HLE calls in the %u s before %u s:\n%s", seconds, n * seconds, calls.c_str());
+                std::fprintf(stderr, "HLE calls in the %u s before %u s (calls, time in them):\n%s", seconds,
+                             n * seconds, calls.c_str());
+                // (and the CPU time each host thread used meanwhile: what is busy)
+                struct Used {
+                    u64 id, ns;
+                    char name[64];
+                };
+                static nx::vector<Used> before;
+                nx::vector<Used> now;
+                host::thread_times(
+                    [](u64 id, const char* name, u64 ns, void* user) {
+                        Used u{id, ns, {}};
+                        std::snprintf(u.name, sizeof u.name, "%s", name);
+                        static_cast<nx::vector<Used>*>(user)->push_back(u);
+                    },
+                    &now);
+                nx::vector<Used> used;
+                for (const Used& u : now) {
+                    u64 was = 0;
+                    for (const Used& b : before)
+                        if (b.id == u.id) was = b.ns;
+                    if (u.ns - was >= 10'000'000) used.push_back(Used{u.id, u.ns - was, {}}), std::memcpy(used.back().name, u.name, sizeof u.name);
+                }
+                before = now;
+                std::sort(used.begin(), used.end(), [](const Used& a, const Used& b) { return a.ns > b.ns; });
+                std::fprintf(stderr, "CPU time by host thread in those %u s:\n", seconds);
+                for (const Used& u : used)
+                    std::fprintf(stderr, "  %9.1f ms (%3.0f%%) %s [%llu]\n", static_cast<f64>(u.ns) / 1e6,
+                                 static_cast<f64>(u.ns) / (seconds * 1e7), u.name, static_cast<unsigned long long>(u.id));
             }
             // PSVRECORE_DUMP=<address>:<bytes>,...: guest memory, in words, with each report
             if (const char* dump = std::getenv("PSVRECORE_DUMP")) {

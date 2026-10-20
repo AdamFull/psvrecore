@@ -30,6 +30,10 @@ bool watch(void* const* addresses, const u32* sizes, u32 count, WatchHandler on_
 // symbols, when it has them.
 void* find_code(const char* name);
 void describe_code(void* pc, char* out, usize out_size);
+// Each of the process's threads: its id, its name (or ""), and the CPU time it has used (user and kernel). Nothing
+// where the host cannot tell (only Windows does here).
+using ThreadTime = void (*)(u64 id, const char* name, u64 cpu_ns, void* user);
+void thread_times(ThreadTime each, void* user);
 
 enum class OpenMode : u32 {
     Read = 1,

@@ -10,6 +10,7 @@
 #include "psvrecore/log.hpp"
 #include "psvrecore/recomp/support.hpp"
 #include "psvrecore/runtime/runtime.hpp"
+#include "core/foundation/platform/os.h"
 #include "core/foundation/containers/hash_map.h"
 #include "core/foundation/strings/format.h"
 
@@ -41,13 +42,16 @@ Registered* find_library(u32 library_nid, nx::string_view name) {
     return nullptr;
 }
 
-// Counted calls: a trampoline per bound function (up to kCountedSlots), counting its calls.
+// Counted calls: a trampoline per bound function (up to kCountedSlots), counting its calls and the time spent in
+// them (waits included: a function that blocks shows where the game waits).
 constexpr u32 kCountedSlots = 768;
 struct CountedSlot {
     PsvFunction function = nullptr;
     const char* name = nullptr;
     std::atomic<u64> calls{0};
+    std::atomic<u64> ns{0};
     u64 reported = 0;
+    u64 reported_ns = 0;
 };
 CountedSlot g_counted[kCountedSlots];
 std::atomic<u32> g_counted_used{0};
@@ -55,7 +59,9 @@ std::atomic<u32> g_counted_used{0};
 template <u32 I>
 void counted_entry(PsvContext* ctx, uint32_t ret) {
     g_counted[I].calls.fetch_add(1, std::memory_order_relaxed);
+    const u64 start = nx::os::ticks_ns();
     g_counted[I].function(ctx, ret);
+    g_counted[I].ns.fetch_add(nx::os::ticks_ns() - start, std::memory_order_relaxed);
 }
 template <u32... I>
 constexpr std::array<PsvFunction, sizeof...(I)> counted_entries(std::integer_sequence<u32, I...>) {
@@ -88,16 +94,23 @@ PsvFunction bind(const Function& f) {
 
 nx::string describe_calls() {
     nx::scoped_lock<nx::mutex> held(g_lock);
-    nx::vector<std::pair<u64, const char*>> called;
+    struct Called {
+        u64 calls, ns;
+        const char* name;
+    };
+    nx::vector<Called> called;
     const u32 used = g_counted_used.load(std::memory_order_acquire);
     for (u32 i = 0; i < used; ++i) {
         const u64 now = g_counted[i].calls.load(std::memory_order_relaxed);
-        if (now != g_counted[i].reported) called.push_back({now - g_counted[i].reported, g_counted[i].name});
+        const u64 ns = g_counted[i].ns.load(std::memory_order_relaxed);
+        if (now != g_counted[i].reported) called.push_back({now - g_counted[i].reported, ns - g_counted[i].reported_ns, g_counted[i].name});
         g_counted[i].reported = now;
+        g_counted[i].reported_ns = ns;
     }
-    std::sort(called.begin(), called.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::sort(called.begin(), called.end(), [](const Called& a, const Called& b) { return a.ns > b.ns; });
     nx::string out;
-    for (const auto& [n, name] : called) out += nx::format("  {:>8} {}\n", n, name);
+    for (const Called& c : called)
+        out += nx::format("  {:>8} {:>9.1f} ms {}\n", c.calls, static_cast<f64>(c.ns) / 1e6, c.name);
     return out;
 }
 

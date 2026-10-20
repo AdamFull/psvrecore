@@ -79,6 +79,8 @@ void describe_code(void* pc, char* out, usize out_size) {
     if (out_size) snprintf(out, out_size, "%p", pc);
 }
 
+void thread_times(ThreadTime, void*) {}
+
 void set_fault_region(void* base, u64 size, FaultHandler on_fault) {
     g_fault.handler.store(nullptr, std::memory_order_release);
     g_fault.base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_relaxed);

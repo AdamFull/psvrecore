@@ -187,6 +187,32 @@ void* find_code(const char* name) {
     return reinterpret_cast<void*>(symbol->Address);
 }
 
+void thread_times(ThreadTime each, void* user) {
+    const DWORD process = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof entry;
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != process) continue;
+        HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+        if (!thread) continue;
+        FILETIME created, exited, kernel, user_time;
+        char name[128] = "";
+        PWSTR wide = nullptr;
+        if (SUCCEEDED(GetThreadDescription(thread, &wide)) && wide) {
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, name, sizeof name, nullptr, nullptr);
+            LocalFree(wide);
+        }
+        if (GetThreadTimes(thread, &created, &exited, &kernel, &user_time)) {
+            auto ticks = [](const FILETIME& f) { return (u64{f.dwHighDateTime} << 32) | f.dwLowDateTime; };
+            each(entry.th32ThreadID, name, (ticks(kernel) + ticks(user_time)) * 100, user);
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+}
+
 void describe_code(void* pc, char* out, usize out_size) {
     nx::scoped_lock<nx::mutex> held(g_symbols_lock);
     const bool ready = symbols_ready();

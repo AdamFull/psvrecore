@@ -170,3 +170,32 @@ TEST_CASE("gxm colour surfaces: what a scene writes in each layout reads back as
         CHECK(all);
     }
 }
+
+TEST_CASE("gxm textures: 8-bit components in every swizzle come out as their bytes, 0 or 255") {
+    Memory m;
+    m.bytes = {0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44};
+    auto read = [&](u32 address, void* out, u32 size) { return m.read(address, out, size); };
+    auto texel = [&](u32 base_format, u32 swizzle) {
+        TextureInfo t;
+        t.base_format = base_format;
+        t.swizzle = swizzle;
+        t.type = texture_type::kLinear;
+        t.width = 2, t.height = 1;
+        t.stride = 8;
+        auto texels = read_texels(t, read);
+        REQUIRE(texels);
+        REQUIRE(texels->bytes == 4);
+        u32 v;
+        std::memcpy(&v, texels->data.data() + 4, 4);  // (the second texel)
+        return v;
+    };
+    // (U8U8U8U8: c0 the lowest byte; RGBA out, as R in the lowest byte)
+    CHECK(texel(0x0C000000, 0) == 0x44332211u);  // ABGR
+    CHECK(texel(0x0C000000, 1) == 0x44112233u);  // ARGB
+    CHECK(texel(0x0C000000, 2) == 0x11223344u);  // RGBA
+    CHECK(texel(0x0C000000, 3) == 0x11443322u);  // BGRA
+    CHECK(texel(0x0C000000, 4) == 0xFF332211u);  // 1BGR
+    CHECK(texel(0x0C000000, 5) == 0xFF112233u);  // 1RGB
+    CHECK(texel(0x0C000000, 6) == 0xFF223344u);  // RGB1
+    CHECK(texel(0x0C000000, 7) == 0xFF443322u);  // BGR1
+}
