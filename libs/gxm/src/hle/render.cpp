@@ -206,8 +206,37 @@ bool mask_in_stencil(const DepthLayout& l) { return l.mask && !l.stencil; }
 
 // The surface's samples as the depth image's aspects take them: depth (f32, or 24-bit unorm words for a
 // D24_UNORM_S8_UINT image) and stencil bytes (or the mask bits).
+// Samples of a row from x on that follow each other in the surface: to the end of the row inside its 32x32 tile, or
+// of the row.
+u32 depth_run(const DepthStencilSurface& s, u32 x, u32 width) {
+    return (s.control & kDsTiled) ? nx::min(32 - x % 32, width - x) : width - x;
+}
+
+// 32-bit float depth, the image's words the surface's (but for a mask bit that is the background's): a run at a time.
+bool plain_depth(const DepthLayout& l, bool unorm24) { return l.depth_bytes == 4 && !l.packed && !unorm24 && !mask_in_stencil(l); }
+
 void read_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height, bool unorm24,
                         u32* depth, u8* stencil) {
+    if (plain_depth(l, unorm24)) {
+        const u8* d = memory().host(s.depth_data);
+        const u8* st = l.stencil ? memory().host(s.stencil_data) : nullptr;
+        const u8 background = static_cast<u8>(s.background_control & 0xFF);
+        for (u32 y = 0; y < height; ++y)
+            for (u32 x = 0; x < width;) {
+                const u32 n = depth_run(s, x, width), i = depth_sample(s, x, y), at = y * width + x;
+                for (u32 k = 0; k < n; ++k) {
+                    u32 w;
+                    std::memcpy(&w, d + (usize{i} + k) * 4, 4);
+                    f32 z = std::bit_cast<f32>(l.mask ? w & 0x7FFFFFFFu : w);
+                    z = nx::clamp(std::isnan(z) ? 0.0f : z, 0.0f, 1.0f);
+                    depth[at + k] = std::bit_cast<u32>(z);
+                }
+                if (st) std::memcpy(stencil + at, st + i, n);
+                else std::memset(stencil + at, background, n);
+                x += n;
+            }
+        return;
+    }
     for (u32 y = 0; y < height; ++y) {
         for (u32 x = 0; x < width; ++x) {
             const u32 i = depth_sample(s, x, y), at = y * width + x;
@@ -236,6 +265,25 @@ void read_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 
 void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height, bool unorm24,
                          const u32* depth, const u8* stencil) {
     const u32 mask = l.mask && (s.background_control & 0x100) ? 0x80000000u : 0;
+    if (plain_depth(l, unorm24)) {
+        u8* d = memory().host(s.depth_data);
+        u8* st = l.stencil ? memory().host(s.stencil_data) : nullptr;
+        for (u32 y = 0; y < height; ++y)
+            for (u32 x = 0; x < width;) {
+                const u32 n = depth_run(s, x, width), i = depth_sample(s, x, y), at = y * width + x;
+                if (!mask) {
+                    std::memcpy(d + usize{i} * 4, depth + at, usize{n} * 4);
+                } else {
+                    for (u32 k = 0; k < n; ++k) {
+                        const u32 w = depth[at + k] | mask;
+                        std::memcpy(d + (usize{i} + k) * 4, &w, 4);
+                    }
+                }
+                if (st) std::memcpy(st + i, stencil + at, n);
+                x += n;
+            }
+        return;
+    }
     for (u32 y = 0; y < height; ++y) {
         for (u32 x = 0; x < width; ++x) {
             const u32 i = depth_sample(s, x, y), at = y * width + x;
@@ -367,6 +415,9 @@ struct Renderer {
         nx::vector<VkBufferImageCopy> regions;
     };
     nx::vector<TextureUpload> texture_uploads;
+    // Depth/stencil images a scene drew with and no longer needs, for the next scene of their size: destroying one
+    // (its memory freed, its framebuffers forgotten) took 3-25 ms on a desktop's driver, scene after scene.
+    nx::vector<vk::Image> free_depths;
     // Scenes submitted to the GPU whose results are not in guest memory yet, oldest first: what each writes there,
     // the surface whose image it draws, and what finishes it (the write-back, the notifications, the clean-up) once
     // the GPU is done. A scene is finished when a later one has been submitted (the GPU runs it while the CPU
@@ -933,6 +984,39 @@ DepthTarget* depth_target_for(Renderer& r, const DepthStencilSurface& s, const D
     return t;
 }
 
+constexpr usize kFreeDepths = 6;  // (kept for reuse; more are destroyed)
+
+// A depth/stencil image of this size: one a scene gave back, else a new one.
+Result<vk::Image> take_depth_image(Renderer& r, VkFormat format, u32 width, u32 height) {
+    for (usize i = 0; i < r.free_depths.size(); ++i) {
+        const vk::Image& im = r.free_depths[i];
+        if (im.desc.format == format && im.desc.width == width && im.desc.height == height) {
+            vk::Image out = im;
+            r.free_depths.erase(r.free_depths.begin() + static_cast<std::ptrdiff_t>(i));
+            return out;
+        }
+    }
+    vk::ImageDesc dd;
+    dd.format = format;
+    dd.width = width;
+    dd.height = height;
+    dd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    return vk::create_image(*r.device, dd);
+}
+
+// A scene's depth/stencil image given back once the GPU is done with it (its contents no matter: a scene clears or
+// loads its depth).
+void free_depth_image(Renderer& r, vk::Image& image) {
+    r.free_depths.push_back(image);
+    image = {};
+    if (r.free_depths.size() > kFreeDepths) {
+        vk::Image& oldest = r.free_depths.front();
+        r.passes->forget(oldest.view);
+        vk::destroy_image(*r.device, oldest);
+        r.free_depths.erase(r.free_depths.begin());
+    }
+}
+
 constexpr usize kKeptDepths = 8;  // (the most kept: the least recently used one no pending scene draws with goes)
 
 // The kept depth image of a depth/stencil surface at `scale`: found, or (`make`) made.
@@ -1081,6 +1165,9 @@ struct SceneProfile {
     u64 colour_uploads = 0;
     u64 began = 0, ns_before[kParts] = {}, misses_before = 0, miss_ns_before = 0;  // (this scene's start)
     u64 pipelines_made = 0, pipeline_ns = 0, pipelines_before = 0, pipeline_ns_before = 0;  // (made while drawing)
+    u64 finish_wait_before = 0, finish_work_before = 0, finished_before = 0;
+    // (the write-back's parts: the colour, the uniform buffers and counters, the depth and stencil, the rest)
+    u64 back_ns[4] = {}, back_before[4] = {};
     u64 buffer_wait_ns = 0;  // (sceGxmEndScene's wait for the display to let the scene's buffer go)
     bool on = false;
     bool read = false;  // (the switch, read at the first scene: --env sets it after the program starts)
@@ -1115,6 +1202,8 @@ struct SceneProfile {
             began = at;
             std::memcpy(ns_before, ns, sizeof ns);
             misses_before = misses, miss_ns_before = miss_ns, pipelines_before = pipelines_made, pipeline_ns_before = pipeline_ns;
+            finish_wait_before = finish_wait_ns, finish_work_before = finish_work_ns, finished_before = finished;
+            std::memcpy(back_before, back_ns, sizeof back_ns);
         }
     }
     void mark(u32 i) {
@@ -1131,9 +1220,16 @@ struct SceneProfile {
             for (u32 i : kOrder)
                 if (ns[i] - ns_before[i] >= 1'000'000)
                     parts += nx::format(" {} {:.1f};", kNames[i], static_cast<f64>(ns[i] - ns_before[i]) / 1e6);
-            nx::logi(logs::gpu, "gxm profile: a slow scene, {:.1f} ms:{} {} new textures ({:.1f} ms), {} pipelines made ({:.1f} ms)",
+            nx::logi(logs::gpu, "gxm profile: a slow scene, {:.1f} ms:{} {} new textures ({:.1f} ms), {} pipelines made ({:.1f} ms), "
+                     "{} earlier scenes finished ({:.1f} ms waiting for the GPU, {:.1f} writing back)",
                      static_cast<f64>(took) / 1e6, parts, misses - misses_before, static_cast<f64>(miss_ns - miss_ns_before) / 1e6,
-                     pipelines_made - pipelines_before, static_cast<f64>(pipeline_ns - pipeline_ns_before) / 1e6);
+                     pipelines_made - pipelines_before, static_cast<f64>(pipeline_ns - pipeline_ns_before) / 1e6,
+                     finished - finished_before, static_cast<f64>(finish_wait_ns - finish_wait_before) / 1e6,
+                     static_cast<f64>(finish_work_ns - finish_work_before) / 1e6);
+            if (finish_work_ns - finish_work_before >= 2'000'000)
+                nx::logi(logs::gpu, "gxm profile: written back: colour {:.1f} ms, buffers and counters {:.1f}, depth {:.1f}, the rest {:.1f}",
+                         static_cast<f64>(back_ns[0] - back_before[0]) / 1e6, static_cast<f64>(back_ns[1] - back_before[1]) / 1e6,
+                         static_cast<f64>(back_ns[2] - back_before[2]) / 1e6, static_cast<f64>(back_ns[3] - back_before[3]) / 1e6);
         }
         if (++scenes < 200) return;
         u64 all = 0;
@@ -1984,12 +2080,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     if (has_depth && depth_keeper) {
         depth = depth_keeper->image;
     } else if (has_depth) {
-        vk::ImageDesc dd;
-        dd.format = d.caps().depth_stencil_format;
-        dd.width = draw_w;
-        dd.height = draw_h;
-        dd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (auto img = vk::create_image(d, dd)) depth = *img;
+        if (auto img = take_depth_image(r, d.caps().depth_stencil_format, draw_w, draw_h)) depth = *img;
     }
     if (!color && !depth.image) return false;
     g_profile.mark(0);
@@ -2296,8 +2387,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         if (depth_keeper) {
             depth_keeper->image.layout = depth.layout;  // (kept)
         } else if (depth.image) {
-            r.passes->forget(depth.view);
-            vk::destroy_image(d, depth);
+            free_depth_image(r, depth);  // (nothing submitted uses it)
         }
     };
     if (!sa_buf || !mem_buf || !vb || !ib || !readback || ((load_depth || store_depth) && !depth_buf)) {
@@ -2655,6 +2745,13 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
                 ++g_profile.gpu_measured;
             }
         }
+        u64 back_at = g_profile.on ? nx::os::ticks_ns() : 0;
+        auto back_mark = [&](u32 part) {
+            if (!g_profile.on) return;
+            const u64 n = nx::os::ticks_ns();
+            g_profile.back_ns[part] += n - back_at;
+            back_at = n;
+        };
         if (ok && color) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
@@ -2664,6 +2761,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         } else if (!ok && target) {
             target->written.clear();  // (the image may hold what guest memory does not)
         }
+        back_mark(0);
         if (!ok && kept_depth) kept_depth->written.clear();
         // (the uniform buffers programs stored to)
         bool invalidated = false;
@@ -2687,6 +2785,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
                 }
             }
         }
+        back_mark(1);
         if (ok && stores_depth) {
             vk::invalidate(d, *depth_buf);
             const u8* src = static_cast<const u8*>(depth_buf->mapped);
@@ -2704,19 +2803,18 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
             }
             if (kept_depth) depth_contents(depth_ranges(ds, dl, width, height), kept_depth->written);
         }
+        back_mark(2);
         // (the scene's notifications, now that guest memory holds what it drew)
         for (const Notification& n : notifications) notify(n);
         if (stamps) vkDestroyQueryPool(d.device(), stamps, nullptr);
         if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
         vkDestroyDescriptorPool(d.device(), pool, nullptr);
         for (vk::Buffer& b : buffers) vk::destroy_buffer(d, b);
-        if (!depth_target && !kept_depth && depth.image) {
-            r.passes->forget(depth.view);
-            vk::destroy_image(d, depth);
-        }
+        if (!depth_target && !kept_depth && depth.image) free_depth_image(r, depth);
         for (Renderer::TargetCopy& c : copies)
             if (c.strip.buffer) vk::destroy_buffer(d, c.strip);
         for (Renderer::TextureUpload& u : uploads) vk::destroy_buffer(d, u.staging);
+        back_mark(3);
     };
     r.target_copies.clear();  // (moved into the scene's finish: the guard finds none)
     r.texture_uploads.clear();
