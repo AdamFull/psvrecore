@@ -619,7 +619,16 @@ void Window::update_view() {
 
 bool Window::pump(runtime::Runtime* rt, u32 wait_ms) {
     SDL_Event e;
+#if defined(__ANDROID__)
+    // (SDL's wait spins on Android until the time is up, a whole CPU the game's threads then miss: polled, and slept)
+    bool got = SDL_PollEvent(&e);
+    if (!got && wait_ms) {
+        SDL_Delay(wait_ms);
+        got = SDL_PollEvent(&e);
+    }
+#else
     bool got = wait_ms ? SDL_WaitEventTimeout(&e, static_cast<Sint32>(wait_ms)) : SDL_PollEvent(&e);
+#endif
     while (got) {
         handle(e, rt);
         got = SDL_PollEvent(&e);

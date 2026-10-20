@@ -211,6 +211,8 @@ Result<CommandLine> parse_command_line(const Game& game, int argc, const char* c
         .option("settings", c.settings_file, "the settings file (default: settings.ini in the user's data folder)",
                 {.value_name = "FILE"})
         .option_many("set", c.assignments, "a setting, over the file's", {.value_name = "SECTION.KEY=VALUE"})
+        .option_many("env", c.environment, "an environment variable to set first (PSVRECORE_HLE_COUNTS=5, ...)",
+                     {.value_name = "NAME=VALUE"})
         .flag("fullscreen", fullscreen, "full screen (display.fullscreen=true)")
         .flag("windowed", windowed, "in a window (display.fullscreen=false)")
         .option("scale", scale, "the window's size in screens (display.scale)", {.value_name = "N"})
@@ -297,6 +299,16 @@ int run(const Game& game, int argc, char** argv) {
         return 0;
     }
     const CommandLine& cl = *command_line;
+    for (const nx::string& e : cl.environment) {
+        const usize eq = e.view().find('=');
+        if (eq == nx::string_view::npos || eq == 0) return fail(nx::format("--env {}: expected NAME=VALUE", e), true);
+        const nx::string name(e.view().substr(0, eq)), value(e.view().substr(eq + 1));
+#if defined(_WIN32)
+        _putenv_s(name.c_str(), value.c_str());
+#else
+        setenv(name.c_str(), value.c_str(), 1);
+#endif
+    }
     if (cl.list_gpus) {
         auto gpus = vulkan::Device::list();
         if (!gpus) return fail(nx::format("Vulkan: {}", gpus.error().message), true);

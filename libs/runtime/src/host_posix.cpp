@@ -1,9 +1,12 @@
 #include "psvrecore/runtime/host.hpp"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -79,7 +82,37 @@ void describe_code(void* pc, char* out, usize out_size) {
     if (out_size) snprintf(out, out_size, "%p", pc);
 }
 
-void thread_times(ThreadTime, void*) {}
+void thread_times(ThreadTime each, void* user) {
+#if defined(__linux__)
+    // (/proc/self/task/<tid>: comm holds the name, stat the user and system times in clock ticks, fields 14 and 15)
+    DIR* tasks = opendir("/proc/self/task");
+    if (!tasks) return;
+    const long ticks = sysconf(_SC_CLK_TCK);
+    while (dirent* e = readdir(tasks)) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char path[64], name[64] = "", stat[1024] = "";
+        snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+        if (FILE* f = fopen(path, "r")) {
+            if (fgets(name, sizeof name, f)) name[strcspn(name, "\n")] = '\0';
+            fclose(f);
+        }
+        snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        const bool read = fgets(stat, sizeof stat, f) != nullptr;
+        fclose(f);
+        const char* after = read ? strrchr(stat, ')') : nullptr;  // (the name in parentheses may hold spaces)
+        if (!after || ticks <= 0) continue;
+        unsigned long long utime = 0, stime = 0;
+        // (after ')': state, then fields 4-13, then utime and stime)
+        if (sscanf(after + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &utime, &stime) != 2) continue;
+        each(strtoull(e->d_name, nullptr, 10), name, (utime + stime) * 1'000'000'000ull / static_cast<u64>(ticks), user);
+    }
+    closedir(tasks);
+#else
+    (void)each, (void)user;
+#endif
+}
 
 void set_fault_region(void* base, u64 size, FaultHandler on_fault) {
     g_fault.handler.store(nullptr, std::memory_order_release);

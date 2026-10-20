@@ -41,6 +41,8 @@ struct Game {
 struct CommandLine {
     nx::string settings_file;              // --settings (empty: the user's data folder's settings.ini)
     nx::vector<nx::string> assignments;    // section.key=value, from --set and the options that stand for one
+    nx::vector<nx::string> environment;    // --env: NAME=VALUE, set before the runtime starts (debugging switches
+                                           // where the environment cannot be given: an Android activity)
     nx::string input;                      // --input: scripted controls, or @file
     nx::string out;                        // --out: where shots go
     u32 timeout_s = 0;                     // --timeout: end after this long (0: never)
