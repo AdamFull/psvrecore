@@ -364,3 +364,21 @@ TEST_CASE("timers: count microseconds of the process's time while started") {
     CHECK(call32(ctx, kSceThreadmgr, kStart, {u(uid)}) == static_cast<i32>(0x80028241u));
     CHECK(call(ctx, kSceThreadmgr, kTime, {u(uid)}) == ~u64{0});
 }
+
+TEST_CASE("recomp: a function stood in for a registered one is what lookups find, and gives back the one it replaced") {
+    static PsvFunction original = nullptr;
+    static u32 calls = 0;
+    auto first = [](PsvContext*, uint32_t) {};
+    auto second = [](PsvContext* ctx, uint32_t ret) {
+        ++calls;
+        original(ctx, ret);
+    };
+    constexpr u32 kAt = 0xDEAD0001;  // (Thumb code: bit 0 set, as calls give it)
+    CHECK(recomp::override_function(kAt, first) == nullptr);
+    CHECK(recomp::find_function(kAt) == static_cast<PsvFunction>(first));
+    original = recomp::override_function(kAt, second);
+    CHECK(original == static_cast<PsvFunction>(first));
+    recomp::find_function(kAt)(nullptr, 0);
+    CHECK(calls == 1);
+    recomp::override_function(kAt, nullptr);
+}

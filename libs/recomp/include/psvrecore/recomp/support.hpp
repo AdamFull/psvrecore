@@ -16,6 +16,11 @@ namespace psvrecore::recomp {
 void register_module(const PsvModuleCode& module);
 void clear_modules();
 PsvFunction find_function(u32 code);
+// Puts `f` where the function at `code` was (its address as calls give it: bit 0 set for Thumb code), for the calls
+// that look it up (indirect calls and jumps: direct calls
+// are compiled to the function itself), and returns the one it replaces (nullptr: none was there). Before the
+// game starts: the registry is not locked.
+PsvFunction override_function(u32 code, PsvFunction f);
 
 struct TrapInfo {
     u32 pc = 0;

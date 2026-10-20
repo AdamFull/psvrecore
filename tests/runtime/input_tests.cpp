@@ -143,3 +143,29 @@ TEST_CASE("touch: panel information, sampling state, reports") {
     CHECK(call32(ctx, kSceTouch, kTouchPeek, {0, buf, 4}) >= 1);
     CHECK(call32(ctx, kSceTouch, kTouchSampling, {2, 1}) < 0);
 }
+
+TEST_CASE("ctrl: a pad filter changes each sample a read returns, on port 0 only") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    const u32 buf = scratch(64 * 32);
+    REQUIRE(call32(ctx, kSceCtrl, kSetMode, {1}) == 0);
+    static u32 calls = 0;
+    calls = 0;
+    t.rt.input().set_pad_filter(
+        [](PadState& s, u64, void* user) {
+            ++*static_cast<u32*>(user);
+            s.buttons |= kCross;
+            s.rx = 0xFF;
+        },
+        &calls);
+    REQUIRE(call32(ctx, kSceCtrl, kPeek, {0, buf, 1}) == 1);
+    CHECK(data(t, buf, 0).buttons == kCross);
+    CHECK(data(t, buf, 0).rx == 0xFF);
+    CHECK(calls == 1);
+    REQUIRE(call32(ctx, kSceCtrl, kPeek, {1, buf, 1}) == 1);  // (another controller: idle, unfiltered)
+    CHECK(data(t, buf, 0).buttons == 0);
+    CHECK(calls == 1);
+    t.rt.input().set_pad_filter(nullptr, nullptr);
+    REQUIRE(call32(ctx, kSceCtrl, kPeek, {0, buf, 1}) == 1);
+    CHECK(data(t, buf, 0).buttons == 0);
+}

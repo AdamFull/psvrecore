@@ -68,6 +68,7 @@ i32 take(i32 port, i32 count, bool block, Sample* out) {
                         : c.history.peek(static_cast<u32>(count), out, sample_of);
     for (u32 i = 0; i < n; ++i) {
         if (port != 0) out[i].state = PadState{};
+        else runtime().input().filter_pad(out[i].state, out[i].timestamp * 1000);
         if (c.mode == 0) out[i].state.lx = out[i].state.ly = out[i].state.rx = out[i].state.ry = 0x80;
     }
     return static_cast<i32>(n);

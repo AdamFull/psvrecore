@@ -16,6 +16,10 @@
 #include "psvrecore/recomp/guest.h"
 #include "core/foundation/core/foundation.h"
 
+namespace psvrecore::runtime {
+class Runtime;
+}
+
 namespace psvrecore::frontend {
 
 struct Game {
@@ -28,6 +32,9 @@ struct Game {
     // Checks the folder of the eboot.bin that runs (the update's, when there is one: see layout.hpp) before anything
     // starts, that it holds a version the code was generated from; an error is shown and the program ends.
     Result<void> (*check)(const nx::string& executable_folder) = nullptr;
+    // Called once the runtime is up and the code registered, before the game boots: the game's own additions (the
+    // functions it stands in for recompiled ones, debugging aids).
+    void (*prepare)(runtime::Runtime& rt) = nullptr;
 };
 
 // What the command line asks for besides settings.

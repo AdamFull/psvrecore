@@ -419,6 +419,7 @@ int run(const Game& game, int argc, char** argv) {
     // (what earlier runs drew with, made now: nothing of it is translated or compiled while the game plays)
     const gxm::WarmUp warm = gxm::warm_up();
     for (const PsvModuleCode* code : game.code) rt.loader().add_code(*code);
+    if (game.prepare) game.prepare(rt);
     runtime::Loader::BootOptions boot;
     boot.main = nx::string(game.main);
     for (const char* m : game.modules) boot.modules.push_back(m);
@@ -444,6 +445,8 @@ int run(const Game& game, int argc, char** argv) {
         display.probes = script.probes();
     }
     const u64 booted = nx::os::ticks_ns();
+    if (!script.finished())
+        nx::logi(logs::frontend, "script: its time 0 is the kernel clock's {:.3f} s", static_cast<f64>(rt.kernel().clock_ns()) / 1e9);
     u64 saved_at = booted;
     const char* ended = "the window was closed";
     while (true) {

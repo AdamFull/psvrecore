@@ -34,6 +34,14 @@ public:
 
     // The sample of the blank at `t_ns` whose previous sample was at `previous_ns`.
     PadState pad_sample(u64 previous_ns, u64 t_ns);
+
+    // A function that may change each controller sample as the game reads it (once per sample a read returns,
+    // from the reading thread): a replay or an automatic player stands in for the player this way.
+    using PadFilter = void (*)(PadState& sample, u64 t_ns, void* user);
+    void set_pad_filter(PadFilter filter, void* user) { filter_ = filter, filter_user_ = user; }
+    void filter_pad(PadState& sample, u64 t_ns) {
+        if (filter_) filter_(sample, t_ns, filter_user_);
+    }
     TouchState touch_sample(u32 port, u64 t_ns);
 
 private:
@@ -43,6 +51,8 @@ private:
         T state;
     };
     nx::mutex lock_;
+    PadFilter filter_ = nullptr;
+    void* filter_user_ = nullptr;
     PadState pad_;  // (the state before the oldest event kept)
     nx::vector<Event<PadState>> pad_events_;
     TouchState touch_[2];

@@ -56,6 +56,14 @@ PsvFunction find_function(u32 code) {
     return it == map.end() ? nullptr : it->second;
 }
 
+PsvFunction override_function(u32 code, PsvFunction f) {
+    auto& map = functions();
+    auto it = map.find(code);
+    const PsvFunction previous = it == map.end() ? nullptr : it->second;
+    map[code] = f;
+    return previous;
+}
+
 const char* trap_name(u32 kind) {
     switch (kind) {
         case PSV_TRAP_UNDEFINED: return "undefined instruction";
