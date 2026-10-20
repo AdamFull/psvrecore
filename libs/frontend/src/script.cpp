@@ -6,6 +6,7 @@
 #include <charconv>
 #include <optional>
 
+#include "psvrecore/log.hpp"
 #include "core/foundation/strings/format.h"
 
 namespace psvrecore::frontend {
@@ -93,16 +94,41 @@ Result<ScriptItem> parse_item(const nx::vector<nx::string_view>& w, nx::string_v
         item.what = ScriptItem::What::Wait;
         u32 rgb = 0;
         const auto hex = w.size() > 4 ? std::from_chars(w[4].data(), w[4].data() + w[4].size(), rgb, 16) : std::from_chars_result{};
-        if ((w.size() != 5 && w.size() != 6) || !number(w[2], &item.x) || !number(w[3], &item.y) || w[4].size() != 6 ||
-            hex.ec != std::errc{} || hex.ptr != w[4].data() + w[4].size() ||
-            (w.size() == 6 && (!number(w[5], &item.tolerance) || item.tolerance < 0 || item.tolerance > 255)))
-            return bad("expected wait <x> <y> <rrggbb> [<tolerance 0-255>]");
+        auto bad_wait = [&] { return bad("expected wait <x> <y> <rrggbb> [<tolerance 0-255>] [press <button> <ms>]"); };
+        if (w.size() < 5 || !number(w[2], &item.x) || !number(w[3], &item.y) || w[4].size() != 6 ||
+            hex.ec != std::errc{} || hex.ptr != w[4].data() + w[4].size())
+            return bad_wait();
+        usize at = 5;
+        if (at < w.size() && w[at] != "press") {
+            if (!number(w[at], &item.tolerance) || item.tolerance < 0 || item.tolerance > 255) return bad_wait();
+            ++at;
+        }
+        if (at < w.size()) {
+            if (w.size() != at + 3 || w[at] != "press") return bad_wait();
+            item.press = pad_button(nx::string(w[at + 1]));
+            if (item.press == SDL_GAMEPAD_BUTTON_INVALID || !number(w[at + 2], &item.press_every) || item.press_every < 200)
+                return bad("wait ... press <button> <ms>: a gamepad button, every 200 ms or more");
+        }
         item.rgb = rgb;
+    } else if (what == "watch") {
+        item.what = ScriptItem::What::Watch;
+        u32 rgb = 0;
+        const auto hex = w.size() > 4 ? std::from_chars(w[4].data(), w[4].data() + w[4].size(), rgb, 16) : std::from_chars_result{};
+        if (w.size() != 8 || !number(w[2], &item.x) || !number(w[3], &item.y) || w[4].size() != 6 ||
+            hex.ec != std::errc{} || hex.ptr != w[4].data() + w[4].size() || !number(w[5], &item.tolerance) ||
+            item.tolerance < 0 || item.tolerance > 255 || w[6] != "press")
+            return bad("expected watch <x> <y> <rrggbb> <tolerance 0-255> press <button>");
+        item.press = pad_button(nx::string(w[7]));
+        if (item.press == SDL_GAMEPAD_BUTTON_INVALID) return bad("watch ... press <button>: a gamepad button");
+        item.rgb = rgb;
+    } else if (what == "unwatch") {
+        item.what = ScriptItem::What::Unwatch;
+        if (w.size() != 2) return bad("expected unwatch");
     } else if (what == "quit") {
         item.what = ScriptItem::What::Quit;
         if (w.size() != 2) return bad("expected quit");
     } else {
-        return bad("expected key, pad, axis, touch, shot, wait or quit");
+        return bad("expected key, pad, axis, touch, shot, wait, watch, unwatch or quit");
     }
     return item;
 }
@@ -146,24 +172,91 @@ Result<nx::vector<ScriptItem>> parse_script(nx::string_view text) {
     return items;
 }
 
+namespace {
+
+void push_pad(i32 button, bool down) {
+    SDL_Event e{};
+    e.type = down ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+    e.gbutton.which = 0x7FFFFFFF;  // (a gamepad of the script's own)
+    e.gbutton.button = static_cast<u8>(button);
+    e.gbutton.down = down;
+    e.common.timestamp = SDL_GetTicksNS();
+    SDL_PushEvent(&e);
+}
+
+}  // namespace
+
 nx::vector<std::pair<f32, f32>> Script::probes() const {
     nx::vector<std::pair<f32, f32>> out;
     for (const ScriptItem& s : items_)
-        if (s.what == ScriptItem::What::Wait) out.push_back({s.x, s.y});
+        if (s.what == ScriptItem::What::Wait || s.what == ScriptItem::What::Watch) out.push_back({s.x, s.y});
     return out;
 }
 
+static bool near_colour(u32 c, u32 want, i32 tolerance) {
+    for (u32 shift : {16u, 8u, 0u}) {
+        const i32 d = static_cast<i32>((c >> shift) & 0xFF) - static_cast<i32>((want >> shift) & 0xFF);
+        if (d < -tolerance || d > tolerance) return false;
+    }
+    return true;
+}
+
+void Script::look(u64 ms, Pixel pixel) {
+    for (Watching& w : watching_) {
+        if (w.down_at && ms - w.down_at >= 60) {
+            push_pad(w.item->press, false);
+            w.down_at = 0;
+        }
+        const std::optional<u32> c = pixel(w.item->x, w.item->y);
+        const bool now = c && near_colour(*c, w.item->rgb, w.item->tolerance);
+        if (now && !w.matched && !w.down_at) {  // (it turned that colour: a press)
+            push_pad(w.item->press, true);
+            w.down_at = ms ? ms : 1;
+        }
+        w.matched = now;
+    }
+}
+
+
 bool Script::play(u64 ms, platform::Window* window, nx::function_ref<void(const nx::string&)> shot, Pixel pixel) {
+    look(ms, pixel);
     for (; next_ < items_.size() && since_ms_ + items_[next_].at_ms <= ms; ++next_) {
         const ScriptItem& s = items_[next_];
+        if (s.what == ScriptItem::What::Watch) {
+            watching_.push_back(Watching{&s});
+            continue;
+        }
+        if (s.what == ScriptItem::What::Unwatch) {
+            for (Watching& w : watching_)
+                if (w.down_at) push_pad(w.item->press, false);
+            watching_.clear();
+            continue;
+        }
         if (s.what == ScriptItem::What::Wait) {
             const std::optional<u32> c = pixel(s.x, s.y);
             auto near = [&](u32 shift) {
                 const i32 d = static_cast<i32>((*c >> shift) & 0xFF) - static_cast<i32>((s.rgb >> shift) & 0xFF);
                 return d >= -s.tolerance && d <= s.tolerance;
             };
-            if (!c || !near(16) || !near(8) || !near(0)) return true;  // (held until a frame shows it)
+            if (!c || !near(16) || !near(8) || !near(0)) {
+                // (held until a frame shows it, pressing meanwhile if asked: down for 100 ms, then up)
+                if (s.press >= 0) {
+                    if (press_down_ && ms - pressed_at_ >= 100) {
+                        push_pad(s.press, false);
+                        press_down_ = false;
+                    } else if (!press_down_ && (pressed_at_ == 0 || ms - pressed_at_ >= s.press_every)) {
+                        push_pad(s.press, true);
+                        pressed_at_ = ms;
+                        press_down_ = true;
+                    }
+                }
+                return true;
+            }
+            if (press_down_) push_pad(s.press, false);
+            press_down_ = false;
+            pressed_at_ = 0;
             since_ms_ = ms;
+            nx::logi(logs::frontend, "script: wait for {:06x} at ({}, {}) met at {} ms", s.rgb, s.x, s.y, ms);
             continue;
         }
         SDL_Event e{};
@@ -208,7 +301,9 @@ bool Script::play(u64 ms, platform::Window* window, nx::function_ref<void(const 
                 break;
             }
             case ScriptItem::What::Shot: shot(s.name); continue;
-            case ScriptItem::What::Wait: continue;  // (met above)
+            case ScriptItem::What::Wait:
+            case ScriptItem::What::Watch:
+            case ScriptItem::What::Unwatch: continue;  // (done above)
             case ScriptItem::What::Quit: ++next_; return false;
         }
         e.common.timestamp = SDL_GetTicksNS();

@@ -220,7 +220,7 @@ TEST_CASE("script: items by time, comments, and what each takes") {
     }
     auto r = parse_script("100 key z down; 200 jump");
     REQUIRE_FALSE(r);
-    CHECK(r.error().message == "input '200 jump': expected key, pad, axis, touch, shot, wait or quit");
+    CHECK(r.error().message == "input '200 jump': expected key, pad, axis, touch, shot, wait, watch, unwatch or quit");
 }
 
 TEST_CASE("script: a wait holds what follows until a frame shows its colour; their times count from then") {
@@ -238,8 +238,16 @@ TEST_CASE("script: a wait holds what follows until a frame shows its colour; the
     CHECK(v[2].tolerance == 10);
     CHECK(v[3].name == "c");
     CHECK(v[5].tolerance == 24);
-    for (const char* bad : {"1 wait 1 2", "1 wait 1 2 ff80", "1 wait 1 2 gg8000", "1 wait 1 2 ff8000 300"})
+    for (const char* bad : {"1 wait 1 2", "1 wait 1 2 ff80", "1 wait 1 2 gg8000", "1 wait 1 2 ff8000 300",
+                            "1 wait 1 2 ff8000 press", "1 wait 1 2 ff8000 press nosuch 500", "1 wait 1 2 ff8000 press cross 50",
+                            "1 wait 1 2 ff8000 10 press cross 500 more"})
         CHECK_FALSE(parse_script(bad));
+    auto pressing = parse_script("0 wait 1 2 ff8000 press cross 500; 0 wait 1 2 ff8000 8 press circle 300");
+    REQUIRE(pressing);
+    CHECK((*pressing)[0].press == SDL_GAMEPAD_BUTTON_SOUTH);
+    CHECK((*pressing)[0].press_every == 500);
+    CHECK((*pressing)[1].tolerance == 8);
+    CHECK((*pressing)[1].press == SDL_GAMEPAD_BUTTON_EAST);
 
     Script script(*items);
     REQUIRE(script.probes().size() == 2);
@@ -264,6 +272,28 @@ TEST_CASE("script: a wait holds what follows until a frame shows its colour; the
     CHECK_FALSE(script.finished());  // (the last wait: 000000 not shown)
     colour = 0x101010u;
     CHECK(script.play(3070, nullptr, shot, pixel));
+    CHECK(script.finished());
+}
+
+TEST_CASE("script: watches parse, and look at their points alongside the rest") {
+    auto items = parse_script("100 watch 790 121 ffdc31 30 press triangle; 100 watch 135 272 ffdc31 30 press left; 5000 unwatch");
+    if (!items) std::printf("%s\n", items.error().message.c_str());
+    REQUIRE(items);
+    REQUIRE(items->size() == 3);
+    CHECK((*items)[0].what == ScriptItem::What::Watch);
+    CHECK((*items)[0].press == SDL_GAMEPAD_BUTTON_NORTH);
+    CHECK((*items)[1].press == SDL_GAMEPAD_BUTTON_DPAD_LEFT);
+    CHECK((*items)[2].what == ScriptItem::What::Unwatch);
+    for (const char* bad : {"1 watch 1 2 ffdc31 30", "1 watch 1 2 ffdc31 press cross", "1 watch 1 2 ffdc31 30 press nosuch",
+                            "1 unwatch now"})
+        CHECK_FALSE(parse_script(bad));
+    Script script(*items);
+    CHECK(script.probes().size() == 2);
+    // (without a window or SDL's events running, the presses go nowhere: the script just goes on)
+    auto pixel = [&](f32, f32) -> std::optional<u32> { return 0xFFDC31u; };
+    auto shot = [&](const nx::string&) {};
+    CHECK(script.play(200, nullptr, shot, pixel));
+    CHECK(script.play(6000, nullptr, shot, pixel));
     CHECK(script.finished());
 }
 
