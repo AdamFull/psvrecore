@@ -284,8 +284,12 @@ TEST_CASE("script: watches parse, and look at their points alongside the rest") 
     CHECK((*items)[0].press == SDL_GAMEPAD_BUTTON_NORTH);
     CHECK((*items)[1].press == SDL_GAMEPAD_BUTTON_DPAD_LEFT);
     CHECK((*items)[2].what == ScriptItem::What::Unwatch);
+    auto later = parse_script("0 watch 1 2 ffdc31 30 press cross after 250");
+    REQUIRE(later);
+    CHECK((*later)[0].press_after == 250);
     for (const char* bad : {"1 watch 1 2 ffdc31 30", "1 watch 1 2 ffdc31 press cross", "1 watch 1 2 ffdc31 30 press nosuch",
-                            "1 unwatch now"})
+                            "1 watch 1 2 ffdc31 30 press cross after", "1 watch 1 2 ffdc31 30 press cross later 5",
+                            "1 watch 1 2 ffdc31 30 press cross after 20000", "1 unwatch now"})
         CHECK_FALSE(parse_script(bad));
     Script script(*items);
     CHECK(script.probes().size() == 2);

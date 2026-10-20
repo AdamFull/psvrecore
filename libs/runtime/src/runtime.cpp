@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "psvrecore/log.hpp"
 #include "psvrecore/recomp/support.hpp"
@@ -51,10 +52,39 @@ void on_guest_fault(u64 offset, bool write) {
 // - every write to a guest address (1, 2, 4 or 8 bytes, 4 by default, aligned to its size) is reported with the
 //   value now there, the guest thread and its registers, and the host function that wrote;
 // - every call of a host function by its name (a generated one, f_<address>) is reported with the guest registers
-//   it is called with.
+//   it is called with, and with f_<address>@r<n>+<offset>[+<offset>...] (hex) the words at those offsets from that
+//   register too (as numbers and as floats: a structure's fields, frame by frame); @r<n>[<offset>]+... takes them
+//   from the pointer at that offset from the register instead ([a][b]: through two pointers, up to four), and more
+//   @ groups read more (eight words in all).
+struct WatchedRead {
+    u32 reg;
+    u32 through[4];  // (the offsets of the pointers to read through)
+    u32 through_count;
+    u32 offset;
+};
 u32 g_watched[4];
 u32 g_watched_size[4];  // (0: a function)
 const char* g_watched_name[4];
+WatchedRead g_watched_reads[4][8];
+u32 g_watched_read_count[4];
+
+// The reads a function watch's "@..." groups ask for.
+void parse_reads(char* spec, u32 index) {
+    for (char* at = spec; at && *at == '@' && at[1] == 'r';) {
+        char* rest = nullptr;
+        WatchedRead r{};
+        r.reg = static_cast<u32>(std::strtoul(at + 2, &rest, 10)) & 15;
+        while (*rest == '[' && r.through_count < 4) {
+            r.through[r.through_count++] = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+            if (*rest == ']') ++rest;
+        }
+        while (*rest == '+' && g_watched_read_count[index] < 8) {
+            r.offset = static_cast<u32>(std::strtoul(rest + 1, &rest, 16));
+            g_watched_reads[index][g_watched_read_count[index]++] = r;
+        }
+        at = *rest == '@' ? rest : nullptr;
+    }
+}
 
 // The registers that point at text in guest memory: the text (" [r1 \"...\"]").
 void print_texts(const u32* r, u32 count) {
@@ -79,9 +109,24 @@ void on_watched(u32 index, void* host_pc, void* first_argument) {
     kernel::Thread* t = Kernel::current();
     if (g_watched_size[index] == 0) {
         const auto* ctx = static_cast<const PsvContext*>(first_argument);
-        std::fprintf(stderr, "watch: %s in thread '%s' r0 %08x r1 %08x r2 %08x r3 %08x sp %08x lr %08x",
-                     g_watched_name[index], t ? t->name.c_str() : "(host)", ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3],
-                     ctx->r[13], ctx->r[14]);
+        Runtime* rt = current_runtime();
+        std::fprintf(stderr, "watch: %s at %.3f s in thread '%s' r0 %08x r1 %08x r2 %08x r3 %08x sp %08x lr %08x",
+                     g_watched_name[index], rt ? static_cast<f64>(rt->kernel().clock_ns()) / 1e9 : 0.0,
+                     t ? t->name.c_str() : "(host)", ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3], ctx->r[13], ctx->r[14]);
+        for (u32 i = 0; i < g_watched_read_count[index]; ++i) {
+            const WatchedRead& r = g_watched_reads[index][i];
+            u32 base = ctx->r[r.reg];
+            for (u32 k = 0; k < r.through_count; ++k) {
+                const u32 slot = base + r.through[k];
+                base = rt && rt->memory().valid(slot, 4) ? psv_ld32(slot) : 0;
+            }
+            const u32 at = base + r.offset;
+            if (!rt || !rt->memory().valid(at, 4)) continue;
+            const u32 word = psv_ld32(at);
+            f32 f;
+            std::memcpy(&f, &word, sizeof f);
+            std::fprintf(stderr, " [%08x] %08x (%g)", at, word, static_cast<f64>(f));
+        }
         print_texts(ctx->r, 4);
         std::fprintf(stderr, "\n");
         std::fflush(stderr);
@@ -129,6 +174,12 @@ void watch_from_environment(u8* base) {
             if (g_watched_size[count] == 0) g_watched_size[count] = 4;
             addresses[count] = base + g_watched[count];
         } else {
+            if (char* at = std::strchr(p, '@')) {
+                static char reads[4][128];
+                std::snprintf(reads[count], sizeof reads[count], "%s", at);
+                *at = '\0';
+                parse_reads(reads[count], count);
+            }
             addresses[count] = host::find_code(p);
             if (!addresses[count]) {
                 nx::logw(logs::kernel, "PSVRECORE_WATCH: no host function '{}'", p);

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <optional>
 
 #include "psvrecore/log.hpp"
@@ -114,10 +115,11 @@ Result<ScriptItem> parse_item(const nx::vector<nx::string_view>& w, nx::string_v
         item.what = ScriptItem::What::Watch;
         u32 rgb = 0;
         const auto hex = w.size() > 4 ? std::from_chars(w[4].data(), w[4].data() + w[4].size(), rgb, 16) : std::from_chars_result{};
-        if (w.size() != 8 || !number(w[2], &item.x) || !number(w[3], &item.y) || w[4].size() != 6 ||
+        if ((w.size() != 8 && w.size() != 10) || !number(w[2], &item.x) || !number(w[3], &item.y) || w[4].size() != 6 ||
             hex.ec != std::errc{} || hex.ptr != w[4].data() + w[4].size() || !number(w[5], &item.tolerance) ||
-            item.tolerance < 0 || item.tolerance > 255 || w[6] != "press")
-            return bad("expected watch <x> <y> <rrggbb> <tolerance 0-255> press <button>");
+            item.tolerance < 0 || item.tolerance > 255 || w[6] != "press" ||
+            (w.size() == 10 && (w[8] != "after" || !number(w[9], &item.press_after) || item.press_after > 10000)))
+            return bad("expected watch <x> <y> <rrggbb> <tolerance 0-255> press <button> [after <ms, up to 10000>]");
         item.press = pad_button(nx::string(w[7]));
         if (item.press == SDL_GAMEPAD_BUTTON_INVALID) return bad("watch ... press <button>: a gamepad button");
         item.rgb = rgb;
@@ -201,7 +203,7 @@ static bool near_colour(u32 c, u32 want, i32 tolerance) {
     return true;
 }
 
-void Script::look(u64 ms, Pixel pixel) {
+void Script::look(u64 ms, Pixel pixel, nx::function_ref<void(const nx::string&)> shot) {
     for (Watching& w : watching_) {
         if (w.down_at && ms - w.down_at >= 60) {
             push_pad(w.item->press, false);
@@ -209,17 +211,21 @@ void Script::look(u64 ms, Pixel pixel) {
         }
         const std::optional<u32> c = pixel(w.item->x, w.item->y);
         const bool now = c && near_colour(*c, w.item->rgb, w.item->tolerance);
-        if (now && !w.matched && !w.down_at) {  // (it turned that colour: a press)
+        if (now && !w.matched) w.due.push_back(ms + w.item->press_after);  // (it turned that colour: a press)
+        w.matched = now;
+        if (!w.due.empty() && w.due.front() <= ms && !w.down_at) {
+            w.due.erase(w.due.begin());
             push_pad(w.item->press, true);
+            nx::logi(logs::frontend, "script: watch at ({}, {}) pressed at {} ms", w.item->x, w.item->y, ms);
+            if (std::getenv("PSVRECORE_WATCH_SHOTS")) shot(nx::format("w{:06d}_{}", ms, w.item->press));
             w.down_at = ms ? ms : 1;
         }
-        w.matched = now;
     }
 }
 
 
 bool Script::play(u64 ms, platform::Window* window, nx::function_ref<void(const nx::string&)> shot, Pixel pixel) {
-    look(ms, pixel);
+    look(ms, pixel, shot);
     for (; next_ < items_.size() && since_ms_ + items_[next_].at_ms <= ms; ++next_) {
         const ScriptItem& s = items_[next_];
         if (s.what == ScriptItem::What::Watch) {

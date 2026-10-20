@@ -160,8 +160,12 @@ controls, until the window is closed or `--timeout` seconds have passed. `--inpu
 `<ms> <what> <args>` separated by `;` or new lines (the time from the boot): `key <SDL key name> down|up`,
 `pad <button> down|up` (the console's names: cross, circle, square, triangle, up, down, left, right, l, r, start,
 select, l3, r3), `axis <SDL gamepad axis> <value>`, `touch <x> <y> down|move|up` (in the screen's 960x544),
-`shot <name>` (the next frame shown is saved as `<name>.png`) and `quit`. The shots go to the frames folder; `--frames`
-counts them:
+`shot <name>` (the next frame shown is saved as `<name>.png`) and `quit`. Two items look at the screen:
+`wait <x> <y> <rrggbb> [<tolerance>] [press <button> <ms>]` holds the script until a frame shown has that colour
+there (pressing the button every so many ms meanwhile, if asked; the items after it count from then), and
+`watch <x> <y> <rrggbb> <tolerance> press <button> [after <ms>]` presses the button each time that point turns
+that colour, or so many ms after, until `unwatch` (a player for a rhythm game's lanes). The shots go to the frames
+folder; `--frames` counts them:
 
 ```
 python scripts/sample_check.py --sdk C:/path/to/sdk input_output_devices/api_ctrl/analog_stick --frames 1 \
@@ -266,7 +270,8 @@ Environment variables the runtime reads, for finding what a game does; they cost
 | Variable | What it does |
 |---|---|
 | `PSVRECORE_FAULT_DUMP=1` | A guest memory fault also prints the 64 bytes at each register's address. |
-| `PSVRECORE_WATCH=<address>[:<size>],<function>,...` | Up to four hardware watchpoints (Windows, x86-64): a write to a guest address (1, 2, 4 or 8 bytes, 4 by default) prints the value now there, the host function that wrote, the guest thread's registers, the text registers point at, and the words at its stack pointer; a call of a host function by name (a generated `f_<address>`, called through a pointer: one called directly may be inlined) prints the guest registers it gets. |
+| `PSVRECORE_WATCH=<address>[:<size>],<function>,...` | Up to four hardware watchpoints (Windows, x86-64): a write to a guest address (1, 2, 4 or 8 bytes, 4 by default) prints the value now there, the host function that wrote, the guest thread's registers, the text registers point at, and the words at its stack pointer; a call of a host function by name (a generated `f_<address>`, called through a pointer: one called directly may be inlined) prints the time and the guest registers it gets. `f_<address>@r<n>+<offset>+...` (hex) also prints the words at those offsets from the register, as numbers and floats; `@r<n>[<offset>]...` reads through the pointer at that offset first (`[a][b]` through two), and more `@` groups read more (eight words in all): `f_8101EA62@r0[8]+1dc` prints a field of the structure the first argument's third word points to at every call. |
+| `PSVRECORE_WATCH_SHOTS=1` | Each press of an input script's `watch` also saves a shot (`w<ms>_<button>.png`), to see what the watch saw. |
 | `PSVRECORE_THREADS=<seconds>` | Every so many seconds, each guest thread's state, priority, link register and what it waits for. |
 | `PSVRECORE_HLE_COUNTS=<seconds>` | Every so many seconds, the HLE functions called since the last report and how often. |
 | `PSVRECORE_DUMP=<address>:<bytes>,...` | Guest memory, in words, with each report (every 10 seconds without the two above). |

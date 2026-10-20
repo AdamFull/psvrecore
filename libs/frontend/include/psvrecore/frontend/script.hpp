@@ -15,10 +15,10 @@
 //                                            component within the tolerance, 24 by default) at that point of the
 //                                            screen, pressing the gamepad button every so many ms meanwhile if asked;
 //                                            the items after a wait count their times from when it was met
-//     watch <x> <y> <rrggbb> <tolerance> press <button>
+//     watch <x> <y> <rrggbb> <tolerance> press <button> [after <ms>]
 //                                            from then on, presses the gamepad button (for 60 ms) each time that
-//                                            point turns that colour, alongside what else the script does (a player
-//                                            for a rhythm game's lanes, say)
+//                                            point turns that colour, or so many ms after, alongside what else the
+//                                            script does (a player for a rhythm game's lanes, say)
 //     unwatch                                ends the watches
 //     quit                                   ends the program
 
@@ -44,7 +44,8 @@ struct ScriptItem {
     u32 rgb = 0;        // a wait's colour (0xRRGGBB)
     i32 tolerance = 24; // a wait's: per component
     i32 press = -1;     // a wait's button to press while it waits, a watch's to press (SDL's), or none
-    u32 press_every = 0;
+    u32 press_every = 0;  // a wait's: how often
+    u32 press_after = 0;  // a watch's: how long after the colour came
     nx::string name;    // a shot's
 };
 
@@ -78,9 +79,10 @@ private:
         const ScriptItem* item;
         bool matched = false;
         u64 down_at = 0;
+        nx::vector<u64> due;  // (the presses still to come, in time order)
     };
     nx::vector<Watching> watching_;
-    void look(u64 ms, Pixel pixel);
+    void look(u64 ms, Pixel pixel, nx::function_ref<void(const nx::string&)> shot);
 };
 
 }  // namespace psvrecore::frontend
