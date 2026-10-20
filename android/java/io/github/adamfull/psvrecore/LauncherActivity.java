@@ -40,6 +40,27 @@ public class LauncherActivity extends Activity {
         return new File(getExternalFilesDir(null), "game");
     }
 
+    // A game folder put in the application's internal storage from a computer (adb's run-as reaches only that):
+    // used when the shared folder has no game.
+    private File deployedFolder() {
+        return new File(getFilesDir(), "game");
+    }
+
+    // Whether a folder holds the game's files: an application folder (eboot.bin at its top), or a copy of the
+    // console's ux0: folders (app/<title ID>/eboot.bin, with patch/ and addcont/ beside it).
+    private static boolean holdsGame(File folder) {
+        if (new File(folder, "eboot.bin").isFile()) return true;
+        File[] titles = new File(folder, "app").listFiles();
+        if (titles != null)
+            for (File t : titles)
+                if (new File(t, "eboot.bin").isFile()) return true;
+        return false;
+    }
+
+    private boolean gamePresent() {
+        return holdsGame(gameFolder()) || holdsGame(deployedFolder());
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -104,7 +125,7 @@ public class LauncherActivity extends Activity {
 
     // What the menu says and offers, as the game's files are there or not.
     private void update() {
-        boolean present = new File(gameFolder(), "eboot.bin").isFile();
+        boolean present = gamePresent();
         play.setEnabled(present && !copying);
         settings.setEnabled(!copying);
         choose.setEnabled(!copying);
@@ -216,6 +237,9 @@ public class LauncherActivity extends Activity {
     private void startGame() {
         Intent intent = new Intent(this, PsvrecoreActivity.class);
         if (getIntent().getExtras() != null) intent.putExtras(getIntent().getExtras());
+        // (the game a computer put in internal storage, when the shared folder has none: named on the command line)
+        if (!intent.hasExtra("args") && !holdsGame(gameFolder()) && holdsGame(deployedFolder()))
+            intent.putExtra("args", new String[] {"--game", deployedFolder().getAbsolutePath()});
         startActivity(intent);
         finish();
     }

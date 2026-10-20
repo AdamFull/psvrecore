@@ -210,7 +210,11 @@ python scripts/android_apk.py --manifest <AndroidManifest.xml> --lib build/andro
 
 On the device, the launcher offers Play, Settings, and the game's application folder: chosen with the system's folder
 picker and copied into the application's folder, `Android/data/<package>/files/game`. The settings file and the data
-are there too, and standard output goes to `output.txt` there. While playing, the settings open over the game from
+are there too, and standard output goes to `output.txt` there. The game folder is either the application folder
+(eboot.bin at its top) or a copy of the console's ux0: folders (`app/<title ID>`, with `patch/` and `addcont/`
+beside it). A debuggable build can also be given its files from a computer, into its internal storage
+(`files/game`, through `adb exec-in run-as`: run-as reaches nothing else); Play uses that folder when the shared one
+holds no game. While playing, the settings open over the game from
 the on-screen menu button (at the top in the middle) or Back; the game is suspended meanwhile, and what applies while
 it runs (the on-screen controls, filtering, sound, the log's level) applies when it goes on.
 
