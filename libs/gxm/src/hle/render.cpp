@@ -251,11 +251,11 @@ struct Target {
     u32 address = 0, format = 0, width = 0, height = 0;
     SurfaceLayout layout;
     vk::Image image;  // the surface's size: loaded from guest memory and read back to it
-    // At an internal resolution above 1: the surface as drawn (scale times its size), and its bytes as last written
-    // back. While guest memory still holds those bytes, `scaled` is the surface; once anything else wrote there, the
-    // surface is loaded again from guest memory.
+    // At an internal resolution above 1: the surface as drawn (scale times its size).
     vk::Image scaled;
     u32 scale = 1;
+    // The surface's bytes as last written back. While guest memory still holds them, `image` (and `scaled`) is the
+    // surface and is not loaded again; once anything else wrote there, it is loaded from guest memory.
     nx::vector<u8> written;
 };
 
@@ -273,8 +273,15 @@ struct DepthTarget {
 struct CachedTexture {
     vk::Image image;
     VkSampler sampler = VK_NULL_HANDLE;
-    u64 used = 0;  // (the scene it was last used in)
+    u64 used = 0;   // (the scene it was last used in)
+    u64 bytes = 0;  // (its texels)
 };
+
+// How long a texture no scene uses is kept (scenes: a second or two at a game's usual 2-4 a frame), and the most the
+// cache holds (the least recently used go first past it): a texture's content changing every frame (a render target
+// read back as a texture) makes a new one each time.
+constexpr u64 kTextureUnusedScenes = 180;
+constexpr u64 kTextureBudget = 256ull << 20;
 
 struct Renderer {
     bool tried = false;
@@ -301,6 +308,10 @@ struct Renderer {
     vk::Image white, white_cube;
     VkSampler sampler = VK_NULL_HANDLE;
     nx::hash_map<u64, CachedTexture> textures;
+    u64 texture_bytes = 0;  // (the cached textures' texels)
+    // (by a hash of the control words: the content key last cached for them, whose image the next content those
+    // words show is uploaded into: a render target read as a texture is one image, not one a frame)
+    nx::hash_map<u64, u64> by_words;
     nx::hash_map<u64, nx::string> failed_textures;
     u64 scenes = 0;
 };
@@ -835,6 +846,8 @@ struct SceneProfile {
         for (u64 n : ns) all += n;
         std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each:", scenes, static_cast<f64>(all) / 1e6 / scenes);
         for (u32 i = 0; i < kParts; ++i) std::fprintf(stderr, " %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
+        std::fprintf(stderr, " cached %u textures, %.0f MiB;", static_cast<u32>(renderer().textures.size()),
+                     static_cast<f64>(renderer().texture_bytes) / 1048576.0);
         std::fprintf(stderr,
                      " textures: %.1f lookups, %.1f hashed (%.2f ms), %.2f new (%.0f KiB, %.2f ms: decoded %.2f, made "
                      "%.2f, uploaded %.2f) a scene\n",
@@ -936,6 +949,29 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     d.cube = texels->faces == 6;
     const u64 decoded_at = g_profile.on ? nx::os::ticks_ns() : 0;
     if (g_profile.on) g_profile.decode_ns += decoded_at - miss_start;
+    // (the image these words showed before, when no draw of this scene samples it and it has this size and format)
+    if (auto was = r.by_words.find(wh.value()); was != r.by_words.end()) {
+        auto old = r.textures.find(was->second);
+        if (old != r.textures.end() && old->second.used != r.scenes) {
+            const vk::ImageDesc& od = old->second.image.desc;
+            if (od.format == d.format && od.width == d.width && od.height == d.height && od.mips == d.mips &&
+                od.layers == d.layers && od.cube == d.cube) {
+                CachedTexture c = old->second;
+                r.textures.erase(old);
+                if (!upload_texels(*r.device, c.image, *texels)) {
+                    r.texture_bytes -= c.bytes;
+                    vk::destroy_image(*r.device, c.image);
+                    r.by_words.erase(wh.value());
+                    return nullptr;
+                }
+                if (g_profile.on) g_profile.upload_ns += nx::os::ticks_ns() - decoded_at;
+                c.used = r.scenes;
+                r.by_words[wh.value()] = key;
+                auto [it, added] = r.textures.emplace(key, c);
+                return &it->second;
+            }
+        }
+    }
     auto image = vk::create_image(*r.device, d);
     const u64 created_at = g_profile.on ? nx::os::ticks_ns() : 0;
     if (g_profile.on) g_profile.create_ns += created_at - decoded_at;
@@ -949,8 +985,27 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     c.image = *image;
     c.sampler = texture_sampler(r, info, d.format, texels->levels);
     c.used = r.scenes;
+    c.bytes = texels->data.size();
+    r.texture_bytes += c.bytes;
+    r.by_words[wh.value()] = key;
     auto [it, added] = r.textures.emplace(key, c);
     return &it->second;
+}
+
+// The cached textures no scene has used for a while, and the least recently used past the budget, destroyed (at a
+// scene's start: the scenes before are done on the GPU).
+void evict_textures(Renderer& r) {
+    if (r.scenes % 32 != 0 && r.texture_bytes <= kTextureBudget) return;
+    nx::vector<std::pair<u64, u64>> by_age;  // (last used, key)
+    for (const auto& [key, t] : r.textures) by_age.push_back({t.used, key});
+    std::sort(by_age.begin(), by_age.end());
+    for (const auto& [used, key] : by_age) {
+        if (used + kTextureUnusedScenes >= r.scenes && r.texture_bytes <= kTextureBudget) break;
+        auto it = r.textures.find(key);
+        r.texture_bytes -= it->second.bytes;
+        vk::destroy_image(*r.device, it->second.image);
+        r.textures.erase(it);
+    }
 }
 
 // Whether a fragment program's secondary program reads per-tile special registers (pixelX, pixelY, tileXY): it runs
@@ -1090,6 +1145,7 @@ void render_scene(Context& context, Scene& scene) {
     if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return;
     nx::scoped_lock<nx::mutex> targets_held(r.targets_lock);
     ++r.scenes;
+    evict_textures(r);
     if (const Trace& t = trace(); t.on && r.scenes >= t.first && r.scenes <= t.last) trace_scene(r.scenes, scene);
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
@@ -1129,8 +1185,15 @@ void render_scene(Context& context, Scene& scene) {
 
         // The colour as it is in guest memory (GXM loads it at the start of every scene). At the internal
         // resolution, the tiles that changed since the last scene wrote it back are scaled up into the scaled image
-        // in the commands below (the CPU's text over a frame, a cleared area); the rest of it is kept.
-        if (scale == 1 || !changes.tiles.empty()) {
+        // in the commands below (the CPU's text over a frame, a cleared area); the rest of it is kept. At the
+        // surface's own size, the image is kept as it is while guest memory still holds what the last scene wrote
+        // back (a surface drawn scene after scene, or drawn and then read as a texture).
+        bool kept = false;
+        if (scale == 1 && !target->written.empty()) {
+            const Changes now = surface_changes(*target);
+            kept = !now.all && now.pixels == 0;
+        }
+        if ((scale == 1 && !kept) || (scale > 1 && !changes.tiles.empty())) {
             nx::vector<u8> texels(usize{width} * height * cf.bytes);
             gather(layout, cs.data, texels.data());
             const VkImageLayout layout = scale > 1 ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1767,8 +1830,8 @@ void render_scene(Context& context, Scene& scene) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
             scatter(layout, cs.data, src);
-            // (what guest memory holds now, to know whether the scaled image is still the surface)
-            if (scale > 1) target->written.assign(src, src + usize{width} * height * cf.bytes);
+            // (what guest memory holds now, to know whether the image (or the scaled one) is still the surface)
+            target->written.assign(src, src + usize{width} * height * cf.bytes);
         }
         // (the uniform buffers programs stored to)
         bool invalidated = false;
@@ -1813,6 +1876,7 @@ void render_scene(Context& context, Scene& scene) {
         }
     } else {
         nx::loge(logs::gpu, "scene: {}", done.error().message);
+        if (target) target->written.clear();  // (the image may hold what guest memory does not)
     }
     g_profile.mark(6);
     if (queries) vkDestroyQueryPool(d.device(), queries, nullptr);
