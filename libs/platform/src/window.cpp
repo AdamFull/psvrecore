@@ -9,10 +9,12 @@
 #include <cstring>
 
 #include "psvrecore/log.hpp"
+#include "frame_stats.hpp"
 #include "quads.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "psvrecore/vulkan/device.hpp"
 #include "psvrecore/vulkan/resources.hpp"
+#include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
 #include "core/foundation/threading/sync.h"
 #include "core/foundation/threading/thread.h"
@@ -113,6 +115,13 @@ struct Window::Presenter {
     bool atlas_changed = false;
     vulkan::Image atlas;
 
+    // The frame rate overlay: the frame times (from show(), under `lock`), its quads as the next draw shows them, and
+    // its font as an image (the presenting thread's; made for the swapchain's format).
+    FrameStats stats;
+    std::atomic<bool> show_stats{false};
+    nx::vector<Quad> stats_drawn;
+    vulkan::Image stats_atlas;
+
     // The last image presented (keep_last).
     nx::mutex readback_lock;
     std::atomic<bool> keep{false};
@@ -142,6 +151,7 @@ struct Window::Presenter {
         }
         vulkan::destroy_buffer(*device, readback);
         vulkan::destroy_image(*device, atlas);
+        vulkan::destroy_image(*device, stats_atlas);
         quads.reset();
         if (pool) vkDestroyCommandPool(d, pool, nullptr);
     }
@@ -194,6 +204,8 @@ struct Window::Presenter {
                     has_pending = false;
                 }
                 overlay_drawn = overlay;
+                stats_drawn.clear();
+                if (show_stats.load()) stats.quads(pixel_w.load(), pixel_h.load(), stats_drawn);
                 if (atlas_changed) {
                     atlas_upload = std::move(atlas_pixels);
                     atlas_upload_w = atlas_w, atlas_upload_h = atlas_h;
@@ -315,7 +327,7 @@ struct Window::Presenter {
             vkCreateSemaphore(d, &si, nullptr, &s);
             rendered.push_back(s);
         }
-        if (auto r = quads->init(chosen.format, kFramesInFlight * 2); !r) {
+        if (auto r = quads->init(chosen.format, kFramesInFlight * 3); !r) {
             nx::loge(logs::display, "display: {}", r.error().message);
             failed = true;
             return false;
@@ -396,6 +408,23 @@ struct Window::Presenter {
             atlas_upload.clear();
         }
 
+        // The frame rate overlay's font, once it is shown.
+        if (!stats_drawn.empty() && (!stats_atlas.image || stats_atlas.desc.format != texture_format)) {
+            if (stats_atlas.image) {
+                device->wait_idle();
+                vulkan::destroy_image(*device, stats_atlas);
+            }
+            nx::vector<u8> pixels;
+            vulkan::ImageDesc desc;
+            desc.format = texture_format;
+            FrameStats::atlas(pixels, desc.width, desc.height);
+            if (auto image = vulkan::create_image(*device, desc)) {
+                stats_atlas = *image;
+                if (auto r = vulkan::upload_image(*device, stats_atlas, pixels); !r)
+                    nx::loge(logs::display, "display: the frame rate overlay: {}", r.error().message);
+            }
+        }
+
         // The frame into this slot's image.
         const bool have = current_w && current_h;
         if (have) {
@@ -460,11 +489,15 @@ struct Window::Presenter {
             q.x0 = std::round(v.x), q.y0 = std::round(v.y);
             q.x1 = std::round(v.x + v.w), q.y1 = std::round(v.y + v.h);
             const bool exact = q.x1 - q.x0 == static_cast<f32>(current_w) && q.y1 - q.y0 == static_cast<f32>(current_h);
-            quads->draw(f.cmd, quads->texture(slot * 2, f.image.view, smooth && !exact), q, false);
+            quads->draw(f.cmd, quads->texture(slot * 3, f.image.view, smooth && !exact), q, false);
         }
         if (atlas.image && !overlay_drawn.empty()) {
-            const VkDescriptorSet sprites = quads->texture(slot * 2 + 1, atlas.view, true);
+            const VkDescriptorSet sprites = quads->texture(slot * 3 + 1, atlas.view, true);
             for (const Quad& q : overlay_drawn) quads->draw(f.cmd, sprites, q, true);
+        }
+        if (stats_atlas.image && !stats_drawn.empty()) {
+            const VkDescriptorSet font = quads->texture(slot * 3 + 2, stats_atlas.view, false);
+            for (const Quad& q : stats_drawn) quads->draw(f.cmd, font, q, true);
         }
         quads->end(f.cmd);
         if (read && readback.buffer) {
@@ -570,6 +603,7 @@ Result<nx::unique_ptr<Window>> Window::open(const Options& options) {
     w->presenter_->device = std::move(*device);
     w->presenter_->vsync = options.vsync;
     w->presenter_->smooth = options.smooth;
+    w->presenter_->show_stats = options.fps_overlay;
     // (the on-screen controls: their atlas once, their quads as they change)
     TouchControls& controls = w->input_.controls();
     controls.set_mode(options.controls);
@@ -674,6 +708,7 @@ void Window::handle(const SDL_Event& e, runtime::Runtime* rt) {
         case SDL_EVENT_KEY_DOWN:
             if (e.key.key == SDLK_F11 && !e.key.repeat)
                 SDL_SetWindowFullscreen(window_, !(SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN));
+            if (e.key.key == SDLK_F3 && !e.key.repeat) set_fps_overlay(!fps_overlay());
             break;
         default: break;
     }
@@ -714,6 +749,7 @@ void Window::show_pixels(const u8* pixels, u32 width, u32 height, u32 pitch, u32
         }
         p.pending_w = width, p.pending_h = height;
         p.has_pending = true;
+        p.stats.record(nx::os::ticks_ns());
     }
     p.wake.notify_one();
 }
@@ -739,6 +775,14 @@ void Window::set_overlay_atlas(const u8* rgba, u32 width, u32 height) {
     }
     presenter_->wake.notify_one();
 }
+
+void Window::set_fps_overlay(bool on) {
+    if (!presenter_) return;
+    presenter_->show_stats.store(on);
+    presenter_->request_redraw();
+}
+
+bool Window::fps_overlay() const { return presenter_ && presenter_->show_stats.load(); }
 
 void Window::set_smooth(bool smooth) {
     if (!presenter_) return;

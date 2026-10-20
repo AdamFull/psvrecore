@@ -19,6 +19,7 @@ endif()
 
 add_library(psvrecore_platform STATIC
     src/audio.cpp
+    src/frame_stats.cpp
     src/input.cpp
     src/quads.cpp
     src/touch_controls.cpp

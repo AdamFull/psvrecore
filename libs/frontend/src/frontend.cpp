@@ -43,6 +43,14 @@ public:
     nx::vector<std::optional<u32>> probed;
 
     void show(const gxm::Frame& f) override {
+        // (PSVRECORE_SHOTS_FROM_WINDOW=1: shots of what the window presented, the overlays over the picture, at the
+        // window's size)
+        static const bool from_window = [] {
+            const char* v = std::getenv("PSVRECORE_SHOTS_FROM_WINDOW");
+            return v && *v && *v != '0';
+        }();
+        if (from_window && window) window->keep_last(true);
+        const u64 presented_before = window ? window->presented() : 0;
         if (window) window->show(f);
         if (!probes.empty()) {
             // (from the frame in guest memory, at its own size)
@@ -66,6 +74,15 @@ public:
             if (shots.empty()) return;
             name = shots.front();
             shots.erase(shots.begin());
+        }
+        if (from_window && window) {
+            nx::vector<u8> pixels;
+            u32 w = 0, h = 0;
+            if (window->wait_presented(presented_before + 1, 500) && window->last_image(&pixels, &w, &h)) {
+                const nx::string path = nx::format("{}/{}.png", out, name);
+                if (io::write_png(path.c_str(), w, h, pixels.data())) nx::logi(logs::frontend, "shot (the window): {}", path);
+                return;
+            }
         }
         // (at the internal resolution when the frame was drawn at one)
         const u8* base = f.scaled ? f.scaled : runtime::runtime().memory().host(f.address);
@@ -138,6 +155,7 @@ void apply_live(const Settings& s, Lifecycle& l) {
     controls.set_opacity(s.controls_opacity);
     controls.set_scale(s.controls_scale);
     l.window->set_smooth(s.smooth);
+    l.window->set_fps_overlay(s.fps_overlay);
     l.sound.store(s.audio);
     if (l.audio) l.audio->set_paused(!s.audio);
     nx::log::set_level(log_level(s.log_level.view()));
@@ -383,6 +401,7 @@ int run(const Game& game, int argc, char** argv) {
     window_options.fullscreen = s.fullscreen;
     window_options.vsync = s.vsync;
     window_options.smooth = s.smooth;
+    window_options.fps_overlay = s.fps_overlay;
     window_options.gpu = s.gpu;
     window_options.validation = s.validation;
     window_options.hidden = cl.hidden;

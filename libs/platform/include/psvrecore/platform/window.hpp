@@ -46,6 +46,7 @@ public:
         TouchControls::Mode controls = TouchControls::Mode::Auto;
         f32 controls_opacity = 0.5f;
         f32 controls_scale = 1.0f;
+        bool fps_overlay = false;  // the frame rate and a graph of the frame times over the picture
     };
 
     static Result<nx::unique_ptr<Window>> open(const Options& options);
@@ -79,6 +80,10 @@ public:
     void set_overlay_atlas(const u8* rgba, u32 width, u32 height);
     // Filtering the picture when it is scaled, changed while running.
     void set_smooth(bool smooth);
+    // The frame rate overlay (its numbers over the last second, and the last frames' times as a graph) shown or not,
+    // changed while running (F3 switches it on a desktop).
+    void set_fps_overlay(bool on);
+    bool fps_overlay() const;
     // The view and the on-screen controls laid out again (after their settings changed).
     void refresh_view() { update_view(); }
     // The application to the background (on Android: before its window's surface goes) and back: nothing is drawn
