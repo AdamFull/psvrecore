@@ -2125,6 +2125,30 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             return std::find(skip.begin(), skip.end(), dr.vertex ? dr.vertex->guest : 0) != skip.end() ||
                    std::find(skip.begin(), skip.end(), dr.fragment ? dr.fragment->guest : 0) != skip.end();
         });
+    // A scene without draws leaves guest memory as it is: its colour loaded and stored unchanged, its depth too (or
+    // not stored). Nothing is rendered or written back (a depth surface loaded and scaled up takes milliseconds); its
+    // notifications are written after the scenes before it, an empty submission in their order. One that stores a
+    // depth surface it does not load clears it, and one with visibility counters writes them: rendered.
+    if (scene.draws.empty() && !scene.visibility_buffer &&
+        !(scene.has_depth && (scene.depth.control & kDsForceStore) && !(scene.depth.control & kDsForceLoad))) {
+        auto shot = nx::make_unique<vk::OneShot>(*r.device);
+        if (auto cmd = shot->begin(); cmd && shot->submit()) {
+            copies_recorded = true;
+            Renderer::Pending pending;
+            pending.shot = std::move(shot);
+            pending.number = number;
+            r.submitted = number;
+            pending.finish = [notes = std::move(notifications)](bool) {
+                for (const Notification& n : notes) notify(n);
+            };
+            g_finish_why = 0;
+            finish_pending(r, false);
+            finish_pending(r, true, kScenesInFlight - 1);
+            r.pending.push_back(std::move(pending));
+            r.pending_count.store(static_cast<u32>(r.pending.size()), std::memory_order_release);
+            return true;
+        }
+    }
     capture_draw(r.scenes, scene);
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
@@ -2670,12 +2694,16 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     nx::vector<VkDescriptorSet> descriptor_sets(plans.size(), VK_NULL_HANDLE);
     nx::vector<Target*> sampled;  // (surfaces drawn at the internal resolution the draws read as textures)
     nx::vector<DepthTarget*> sampled_depth;
+    // (draws binding the same textures share a set: made once a scene, not written again for each)
+    nx::hash_map<u64, VkDescriptorSet> same_sets;
+    // (at the internal resolution: the scaled surface a texture's words read, found once a scene: finding it compares
+    // the surface with guest memory)
+    struct Scaled {
+        DepthTarget* depth;
+        Target* color;
+    };
+    nx::hash_map<u64, Scaled> scaled_of;
     for (usize i = 0; i < plans.size(); ++i) {
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool = pool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts = &r.set_layout;
-        vkAllocateDescriptorSets(d.device(), &ai, &descriptor_sets[i]);
         VkDescriptorBufferInfo bi[2] = {{sa_buf->buffer, 0, VK_WHOLE_SIZE}, {mem_buf->buffer, 0, VK_WHOLE_SIZE}};
         // The units each program declares: the draw's texture there, or a white texel of the declared kind.
         VkDescriptorImageInfo ii[kDrawBindings];
@@ -2692,8 +2720,21 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 const u32 binding = (stage ? kDrawBindingFragmentTextures : kDrawBindingVertexTextures) + unit;
                 ii[binding].imageView = q.sampler_cube ? r.white_cube.view : r.white.view;
                 const TextureWords& words = stage ? dr.fragment_textures[unit] : dr.vertex_textures[unit];
+                Scaled sc{nullptr, nullptr};
+                if (state().options->render_scale > 1 && !q.sampler_cube) {
+                    nx::fnv1a64 wh;
+                    for (u32 w : words.words) wh.combine(w);
+                    if (auto it = scaled_of.find(wh.value()); it != scaled_of.end()) {
+                        sc = it->second;
+                    } else {
+                        const TextureInfo info = decode_texture(words.words);
+                        sc.depth = scaled_depth_texture(r, info, depth_target);
+                        sc.color = sc.depth ? nullptr : scaled_texture(r, info, target);
+                        scaled_of[wh.value()] = sc;
+                    }
+                }
                 // (a depth surface stored at the internal resolution: its depth read there)
-                if (DepthTarget* dt = q.sampler_cube ? nullptr : scaled_depth_texture(r, decode_texture(words.words), depth_target)) {
+                if (DepthTarget* dt = sc.depth) {
                     const TextureInfo info = decode_texture(words.words);
                     ii[binding].imageView = dt->depth_view;
                     const VkSampler smp = texture_sampler(r, info, dt->image.desc.format, 1);
@@ -2702,7 +2743,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                     continue;
                 }
                 // (a surface drawn at the internal resolution: read there)
-                if (Target* st = q.sampler_cube ? nullptr : scaled_texture(r, decode_texture(words.words), target)) {
+                if (Target* st = sc.color) {
                     const TextureInfo info = decode_texture(words.words);
                     ii[binding].imageView = st->scaled.view;
                     const VkSampler smp = texture_sampler(r, info, st->scaled.desc.format, 1);
@@ -2716,8 +2757,21 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 }
             }
         }
-        VkWriteDescriptorSet w[kDrawBindings]{};
         const u32 writes = reads_color ? kDrawBindings : kDrawBindingColor;  // (no input attachment outside such passes)
+        nx::fnv1a64 same;
+        for (u32 b = kDrawBindingFragmentTextures; b < writes; ++b)
+            same.combine_all(reinterpret_cast<u64>(ii[b].imageView), reinterpret_cast<u64>(ii[b].sampler));
+        if (auto it = same_sets.find(same.value()); it != same_sets.end()) {
+            descriptor_sets[i] = it->second;
+            continue;
+        }
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &r.set_layout;
+        vkAllocateDescriptorSets(d.device(), &ai, &descriptor_sets[i]);
+        same_sets[same.value()] = descriptor_sets[i];
+        VkWriteDescriptorSet w[kDrawBindings]{};
         for (u32 b = 0; b < writes; ++b) {
             w[b] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w[b].dstSet = descriptor_sets[i];
@@ -2885,6 +2939,25 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         const VkViewport viewport{0, 0, static_cast<f32>(target_w * scale), static_cast<f32>(target_h * scale), 0, 1};
         vkCmdSetViewport(*cmd, 0, 1, &viewport);
         const f32 blend[4] = {0, 0, 0, 0};
+        vkCmdSetBlendConstants(*cmd, blend);
+        // (the state the draw before set: what a draw would set again the same is not recorded again)
+        struct Last {
+            VkPipeline pipeline = VK_NULL_HANDLE;
+            VkRect2D scissor{{-1, -1}, {0, 0}};
+            u32 ref[2] = {~0u, ~0u}, compare[2] = {~0u, ~0u}, write[2] = {~0u, ~0u};
+            f32 bias[2] = {-1e30f, -1e30f};
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            VkDeviceSize streams[16];
+            VkDeviceSize index_offset = ~VkDeviceSize{0};
+            VkIndexType index_type = VK_INDEX_TYPE_MAX_ENUM;
+        } last;
+        for (VkDeviceSize& s : last.streams) s = ~VkDeviceSize{0};
+        auto stencil = [&](u32 face, u32 ref, u32 compare, u32 write) {
+            const VkStencilFaceFlags f = face ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+            if (last.ref[face] != ref) vkCmdSetStencilReference(*cmd, f, ref), last.ref[face] = ref;
+            if (last.compare[face] != compare) vkCmdSetStencilCompareMask(*cmd, f, compare), last.compare[face] = compare;
+            if (last.write[face] != write) vkCmdSetStencilWriteMask(*cmd, f, write), last.write[face] = write;
+        };
         for (usize i = 0; i < plans.size(); ++i) {
             const DrawPlan& p = plans[i];
             const DrawState& st = p.draw->state;
@@ -2899,30 +2972,38 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 vkCmdPipelineBarrier(*cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                      VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0, nullptr, 0, nullptr);
             }
-            vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
-            vkCmdSetScissor(*cmd, 0, 1, &p.scissor);
+            if (last.pipeline != p.pipeline) vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline), last.pipeline = p.pipeline;
+            if (std::memcmp(&last.scissor, &p.scissor, sizeof p.scissor) != 0)
+                vkCmdSetScissor(*cmd, 0, 1, &p.scissor), last.scissor = p.scissor;
             const StencilState& front = st.stencil[0];
             const StencilState& back = st.stencil[st.two_sided ? 1 : 0];
             if (mask_bits) {
                 const bool update = p.draw->fragment->mask_update;
-                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_FRONT_BIT, update ? (front.func >> 25) & 1 : 1);
-                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_BACK_BIT, update ? (back.func >> 25) & 1 : 1);
-                vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
-                vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_FRONT_AND_BACK, update ? 1 : 0);
+                stencil(0, update ? (front.func >> 25) & 1 : 1, 1, update ? 1 : 0);
+                stencil(1, update ? (back.func >> 25) & 1 : 1, 1, update ? 1 : 0);
             } else {
-                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_FRONT_BIT, front.ref);
-                vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_BACK_BIT, back.ref);
-                vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_FRONT_BIT, front.compare_mask);
-                vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_BACK_BIT, back.compare_mask);
-                vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_FRONT_BIT, front.write_mask);
-                vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_BACK_BIT, back.write_mask);
+                stencil(0, front.ref, front.compare_mask, front.write_mask);
+                stencil(1, back.ref, back.compare_mask, back.write_mask);
             }
-            vkCmdSetDepthBias(*cmd, static_cast<f32>(st.depth_bias_units[0]), 0.0f, static_cast<f32>(st.depth_bias_factor[0]));
-            vkCmdSetBlendConstants(*cmd, blend);
-            vkCmdBindDescriptorSets(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 0, 1, &descriptor_sets[i], 0, nullptr);
+            const f32 bias[2] = {static_cast<f32>(st.depth_bias_units[0]), static_cast<f32>(st.depth_bias_factor[0])};
+            if (bias[0] != last.bias[0] || bias[1] != last.bias[1]) {
+                vkCmdSetDepthBias(*cmd, bias[0], 0.0f, bias[1]);
+                last.bias[0] = bias[0], last.bias[1] = bias[1];
+            }
+            if (last.set != descriptor_sets[i]) {
+                vkCmdBindDescriptorSets(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 0, 1, &descriptor_sets[i], 0, nullptr);
+                last.set = descriptor_sets[i];
+            }
             vkCmdPushConstants(*cmd, r.layout, push_stages, 0, sizeof p.constants, &p.constants);
-            for (const auto& [binding, offset] : p.streams) vkCmdBindVertexBuffers(*cmd, binding, 1, &vb->buffer, &offset);
-            vkCmdBindIndexBuffer(*cmd, ib->buffer, p.index_offset, p.index_type);
+            for (const auto& [binding, offset] : p.streams) {
+                if (binding < 16 && last.streams[binding] == offset) continue;
+                vkCmdBindVertexBuffers(*cmd, binding, 1, &vb->buffer, &offset);
+                if (binding < 16) last.streams[binding] = offset;
+            }
+            if (last.index_offset != p.index_offset || last.index_type != p.index_type) {
+                vkCmdBindIndexBuffer(*cmd, ib->buffer, p.index_offset, p.index_type);
+                last.index_offset = p.index_offset, last.index_type = p.index_type;
+            }
             const bool query = queries && query_of[i] != ~0u;
             // (precise: increments count samples; a set needs only whether any passed)
             if (query)
