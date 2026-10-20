@@ -180,6 +180,7 @@ void destroy_buffer(Device& device, DeviceBuffer& buffer) {
 OneShot::OneShot(Device& device) : device_(device) {}
 
 OneShot::~OneShot() {
+    if (fence_ && !waited_) vkWaitForFences(device_.device(), 1, &fence_, VK_TRUE, 30'000'000'000ull);
     if (fence_) vkDestroyFence(device_.device(), fence_, nullptr);
     if (pool_) vkDestroyCommandPool(device_.device(), pool_, nullptr);
 }
@@ -203,6 +204,22 @@ Result<VkCommandBuffer> OneShot::begin() {
 }
 
 Result<void> OneShot::submit_and_wait() {
+    if (auto r = submit(); !r) return r;
+    return wait();
+}
+
+bool OneShot::done() const { return fence_ && (waited_ || vkGetFenceStatus(device_.device(), fence_) == VK_SUCCESS); }
+
+Result<void> OneShot::wait() {
+    if (!fence_) return nx::err(vk_error("vkWaitForFences (nothing submitted)", VK_ERROR_INITIALIZATION_FAILED));
+    if (waited_) return {};
+    if (const VkResult r = vkWaitForFences(device_.device(), 1, &fence_, VK_TRUE, 30'000'000'000ull); r != VK_SUCCESS)
+        return nx::err(vk_error("vkWaitForFences", r));
+    waited_ = true;
+    return {};
+}
+
+Result<void> OneShot::submit() {
     if (const VkResult r = vkEndCommandBuffer(cmd_); r != VK_SUCCESS) return nx::err(vk_error("vkEndCommandBuffer", r));
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (const VkResult r = vkCreateFence(device_.device(), &fi, nullptr, &fence_); r != VK_SUCCESS)
@@ -210,9 +227,12 @@ Result<void> OneShot::submit_and_wait() {
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd_;
-    if (const VkResult r = device_.submit(submit, fence_); r != VK_SUCCESS) return nx::err(vk_error("vkQueueSubmit", r));
-    if (const VkResult r = vkWaitForFences(device_.device(), 1, &fence_, VK_TRUE, 30'000'000'000ull); r != VK_SUCCESS)
-        return nx::err(vk_error("vkWaitForFences", r));
+    if (const VkResult r = device_.submit(submit, fence_); r != VK_SUCCESS) {
+        // (nothing to wait for)
+        vkDestroyFence(device_.device(), fence_, nullptr);
+        fence_ = VK_NULL_HANDLE;
+        return nx::err(vk_error("vkQueueSubmit", r));
+    }
     return {};
 }
 

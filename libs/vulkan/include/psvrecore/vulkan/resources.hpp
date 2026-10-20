@@ -45,7 +45,8 @@ struct DeviceBuffer {
 Result<DeviceBuffer> create_device_buffer(Device& device, VkDeviceSize size, VkBufferUsageFlags usage);
 void destroy_buffer(Device& device, DeviceBuffer& buffer);
 
-// A command buffer recorded, submitted and waited for (uploads, readbacks, tests).
+// A command buffer recorded, submitted and waited for (uploads, readbacks, tests); or submitted, and waited for
+// later (submit, then done or wait: work the CPU goes on beside). Destroyed, it waits for what it submitted first.
 class OneShot {
 public:
     explicit OneShot(Device& device);
@@ -55,12 +56,16 @@ public:
 
     Result<VkCommandBuffer> begin();
     Result<void> submit_and_wait();
+    Result<void> submit();
+    bool done() const;  // (submitted and finished on the GPU)
+    Result<void> wait();
 
 private:
     Device& device_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+    bool waited_ = false;
 };
 
 // Fills mip 0, layer `layer` of an image with tightly packed texels and leaves it in `final_layout`.
