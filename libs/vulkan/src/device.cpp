@@ -319,6 +319,13 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
              VK_API_VERSION_MINOR(caps.api_version), caps.dynamic_rendering ? "dynamic rendering" : "render passes",
              caps.raster_order_attachment ? ", rasterization-order attachments" : "", caps.int64 ? ", int64" : "",
              d->messenger_ ? "; validation layer on" : "");
+    // (what the device offers that faster paths could use: not enabled)
+    nx::string offered;
+    for (const char* name : {"VK_EXT_external_memory_host", "VK_KHR_dynamic_rendering_local_read", "VK_EXT_shader_tile_image",
+                             "VK_EXT_graphics_pipeline_library", "VK_EXT_extended_dynamic_state3",
+                             "VK_ARM_rasterization_order_attachment_access"})
+        if (has_ext(name)) offered += nx::format("{}{}", offered.empty() ? "" : ", ", name);
+    nx::logi(logs::gpu, "Vulkan device: also offers {}", offered.empty() ? nx::string("none of the optional ones") : offered);
     return d;
 }
 

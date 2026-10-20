@@ -480,14 +480,34 @@ Renderer& renderer() {
 // (PSVRECORE_GXM_PROFILE: why the next scenes are finished)
 u32 g_finish_why = 0;
 
+// A guest thread's CPU given up (Kernel::Blocking) while the host works or waits on its behalf, and taken back at the
+// end (which may wait for a CPU): once, nothing inside an outer one.
+thread_local bool t_cpu_given_up = false;
+struct CpuGivenUp {
+    std::optional<runtime::Kernel::Blocking> blocking;
+    CpuGivenUp() {
+        if (!t_cpu_given_up && runtime::Kernel::current()) {
+            blocking.emplace(runtime::runtime().kernel());
+            t_cpu_given_up = true;
+        }
+    }
+    void reset() {
+        if (!blocking) return;
+        t_cpu_given_up = false;
+        blocking.reset();
+    }
+    ~CpuGivenUp() noexcept(false) { reset(); }
+    CpuGivenUp(const CpuGivenUp&) = delete;
+    CpuGivenUp& operator=(const CpuGivenUp&) = delete;
+};
+
 // The renderer's lock, held: a guest thread waiting for it (another renders a scene, or writes one back: milliseconds)
 // gives up its CPU meanwhile, for the game's other threads, instead of keeping it idle.
 struct TargetsHeld {
     nx::mutex& m;
     explicit TargetsHeld(Renderer& r) : m(r.targets_lock) {
         if (m.try_lock()) return;
-        std::optional<runtime::Kernel::Blocking> blocking;
-        if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+        CpuGivenUp blocking;
         m.lock();
         try {
             blocking.reset();  // (a CPU again; a thread ending meanwhile unwinds from here)
@@ -3097,8 +3117,7 @@ void finish_pending(Renderer& r, bool all, usize keep) {
             waited = p.shot->wait();
         } else {
             // (a guest thread waiting for the GPU gives up its CPU meanwhile)
-            std::optional<runtime::Kernel::Blocking> blocking;
-            if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+            CpuGivenUp blocking;
             waited = p.shot->wait();
         }
         if (!waited) nx::loge(logs::gpu, "scene: {}", waited.error().message);
@@ -3137,8 +3156,7 @@ void render_ended(Renderer& r, Renderer::Ended& e) {
     State& st = state();
     if (e.scene.fragment_sync) {
         const u64 t0 = nx::os::ticks_ns();
-        std::optional<runtime::Kernel::Blocking> blocking;
-        if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+        CpuGivenUp blocking;
         nx::scoped_lock<nx::mutex> held(st.queue_lock);
         st.queue_changed.wait(st.queue_lock, [&] {
             auto it = st.holds_released.find(e.scene.fragment_sync);
@@ -3184,8 +3202,7 @@ void wait_rendered(Renderer& r, u64 limit) {
         upto = nx::min(limit, r.ended);
         if (r.rendered >= upto) return;
     }
-    std::optional<runtime::Kernel::Blocking> blocking;
-    if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+    CpuGivenUp blocking;
     nx::scoped_lock<nx::mutex> held(r.scenes_lock);
     r.scenes_changed.wait(r.scenes_lock, [&] { return r.rendered >= upto; });
 }
@@ -3230,8 +3247,7 @@ void end_scene(Scene&& scene, nx::vector<Notification> notifications) {
     }
     if (!queued) {
         // (the renderer that far behind: the game's thread waits for it, without its CPU)
-        std::optional<runtime::Kernel::Blocking> blocking;
-        if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+        CpuGivenUp blocking;
         nx::scoped_lock<nx::mutex> held(r.scenes_lock);
         r.scenes_changed.wait(r.scenes_lock, [&] { return r.ended_scenes.size() < kEndedScenes; });
         e.number = ++r.ended;
@@ -3267,8 +3283,7 @@ void finish_scenes(u64 limit) {
         // (numbers of scenes not submitted, with nothing to draw, are skipped)
         if (r.finished >= upto || r.pending.front().number > upto) return;
     }
-    std::optional<runtime::Kernel::Blocking> blocking;
-    if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+    CpuGivenUp blocking;
     for (;;) {
         {
             nx::scoped_lock<nx::mutex> held(r.targets_lock);
