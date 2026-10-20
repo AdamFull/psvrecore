@@ -501,6 +501,25 @@ struct CpuGivenUp {
     CpuGivenUp& operator=(const CpuGivenUp&) = delete;
 };
 
+// A guest thread's CPU lent while it renders (Kernel::lend_cpu): the console's GPU renders a scene, not one of the
+// game's CPUs, which its other threads have meanwhile; the thread takes it back after, ahead of them. (Its waits
+// inside give nothing up again.)
+struct CpuLent {
+    bool lent = false;
+    CpuLent() {
+        if (t_cpu_given_up || !runtime::Kernel::current()) return;
+        lent = runtime::runtime().kernel().lend_cpu();
+        t_cpu_given_up = lent;
+    }
+    ~CpuLent() noexcept(false) {
+        if (!lent) return;
+        t_cpu_given_up = false;
+        runtime::runtime().kernel().reclaim_cpu();
+    }
+    CpuLent(const CpuLent&) = delete;
+    CpuLent& operator=(const CpuLent&) = delete;
+};
+
 // The renderer's lock, held: a guest thread waiting for it (another renders a scene, or writes one back: milliseconds)
 // gives up its CPU meanwhile, for the game's other threads, instead of keeping it idle.
 struct TargetsHeld {
@@ -3154,6 +3173,12 @@ constexpr usize kEndedScenes = 1;
 // one not rendered (nothing to draw into, no device) has its notifications written now, after the scenes before.
 void render_ended(Renderer& r, Renderer::Ended& e) {
     State& st = state();
+    static const bool keep_cpu = [] {
+        const char* v = std::getenv("PSVRECORE_GXM_KEEP_CPU");
+        return v && *v && *v != '0';
+    }();
+    std::optional<CpuLent> lent;
+    if (!keep_cpu) lent.emplace();
     if (e.scene.fragment_sync) {
         const u64 t0 = nx::os::ticks_ns();
         CpuGivenUp blocking;

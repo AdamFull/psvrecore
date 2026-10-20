@@ -304,6 +304,49 @@ void Kernel::begin_blocking() {
     impl_->dispatch();
 }
 
+bool Kernel::lend_cpu() {
+    Thread* t = t_current;
+    if (!t || t->cpu < 0) return false;
+    Lock guard(impl_->lock);
+    const i32 cpu = t->cpu;
+    t->state = ThreadState::Waiting;
+    t->wait = Wait{};
+    impl_->release_cpu(t);
+    t->lent_cpu = cpu;
+    impl_->dispatch();
+    return true;
+}
+
+void Kernel::reclaim_cpu() {
+    Thread* t = t_current;
+    if (!t || t->lent_cpu < 0) return;
+    Lock guard(impl_->lock);
+    const i32 cpu = t->lent_cpu;
+    t->lent_cpu = -1;
+    if (impl_->suspended) {
+        // (no CPU for anyone until resume(): in line as any thread)
+        impl_->make_ready(t);
+        impl_->wait_for_cpu(t);
+    } else {
+        // The borrower (if any) to the front of the ready threads, giving the CPU up at its next kernel call.
+        if (Thread* o = impl_->cpus[static_cast<usize>(cpu)]) {
+            impl_->release_cpu(o);
+            o->state = ThreadState::Ready;
+            o->ready_since = impl_->now_ns();
+            o->ready_order = static_cast<u64>(--impl_->front_order);
+            o->lost_cpu.store(true, std::memory_order_release);
+            impl_->ready.push_back(o);
+        }
+        impl_->cpus[static_cast<usize>(cpu)] = t;
+        t->cpu = cpu;
+        t->state = ThreadState::Running;
+        t->held_since = impl_->now_ns();
+        t->lost_cpu.store(false, std::memory_order_relaxed);
+        impl_->dispatch();  // (the borrower to another CPU, if one is free)
+    }
+    if (t->terminate) throw ThreadExit{err::kWaitCancel};
+}
+
 void Kernel::end_blocking() {
     Thread* t = t_current;
     if (!t) return;

@@ -177,6 +177,45 @@ TEST_CASE("kernel: no time slicing among threads of equal priority") {
     CHECK(g_log.joined() == "w1+ w1- w2+ w2-");
 }
 
+TEST_CASE("kernel: a thread lending its CPU for host work takes it back ahead of a thread of its priority") {
+    TestRuntime t(1, 100);
+    g_log.events.clear();
+    g_value = 0;
+    GuestCode code;
+    // w1 lends its CPU for 30 ms of host work: w2 (the same priority) runs meanwhile, and gives the CPU back at its
+    // next kernel call once w1 takes it back, though threads of equal priority do not preempt each other otherwise.
+    const u32 w1 = code.add([](PsvContext*, uint32_t) {
+        g_log.add("w1+");
+        Kernel& k = runtime::runtime().kernel();
+        CHECK(k.lend_cpu());
+        spin_ms(30);
+        k.reclaim_cpu();
+        g_log.add("w1 back");
+        const u32 before = g_value.load();
+        spin_ms(20);
+        CHECK(g_value.load() - before <= 1);  // (w2 stopped at its next call)
+        g_log.add("w1-");
+    });
+    const u32 w2 = code.add([](PsvContext* ctx, uint32_t) {
+        g_log.add("w2+");
+        for (int i = 0; i < 100; ++i) {
+            spin_ms(1);
+            g_value.fetch_add(1);
+            call32(ctx, kSceLibKernel, kGetThreadId, {});
+        }
+        g_log.add("w2-");
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    const i32 a = create_thread(ctx, "w1", w1, 150), b = create_thread(ctx, "w2", w2, 150);
+    start_thread(ctx, a);
+    start_thread(ctx, b);
+    wait_end(ctx, a);
+    wait_end(ctx, b);
+    CHECK(g_value.load() == 100);
+    CHECK(g_log.joined() == "w1+ w2+ w1 back w1- w2-");
+}
+
 TEST_CASE("kernel: three CPUs run three threads at once, never four") {
     TestRuntime t(3, 100);
     static std::atomic<u32> running{0}, most{0}, arrived{0};

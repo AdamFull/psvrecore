@@ -136,6 +136,7 @@ struct Thread : Object {
     i32 affinity = 0;  // CPU mask (bits 16-18)
     i32 cpu = -1;      // the CPU it holds, or -1
     i32 last_cpu = -1;
+    i32 lent_cpu = -1;  // the CPU it lent (lend_cpu), or -1
     u64 ready_order = 0;  // FIFO position among ready threads of its priority
     std::atomic<bool> lost_cpu{false};  // set when its CPU was taken while it runs guest code
     // (the time it has held a CPU, and been ready without one: host clock, ns)
@@ -236,6 +237,12 @@ public:
         explicit Blocking(Kernel& kernel) : k(kernel) { k.begin_blocking(); }
         ~Blocking() noexcept(false) { k.end_blocking(); }
     };
+    // Around long host work on the thread's behalf that the console does elsewhere (the GPU rendering a scene): its
+    // CPU lent to the threads ready meanwhile, and taken back at the end ahead of them all (a borrower gives it up at
+    // its next kernel call, as a thread preempted does), so the thread does not wait behind threads of its own
+    // priority, which do not give way to it. False (nothing lent) when it holds no CPU.
+    bool lend_cpu();
+    void reclaim_cpu();
 
     // ---- threads
     Uid create_thread(nx::string_view name, u32 entry, i32 priority, u32 stack_size, u32 attr, i32 affinity);
