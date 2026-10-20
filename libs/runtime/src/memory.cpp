@@ -37,6 +37,8 @@ bool GuestMemory::init() {
     if (!nx::vmem::reserve(&reservation, size)) return false;
     base_ = static_cast<u8*>(reservation);
     reserved_ = size;
+    pages_ = nx::make_unique<Pages>();
+    for (std::atomic<u8>& a : pages_->access) a.store(0, std::memory_order_relaxed);
     psv_membase = base_;
     return true;
 }
@@ -45,6 +47,7 @@ void GuestMemory::shutdown() {
     if (!base_) return;
     {
         nx::scoped_lock<nx::mutex> guard(lock_);
+        for (const auto& [base, block] : blocks_) set_pages(block.base, block.size, Access::None);
         blocks_.clear();
     }
     if (psv_membase == base_) psv_membase = nullptr;
@@ -74,6 +77,13 @@ bool GuestMemory::commit(u32 base, u32 size, Access access) {
     return true;
 }
 
+void GuestMemory::set_pages(u32 base, u32 size, Access access) {
+    if (!pages_) return;
+    const u64 end = (u64{base} + size + kPageSize - 1) / kPageSize;
+    for (u64 p = base / kPageSize; p < end && p < kGuestSpace / kPageSize; ++p)
+        pages_->access[p].store(static_cast<u8>(access), std::memory_order_release);
+}
+
 bool GuestMemory::overlaps(u32 base, u32 size) const {
     const u64 end = u64{base} + size;
     auto it = blocks_.upper_bound(base);
@@ -92,6 +102,7 @@ bool GuestMemory::map_fixed(u32 base, u32 size, Access access, BlockKind kind, n
     if (overlaps(base, size)) return false;
     if (!commit(base, size, access)) return false;
     blocks_[base] = Block{base, size, kind, access, nx::string(name), 0, 0};
+    set_pages(base, size, access);
     return true;
 }
 
@@ -122,6 +133,7 @@ u32 GuestMemory::map_anywhere(const Region& region, u32 size, u32 alignment, Acc
     const u32 base = static_cast<u32>(candidate);
     if (!commit(base, size, access)) return 0;
     blocks_[base] = Block{base, size, kind, access, nx::string(name), uid, type};
+    set_pages(base, size, access);
     return base;
 }
 
@@ -138,6 +150,7 @@ bool GuestMemory::unmap(u32 base) {
     if (it == blocks_.end()) return false;
     const u64 page = host_page();
     const u64 begin = it->second.base, end = u64{it->second.base} + it->second.size;
+    set_pages(it->second.base, it->second.size, Access::None);
     blocks_.erase(it);
     // Give back the host pages no other block touches.
     u64 free_begin = (begin + page - 1) & ~(page - 1), free_end = end & ~(page - 1);
@@ -157,6 +170,7 @@ bool GuestMemory::protect(u32 base, Access access) {
     if (inner_end > inner_begin)
         nx::vmem::protect(base_ + inner_begin, static_cast<usize>(inner_end - inner_begin), host_protection(access));
     it->second.access = access;
+    set_pages(it->second.base, it->second.size, access);
     return true;
 }
 
@@ -198,6 +212,15 @@ u64 GuestMemory::mapped_bytes(BlockKind kind, const Region& region) const {
 
 bool GuestMemory::valid(u32 address, u32 size, bool write) const {
     if (size == 0) return true;
+    if (pages_) {
+        // (by page, without the lock: blocks are whole pages)
+        const u64 end = (u64{address} + size - 1) / kPageSize;
+        if (end >= kGuestSpace / kPageSize) return false;
+        const u8 want = static_cast<u8>(write ? Access::ReadWrite : Access::Read);
+        for (u64 p = address / kPageSize; p <= end; ++p)
+            if ((pages_->access[p].load(std::memory_order_acquire) & want) != want) return false;
+        return true;
+    }
     nx::scoped_lock<nx::mutex> guard(lock_);
     u64 at = address;
     const u64 end = u64{address} + size;

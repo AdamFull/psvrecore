@@ -444,6 +444,26 @@ struct Renderer {
     };
     nx::vector<Pending> pending;
     std::atomic<u32> pending_count{0};
+    // The scenes ended and not yet rendered, in order (end_scene; the renderer's thread renders them), numbered from
+    // 1 as they end; `rendered` the last that thread is done with.
+    struct Ended {
+        Scene scene;
+        nx::vector<Notification> notes;
+        u64 number = 0;
+    };
+    nx::mutex scenes_lock;
+    nx::cond_var scenes_changed;
+    nx::vector<Ended> ended_scenes;
+    // (a scene's, while it is rendered, kept from scene to scene: render_scene) The guest memory its vertex streams
+    // read, each range at its offset in the scene's vertex buffer; its indices.
+    struct VertexRange {
+        u32 address = 0, bytes = 0;
+        VkDeviceSize offset = 0;
+    };
+    nx::vector<VertexRange> scene_vertex_ranges;
+    nx::vector<u8> scene_indices;
+    u64 ended = 0, rendered = 0;
+    bool worker = false;
     nx::vector<nx::unique_ptr<vk::OneShot>> display_copies;  // (the frames copied to the sink's image, in flight)
     u64 submitted = 0, finished = 0;  // (the numbers of the last scene submitted and the last finished)
     bool flusher = false;
@@ -2045,8 +2065,7 @@ void capture_draw(u64 number, const Scene& scene) {
 
 }  // namespace
 
-bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notifications) {
-    (void)context;
+bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 number) {
     g_profile.start();
     Renderer& r = renderer();
     if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return false;
@@ -2257,7 +2276,28 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         }
         return kMemoryBase + c.offset;
     };
-    nx::vector<u8> vertices, indices;
+    // (the renderer's, kept from scene to scene: their memory reused, not allocated and touched afresh)
+    // (the vertices: the ranges of guest memory the streams read, copied into the vertex buffer once it is made; a
+    // range a stream read before in the scene, which holds this one's, is read again, not copied again; guest
+    // memory is as it is now for all of the scene's draws)
+    nx::vector<Renderer::VertexRange>& vertex_ranges = r.scene_vertex_ranges;
+    VkDeviceSize vertex_bytes = 0;
+    vertex_ranges.clear();
+    auto vertex_range = [&](u32 address, u32 bytes) -> VkDeviceSize {
+        const bool readable = address && bytes && memory().valid(address, bytes);
+        if (readable) {
+            for (const Renderer::VertexRange& v : vertex_ranges)
+                if (v.address && address >= v.address && u64{address} + bytes <= u64{v.address} + v.bytes)
+                    return v.offset + (address - v.address);
+            depend(address, bytes);
+        }
+        const VkDeviceSize at = vertex_bytes;
+        vertex_ranges.push_back({readable ? address : 0, bytes, at});  // (address 0: zeros)
+        vertex_bytes += (VkDeviceSize{bytes} + 15) & ~VkDeviceSize{15};
+        return at;
+    };
+    nx::vector<u8>& indices = r.scene_indices;
+    indices.clear();
     nx::vector<DrawPlan> plans;
     plans.reserve(draws);
     for (u32 i = 0; i < draws; ++i) {
@@ -2379,8 +2419,7 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
                     reach = nx::max<u32>(reach, dr.vertex->attributes[a].offset + attribute_bytes(vs.inputs[a]));
             const u32 count = instanced ? dr.instances : max_index + 1;
             const u32 bytes = st.stride ? (count - 1) * st.stride + reach : reach;
-            plan.streams.push_back({s, vertices.size()});
-            host_copy(vertices, dr.streams[s], bytes);
+            plan.streams.push_back({s, vertex_range(dr.streams[s], bytes)});
         }
         switch (dr.primitive) {
             case 0x04000000u: desc.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
@@ -2541,7 +2580,16 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
     }
     vk::Buffer* sa_buf = make(sa.data(), sa.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     vk::Buffer* mem_buf = make(mem_words.data(), mem_words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    vk::Buffer* vb = make(vertices.data(), vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    vk::Buffer* vb = make(nullptr, static_cast<usize>(vertex_bytes), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    if (vb) {
+        // (straight from guest memory into the buffer)
+        u8* out = static_cast<u8*>(vb->mapped);
+        for (const Renderer::VertexRange& v : vertex_ranges) {
+            if (v.address) std::memcpy(out + v.offset, memory().host(v.address), v.bytes);
+            else std::memset(out + v.offset, 0, v.bytes);
+        }
+        vk::flush(d, *vb);
+    }
     vk::Buffer* ib = make(indices.data(), indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     const VkDeviceSize readback_bytes = color ? VkDeviceSize{width} * height * cf.bytes : 0;
     vk::Buffer* readback = make(nullptr, readback_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -3021,7 +3069,8 @@ bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notif
         return true;
     }
     pending.shot = std::move(shot);
-    pending.number = ++r.submitted;
+    pending.number = number;
+    r.submitted = number;
     g_profile.mark(6);
     // (the scenes the GPU is done with; and the oldest, waited for, when it has kScenesInFlight with this one)
     g_finish_why = 0;
@@ -3074,14 +3123,138 @@ void profile_buffer_wait(u64 ns) {
     if (g_profile.on) g_profile.buffer_wait_ns += ns;
 }
 
+namespace {
+
+thread_local bool t_scene_thread = false;  // (the renderer's thread)
+// (ended and not yet rendered, at most: the game's thread waits for the renderer beyond. One: P4D rewrites what a
+// scene reads about a frame after it ends, which the console's GPU has read by then; with two frames' worth (8)
+// its frames showed what later ones wrote)
+constexpr usize kEndedScenes = 1;
+
+// An ended scene rendered: once the display has let its buffer go (the GPU's wait for its fragment sync object);
+// one not rendered (nothing to draw into, no device) has its notifications written now, after the scenes before.
+void render_ended(Renderer& r, Renderer::Ended& e) {
+    State& st = state();
+    if (e.scene.fragment_sync) {
+        const u64 t0 = nx::os::ticks_ns();
+        std::optional<runtime::Kernel::Blocking> blocking;
+        if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+        nx::scoped_lock<nx::mutex> held(st.queue_lock);
+        st.queue_changed.wait(st.queue_lock, [&] {
+            auto it = st.holds_released.find(e.scene.fragment_sync);
+            return st.stopping || (it != st.holds_released.end() ? it->second : 0) >= e.scene.fragment_holds;
+        });
+        profile_buffer_wait(nx::os::ticks_ns() - t0);
+    }
+    if (!render_scene(e.scene, e.notes, e.number)) {
+        {
+            TargetsHeld held(r);
+            finish_pending(r, true);  // (the scenes before it first: notifications are written in order)
+        }
+        for (const Notification& n : e.notes) notify(n);
+    }
+}
+
+void scene_thread(Renderer& r) {
+    t_scene_thread = true;
+    for (;;) {
+        Renderer::Ended e;
+        {
+            nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+            r.scenes_changed.wait(r.scenes_lock, [&] { return !r.ended_scenes.empty(); });
+            e = std::move(r.ended_scenes.front());
+            r.ended_scenes.erase(r.ended_scenes.begin());
+        }
+        render_ended(r, e);
+        {
+            nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+            r.rendered = e.number;
+        }
+        r.scenes_changed.notify_all();
+    }
+}
+
+// The renderer's thread done with the scenes ended up to `limit` (not those ended while this waits); a guest
+// thread gives up its CPU meanwhile.
+void wait_rendered(Renderer& r, u64 limit) {
+    if (t_scene_thread) return;
+    u64 upto;
+    {
+        nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+        upto = nx::min(limit, r.ended);
+        if (r.rendered >= upto) return;
+    }
+    std::optional<runtime::Kernel::Blocking> blocking;
+    if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+    nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+    r.scenes_changed.wait(r.scenes_lock, [&] { return r.rendered >= upto; });
+}
+
+}  // namespace
+
+void end_scene(Scene&& scene, nx::vector<Notification> notifications) {
+    Renderer& r = renderer();
+    // (on the renderer's own thread only with PSVRECORE_GXM_SCENE_THREAD=1: there, a scene's copies run on a thread
+    // that sleeps between scenes, with cold caches; a song on a Pixel 8a ran at 27.3 frames a second so, 28.1 on the
+    // game's thread)
+    static const bool sync = [] {
+        const char* v = std::getenv("PSVRECORE_GXM_SCENE_THREAD");
+        return !(v && *v && *v != '0');
+    }();
+    Renderer::Ended e{std::move(scene), std::move(notifications), 0};
+    if (sync) {
+        {
+            nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+            e.number = ++r.ended;
+        }
+        render_ended(r, e);
+        nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+        r.rendered = e.number;
+        return;
+    }
+    bool start = false, queued = false;
+    {
+        nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+        if (!r.worker) r.worker = start = true;
+        if (r.ended_scenes.size() < kEndedScenes) {
+            e.number = ++r.ended;
+            r.ended_scenes.push_back(std::move(e));
+            queued = true;
+        }
+    }
+    if (start) {
+        nx::thread_options options;
+        options.name = "gxm render";
+        nx::thread worker([&r] { scene_thread(r); }, options);
+        worker.detach();
+    }
+    if (!queued) {
+        // (the renderer that far behind: the game's thread waits for it, without its CPU)
+        std::optional<runtime::Kernel::Blocking> blocking;
+        if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
+        nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+        r.scenes_changed.wait(r.scenes_lock, [&] { return r.ended_scenes.size() < kEndedScenes; });
+        e.number = ++r.ended;
+        r.ended_scenes.push_back(std::move(e));
+    }
+    r.scenes_changed.notify_all();
+}
+
 u64 scenes_submitted() {
     Renderer& r = renderer();
-    TargetsHeld held(r);
-    return r.submitted;
+    nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+    return r.ended;
+}
+
+u64 scenes_rendered() {
+    Renderer& r = renderer();
+    nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+    return r.rendered;
 }
 
 void finish_scenes(u64 limit) {
     Renderer& r = renderer();
+    wait_rendered(r, limit);
     if (!r.pending_count.load(std::memory_order_acquire)) return;
     // The scenes pending now up to `limit` (not those submitted while this waits), waited for without the renderer's
     // lock: the game's thread prepares its next scene meanwhile; each finished, under the lock, once the GPU is done
@@ -3091,7 +3264,8 @@ void finish_scenes(u64 limit) {
         TargetsHeld held(r);
         if (r.pending.empty()) return;
         upto = nx::min(limit, r.pending.back().number);
-        if (r.finished >= upto) return;
+        // (numbers of scenes not submitted, with nothing to draw, are skipped)
+        if (r.finished >= upto || r.pending.front().number > upto) return;
     }
     std::optional<runtime::Kernel::Blocking> blocking;
     if (runtime::Kernel::current()) blocking.emplace(runtime::runtime().kernel());
@@ -3100,7 +3274,7 @@ void finish_scenes(u64 limit) {
             nx::scoped_lock<nx::mutex> held(r.targets_lock);
             g_finish_why = 2;
             finish_pending(r, false);
-            if (r.finished >= upto || r.pending.empty()) return;
+            if (r.finished >= upto || r.pending.empty() || r.pending.front().number > upto) return;
         }
         nx::this_thread::sleep_for(std::chrono::microseconds(100));
     }

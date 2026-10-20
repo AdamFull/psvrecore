@@ -9,6 +9,7 @@
 // game allocates, thread stacks and thread-local storage. Each block has a name, an owner kind, and a range, and the
 // address space keeps them sorted so a guest address finds its block.
 
+#include <atomic>
 #include <span>
 
 #include "core/foundation/containers/map.h"
@@ -98,10 +99,17 @@ public:
 private:
     bool commit(u32 base, u32 size, Access access);
     bool overlaps(u32 base, u32 size) const;
+    void set_pages(u32 base, u32 size, Access access);  // (under lock_)
 
     u8* base_ = nullptr;
     usize reserved_ = 0;
     mutable nx::mutex lock_;
+    // Each guest page's access as its block has it (blocks are whole pages; Access::None where none is mapped):
+    // valid() reads it without the lock, which every thread's HLE calls and the renderer's thread take otherwise.
+    struct Pages {
+        std::atomic<u8> access[(1ull << 32) / kPageSize];
+    };
+    nx::unique_ptr<Pages> pages_;
     nx::map<u32, Block> blocks_;  // by base
     nx::vector<Region> reserved_ranges_;
 };

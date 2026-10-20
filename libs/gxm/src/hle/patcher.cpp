@@ -13,6 +13,18 @@ namespace psvrecore::gxm::hle {
 
 namespace {
 
+// A program released, kept until the scenes ended so far are rendered (the renderer's thread may yet draw with it);
+// those released before whose scenes are rendered now freed.
+void retire(State& s, State::Retired x) {
+    x.after = scenes_submitted();
+    s.retired.push_back(std::move(x));
+    const u64 rendered = scenes_rendered();
+    for (usize i = 0; i < s.retired.size();) {
+        if (s.retired[i].after <= rendered) s.retired.erase(s.retired.begin() + static_cast<isize>(i));
+        else ++i;
+    }
+}
+
 constexpr u32 kSceGxm = 0xF76B66BD;
 
 runtime::GuestMemory& memory() { return runtime::runtime().memory(); }
@@ -132,9 +144,25 @@ i32 sceGxmShaderPatcherDestroy(u32 patcher) {
     nx::scoped_lock<nx::mutex> held(s.lock);
     Patcher* p = patcher_of(patcher);
     if (!p) return err::kInvalidPointer;
-    for (VertexProgram* v : p->vertex_programs) s.vertex_programs.erase(v->guest);
-    for (FragmentProgram* f : p->fragment_programs) s.fragment_programs.erase(f->guest);
-    for (Program* r : p->programs) s.programs.erase(r->guest);
+    // (its programs kept until the scenes ended so far are rendered)
+    for (VertexProgram* v : p->vertex_programs) {
+        State::Retired x;
+        if (auto it = s.vertex_programs.find(v->guest); it != s.vertex_programs.end()) x.vertex = std::move(it->second);
+        s.vertex_programs.erase(v->guest);
+        retire(s, std::move(x));
+    }
+    for (FragmentProgram* f : p->fragment_programs) {
+        State::Retired x;
+        if (auto it = s.fragment_programs.find(f->guest); it != s.fragment_programs.end()) x.fragment = std::move(it->second);
+        s.fragment_programs.erase(f->guest);
+        retire(s, std::move(x));
+    }
+    for (Program* r : p->programs) {
+        State::Retired x;
+        if (auto it = s.programs.find(r->guest); it != s.programs.end()) x.program = std::move(it->second);
+        s.programs.erase(r->guest);
+        retire(s, std::move(x));
+    }
     s.patchers.erase(patcher);
     return 0;
 }
@@ -201,7 +229,10 @@ i32 unregister(u32 patcher, u32 id, bool force) {
     for (FragmentProgram* f : p->fragment_programs)
         if (f->program == r && !force) return err::kProgramInUse;
     std::erase(p->programs, r);
+    State::Retired x;
+    x.program = std::move(it->second);
     s.programs.erase(it);
+    retire(s, std::move(x));
     return 0;
 }
 i32 sceGxmShaderPatcherUnregisterProgram(u32 patcher, u32 id) { return unregister(patcher, id, false); }
@@ -361,7 +392,10 @@ i32 sceGxmShaderPatcherReleaseVertexProgram(u32 patcher, u32 program) {
     if (!p || it == s.vertex_programs.end()) return err::kInvalidPointer;
     if (--it->second->references > 0) return 0;
     std::erase(p->vertex_programs, it->second.get());
+    State::Retired x;
+    x.vertex = std::move(it->second);
     s.vertex_programs.erase(it);
+    retire(s, std::move(x));
     return 0;
 }
 i32 sceGxmShaderPatcherReleaseFragmentProgram(u32 patcher, u32 program) {
@@ -372,7 +406,10 @@ i32 sceGxmShaderPatcherReleaseFragmentProgram(u32 patcher, u32 program) {
     if (!p || it == s.fragment_programs.end()) return err::kInvalidPointer;
     if (--it->second->references > 0) return 0;
     std::erase(p->fragment_programs, it->second.get());
+    State::Retired x;
+    x.fragment = std::move(it->second);
     s.fragment_programs.erase(it);
+    retire(s, std::move(x));
     return 0;
 }
 

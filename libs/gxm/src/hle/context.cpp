@@ -121,23 +121,18 @@ i32 sceGxmEndScene(u32 context, Ptr<const Notification> vertex_notification, Ptr
         scene = std::move(c->scene);
         c->scene = Scene{};
     }
-    // (the GPU's wait for the fragment sync object: its buffer drawn only once the display has let it go)
+    // (the GPU's wait for the fragment sync object, as it is now: its buffer drawn once the display lets it go)
     if (scene.fragment_sync) {
-        const u64 t0 = nx::os::ticks_ns();
-        runtime::Kernel::Blocking blocking(runtime::runtime().kernel());
         nx::scoped_lock<nx::mutex> held(st.queue_lock);
-        st.queue_changed.wait(st.queue_lock, [&] { return st.stopping || !st.display_holds.contains(scene.fragment_sync); });
-        profile_buffer_wait(nx::os::ticks_ns() - t0);
+        auto it = st.holds_placed.find(scene.fragment_sync);
+        scene.fragment_holds = it != st.holds_placed.end() ? it->second : 0;
     }
     // (the notifications as they are now: written once the scene is done, after the game may have reused them)
     nx::vector<Notification> notes;
     if (vertex_notification && memory().valid(vertex_notification.address, sizeof(Notification))) notes.push_back(*vertex_notification);
     if (fragment_notification && memory().valid(fragment_notification.address, sizeof(Notification)))
         notes.push_back(*fragment_notification);
-    if (!render_scene(*c, scene, notes)) {
-        finish_scenes();  // (the scenes before it first: notifications are written in order)
-        for (const Notification& n : notes) notify(n);
-    }
+    end_scene(std::move(scene), std::move(notes));
     return 0;
 }
 

@@ -54,6 +54,8 @@ i32 sceGxmInitialize(Ptr<const InitializeParams> p) {
     s.queue.clear();
     s.queue_data_free.clear();
     s.display_holds.clear();
+    s.holds_placed.clear();
+    s.holds_released.clear();
     for (u32 i = 0; i < params.display_queue_max_pending + 1; ++i)
         s.queue_data_free.push_back(guest_alloc(nx::max<u32>(params.display_queue_callback_data_size, 4)));
     s.initialized = true;
@@ -139,6 +141,8 @@ i32 sceGxmSyncObjectDestroy(u32 sync) {
     {
         nx::scoped_lock<nx::mutex> held(s.queue_lock);
         s.display_holds.erase(sync);
+        // (its holds gone: released)
+        if (auto it = s.holds_placed.find(sync); it != s.holds_placed.end()) s.holds_released[sync] = it->second;
     }
     s.queue_changed.notify_all();
     return 0;
@@ -184,6 +188,7 @@ i32 sceGxmDisplayQueueAddEntry(u32 old_buffer, u32 new_buffer, u32 data) {
         // (the new buffer's sync object held until a later entry replaces it; the old one released after this flip)
         nx::scoped_lock<nx::mutex> held(s.queue_lock);
         ++s.display_holds[new_buffer];
+        ++s.holds_placed[new_buffer];
         s.queue.push_back(DisplayEntry{old_buffer, new_buffer, slot, scenes_submitted()});
     }
     s.queue_changed.notify_all();

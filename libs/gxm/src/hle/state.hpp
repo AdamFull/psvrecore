@@ -276,6 +276,7 @@ struct Scene {
     u32 flags = 0;
     u32 visibility_buffer = 0;  // (core 0's counters; 0: none)
     u32 fragment_sync = 0;      // (the sync object it waits for; 0: none)
+    u64 fragment_holds = 0;     // (the holds placed on it when the scene ended: rendered once that many are released)
     nx::vector<Draw> draws;
 };
 
@@ -330,6 +331,15 @@ struct State {
     nx::hash_map<u32, nx::unique_ptr<Program>> programs;
     nx::hash_map<u32, nx::unique_ptr<VertexProgram>> vertex_programs;
     nx::hash_map<u32, nx::unique_ptr<FragmentProgram>> fragment_programs;
+    // Programs released while scenes ended before may still draw with them (the renderer's thread renders those
+    // after): kept until the scenes ended up to `after` are rendered (patcher.cpp).
+    struct Retired {
+        u64 after = 0;
+        nx::unique_ptr<Program> program;
+        nx::unique_ptr<VertexProgram> vertex;
+        nx::unique_ptr<FragmentProgram> fragment;
+    };
+    nx::vector<Retired> retired;
     nx::unique_ptr<Program> mask_update_program;  // (made on first use)
     nx::hash_map<u32, nx::vector<Draw>> command_lists;  // (by id)
     u32 next_command_list = 1;
@@ -345,6 +355,9 @@ struct State {
     // fragment sync object is held waits for it before it renders (the GPU's wait), so a buffer is not drawn into
     // while it is shown.
     nx::hash_map<u32, u32> display_holds;
+    // The holds placed and released (released in the order placed) on each sync object, ever: a scene waits for
+    // those placed before it ended (Scene::fragment_holds), not for its own frame's, queued after it.
+    nx::hash_map<u32, u64> holds_placed, holds_released;
     nx::vector<u32> queue_data_free;  // guest blocks for callback data
     nx::thread display_thread;
     bool stopping = false;
@@ -357,17 +370,20 @@ State& state();
 // A guest block of `size` bytes (16-byte aligned) for the library's own use; 0 if guest memory is exhausted.
 u32 guest_alloc(u32 size);
 
-// Renders a scene (render.cpp): submitted to the GPU, its colour surface (and stored depth, visibility counters,
-// stored uniform buffers) written to guest memory and its notifications written once the GPU is done, while the
-// game goes on (see finish_scenes). False when it was not rendered (nothing to draw into, no device): its
-// notifications are the caller's to write.
-bool render_scene(Context& context, Scene& scene, nx::vector<Notification> notifications);
-// The scenes rendered so far finished: their results in guest memory, their notifications written. At the
-// library's points of synchronisation (a notification waited for, sceGxmFinish, the display queue, transfers, a
-// frame buffer set, memory unmapped), before anything reads what the GPU draws.
-void finish_scenes(u64 upto = ~0ull);  // (the scenes submitted up to this one, in submission order from 1)
-// The number of the last scene submitted (0: none yet).
+// A scene ended (render.cpp), numbered (from 1) and rendered in order: once the display lets its buffer go (its
+// fragment sync object), submitted to the GPU, its colour surface (and stored depth, visibility counters, stored
+// uniform buffers) written to guest memory and its notifications written once the GPU is done, while the game goes on
+// (see finish_scenes). On the game's thread; with PSVRECORE_GXM_SCENE_THREAD=1 on the renderer's own (the game's
+// thread waits for it only when it is a scene behind).
+void end_scene(Scene&& scene, nx::vector<Notification> notifications);
+// The scenes ended so far (up to `upto`) rendered and finished: their results in guest memory, their notifications
+// written. At the library's points of synchronisation (a notification waited for, sceGxmFinish, the display queue,
+// transfers, a frame buffer set, memory unmapped), before anything reads what the GPU draws.
+void finish_scenes(u64 upto = ~0ull);  // (the scenes ended up to this one, numbered from 1)
+// The number of the last scene ended (0: none yet).
 u64 scenes_submitted();
+// The number of the last scene the renderer's thread is done with (submitted, or found to have nothing to draw).
+u64 scenes_rendered();
 // (on the display queue's thread, while it shows a frame: the last of that frame's scenes, which the frame buffer
 // set from its callback waits for, not the next frame's)
 inline thread_local u64 t_frame_scenes = ~0ull;
