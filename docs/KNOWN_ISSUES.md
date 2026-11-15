@@ -356,7 +356,8 @@
   puts in its folder (`Android/data/<package>/files`) belongs to someone else and cannot be read (it was refused). So
   the launcher copies the folder the user picks (the system's folder picker) into `game/` there, which needs the space
   twice over while it copies. The copy is not checked beyond `eboot.bin` being there.
-- **Android: standard output and error go to `output.txt`** in that folder; the log goes to logcat as well.
+- **Android: standard output and error go to `output.txt`** in that folder (the three runs before kept as
+  `output.1.txt` to `output.3.txt`); the log goes to logcat as well.
 - **The command line is the frontend's** on every platform; on Android it is the intent's `args` array (empty from
   the home screen).
 - **nx-foundation warns on Android** (`platform/process.cpp`: an unused function `keep`) since the frontend links it

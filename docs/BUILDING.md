@@ -210,7 +210,8 @@ python scripts/android_apk.py --manifest <AndroidManifest.xml> --lib build/andro
 
 On the device, the launcher offers Play, Settings, and the game's application folder: chosen with the system's folder
 picker and copied into the application's folder, `Android/data/<package>/files/game`. The settings file and the data
-are there too, and standard output goes to `output.txt` there. The game folder is either the application folder
+are there too, and standard output goes to `output.txt` there (the three runs before kept as `output.1.txt` to
+`output.3.txt`). The game folder is either the application folder
 (eboot.bin at its top) or a copy of the console's ux0: folders (`app/<title ID>`, with `patch/` and `addcont/`
 beside it). A debuggable build can also be given its files from a computer, into its internal storage
 (`files/game`, through `adb exec-in run-as`: run-as reaches nothing else); Play uses that folder when the shared one
@@ -278,7 +279,7 @@ environment cannot be given (an Android activity, started with `am start ... --e
 | `PSVRECORE_FAULT_DUMP=1` | A guest memory fault also prints the 64 bytes at each register's address. |
 | `PSVRECORE_WATCH=<address>[:<size>],<function>,...` | Up to four hardware watchpoints (Windows, x86-64): a write to a guest address (1, 2, 4 or 8 bytes, 4 by default) prints the value now there, the host function that wrote, the guest thread's registers, the text registers point at, and the words at its stack pointer; a call of a host function by name (a generated `f_<address>`, called through a pointer: one called directly may be inlined) prints the time and the guest registers it gets. `f_<address>@r<n>+<offset>+...` (hex) also prints the words at those offsets from the register, as numbers and floats; `@r<n>[<offset>]...` reads through the pointer at that offset first (`[a][b]` through two), and more `@` groups read more (eight words in all): `f_8101EA62@r0[8]+1dc` prints a field of the structure the first argument's third word points to at every call. |
 | `PSVRECORE_WATCH_SHOTS=1` | Each press of an input script's `watch` also saves a shot (`w<ms>_<button>.png`), to see what the watch saw. |
-| `PSVRECORE_THREADS=<seconds>` | Every so many seconds, each guest thread's state, priority, link register and what it waits for. |
+| `PSVRECORE_THREADS=<seconds>` | Every so many seconds, each guest thread's state, priority, link register and what it waits for. Without it, the same goes to the log as warnings whenever the picture stands still for 3 s with the application in front (again at 10 s), with the renderer's scene counts and the host threads using the CPU. |
 | `PSVRECORE_HLE_COUNTS=<seconds>` | Every so many seconds, the HLE functions called since the last report, how often and the time spent in them (waits included: what blocks shows where the game waits), and the CPU time each host thread used meanwhile (Windows). |
 | `PSVRECORE_FRAME_STATS=<seconds>` | Every so many seconds, the frames the game displayed, their rate, the frame times' median, 99th percentile and worst, and the hitches (frames half again as long as the median); each hitch logged as it comes. |
 | `PSVRECORE_HITCH_TRACE=1` | With the above: at each hitch, what every guest thread did since the frame before (its long calls, the long stretches of its own code), and the console's CPUs it held and waited for. |

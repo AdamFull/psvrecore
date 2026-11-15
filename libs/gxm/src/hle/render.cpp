@@ -3533,4 +3533,23 @@ PlayStats play_stats() {
     return PlayStats{r.translated.load(), r.made_pipelines.load()};
 }
 
+RendererState renderer_state() {
+    hle::Renderer& r = hle::renderer();
+    RendererState s;
+    s.pending = r.pending_count.load(std::memory_order_acquire);
+    if (r.scenes_lock.try_lock()) {
+        s.ended = r.ended, s.rendered = r.rendered;
+        r.scenes_lock.unlock();
+    } else {
+        s.busy = true;
+    }
+    if (r.targets_lock.try_lock()) {
+        s.submitted = r.submitted, s.finished = r.finished;
+        r.targets_lock.unlock();
+    } else {
+        s.busy = true;
+    }
+    return s;
+}
+
 }  // namespace psvrecore::gxm

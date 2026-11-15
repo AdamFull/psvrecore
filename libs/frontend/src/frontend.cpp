@@ -8,6 +8,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include "psvrecore/log.hpp"
 #include "psvrecore/platform/audio.hpp"
 #include "psvrecore/platform/window.hpp"
+#include "psvrecore/runtime/host.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "psvrecore/vulkan/device.hpp"
 #include "core/foundation/platform/filesystem.h"
@@ -26,6 +28,7 @@
 #include "core/foundation/serialization/arguments.h"
 #include "core/foundation/strings/format.h"
 #include "core/foundation/threading/sync.h"
+#include "core/foundation/threading/thread.h"
 
 namespace psvrecore::frontend {
 
@@ -35,6 +38,7 @@ namespace {
 class Display : public gxm::DisplaySink {
 public:
     platform::Window* window = nullptr;
+    std::atomic<u64> shown{0};  // (frames the game has shown)
     nx::string out;
     nx::mutex lock;
     nx::vector<nx::string> shots;
@@ -64,6 +68,7 @@ public:
         // (PSVRECORE_SHOTS_FROM_WINDOW=1: shots of what the window presented, the overlays over the picture, at the
         // window's size)
         const bool from_window = shots_from_window();
+        shown.fetch_add(1, std::memory_order_relaxed);
         if (from_window && window) window->keep_last(true);
         const u64 presented_before = window ? window->presented() : 0;
         if (window) window->show(f);
@@ -158,6 +163,106 @@ struct Lifecycle {
 };
 
 std::atomic<Lifecycle*> g_lifecycle{nullptr};
+
+// The picture standing still while the application is in front: after 3 s (and again after 10 s), a warning in the
+// log with what each of the game's threads is doing, which host threads use the CPU, and where the renderer is (the
+// game's frames and the window's presents counted apart: the game stopped, or the window). For finding a freeze
+// from a player's log.
+class StallWatch {
+public:
+    StallWatch(runtime::Runtime& rt, platform::Window& window, Display& display, Lifecycle& lifecycle)
+        : rt_(rt), window_(window), display_(display), lifecycle_(lifecycle) {
+        nx::thread_options options;
+        options.name = "stall watch";
+        thread_ = nx::thread([this] { run(); }, options);
+    }
+    ~StallWatch() {
+        stop_.store(true);
+        if (thread_.joinable()) thread_.join();
+    }
+    StallWatch(const StallWatch&) = delete;
+    StallWatch& operator=(const StallWatch&) = delete;
+
+private:
+    void run() {
+        u64 shown = display_.shown.load(), presented = window_.presented();
+        u64 shown_at = nx::os::ticks_ns(), presented_at = shown_at;
+        u32 reports = 0;
+        u64 stood_since = 0;  // (when the picture last moved, once reported)
+        while (!stop_.load()) {
+            nx::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const u64 now = nx::os::ticks_ns();
+            bool background;
+            {
+                nx::scoped_lock<nx::mutex> held(lifecycle_.lock);
+                background = lifecycle_.background;
+            }
+            if (const u64 s = display_.shown.load(); s != shown) shown = s, shown_at = now;
+            if (const u64 p = window_.presented(); p != presented) presented = p, presented_at = now;
+            if (background || rt_.kernel().suspended()) shown_at = presented_at = now;
+            const u64 still = now - nx::min(shown_at, presented_at);
+            if (reports && now - shown_at < 1'000'000'000ull && now - presented_at < 1'000'000'000ull) {
+                nx::logw(logs::frontend, "the picture moves again after {:.1f} s", static_cast<f64>(now - stood_since) / 1e9);
+                reports = 0;
+            }
+            if ((reports == 0 && still >= 3'000'000'000ull) || (reports == 1 && still >= 10'000'000'000ull)) {
+                if (++reports == 1) stood_since = now - still;
+                report(now - shown_at, now - presented_at);
+            }
+        }
+    }
+
+    void report(u64 since_shown, u64 since_presented) {
+        nx::logw(logs::frontend, "the picture has stood still: the game's last frame {:.1f} s ago, the window's last "
+                 "present {:.1f} s ago",
+                 static_cast<f64>(since_shown) / 1e9, static_cast<f64>(since_presented) / 1e9);
+        const gxm::RendererState g = gxm::renderer_state();
+        nx::logw(logs::frontend, "  the renderer: {} scenes ended, {} rendered, {} submitted, {} finished, {} pending on the "
+                 "GPU{}", g.ended, g.rendered, g.submitted, g.finished, g.pending, g.busy ? " (a lock held now)" : "");
+        // (the host threads busy over the next second: a spinning or working one, or none)
+        struct Used {
+            u64 id, ns;
+            char name[48];
+        };
+        auto sample = [] {
+            nx::vector<Used> out;
+            runtime::host::thread_times(
+                [](u64 id, const char* name, u64 ns, void* user) {
+                    Used u{id, ns, {}};
+                    std::snprintf(u.name, sizeof u.name, "%s", name);
+                    static_cast<nx::vector<Used>*>(user)->push_back(u);
+                },
+                &out);
+            return out;
+        };
+        const nx::vector<Used> before = sample();
+        nx::this_thread::sleep_for(std::chrono::seconds(1));
+        nx::string busy;
+        for (const Used& u : sample()) {
+            u64 was = u.ns;
+            for (const Used& b : before)
+                if (b.id == u.id) was = b.ns;
+            if (u.ns - was >= 20'000'000) busy += nx::format(" {} {:.0f}%;", u.name[0] ? u.name : "?", static_cast<f64>(u.ns - was) / 1e7);
+        }
+        nx::logw(logs::frontend, "  host threads using the CPU over a second:{}", busy.empty() ? nx::string(" none") : busy);
+        // (last: it takes the kernel's lock, which a stuck kernel may hold)
+        const nx::string threads = rt_.kernel().describe_threads();
+        usize at = 0;
+        while (at < threads.size()) {
+            usize end = threads.find('\n', at);
+            if (end == nx::string::npos) end = threads.size();
+            nx::logw(logs::frontend, "{}", nx::string_view(threads).substr(at, end - at));
+            at = end + 1;
+        }
+    }
+
+    runtime::Runtime& rt_;
+    platform::Window& window_;
+    Display& display_;
+    Lifecycle& lifecycle_;
+    std::atomic<bool> stop_{false};
+    nx::thread thread_;
+};
 // Set when a settings screen has changed the settings file: what applies while the game runs is read again.
 std::atomic<bool> g_settings_changed{false};
 
@@ -355,6 +460,10 @@ int run(const Game& game, int argc, char** argv) {
     // (standard output and error reach nothing there: they go to output.txt in the user's folder)
     if (!user.empty()) {
         const nx::string output = join(user, "output.txt");
+        // (the runs before kept: output.1.txt the last, up to output.3.txt)
+        for (int i = 2; i >= 1; --i)
+            std::rename(join(user, nx::format("output.{}.txt", i)).c_str(), join(user, nx::format("output.{}.txt", i + 1)).c_str());
+        std::rename(output.c_str(), join(user, "output.1.txt").c_str());
         if (std::freopen(output.c_str(), "w", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, 0);
         if (std::freopen(output.c_str(), "a", stderr)) std::setvbuf(stderr, nullptr, _IONBF, 0);
     }
@@ -483,6 +592,7 @@ int run(const Game& game, int argc, char** argv) {
     lifecycle.sound.store(s.audio);
     SDL_AddEventWatch(on_app_event, &lifecycle);
     g_lifecycle.store(&lifecycle);
+    StallWatch stall_watch(rt, *window->get(), display, lifecycle);
 
     // Until the window is closed, the game exits, the script quits or the time is up.
     Script script(std::move(script_items));

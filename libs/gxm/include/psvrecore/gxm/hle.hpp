@@ -80,5 +80,14 @@ struct PlayStats {
     u32 translated = 0, pipelines = 0;
 };
 PlayStats play_stats();
+// Where the renderer is (for a report when the picture stands still): the scenes ended, rendered, submitted to the
+// GPU and finished, and how many the GPU still has. Read without waiting for the renderer: `busy` when a lock was
+// held (those numbers then 0).
+struct RendererState {
+    u64 ended = 0, rendered = 0, submitted = 0, finished = 0;
+    u32 pending = 0;
+    bool busy = false;
+};
+RendererState renderer_state();
 
 }  // namespace psvrecore::gxm
