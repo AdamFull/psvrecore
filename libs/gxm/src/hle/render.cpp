@@ -525,15 +525,17 @@ struct CpuLent {
 struct TargetsHeld {
     nx::mutex& m;
     explicit TargetsHeld(Renderer& r) : m(r.targets_lock) {
-        if (m.try_lock()) return;
-        CpuGivenUp blocking;
-        m.lock();
-        try {
-            blocking.reset();  // (a CPU again; a thread ending meanwhile unwinds from here)
-        } catch (...) {
+        // (a CPU is never waited for with the lock held: the game's other threads may keep every CPU, and the
+        // renderer, wanting the lock, then could not go on)
+        while (!m.try_lock()) {
+            CpuGivenUp blocking;
+            if (!blocking.blocking) {
+                m.lock();  // (no CPU to give up: the renderer's thread, or one given up already)
+                return;
+            }
+            m.lock();  // (until the one holding it is done)
             m.unlock();
-            throw;
-        }
+        }  // (a CPU again, then the lock; a thread ending meanwhile unwinds from the CPU's wait, holding nothing)
     }
     ~TargetsHeld() { m.unlock(); }
     TargetsHeld(const TargetsHeld&) = delete;
