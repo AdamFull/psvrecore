@@ -72,6 +72,15 @@ void Kernel::Impl::make_ready(Thread* t, bool front) {
     dispatch();
 }
 
+void Kernel::Impl::stop_running(Thread* t) {
+    release_cpu(t);
+    if (auto it = std::find(ready.begin(), ready.end(), t); it != ready.end()) {
+        ready.erase(it);
+        if (t->ready_since) t->ready_ns += now_ns() - t->ready_since, t->ready_since = 0;
+    }
+    t->lost_cpu.store(false, std::memory_order_relaxed);
+}
+
 void Kernel::Impl::release_cpu(Thread* t) {
     if (t->cpu < 0) return;
     if (t->held_since) t->held_ns += now_ns() - t->held_since, t->held_since = 0;
@@ -156,7 +165,7 @@ i32 Kernel::Impl::block(Thread* t, WaitQueue* queue, std::optional<u64> deadline
     t->wait.queue = queue;
     t->wait.done = false;
     t->wait.result = err::kOk;
-    release_cpu(t);
+    stop_running(t);
     dispatch();
     while (!t->wait.done) {
         i32 own = 0;
@@ -300,7 +309,7 @@ void Kernel::begin_blocking() {
     Lock guard(impl_->lock);
     t->state = ThreadState::Waiting;
     t->wait = Wait{};
-    impl_->release_cpu(t);
+    impl_->stop_running(t);
     impl_->dispatch();
 }
 

@@ -216,6 +216,45 @@ TEST_CASE("kernel: a thread lending its CPU for host work takes it back ahead of
     CHECK(g_log.joined() == "w1+ w2+ w1 back w1- w2-");
 }
 
+TEST_CASE("kernel: a thread preempted while it runs that waits before its next kernel call gets no CPU while it waits") {
+    // Two CPUs: the test's thread keeps one. w1 lends the other to w2 and takes it back while w2 runs (w2 then is
+    // preempted, ready again, until its next kernel call); w2's next call waits on a semaphore. When w1 ends, its CPU
+    // must stay free: w2 waits, and a CPU given to it would be held by a thread asleep (the game froze so).
+    TestRuntime t(2, 100);
+    g_log.events.clear();
+    GuestCode code;
+    const u32 w1 = code.add([](PsvContext*, uint32_t) {
+        Kernel& k = runtime::runtime().kernel();
+        k.lend_cpu();
+        spin_ms(20);
+        k.reclaim_cpu();
+        spin_ms(60);  // (w2 waits meanwhile)
+        g_log.add("w1-");
+    });
+    const u32 w2 = code.add([](PsvContext* ctx, uint32_t) {
+        g_log.add("w2+");
+        spin_ms(50);
+        call32(ctx, kSceLibKernel, kWaitSema, {u(g_object), 1, 0});
+        g_log.add("w2-");
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    g_object = call32(ctx, kSceLibKernel, kCreateSema, {guest_string("s"), 0, 0, 1, 0});
+    REQUIRE(g_object > 0);
+    const i32 a = create_thread(ctx, "w1", w1, 150), b = create_thread(ctx, "w2", w2, 150);
+    start_thread(ctx, a);
+    start_thread(ctx, b);
+    spin_ms(150);  // (the test's thread keeps its CPU)
+    const u32 info = scratch(128);
+    psv_st32(info, 128);
+    CHECK(call32(ctx, kSceLibKernel, kGetThreadInfo, {u(b), info}) == 0);
+    CHECK(psv_ld32(info + 44) == 0x08);  // status: WAITING, not given a CPU
+    CHECK(call32(ctx, kSceThreadmgr, kSignalSema, {u(g_object), 1}) == 0);
+    wait_end(ctx, a);
+    wait_end(ctx, b);
+    CHECK(g_log.joined() == "w2+ w1- w2-");
+}
+
 TEST_CASE("kernel: three CPUs run three threads at once, never four") {
     TestRuntime t(3, 100);
     static std::atomic<u32> running{0}, most{0}, arrived{0};

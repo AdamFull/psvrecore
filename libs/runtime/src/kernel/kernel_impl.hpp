@@ -84,6 +84,10 @@ struct Kernel::Impl {
     static bool allowed(const kernel::Thread* t, i32 cpu);
     void make_ready(kernel::Thread* t, bool front = false);
     void release_cpu(kernel::Thread* t);
+    // The thread stops being able to run (it waits): its CPU let go, and out of the ready threads, where a thread
+    // preempted while it ran guest code still is until its next kernel call; one that waited from there and was given
+    // a CPU would hold it asleep.
+    void stop_running(kernel::Thread* t);
     void dispatch();
     void wait_for_cpu(kernel::Thread* t);
     // The calling thread (t) waits, without the lock, until woken or the deadline; then takes the lock again.
