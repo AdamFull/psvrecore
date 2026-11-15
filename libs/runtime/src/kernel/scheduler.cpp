@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "kernel_impl.hpp"
+#include "psvrecore/runtime/host.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/threading/thread.h"
@@ -332,6 +333,7 @@ void Kernel::reclaim_cpu() {
     Lock guard(impl_->lock);
     const i32 cpu = t->lent_cpu;
     t->lent_cpu = -1;
+    if (t->cpu >= 0) return;  // (one again already: a wait inside the work ended with one)
     if (impl_->suspended) {
         // (no CPU for anyone until resume(): in line as any thread)
         impl_->make_ready(t);
@@ -430,6 +432,7 @@ bool Kernel::shutdown_complete() const {
 }
 
 Uid Kernel::adopt_host_thread(nx::string_view name, i32 priority, u32 stack_size) {
+    host::frame_thread();
     Lock guard(impl_->lock);
     auto t = nx::make_unique<Thread>();
     t->init_priority = t->priority = priority;

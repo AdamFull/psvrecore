@@ -11,7 +11,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+
+#include "psvrecore/log.hpp"
+#include "core/foundation/threading/sync.h"
+#endif
 
 namespace psvrecore::runtime::host {
 
@@ -81,6 +89,90 @@ void* find_code(const char*) { return nullptr; }
 void describe_code(void* pc, char* out, usize out_size) {
     if (out_size) snprintf(out, out_size, "%p", pc);
 }
+
+#if defined(__ANDROID__)
+namespace {
+
+// Android's performance hints (API 33; set_threads 34), found at run time (the application runs from API 29).
+struct PerfHints {
+    using GetManager = void* (*)();
+    using Create = void* (*)(void*, const i32*, size_t, int64_t);
+    using Report = int (*)(void*, int64_t);
+    using SetThreads = int (*)(void*, const i32*, size_t);
+    using Close = void (*)(void*);
+    nx::mutex lock;
+    bool loaded = false;
+    void* manager = nullptr;
+    Create create = nullptr;
+    Report report = nullptr;
+    SetThreads set_threads = nullptr;
+    Close close = nullptr;
+    void* session = nullptr;
+    nx::vector<i32> threads;
+    bool changed = false;
+
+    void load() {
+        loaded = true;
+        void* lib = dlopen("libandroid.so", RTLD_NOW);
+        if (!lib) return;
+        auto get = reinterpret_cast<GetManager>(dlsym(lib, "APerformanceHint_getManager"));
+        create = reinterpret_cast<Create>(dlsym(lib, "APerformanceHint_createSession"));
+        report = reinterpret_cast<Report>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+        set_threads = reinterpret_cast<SetThreads>(dlsym(lib, "APerformanceHint_setThreads"));
+        close = reinterpret_cast<Close>(dlsym(lib, "APerformanceHint_closeSession"));
+        if (get && create && report && close) manager = get();
+    }
+};
+
+PerfHints& perf_hints() {
+    static PerfHints h;
+    return h;
+}
+
+// (a frame's work aimed under the 33 ms of 30 frames a second: the frame times reported are the frames' intervals,
+// so the system raises the CPUs' clocks while they reach it)
+constexpr int64_t kFrameTarget = 28'000'000;
+
+}  // namespace
+
+void frame_thread() {
+    PerfHints& h = perf_hints();
+    const i32 tid = static_cast<i32>(gettid());
+    nx::scoped_lock<nx::mutex> held(h.lock);
+    if (std::find(h.threads.begin(), h.threads.end(), tid) != h.threads.end()) return;
+    h.threads.push_back(tid);
+    h.changed = true;
+}
+
+void frame_time(u64 ns) {
+    PerfHints& h = perf_hints();
+    nx::scoped_lock<nx::mutex> held(h.lock);
+    if (!h.loaded) h.load();
+    if (!h.manager || h.threads.empty()) return;
+    if (h.changed) {
+        // (the threads still there)
+        std::erase_if(h.threads, [](i32 tid) {
+            char path[64];
+            snprintf(path, sizeof path, "/proc/self/task/%d", tid);
+            return access(path, F_OK) != 0;
+        });
+        if (h.session && h.set_threads && h.set_threads(h.session, h.threads.data(), h.threads.size()) == 0) {
+            h.changed = false;
+        } else {
+            if (h.session) h.close(h.session);
+            const bool first = !h.session;
+            h.session = h.create(h.manager, h.threads.data(), h.threads.size(), kFrameTarget);
+            h.changed = false;
+            if (first)
+                nx::logi(logs::kernel, "performance hints: {} for {} threads", h.session ? "on" : "refused", h.threads.size());
+        }
+    }
+    if (h.session) h.report(h.session, static_cast<int64_t>(ns));
+}
+#else
+void frame_thread() {}
+void frame_time(u64) {}
+#endif
 
 void thread_times(ThreadTime each, void* user) {
 #if defined(__linux__)

@@ -34,6 +34,11 @@ void describe_code(void* pc, char* out, usize out_size);
 // where the host cannot tell (only Windows does here).
 using ThreadTime = void (*)(u64 id, const char* name, u64 cpu_ns, void* user);
 void thread_times(ThreadTime each, void* user);
+// The frames' work, for hosts whose CPUs run slow unless told what it needs (Android 13 and later: a performance hint
+// session): the calling thread works on the game's frames (a guest thread's host thread, the renderer's, the
+// window's), and a frame was shown so long after the one before. Nothing elsewhere.
+void frame_thread();
+void frame_time(u64 ns);
 
 enum class OpenMode : u32 {
     Read = 1,

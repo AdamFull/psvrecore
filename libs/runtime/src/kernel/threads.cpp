@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "kernel_impl.hpp"
+#include "psvrecore/runtime/host.hpp"
 #include "psvrecore/recomp/support.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "core/foundation/strings/format.h"
@@ -45,6 +46,7 @@ void Kernel::Impl::spawn_worker() {
 }
 
 void Kernel::Impl::worker_loop(HostWorker* w) {
+    host::frame_thread();  // (guest threads run here: the frames' work)
     {
         Lock guard(lock);
         --workers_starting;

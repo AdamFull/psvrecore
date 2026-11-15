@@ -243,6 +243,17 @@ public:
     // priority, which do not give way to it. False (nothing lent) when it holds no CPU.
     bool lend_cpu();
     void reclaim_cpu();
+    // (around such work: lent if the thread holds a CPU, taken back at the end)
+    struct Lending {
+        Kernel& k;
+        bool lent;
+        explicit Lending(Kernel& kernel) : k(kernel), lent(kernel.lend_cpu()) {}
+        ~Lending() noexcept(false) {
+            if (lent) k.reclaim_cpu();
+        }
+        Lending(const Lending&) = delete;
+        Lending& operator=(const Lending&) = delete;
+    };
 
     // ---- threads
     Uid create_thread(nx::string_view name, u32 entry, i32 priority, u32 stack_size, u32 attr, i32 affinity);

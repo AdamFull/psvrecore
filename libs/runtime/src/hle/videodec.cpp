@@ -241,7 +241,12 @@ i32 sceAvcdecDecode(Ptr<const Ctrl> ctrl, Ptr<const Au> au, Ptr<ArrayPicture> ar
     if (a.es.size && !memory().valid(a.es.address, a.es.size)) return kInvalidPointer;
     const i64 pts = static_cast<i64>((u64{a.pts.upper} << 32) | a.pts.lower);
     nx::vector<media::Picture> decoded;
-    const bool ok = d->h264.decode_annexb({memory().host(a.es.address), a.es.size}, pts, decoded);
+    bool ok;
+    {
+        // (decoded without the guest CPU: the console's AVC decoder does it, while the game's other threads run)
+        Kernel::Lending lent(kernel());
+        ok = d->h264.decode_annexb({memory().host(a.es.address), a.es.size}, pts, decoded);
+    }
     for (auto& p : decoded) d->waiting.push_back(std::move(p));
     ++d->units;
     if (!ok && d->failed++ == 0)

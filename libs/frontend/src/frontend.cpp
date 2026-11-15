@@ -69,6 +69,13 @@ public:
         // window's size)
         const bool from_window = shots_from_window();
         shown.fetch_add(1, std::memory_order_relaxed);
+        {
+            // (the frame's time, for the host's CPU clocks: Android's performance hints)
+            static u64 last = 0;
+            const u64 now = nx::os::ticks_ns();
+            if (last) runtime::host::frame_time(now - last);
+            last = now;
+        }
         if (from_window && window) window->keep_last(true);
         const u64 presented_before = window ? window->presented() : 0;
         if (window) window->show(f);

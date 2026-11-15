@@ -187,6 +187,9 @@ void* find_code(const char* name) {
     return reinterpret_cast<void*>(symbol->Address);
 }
 
+void frame_thread() {}
+void frame_time(u64) {}
+
 void thread_times(ThreadTime each, void* user) {
     const DWORD process = GetCurrentProcessId();
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);

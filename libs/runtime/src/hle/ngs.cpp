@@ -648,6 +648,9 @@ void run_callbacks(PsvContext* ctx, const nx::vector<Pending>& calls) {
 i32 update(PsvContext* ctx, Ngs& n) {
     nx::vector<Pending> calls;
     {
+        // (the mixing without the guest CPU: the console's audio hardware does it, while the game's other threads
+        // run; taken back for the callbacks, which are guest code)
+        Kernel::Lending lent(kernel());
         nx::scoped_lock<nx::mutex> held(n.lock);
         if (!n.user_locked)
             for (auto& r : n.racks)

@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "psvrecore/log.hpp"
@@ -194,6 +195,28 @@ const runtime::hle::Function kDisplayUserFunctions[] = {
 
 // ---- The display queue thread ----------------------------------------------------------------------------------
 
+// (PSVRECORE_FRAME_STATS: for a frame shown late, a frame time over 1.5 of 33 ms after the one before, why: the
+// game queued it late, or its scenes finished late after it was queued)
+void late_frame_why(const DisplayEntry& e, u64 finishing) {
+    static const bool on = [] {
+        const char* v = std::getenv("PSVRECORE_FRAME_STATS");
+        return v && *v;
+    }();
+    if (!on) return;
+    static u64 last_done = 0;
+    const u64 done = nx::os::ticks_ns();
+    const u64 interval = last_done ? done - last_done : 0;
+    last_done = done;
+    if (interval < 50'000'000) return;
+    nx::logi(logs::display, "frames: a late one, {:.1f} ms after the one before: the game queued it {:.1f} ms after "
+             "the one before; the queue took it {:.1f} ms after, its scenes then done in {:.1f} ms (the renderer's lock "
+             "{:.1f}, the GPU {:.1f}, writing back {:.1f})",
+             static_cast<f64>(interval) / 1e6, static_cast<f64>(e.since_last_ns) / 1e6,
+             static_cast<f64>(finishing - e.queued_ns) / 1e6, static_cast<f64>(done - finishing) / 1e6,
+             static_cast<f64>(t_finish_times.lock_ns) / 1e6, static_cast<f64>(t_finish_times.gpu_ns) / 1e6,
+             static_cast<f64>(t_finish_times.finish_ns) / 1e6);
+}
+
 void display_queue_main() {
     State& s = state();
     runtime::Runtime& rt = runtime::runtime();
@@ -211,7 +234,9 @@ void display_queue_main() {
         }
         // (the new buffer complete in guest memory: the frame's scenes the GPU still has finished, here rather than
         // on the game's thread, which goes on meanwhile; not the next frame's, which it may have begun)
+        const u64 finishing = nx::os::ticks_ns();
         finish_scenes(entry.scenes);
+        late_frame_why(entry, finishing);
         if (s.init.display_queue_callback) {
             const u32 args[] = {entry.data};
             t_frame_scenes = entry.scenes;
@@ -237,7 +262,12 @@ void display_queue_main() {
 void start_display_queue() {
     State& s = state();
     s.stopping = false;
-    s.display_thread = nx::thread([] { display_queue_main(); });
+    // (high on the host: it finishes the frame's scenes, writing them back under the renderer's lock, on time for the
+    // blank; not left on a slow core meanwhile)
+    nx::thread_options options;
+    options.name = "gxm display queue";
+    options.priority = nx::thread_priority::High;
+    s.display_thread = nx::thread([] { display_queue_main(); }, options);
 }
 
 void stop_display_queue() {

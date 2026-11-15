@@ -40,6 +40,7 @@
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/io/file.hpp"
 #include "psvrecore/log.hpp"
+#include "psvrecore/runtime/host.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
 #include "shader_cache.hpp"
 #include "core/foundation/platform/os.h"
@@ -592,8 +593,10 @@ bool ensure(Renderer& r) {
         r.flusher = true;
         nx::thread_options options;
         options.name = "gxm scenes";
+        options.priority = nx::thread_priority::High;  // (it writes scenes back holding the renderer's lock: not left on a slow core meanwhile)
         nx::thread flusher(
             [&r] {
+                runtime::host::frame_thread();
                 constexpr u64 kAfter = 4'000'000;  // (ns)
                 u64 seen = 0, since = 0;  // (the oldest scene pending found done, and when)
                 for (;;) {
@@ -3378,6 +3381,7 @@ u64 scenes_rendered() {
 
 void finish_scenes(u64 limit) {
     Renderer& r = renderer();
+    t_finish_times = {};
     wait_rendered(r, limit);
     if (!r.pending_count.load(std::memory_order_acquire)) return;
     // The scenes pending now up to `limit` (not those submitted while this waits), waited for without the renderer's
@@ -3385,7 +3389,9 @@ void finish_scenes(u64 limit) {
     // with it.
     u64 upto;
     {
+        const u64 t0 = nx::os::ticks_ns();
         TargetsHeld held(r);
+        t_finish_times.lock_ns += nx::os::ticks_ns() - t0;
         if (r.pending.empty()) return;
         upto = nx::min(limit, r.pending.back().number);
         // (numbers of scenes not submitted, with nothing to draw, are skipped)
@@ -3394,12 +3400,20 @@ void finish_scenes(u64 limit) {
     CpuGivenUp blocking;
     for (;;) {
         {
+            const u64 t0 = nx::os::ticks_ns();
             nx::scoped_lock<nx::mutex> held(r.targets_lock);
+            const u64 t1 = nx::os::ticks_ns();
             g_finish_why = 2;
+            const u64 before = r.finished;
             finish_pending(r, false);
+            const u64 t2 = nx::os::ticks_ns();
+            t_finish_times.lock_ns += t1 - t0;
+            (r.finished != before ? t_finish_times.finish_ns : t_finish_times.gpu_ns) += t2 - t1;
             if (r.finished >= upto || r.pending.empty() || r.pending.front().number > upto) return;
         }
+        const u64 t3 = nx::os::ticks_ns();
         nx::this_thread::sleep_for(std::chrono::microseconds(100));
+        t_finish_times.gpu_ns += nx::os::ticks_ns() - t3;
     }
 }
 

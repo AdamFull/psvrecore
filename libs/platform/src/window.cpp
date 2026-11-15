@@ -11,6 +11,7 @@
 #include "psvrecore/log.hpp"
 #include "frame_stats.hpp"
 #include "quads.hpp"
+#include "psvrecore/runtime/host.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "psvrecore/vulkan/device.hpp"
 #include "psvrecore/vulkan/resources.hpp"
@@ -96,7 +97,9 @@ struct Window::Presenter {
     struct InFlight {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
-        VkSemaphore acquired = VK_NULL_HANDLE;
+        // (signalled when the swapchain's image is ours: waited for here, not by the GPU, whose queue the renderer's
+        // scenes share and would wait behind a present's wait for the compositor)
+        VkFence acquired = VK_NULL_HANDLE;
         vulkan::Buffer staging;
         vulkan::Image image;
     };
@@ -153,7 +156,7 @@ struct Window::Presenter {
             vulkan::destroy_buffer(*device, f.staging);
             vulkan::destroy_image(*device, f.image);
             if (f.fence) vkDestroyFence(d, f.fence, nullptr);
-            if (f.acquired) vkDestroySemaphore(d, f.acquired, nullptr);
+            if (f.acquired) vkDestroyFence(d, f.acquired, nullptr);
         }
         vulkan::destroy_buffer(*device, readback);
         vulkan::destroy_image(*device, gpu_image);
@@ -181,9 +184,9 @@ struct Window::Presenter {
             fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
             if (VkResult r = vkCreateFence(d, &fi, nullptr, &f.fence); r != VK_SUCCESS)
                 return nx::err(vulkan::vk_error("vkCreateFence", r));
-            VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-            if (VkResult r = vkCreateSemaphore(d, &si, nullptr, &f.acquired); r != VK_SUCCESS)
-                return nx::err(vulkan::vk_error("vkCreateSemaphore", r));
+            VkFenceCreateInfo ai_fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            if (VkResult r = vkCreateFence(d, &ai_fence, nullptr, &f.acquired); r != VK_SUCCESS)
+                return nx::err(vulkan::vk_error("vkCreateFence", r));
         }
         quads = nx::make_unique<QuadRenderer>(*device);
         thread = nx::thread([this] { run(); });
@@ -200,6 +203,7 @@ struct Window::Presenter {
 
     void run() {
         nx::this_thread::set_name("psvrecore display");
+        runtime::host::frame_thread();
         while (true) {
             {
                 nx::scoped_lock<nx::mutex> held(lock);
@@ -391,7 +395,7 @@ struct Window::Presenter {
         next = (next + 1) % kFramesInFlight;
         vkWaitForFences(d, 1, &f.fence, VK_TRUE, UINT64_MAX);
         u32 index = 0;
-        VkResult r = vkAcquireNextImageKHR(d, swapchain, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &index);
+        VkResult r = vkAcquireNextImageKHR(d, swapchain, UINT64_MAX, VK_NULL_HANDLE, f.acquired, &index);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             out_of_date = true;
             return false;
@@ -400,6 +404,8 @@ struct Window::Presenter {
             nx::loge(logs::display, "display: vkAcquireNextImageKHR: {}", vulkan::result_name(r));
             return true;
         }
+        vkWaitForFences(d, 1, &f.acquired, VK_TRUE, UINT64_MAX);
+        vkResetFences(d, 1, &f.acquired);
 
         // The overlay's atlas, when it is new (rarely: the frames in flight done with the old one first).
         const VkFormat texture_format = is_srgb(format) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
@@ -548,11 +554,7 @@ struct Window::Presenter {
         }
         vkEndCommandBuffer(f.cmd);
 
-        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &f.acquired;
-        si.pWaitDstStageMask = &wait_stage;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &f.cmd;
         si.signalSemaphoreCount = 1;

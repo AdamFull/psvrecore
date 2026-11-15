@@ -314,6 +314,7 @@ struct DisplayEntry {
     u32 old_buffer = 0, new_buffer = 0;
     u32 data = 0;     // a copy of the callback data, in guest memory
     u64 scenes = 0;  // the last scene submitted before it: the frame's (scenes_submitted)
+    u64 queued_ns = 0, since_last_ns = 0;  // (when the game queued it, and how long after the frame before)
 };
 
 // The library's state (one per process).
@@ -380,6 +381,11 @@ void end_scene(Scene&& scene, nx::vector<Notification> notifications);
 // written. At the library's points of synchronisation (a notification waited for, sceGxmFinish, the display queue,
 // transfers, a frame buffer set, memory unmapped), before anything reads what the GPU draws.
 void finish_scenes(u64 upto = ~0ull);  // (the scenes ended up to this one, numbered from 1)
+// (the last finish_scenes on this thread: its time waiting for the renderer's lock, for the GPU, and writing back)
+struct FinishTimes {
+    u64 lock_ns = 0, gpu_ns = 0, finish_ns = 0;
+};
+inline thread_local FinishTimes t_finish_times;
 // The number of the last scene ended (0: none yet).
 u64 scenes_submitted();
 // The number of the last scene the renderer's thread is done with (submitted, or found to have nothing to draw).

@@ -5,6 +5,7 @@
 
 #include "psvrecore/log.hpp"
 #include "state.hpp"
+#include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
 
 namespace psvrecore::gxm::hle {
@@ -189,7 +190,10 @@ i32 sceGxmDisplayQueueAddEntry(u32 old_buffer, u32 new_buffer, u32 data) {
         nx::scoped_lock<nx::mutex> held(s.queue_lock);
         ++s.display_holds[new_buffer];
         ++s.holds_placed[new_buffer];
-        s.queue.push_back(DisplayEntry{old_buffer, new_buffer, slot, scenes_submitted()});
+        static u64 last_queued = 0;
+        const u64 now = nx::os::ticks_ns();
+        s.queue.push_back(DisplayEntry{old_buffer, new_buffer, slot, scenes_submitted(), now, last_queued ? now - last_queued : 0});
+        last_queued = now;
     }
     s.queue_changed.notify_all();
     return 0;
