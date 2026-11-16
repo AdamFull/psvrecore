@@ -291,6 +291,15 @@ Runtime::Runtime(const Config& config) : config_(config) {
         return;
     }
     host::set_fault_region(memory_.base(), (1ull << 32) + (1ull << 20), on_guest_fault);
+    host::set_write_watch(
+        [](u64 offset) {
+            Runtime* rt = current_runtime();
+            return rt && rt->memory().resolve_write_fault(offset);
+        },
+        [](u64 offset, u64 size) {
+            if (Runtime* rt = current_runtime(); rt && offset < (1ull << 32))
+                rt->memory().note_write(static_cast<u32>(offset), static_cast<u32>(std::min<u64>(size, (1ull << 32) - offset)));
+        });
     watch_from_environment(memory_.base());
     Kernel::Config kc = config.kernel;
     kc.stack_region = layout::kStacks;
@@ -312,6 +321,7 @@ Runtime::~Runtime() {
     g_runtime.store(nullptr, std::memory_order_release);
     hle::clear_libraries();
     recomp::clear_modules();
+    host::set_write_watch(nullptr, nullptr);
     host::set_fault_region(nullptr, 0, nullptr);
     memory_.shutdown();
 }

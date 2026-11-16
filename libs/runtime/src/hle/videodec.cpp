@@ -105,6 +105,7 @@ bool write_picture(const media::Picture& p, Frame& f) {
     const u32 bytes = type == kPixelRgba || type == kPixelBgra ? 4 : 0;
     const u32 frame_bytes = bytes ? f.pitch * f.height * 4 : f.pitch * f.height * 3 / 2;
     if (!writable(f.picture[0], frame_bytes)) return false;
+    memory().note_write(f.picture[0], frame_bytes);  // (watched pages opened at once, not a fault for each)
     u8* out = memory().host(f.picture[0]);
     if (bytes) {
         // (BT.601, limited range; the alpha the option gives)

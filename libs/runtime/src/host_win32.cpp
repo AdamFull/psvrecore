@@ -49,6 +49,8 @@ struct FaultRegion {
     std::atomic<uintptr_t> base{0};
     std::atomic<u64> size{0};
     std::atomic<FaultHandler> handler{nullptr};
+    std::atomic<FaultResolver> resolve{nullptr};
+    std::atomic<WriteNotice> notice{nullptr};
     void* vectored = nullptr;
 };
 FaultRegion g_fault;
@@ -59,8 +61,12 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
     const FaultHandler handler = g_fault.handler.load(std::memory_order_acquire);
     const uintptr_t base = g_fault.base.load(std::memory_order_relaxed);
     const uintptr_t address = static_cast<uintptr_t>(r->ExceptionInformation[1]);
-    if (!handler || address < base || address - base >= g_fault.size.load(std::memory_order_relaxed))
-        return EXCEPTION_CONTINUE_SEARCH;
+    if (address < base || address - base >= g_fault.size.load(std::memory_order_relaxed)) return EXCEPTION_CONTINUE_SEARCH;
+    if (r->ExceptionInformation[0] == 1) {
+        const FaultResolver resolve = g_fault.resolve.load(std::memory_order_acquire);
+        if (resolve && resolve(address - base)) return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (!handler) return EXCEPTION_CONTINUE_SEARCH;
     handler(address - base, r->ExceptionInformation[0] == 1);
     return EXCEPTION_CONTINUE_SEARCH;  // (the handler reports; the process then ends as for any access violation)
 }
@@ -234,6 +240,11 @@ bool decommit(void* address, usize size) {
     return VirtualFree(address, size, MEM_DECOMMIT) != 0;
 }
 
+void set_write_watch(FaultResolver resolve, WriteNotice notice) {
+    g_fault.resolve.store(resolve, std::memory_order_release);
+    g_fault.notice.store(notice, std::memory_order_release);
+}
+
 void set_fault_region(void* base, u64 size, FaultHandler on_fault) {
     g_fault.handler.store(nullptr, std::memory_order_release);
     g_fault.base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_relaxed);
@@ -285,9 +296,21 @@ void File::close() {
     handle_ = kInvalid;
 }
 
+// (a read into the fault region: its watched pages opened first, and again if one was watched meanwhile)
+static bool notice_write(const void* buffer, u64 size) {
+    const WriteNotice notice = g_fault.notice.load(std::memory_order_acquire);
+    const uintptr_t base = g_fault.base.load(std::memory_order_relaxed);
+    const uintptr_t at = reinterpret_cast<uintptr_t>(buffer);
+    if (!notice || at < base || at - base >= g_fault.size.load(std::memory_order_relaxed)) return false;
+    notice(at - base, size);
+    return true;
+}
+
 i64 File::read_at(u64 offset, void* buffer, u64 size) const {
     u8* out = static_cast<u8*>(buffer);
     u64 done = 0;
+    const bool guest = notice_write(buffer, size);
+    u32 refused = 0;
     while (done < size) {
         OVERLAPPED o{};
         const u64 at = offset + done;
@@ -296,7 +319,9 @@ i64 File::read_at(u64 offset, void* buffer, u64 size) const {
         const DWORD chunk = static_cast<DWORD>(size - done > 0x40000000u ? 0x40000000u : size - done);
         DWORD n = 0;
         if (!ReadFile(reinterpret_cast<HANDLE>(handle_), out + done, chunk, &n, &o)) {
-            if (GetLastError() == ERROR_HANDLE_EOF) break;
+            const DWORD e = GetLastError();
+            if (e == ERROR_HANDLE_EOF) break;
+            if (e == ERROR_NOACCESS && guest && ++refused < 8 && notice_write(out + done, size - done)) continue;
             return done ? static_cast<i64>(done) : -1;
         }
         done += n;

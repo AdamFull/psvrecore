@@ -96,6 +96,19 @@ public:
     // A guest NUL-terminated string at `address` (at most `max` bytes; empty if it is not in mapped memory).
     nx::string string(u32 address, u32 max = 4096) const;
 
+    // Write watching, for caches of what guest memory holds (the renderer's textures, hashed once rather than for
+    // each scene): a range's host pages made read-only until something writes them; the write goes through, and is
+    // counted. A range whose count (writes) is what it was once watched has not been written since. False: a page of
+    // it cannot be watched (not all of it mapped read/write). The OS writing into guest memory (a file read) does
+    // not fault but fails: host::File::read_at says so first (note_write), as may writes known to come (a scene's
+    // write-back: one call, not a fault for each page).
+    bool watch_writes(u32 address, u32 size);
+    u64 writes(u32 address, u32 size) const;
+    void note_write(u32 address, u32 size);
+    // (the fault handler's, from the faulting thread: a write to a watched page, let through; false: not one)
+    bool resolve_write_fault(u64 offset);
+    u64 write_faults() const { return write_faults_.load(std::memory_order_relaxed); }
+
 private:
     bool commit(u32 base, u32 size, Access access);
     bool overlaps(u32 base, u32 size) const;
@@ -110,6 +123,17 @@ private:
         std::atomic<u8> access[(1ull << 32) / kPageSize];
     };
     nx::unique_ptr<Pages> pages_;
+    // By host page (at least the guest's): 0 open, 1 read-only (watched), 2 being opened; and its writes seen.
+    struct Watches {
+        std::atomic<u8> state[(1ull << 32) / kPageSize];
+        std::atomic<u32> count[(1ull << 32) / kPageSize];
+    };
+    nx::unique_ptr<Watches> watches_owner_;  // (made when a range is first watched, under lock_)
+    std::atomic<Watches*> watches_{nullptr};
+    u32 host_shift_ = 12;  // (log2 of the host's page size)
+    std::atomic<u64> write_faults_{0};
+    void open_page(Watches& w, u64 page);  // (a watched page's protection back to read/write, counted)
+    void unwatch(u64 begin, u64 end);       // (under lock_: pages whose protection is set or that go back)
     nx::map<u32, Block> blocks_;  // by base
     nx::vector<Region> reserved_ranges_;
 };

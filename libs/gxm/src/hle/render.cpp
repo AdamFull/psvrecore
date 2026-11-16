@@ -441,6 +441,17 @@ struct Renderer {
     // textures' texels), for the next scenes: not made and freed six times or more a scene.
     nx::vector<vk::Buffer> free_buffers;
     u64 free_buffer_bytes = 0;
+    // A texture's content key, by its control words: its memory watched for writes once hashed (watch_writes), and
+    // hashed again once written, not for each scene (a song's scenes hashed 7 MB each: a sixth of the thread that
+    // ends them, on a phone). One written each time it is looked at, three times running, is hashed each time for
+    // a while (a frame's CPU writes would fault for each page); a movie's frames are.
+    struct ContentMemo {
+        u64 key = 0, writes = 0, hash_until = 0;  // (hash_until: a scene number)
+        u32 address = 0, size = 0, palette = 0;
+        u8 strikes = 0;
+        bool watched = false;
+    };
+    nx::hash_map<u64, ContentMemo> content_memo;
     // (descriptor pools reset, for the next scenes: by size, kPoolSets sets and each power of two above it)
     nx::vector<VkDescriptorPool> free_pools[4];
     // Scenes submitted to the GPU whose results are not in guest memory yet, oldest first: what each writes there,
@@ -1607,6 +1618,7 @@ struct SceneProfile {
                                                 "read (colour surface)", "read (depth surface)", "read (texture)"};
     u64 why_count[kWhys] = {}, why_wait_ns[kWhys] = {};
 
+    u64 unchanged = 0, write_faults = 0;  // (textures found unwritten; writes to watched pages, by the process)
     u64 from_targets = 0, lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
     u64 at = 0;
     u32 part = 0, scenes = 0;
@@ -1682,9 +1694,10 @@ struct SceneProfile {
                      static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
                      static_cast<f64>(from_targets) / scenes);
         std::fprintf(stderr,
-                     " textures: %.1f lookups, %.1f hashed (%.2f ms), %.2f new (%.0f KiB, %.2f ms: decoded %.2f, made "
-                     "%.2f, uploaded %.2f) a scene\n",
-                     static_cast<f64>(lookups) / scenes, static_cast<f64>(hashed) / scenes, static_cast<f64>(hash_ns) / 1e6 / scenes,
+                     " textures: %.1f lookups, %.1f unwritten, %.1f hashed (%.2f ms), %.1f writes to watched pages, %.2f "
+                     "new (%.0f KiB, %.2f ms: decoded %.2f, made %.2f, uploaded %.2f) a scene\n",
+                     static_cast<f64>(lookups) / scenes, static_cast<f64>(unchanged) / scenes, static_cast<f64>(hashed) / scenes,
+                     static_cast<f64>(hash_ns) / 1e6 / scenes, static_cast<f64>(memory().write_faults() - write_faults) / scenes,
                      static_cast<f64>(misses) / scenes, static_cast<f64>(miss_bytes) / 1024.0 / scenes,
                      static_cast<f64>(miss_ns) / 1e6 / scenes, static_cast<f64>(decode_ns) / 1e6 / scenes,
                      static_cast<f64>(create_ns) / 1e6 / scenes, static_cast<f64>(upload_ns) / 1e6 / scenes);
@@ -1692,6 +1705,7 @@ struct SceneProfile {
         *this = SceneProfile{};
         on = read = true;
         gpu_last_end = last_end;
+        write_faults = memory().write_faults();
     }
 };
 SceneProfile g_profile;
@@ -1953,13 +1967,31 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         }
         g_finish_why = 7, finish_pending(r, true);
     }
-    const u64 hash_start = g_profile.on ? nx::os::ticks_ns() : 0;
-    u64 key = content_hash(reinterpret_cast<const u8*>(words.words), sizeof words.words, 0);
-    key = content_hash(static_cast<const u8*>(memory().host(info.address)), size, key);
-    if (info.palette && memory().valid(info.palette, 1024))
-        key = content_hash(static_cast<const u8*>(memory().host(info.palette)), 1024, key);
+    const u32 palette = info.palette && memory().valid(info.palette, 1024) ? info.palette : 0;
+    auto writes = [&] { return memory().writes(info.address, size) + (palette ? memory().writes(palette, 1024) : 0); };
+    Renderer::ContentMemo& memo = r.content_memo[wh.value()];
+    u64 key = 0;
+    if (memo.watched && memo.address == info.address && memo.size == size && memo.palette == palette &&
+        writes() == memo.writes) {
+        key = memo.key;
+        memo.strikes = 0;
+        if (g_profile.on) ++g_profile.unchanged;
+    } else {
+        const u64 hash_start = g_profile.on ? nx::os::ticks_ns() : 0;
+        if (memo.watched && ++memo.strikes >= 3) memo.hash_until = r.scenes + 256, memo.strikes = 0;
+        // (watched before it is hashed: a write while it is, is seen next time)
+        const bool watched = !is_yuv420(info) && memo.hash_until <= r.scenes && memory().watch_writes(info.address, size) &&
+                             (!palette || memory().watch_writes(palette, 1024));
+        const u64 seen_writes = watched ? writes() : 0;
+        key = content_hash(reinterpret_cast<const u8*>(words.words), sizeof words.words, 0);
+        key = content_hash(static_cast<const u8*>(memory().host(info.address)), size, key);
+        if (palette) key = content_hash(static_cast<const u8*>(memory().host(palette)), 1024, key);
+        memo.key = key, memo.writes = seen_writes, memo.watched = watched;
+        memo.address = info.address, memo.size = size, memo.palette = palette;
+        if (r.content_memo.size() > 8192) r.content_memo.clear();  // (the words of textures long gone)
+        if (g_profile.on) ++g_profile.hashed, g_profile.hash_ns += nx::os::ticks_ns() - hash_start;
+    }
     seen[wh.value()] = key;
-    if (g_profile.on) ++g_profile.hashed, g_profile.hash_ns += nx::os::ticks_ns() - hash_start;
     if (auto it = r.textures.find(key); it != r.textures.end()) {
         it->second.used = r.scenes;
         return &it->second;

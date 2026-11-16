@@ -48,6 +48,8 @@ struct FaultRegion {
     std::atomic<uintptr_t> base{0};
     std::atomic<u64> size{0};
     std::atomic<FaultHandler> handler{nullptr};
+    std::atomic<FaultResolver> resolve{nullptr};
+    std::atomic<WriteNotice> notice{nullptr};
     bool installed = false;
     struct sigaction previous_segv {};
     struct sigaction previous_bus {};
@@ -58,8 +60,15 @@ void on_signal(int sig, siginfo_t* info, void* uc) {
     const FaultHandler handler = g_fault.handler.load(std::memory_order_acquire);
     const uintptr_t base = g_fault.base.load(std::memory_order_relaxed);
     const uintptr_t address = reinterpret_cast<uintptr_t>(info->si_addr);
-    if (handler && address >= base && address - base < g_fault.size.load(std::memory_order_relaxed))
-        handler(address - base, false);  // (POSIX does not say whether it was a write)
+    const bool in_region = address >= base && address - base < g_fault.size.load(std::memory_order_relaxed);
+    if (in_region && sig == SIGSEGV) {
+        const int saved = errno;
+        const FaultResolver resolve = g_fault.resolve.load(std::memory_order_acquire);
+        const bool resolved = resolve && resolve(address - base);
+        errno = saved;
+        if (resolved) return;
+    }
+    if (handler && in_region) handler(address - base, false);  // (POSIX does not say whether it was a write)
     // Hand the signal on to whoever had it before (nx-foundation's crash reporter, or the default action).
     const struct sigaction& previous = sig == SIGBUS ? g_fault.previous_bus : g_fault.previous_segv;
     if (previous.sa_flags & SA_SIGINFO) {
@@ -206,6 +215,11 @@ void thread_times(ThreadTime each, void* user) {
 #endif
 }
 
+void set_write_watch(FaultResolver resolve, WriteNotice notice) {
+    g_fault.resolve.store(resolve, std::memory_order_release);
+    g_fault.notice.store(notice, std::memory_order_release);
+}
+
 void set_fault_region(void* base, u64 size, FaultHandler on_fault) {
     g_fault.handler.store(nullptr, std::memory_order_release);
     g_fault.base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_relaxed);
@@ -264,13 +278,26 @@ void File::close() {
     handle_ = kInvalid;
 }
 
+// (a read into the fault region: its watched pages opened first, and again if one was watched meanwhile)
+static bool notice_write(const void* buffer, u64 size) {
+    const WriteNotice notice = g_fault.notice.load(std::memory_order_acquire);
+    const uintptr_t base = g_fault.base.load(std::memory_order_relaxed);
+    const uintptr_t at = reinterpret_cast<uintptr_t>(buffer);
+    if (!notice || at < base || at - base >= g_fault.size.load(std::memory_order_relaxed)) return false;
+    notice(at - base, size);
+    return true;
+}
+
 i64 File::read_at(u64 offset, void* buffer, u64 size) const {
     u8* out = static_cast<u8*>(buffer);
     u64 done = 0;
+    const bool guest = notice_write(buffer, size);
+    u32 refused = 0;
     while (done < size) {
         const ssize_t n = pread(static_cast<int>(handle_), out + done, size - done, static_cast<off_t>(offset + done));
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (errno == EFAULT && guest && ++refused < 8 && notice_write(out + done, size - done)) continue;
             return done ? static_cast<i64>(done) : -1;
         }
         if (n == 0) break;

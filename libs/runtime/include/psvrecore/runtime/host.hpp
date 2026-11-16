@@ -19,6 +19,14 @@ bool decommit(void* address, usize size);
 using FaultHandler = void (*)(u64 offset, bool write);
 void set_fault_region(void* base, u64 size, FaultHandler on_fault);
 
+// Faults in that region the runtime resolves before any is reported: writes to pages it made read-only to see
+// writes (GuestMemory::watch_writes). `resolve` is called from the faulting thread (in a signal handler: it may only
+// use atomics and change pages' protection) and returns true to run the access again. The OS writing into the
+// region (File::read_at) does not fault but fails: `notice` is called first, with the range it writes.
+using FaultResolver = bool (*)(u64 offset);
+using WriteNotice = void (*)(u64 offset, u64 size);
+void set_write_watch(FaultResolver resolve, WriteNotice notice);
+
 // Debugging: up to four hardware watchpoints, in every thread of the process (threads started later are covered
 // within a few milliseconds). Each is an aligned range of 1, 2, 4 or 8 bytes, hit by a write, or (size 0) an
 // instruction, hit when it runs. `on_hit` is called from the thread that hit it, with the watchpoint's index, the

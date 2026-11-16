@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "nxtest.h"
+#include "psvrecore/runtime/host.hpp"
 #include "runtime_support.hpp"
 #include "core/foundation/platform/filesystem.h"
 #include "core/foundation/platform/os.h"
@@ -63,6 +64,76 @@ TEST_CASE("memory: blocks are mapped, found, protected and given back") {
     std::memcpy(m.host(a), "guest\0", 6);
     CHECK(m.string(a) == "guest");
     CHECK(m.string(0x70000000u).empty());  // (unmapped)
+}
+
+TEST_CASE("memory: writes to watched pages go through and are counted") {
+    TempDir dir;
+    TestRuntime t;
+    GuestMemory& m = t.rt.memory();
+    constexpr u32 kBase = 0x90000000u, kSize = 0x40000;  // (whole host pages of 4 or 16 KiB)
+    REQUIRE(m.map_fixed(kBase, kSize, Access::ReadWrite, BlockKind::MemBlock, "watched"));
+    REQUIRE(m.map_fixed(kBase + kSize, 0x10000, Access::Read, BlockKind::Module, "code"));
+    CHECK_FALSE(m.watch_writes(kBase + kSize, 0x1000));  // (not read/write)
+
+    // Reads leave it as it was; a write is let through, and counted.
+    REQUIRE(m.watch_writes(kBase, kSize));
+    const u64 before = m.writes(kBase, kSize), faults = m.write_faults();
+    CHECK(psv_ld32(kBase + 0x1000) == 0);
+    CHECK(m.writes(kBase, kSize) == before);
+    psv_st32(kBase + 0x1000, 0x12345678u);
+    CHECK(psv_ld32(kBase + 0x1000) == 0x12345678u);
+    CHECK(m.writes(kBase, kSize) != before);
+    CHECK(m.write_faults() == faults + 1);
+    psv_st32(kBase + 0x1004, 1);  // (that page is open now: no fault)
+    CHECK(m.write_faults() == faults + 1);
+
+    // Several threads writing one watched page at once: all of their writes land.
+    REQUIRE(m.watch_writes(kBase, kSize));
+    {
+        nx::vector<nx::thread> writers;
+        for (u32 i = 0; i < 4; ++i) writers.emplace_back([i] { psv_st32(kBase + 0x8000 + i * 4, 100 + i); });
+        for (nx::thread& w : writers) w.join();
+    }
+    for (u32 i = 0; i < 4; ++i) CHECK(psv_ld32(kBase + 0x8000 + i * 4) == 100 + i);
+
+    // Written as noted (no fault), and by the OS: a file read into watched pages works, and counts.
+    REQUIRE(m.watch_writes(kBase, kSize));
+    u64 seen = m.writes(kBase, kSize);
+    const u64 faults_before_note = m.write_faults();
+    m.note_write(kBase + 0x2000, 8);
+    CHECK(m.writes(kBase, kSize) != seen);
+    psv_st32(kBase + 0x2000, 7);
+    CHECK(m.write_faults() == faults_before_note);
+    const nx::string path = nx::format("{}/data.bin", dir.path);
+    {
+        host::OpenOptions o;
+        o.mode = host::OpenMode::Write;
+        o.create = o.truncate = true;
+        host::File f = host::File::open(path, o, nullptr);
+        REQUIRE(f.valid());
+        CHECK(f.write_at(0, "file data", 9) == 9);
+    }
+    REQUIRE(m.watch_writes(kBase, kSize));
+    seen = m.writes(kBase, kSize);
+    {
+        host::OpenOptions o;
+        o.mode = host::OpenMode::Read;
+        host::File f = host::File::open(path, o, nullptr);
+        REQUIRE(f.valid());
+        CHECK(f.read_at(0, m.host(kBase + 0x3000), 9) == 9);
+    }
+    CHECK(std::memcmp(m.host(kBase + 0x3000), "file data", 9) == 0);
+    CHECK(m.writes(kBase, kSize) != seen);
+
+    // Given back while watched, and mapped again: writable, fresh, and counted as changed.
+    REQUIRE(m.watch_writes(kBase, kSize));
+    seen = m.writes(kBase, kSize);
+    CHECK(m.unmap(kBase));
+    REQUIRE(m.map_fixed(kBase, kSize, Access::ReadWrite, BlockKind::MemBlock, "again"));
+    CHECK(m.writes(kBase, kSize) != seen);
+    CHECK(psv_ld32(kBase + 0x1000) == 0);
+    psv_st32(kBase + 0x1000, 5);
+    CHECK(psv_ld32(kBase + 0x1000) == 5);
 }
 
 namespace {
