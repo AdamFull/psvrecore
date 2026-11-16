@@ -315,6 +315,11 @@ Id Translator::reg_index(const Operand& o, i64 word, u32 size, BankVar* bank) {
 }
 
 Id Translator::word_ptr(const Operand& o, i64 word, bool write) {
+    // (the secondary form: its draw's secondary attributes read and written in the buffer itself, not copied into a
+    // private array and back: a phone's driver took 0.5-0.7 s to compile each program with the copy, its 512
+    // accesses unrolled around a 256-word array)
+    if (form_ == Form::Secondary && (o.bank == Bank::Primary || o.bank == Bank::Secondary))
+        return buffer_word(sa_buf_, iadd(sa_base_, reg_index(o, word, kBankSize, nullptr)));
     BankVar* bank = nullptr;
     switch (o.bank) {
         case Bank::Temp: bank = &temp_; break;
@@ -1367,21 +1372,15 @@ void Translator::compute_epilogue(Id gid, Id stopped) {
 
 // ---- The secondary form ----------------------------------------------------------------------------------------
 
-// The draw's secondary attributes (of the stage the push constants name), into the program's registers and back.
-// (a dispatch runs the program for the draws of a table in the secondary attributes' buffer: push constant 0 is
-// where the table starts, a workgroup a draw)
+// The draw's secondary attributes (of the stage the push constants name), where the program's registers read and
+// write them (word_ptr). (a dispatch runs the program for the draws of a table in the secondary attributes' buffer:
+// push constant 0 is where the table starts, a workgroup a draw, each with secondary attributes of its own)
 void Translator::secondary_prologue(Id workgroup) {
     const Id draw = load(tu_, buffer_word(sa_buf_, iadd(push_constant(0, tu_), workgroup)));
     sa_base_ = iadd(imul(draw, u(kDrawSecondaryWords)), imul(push_constant(5, tu_), u(256)));
-    sa_.minimum = 256;
-    for (u32 k = 0; k < 256; ++k)
-        store(chain(tp_fu_, sa_.var, {u(k)}), load(tu_, buffer_word(sa_buf_, iadd(sa_base_, u(k)))));
 }
 
-void Translator::secondary_epilogue() {
-    for (u32 k = 0; k < 256; ++k)
-        store(buffer_word(sa_buf_, iadd(sa_base_, u(k))), load(tu_, chain(tp_fu_, sa_.var, {u(k)})));
-}
+void Translator::secondary_epilogue() {}
 
 // ---- The vertex form -------------------------------------------------------------------------------------------
 
