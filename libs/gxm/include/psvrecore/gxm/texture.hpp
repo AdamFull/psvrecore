@@ -74,6 +74,32 @@ namespace detail {
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool reference, bool native_bc = false);
 }  // namespace detail
 
+// YUV420 textures (two planes or three), for a GPU to convert as read_texels does, to the same bytes: the planes as
+// they are in guest memory (the luma plane's rows y_pitch bytes each; the chroma planes' c_pitch texels, two bytes
+// each in the two-plane form, at `second`, and `third`), U and V in the order `swapped` says, and the conversion's
+// tables in 16.16 fixed point (luma with the rounding, red from V, green from U, green from V, blue from U): a
+// channel the sum of its terms shifted down 16, clamped to 0-255.
+struct Yuv420 {
+    u32 width = 0, height = 0;
+    u32 y_pitch = 0, c_pitch = 0;
+    u32 second = 0, third = 0;
+    bool three = false, swapped = false;
+    nx::vector<u8> planes;
+    i32 tables[5][256] = {};
+};
+bool is_yuv420(const TextureInfo& info);
+Result<Yuv420> read_yuv420(const TextureInfo& info, ReadGuest read);
+// The GPU's conversion (yuv420_shader, a compute shader of 8 x 8 invocations, one a pixel): one storage buffer
+// (binding 0 of set 0) of the tables, the planes and then the RGBA pixels it writes (yuv420_buffer lays it out), and
+// these push constants (word offsets in the buffer).
+struct Yuv420Constants {
+    u32 width, height, y_pitch, c_pitch, planes, second, third, flags, out;
+};
+nx::vector<u32> yuv420_shader();
+// The buffer's bytes (yuv420_buffer_bytes), filled but for the pixels; the constants for it.
+usize yuv420_buffer_bytes(const Yuv420& y);
+Yuv420Constants yuv420_buffer(const Yuv420& y, u8* out);
+
 // The colour space conversion of YUV textures' two slots (CSC0, CSC1): SCE_GXM_YUV_PROFILE_* (BT.601 or BT.709,
 // standard or full range). By default CSC0 is BT.601 and CSC1 BT.709, both of standard range.
 void set_yuv_profile(u32 csc, u32 profile);

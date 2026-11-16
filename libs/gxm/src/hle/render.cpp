@@ -414,12 +414,23 @@ struct Renderer {
     nx::vector<TargetCopy> target_copies;
     // New textures' texels (texture_for), uploaded by the scene's commands before its draws: not waited for, as a
     // copy submitted alone would be (behind the scenes the GPU still has). Their buffers go when the scene is done.
+    // A YUV420 texture (a movie's frame) is converted by the commands too (yuv_set: the staging buffer holds the
+    // planes and the conversion's tables, and the pixels it writes, copied from there).
     struct TextureUpload {
         u64 key;  // (the texture's in `textures`)
         vk::Buffer staging;
         nx::vector<VkBufferImageCopy> regions;
+        VkDescriptorSet yuv_set = VK_NULL_HANDLE;
+        Yuv420Constants yuv{};
     };
     nx::vector<TextureUpload> texture_uploads;
+    // The YUV420 conversion's pipeline (none: converted on the CPU, by read_texels), and its sets' pool.
+    struct YuvPipeline {
+        VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+    } yuv;
     // Depth/stencil images a scene drew with and no longer needs, for the next scene of their size: destroying one
     // (its memory freed, its framebuffers forgotten) took 3-25 ms on a desktop's driver, scene after scene.
     nx::vector<vk::Image> free_depths;
@@ -471,6 +482,56 @@ struct Renderer {
     nx::hash_map<u64, nx::string> failed_textures;
     u64 scenes = 0;
 };
+
+// The YUV420 conversion's pipeline (yuv420_shader): unless PSVRECORE_YUV_CPU is set, or the device has none.
+void make_yuv_pipeline(Renderer& r) {
+    if (const char* v = std::getenv("PSVRECORE_YUV_CPU"); v && *v && *v != '0') return;
+    const VkDevice dev = r.device->device();
+    Renderer::YuvPipeline& y = r.yuv;
+    VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    si.bindingCount = 1;
+    si.pBindings = &binding;
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Yuv420Constants)};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.setLayoutCount = 1;
+    li.pSetLayouts = &y.set_layout;
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &push;
+    const nx::vector<u32> code = yuv420_shader();
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = code.size() * 4;
+    mi.pCode = code.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pi.maxSets = 64;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &size;
+    bool ok = vkCreateDescriptorSetLayout(dev, &si, nullptr, &y.set_layout) == VK_SUCCESS &&
+              vkCreatePipelineLayout(dev, &li, nullptr, &y.layout) == VK_SUCCESS &&
+              vkCreateShaderModule(dev, &mi, nullptr, &module) == VK_SUCCESS &&
+              vkCreateDescriptorPool(dev, &pi, nullptr, &y.pool) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module;
+        ci.stage.pName = "main";
+        ci.layout = y.layout;
+        ok = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &y.pipeline) == VK_SUCCESS;
+    }
+    if (module) vkDestroyShaderModule(dev, module, nullptr);
+    if (!ok) {
+        nx::logw(logs::gpu, "gxm: no YUV conversion on the GPU: movies' frames converted on the CPU");
+        if (y.pipeline) vkDestroyPipeline(dev, y.pipeline, nullptr);
+        if (y.pool) vkDestroyDescriptorPool(dev, y.pool, nullptr);
+        if (y.layout) vkDestroyPipelineLayout(dev, y.layout, nullptr);
+        if (y.set_layout) vkDestroyDescriptorSetLayout(dev, y.set_layout, nullptr);
+        y = {};
+    }
+}
 
 Renderer& renderer() {
     // (never destroyed: the flusher thread may look at it until the process ends)
@@ -653,6 +714,7 @@ bool ensure(Renderer& r) {
     li.pushConstantRangeCount = 1;
     li.pPushConstantRanges = &push;
     vkCreatePipelineLayout(d.device(), &li, nullptr, &r.layout);
+    make_yuv_pipeline(r);
     vk::ImageDesc wd;
     wd.width = wd.height = 1;
     if (auto img = vk::create_image(d, wd)) {
@@ -765,8 +827,14 @@ VkPipeline secondary_pipeline_keyed(Renderer& r, const Program& p) {
     const ShaderKey full = secondary_key(p);
     const u64 key = short_key(full);
     if (auto it = r.compute.find(key); it != r.compute.end()) return it->second;
+    const u64 t0 = nx::os::ticks_ns();
     const VkShaderModule m = module_for(r, full, [&] { return translate_secondary(p.gxp, p.secondary); });
+    const u64 t1 = nx::os::ticks_ns();
     const VkPipeline pipeline = m ? make_compute(r, m) : VK_NULL_HANDLE;
+    // (PSVRECORE_GXM_PROFILE: a secondary program's pipeline that took a while to make)
+    if (const u64 t2 = nx::os::ticks_ns(); t2 - t0 >= 5'000'000 && std::getenv("PSVRECORE_GXM_PROFILE"))
+        nx::logi(logs::gpu, "gxm profile: a slow compute pipeline, {:.1f} ms: the module {:.1f}, the pipeline {:.1f}",
+                 static_cast<f64>(t2 - t0) / 1e6, static_cast<f64>(t1 - t0) / 1e6, static_cast<f64>(t2 - t1) / 1e6);
     if (pipeline) {
         r.cache.add_compute(full);
         if (!r.warming) r.made_pipelines.fetch_add(1);
@@ -933,6 +1001,48 @@ Result<void> queue_texels(Renderer& r, u64 key, const Texels& t) {
     }
     r.texture_uploads.push_back(std::move(u));
     return {};
+}
+
+// A YUV420 texture's planes into a staging buffer, to be converted into the texture `key` by the scene's commands
+// (false: no set for it now: read_texels then).
+Result<bool> queue_yuv420(Renderer& r, u64 key, const Yuv420& y) {
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = r.yuv.pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &r.yuv.set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(r.device->device(), &ai, &set) != VK_SUCCESS) return false;
+    const usize bytes = yuv420_buffer_bytes(y);
+    auto staging = take_host_buffer(r, bytes);
+    if (!staging) {
+        vkFreeDescriptorSets(r.device->device(), r.yuv.pool, 1, &set);
+        return nx::err(staging.error());
+    }
+    Renderer::TextureUpload u{key, *staging, {}};
+    u.yuv = yuv420_buffer(y, static_cast<u8*>(staging->mapped));
+    vk::flush(*r.device, *staging);
+    u.yuv_set = set;
+    VkDescriptorBufferInfo bi{staging->buffer, 0, bytes};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &bi;
+    vkUpdateDescriptorSets(r.device->device(), 1, &w, 0, nullptr);
+    VkBufferImageCopy c{};
+    c.bufferOffset = VkDeviceSize{u.yuv.out} * 4;
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {y.width, y.height, 1};
+    u.regions.push_back(c);
+    r.texture_uploads.push_back(std::move(u));
+    return true;
+}
+
+// An upload's buffer (and set) given back.
+void give_upload(Renderer& r, Renderer::TextureUpload& u) {
+    give_host_buffer(r, u.staging);
+    if (u.yuv_set) vkFreeDescriptorSets(r.device->device(), r.yuv.pool, 1, &u.yuv_set);
+    u.yuv_set = VK_NULL_HANDLE;
 }
 
 // Uploads decoded texels and waits: each face's levels.
@@ -1584,6 +1694,22 @@ CachedTexture* texture_from_pending_target(Renderer& r, const TextureInfo& info,
 
 // The copies texture_from_target asked for, and the new textures' uploads, recorded before the scene's draws.
 void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
+    bool converted = false;
+    for (Renderer::TextureUpload& u : r.texture_uploads) {
+        if (!u.yuv_set || r.textures.find(u.key) == r.textures.end()) continue;
+        if (!converted) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.yuv.pipeline);
+        converted = true;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.yuv.layout, 0, 1, &u.yuv_set, 0, nullptr);
+        vkCmdPushConstants(cmd, r.yuv.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof u.yuv, &u.yuv);
+        vkCmdDispatch(cmd, (u.yuv.width + 7) / 8, (u.yuv.height + 7) / 8, 1);
+    }
+    if (converted) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr,
+                             0, nullptr);
+    }
     for (Renderer::TextureUpload& u : r.texture_uploads) {
         auto it = r.textures.find(u.key);
         if (it == r.textures.end()) continue;
@@ -1620,7 +1746,7 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
 void finish_target_copies(Renderer& r, bool recorded) {
     if (!recorded) {
         for (Renderer::TextureUpload& u : r.texture_uploads) {
-            give_host_buffer(r, u.staging);
+            give_upload(r, u);
             if (auto it = r.textures.find(u.key); it != r.textures.end()) {
                 r.texture_bytes -= it->second.bytes;
                 vk::destroy_image(*r.device, it->second.image);
@@ -1702,11 +1828,22 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     if (g_profile.on && g_profile.misses % 50 == 0)
         std::fprintf(stderr, "gxm profile: new texture at %08x: format %08x type %u, %u x %u, %u levels, %u bytes\n",
                      info.address, info.base_format, info.type, info.width, info.height, info.levels, size);
-    auto texels = read_texels(info, [](u32 address, void* out, u32 bytes) {
+    auto read_guest = [](u32 address, void* out, u32 bytes) {
         if (!memory().valid(address, bytes)) return false;
         std::memcpy(out, memory().host(address), bytes);
         return true;
-    }, r.device->caps().texture_bc);
+    };
+    // (a movie's frame: its planes, for the GPU to convert; else the texels, decoded here)
+    std::optional<Yuv420> yuv;
+    if (r.yuv.pipeline && is_yuv420(info)) {
+        if (auto planes = read_yuv420(info, read_guest)) yuv = std::move(*planes);
+    }
+    Result<Texels> texels = Texels{};
+    if (yuv) {
+        texels->width = yuv->width, texels->height = yuv->height;
+    } else {
+        texels = read_texels(info, read_guest, r.device->caps().texture_bc);
+    }
     if (!texels) {
         nx::logw(logs::gxm, "{} (format 0x{:08x}, type {})", texels.error().message, info.base_format, info.type);
         r.failed_textures[key] = texels.error().message;
@@ -1726,6 +1863,19 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     d.cube = texels->faces == 6;
     const u64 decoded_at = g_profile.on ? nx::os::ticks_ns() : 0;
     if (g_profile.on) g_profile.decode_ns += decoded_at - miss_start, miss_time.decoded = decoded_at;
+    // (the texels' upload, or the planes' conversion: decoded here when no set is free for it)
+    auto queue = [&]() -> Result<void> {
+        if (yuv) {
+            auto queued = queue_yuv420(r, key, *yuv);
+            if (!queued) return nx::err(queued.error());
+            if (*queued) return {};
+            auto decoded = read_texels(info, read_guest, r.device->caps().texture_bc);
+            if (!decoded) return nx::err(decoded.error());
+            *texels = std::move(*decoded);
+        }
+        return queue_texels(r, key, *texels);
+    };
+    const u64 texel_bytes = u64{d.width} * d.height * 4;  // (both forms: RGBA8, one level)
     // (the image these words showed before, when no draw of this scene samples it and it has this size and format)
     if (auto was = r.by_words.find(wh.value()); was != r.by_words.end()) {
         auto old = r.textures.find(was->second);
@@ -1735,7 +1885,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
                 od.layers == d.layers && od.cube == d.cube) {
                 CachedTexture c = old->second;
                 r.textures.erase(old);
-                if (!queue_texels(r, key, *texels)) {
+                if (!queue()) {
                     r.texture_bytes -= c.bytes;
                     vk::destroy_image(*r.device, c.image);
                     r.by_words.erase(wh.value());
@@ -1753,7 +1903,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     const u64 created_at = g_profile.on ? nx::os::ticks_ns() : 0;
     if (g_profile.on) g_profile.create_ns += created_at - decoded_at;
     if (!image) return nullptr;
-    if (!queue_texels(r, key, *texels)) {
+    if (!queue()) {
         vk::destroy_image(*r.device, *image);
         return nullptr;
     }
@@ -1762,7 +1912,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     c.image = *image;
     c.sampler = texture_sampler(r, info, d.format, texels->levels);
     c.used = r.scenes;
-    c.bytes = texels->data.size();
+    c.bytes = yuv ? texel_bytes : texels->data.size();
     r.texture_bytes += c.bytes;
     r.by_words[wh.value()] = key;
     auto [it, added] = r.textures.emplace(key, c);
@@ -3182,7 +3332,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (!depth_target && !kept_depth && depth.image) free_depth_image(r, depth);
         for (Renderer::TargetCopy& c : copies)
             if (c.strip.buffer) vk::destroy_buffer(d, c.strip);
-        for (Renderer::TextureUpload& u : uploads) give_host_buffer(r, u.staging);
+        for (Renderer::TextureUpload& u : uploads) give_upload(r, u);
         back_mark(3);
     };
     r.target_copies.clear();  // (moved into the scene's finish: the guard finds none)

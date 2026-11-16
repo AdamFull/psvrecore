@@ -4,11 +4,13 @@
 // PSVRECORE_TEST_GPU=<index> picks the device (by default a discrete GPU).
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "nxtest.h"
 #include "psvrecore/gxm/spirv.hpp"
+#include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/vulkan/frames.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
 #include "spirv/unified1/spirv.h"
@@ -479,5 +481,116 @@ TEST_CASE("vulkan gpu: frames in flight, streamed data and deferred releases") {
     CHECK(near(pixel(image, 32, 32), 255, 0, 0, 255, 0));  // the last frame's colour
     g->passes->forget(color.view);
     destroy_image(d, color);
+    check_no_validation_errors(*g);
+}
+
+TEST_CASE("vulkan gpu: YUV420 textures converted by a compute shader as on the CPU") {
+    auto g = open(false);
+    Device& d = *g->device;
+    const VkShaderModule module = value_or_throw(create_shader(d, gxm::yuv420_shader()));
+    VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    si.bindingCount = 1;
+    si.pBindings = &binding;
+    VkDescriptorSetLayout set_layout;
+    REQUIRE(vkCreateDescriptorSetLayout(d.device(), &si, nullptr, &set_layout) == VK_SUCCESS);
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gxm::Yuv420Constants)};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.setLayoutCount = 1;
+    li.pSetLayouts = &set_layout;
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &push;
+    VkPipelineLayout layout;
+    REQUIRE(vkCreatePipelineLayout(d.device(), &li, nullptr, &layout) == VK_SUCCESS);
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = module;
+    ci.stage.pName = "main";
+    ci.layout = layout;
+    VkPipeline pipeline;
+    REQUIRE(vkCreateComputePipelines(d.device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) == VK_SUCCESS);
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pi.maxSets = 1;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &size;
+    VkDescriptorPool pool;
+    REQUIRE(vkCreateDescriptorPool(d.device(), &pi, nullptr, &pool) == VK_SUCCESS);
+
+    // (planes of noise: every byte value, in every channel's tables)
+    nx::vector<u8> guest(2 * 1024 * 1024);
+    u32 seed = 12345;
+    for (u8& v : guest) seed = seed * 1103515245u + 12345u, v = static_cast<u8>(seed >> 16);
+    auto read = [&](u32 address, void* out, u32 bytes) {
+        if (address + u64{bytes} > guest.size()) return false;
+        std::memcpy(out, guest.data() + address, bytes);
+        return true;
+    };
+    struct Case {
+        u32 format, width, height, swizzle, profile;
+        bool padded;
+    };
+    const Case cases[] = {
+        {0x90000000u, 960, 544, 0, 0, false}, {0x90000000u, 37, 21, 1, 1, false}, {0x91000000u, 64, 48, 2, 2, false},
+        {0x91000000u, 35, 19, 3, 3, false},   {0x90000000u, 50, 30, 2, 1, true},  {0x91000000u, 50, 30, 1, 0, true},
+    };
+    for (const Case& c : cases) {
+        gxm::set_yuv_profile((c.swizzle >> 1) & 1, c.profile);
+        gxm::TextureInfo t;
+        t.base_format = c.format, t.width = c.width, t.height = c.height, t.swizzle = c.swizzle;
+        t.mipmapped = c.padded;
+        t.address = 4096;
+        const auto cpu = value_or_throw(gxm::read_texels(t, read));
+        const auto planes = value_or_throw(gxm::read_yuv420(t, read));
+        const usize bytes = gxm::yuv420_buffer_bytes(planes);
+        Buffer buf = value_or_throw(create_host_buffer(d, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+        const gxm::Yuv420Constants k = gxm::yuv420_buffer(planes, static_cast<u8*>(buf.mapped));
+        flush(d, buf);
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &set_layout;
+        VkDescriptorSet set;
+        REQUIRE(vkAllocateDescriptorSets(d.device(), &ai, &set) == VK_SUCCESS);
+        VkDescriptorBufferInfo bi{buf.buffer, 0, bytes};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = set;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bi;
+        vkUpdateDescriptorSets(d.device(), 1, &w, 0, nullptr);
+        OneShot shot(d);
+        VkCommandBuffer cmd = value_or_throw(shot.begin());
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof k, &k);
+        vkCmdDispatch(cmd, (c.width + 7) / 8, (c.height + 7) / 8, 1);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+        REQUIRE(shot.submit_and_wait());
+        invalidate(d, buf);
+        REQUIRE(cpu.data.size() == usize{c.width} * c.height * 4);
+        const u8* gpu = static_cast<const u8*>(buf.mapped) + usize{k.out} * 4;
+        usize differ = 0, first = 0;
+        for (usize i = 0; i < cpu.data.size(); ++i)
+            if (gpu[i] != cpu.data[i] && differ++ == 0) first = i;
+        if (differ)
+            std::fprintf(stderr, "YUV case format %08x, %u x %u, swizzle %u, profile %u: %zu bytes differ, the first at %zu\n",
+                         c.format, c.width, c.height, c.swizzle, c.profile, differ, first);
+        CHECK(differ == 0);
+        vkFreeDescriptorSets(d.device(), pool, 1, &set);
+        destroy_buffer(d, buf);
+    }
+    gxm::set_yuv_profile(0, 0), gxm::set_yuv_profile(1, 1);
+    vkDestroyDescriptorPool(d.device(), pool, nullptr);
+    vkDestroyPipeline(d.device(), pipeline, nullptr);
+    vkDestroyPipelineLayout(d.device(), layout, nullptr);
+    vkDestroyDescriptorSetLayout(d.device(), set_layout, nullptr);
+    vkDestroyShaderModule(d.device(), module, nullptr);
     check_no_validation_errors(*g);
 }

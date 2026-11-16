@@ -6,6 +6,8 @@
 #include <cstring>
 
 #include "core/foundation/strings/format.h"
+#include "psvrecore/gxm/spirv.hpp"
+#include "spirv/unified1/spirv.h"
 
 namespace psvrecore::gxm {
 
@@ -420,6 +422,21 @@ void yuv_to_rgba(u32 profile, u8 y, u8 u, u8 v, f32 out[4]) {
     out[3] = 1.0f;
 }
 
+// (the 16.16 tables of read_yuv's planar conversion: each byte's term of yuv_to_rgba, times 255; the luma's with the
+// rounding: within one of the exact value, as the floats are)
+void yuv_tables(u32 profile, i32 out[5][256]) {
+    const bool full = profile >= 2, bt709 = profile & 1;
+    const f64 rv = bt709 ? 1.5748 : 1.402, gu = bt709 ? 0.187324 : 0.344136, gv = bt709 ? 0.468124 : 0.714136,
+              bu = bt709 ? 1.8556 : 1.772;
+    for (u32 i = 0; i < 256; ++i) {
+        const f64 y = full ? i / 255.0 : (static_cast<f64>(i) - 16.0) / 219.0;
+        const f64 c = full ? (static_cast<f64>(i) - 128.0) / 255.0 : (static_cast<f64>(i) - 128.0) / 224.0;
+        auto fixed = [](f64 v) { return static_cast<i32>(std::lround(v * 255.0 * 65536.0)); };
+        out[0][i] = fixed(y) + 32768;
+        out[1][i] = fixed(rv * c), out[2][i] = fixed(-gu * c), out[3][i] = fixed(-gv * c), out[4][i] = fixed(bu * c);
+    }
+}
+
 // YUV textures (linear only): YUV420 with two planes (Y, then U and V interleaved) or three (Y, U, V), and YUV422
 // interleaved. The swizzle chooses the order of U and V (or of the four bytes) and the conversion slot. Planes follow
 // each other packed, each row its width rounded up to 8 texels; with mip levels, a plane's offset to the next is that
@@ -458,17 +475,10 @@ Result<Texels> read_yuv(const TextureInfo& t, u32 code, ReadGuest read) {
     if (code != kYUV422) {
         // (the planar layouts, as below a row at a time, in fixed point: each byte's term of yuv_to_rgba, times 255,
         // from a table in 16.16, the three summed and rounded: within one of the exact value, as the floats are)
-        const bool full = profile >= 2, bt709 = profile & 1, swapped = t.swizzle & 1;
-        const f64 rv = bt709 ? 1.5748 : 1.402, gu = bt709 ? 0.187324 : 0.344136, gv = bt709 ? 0.468124 : 0.714136,
-                  bu = bt709 ? 1.8556 : 1.772;
-        i32 ys[256], rvs[256], gus[256], gvs[256], bus[256];
-        for (u32 i = 0; i < 256; ++i) {
-            const f64 y = full ? i / 255.0 : (static_cast<f64>(i) - 16.0) / 219.0;
-            const f64 c = full ? (static_cast<f64>(i) - 128.0) / 255.0 : (static_cast<f64>(i) - 128.0) / 224.0;
-            auto fixed = [](f64 v) { return static_cast<i32>(std::lround(v * 255.0 * 65536.0)); };
-            ys[i] = fixed(y) + 32768;  // (the rounding)
-            rvs[i] = fixed(rv * c), gus[i] = fixed(-gu * c), gvs[i] = fixed(-gv * c), bus[i] = fixed(bu * c);
-        }
+        const bool swapped = t.swizzle & 1;
+        i32 tables[5][256];
+        yuv_tables(profile, tables);
+        const i32 *ys = tables[0], *rvs = tables[1], *gus = tables[2], *gvs = tables[3], *bus = tables[4];
         auto byte = [](i32 v) { return static_cast<u8>(nx::clamp(v >> 16, 0, 255)); };
         for (u32 row = 0; row < h; ++row) {
             const u8* yrow = raw.data() + usize{row} * align8(w);
@@ -532,6 +542,134 @@ Result<Texels> read_yuv(const TextureInfo& t, u32 code, ReadGuest read) {
 }
 
 }  // namespace
+
+bool is_yuv420(const TextureInfo& t) {
+    const u32 code = code_of(t.base_format);
+    return (code == kYUV420P2 || code == kYUV420P3) && is_linear(t.type) && t.width && t.height && t.width <= 4096 &&
+           t.height <= 4096;
+}
+
+Result<Yuv420> read_yuv420(const TextureInfo& t, ReadGuest read) {
+    if (!is_yuv420(t)) return failure("texture: not a YUV420 texture");
+    const u32 code = code_of(t.base_format);
+    const u32 w = t.width, h = t.height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+    auto align8 = [](u32 v) { return (v + 7) & ~7u; };
+    Yuv420 y;
+    y.width = w, y.height = h;
+    y.y_pitch = align8(w), y.c_pitch = align8(cw);
+    y.three = code == kYUV420P3;
+    y.swapped = t.swizzle & 1;
+    y.second = t.mipmapped ? pow2_ceil(w) * pow2_ceil(h) : align8(w) * h;
+    u32 size;
+    if (!y.three) {
+        size = y.second + align8(cw) * 2 * ch;
+    } else {
+        y.third = y.second + (t.mipmapped ? pow2_ceil(cw) * pow2_ceil(ch) : align8(cw) * ch);
+        size = y.third + align8(cw) * ch;
+    }
+    y.planes.resize(size);
+    if (!read(t.address, y.planes.data(), size)) return failure("texture: data outside guest memory");
+    yuv_tables(yuv_profiles[(t.swizzle >> 1) & 1].load(), y.tables);
+    return y;
+}
+
+usize yuv420_buffer_bytes(const Yuv420& y) {
+    return 5 * 256 * 4 + ((y.planes.size() + 3) & ~usize{3}) + usize{y.width} * y.height * 4;
+}
+
+Yuv420Constants yuv420_buffer(const Yuv420& y, u8* out) {
+    std::memcpy(out, y.tables, 5 * 256 * 4);
+    std::memcpy(out + 5 * 256 * 4, y.planes.data(), y.planes.size());
+    const u32 planes = 5 * 256, out_at = planes + static_cast<u32>((y.planes.size() + 3) / 4);
+    return Yuv420Constants{y.width, y.height, y.y_pitch, y.c_pitch, planes, y.second, y.third,
+                           (y.three ? 1u : 0u) | (y.swapped ? 2u : 0u), out_at};
+}
+
+nx::vector<u32> yuv420_shader() {
+    using spirv::Builder;
+    using spirv::Id;
+    Builder b;
+    b.capability(SpvCapabilityShader);
+    const Id tu = b.t_uint(), ti = b.t_int(), tb = b.t_bool(), tv3 = b.t_vector(tu, 3), tvoid = b.t_void();
+    // (the buffer: words)
+    const Id words = b.t_runtime_array(tu);
+    b.decorate(words, SpvDecorationArrayStride, {4});
+    const Id block = b.t_struct({words});
+    b.decorate(block, SpvDecorationBlock);
+    b.member_decorate(block, 0, SpvDecorationOffset, {0});
+    const Id buffer = b.variable(b.t_pointer(SpvStorageClassStorageBuffer, block), SpvStorageClassStorageBuffer);
+    b.decorate(buffer, SpvDecorationDescriptorSet, {0});
+    b.decorate(buffer, SpvDecorationBinding, {0});
+    // (the constants)
+    const Id pc_block = b.t_struct({tu, tu, tu, tu, tu, tu, tu, tu, tu});
+    b.decorate(pc_block, SpvDecorationBlock);
+    for (u32 i = 0; i < 9; ++i) b.member_decorate(pc_block, i, SpvDecorationOffset, {i * 4});
+    const Id pc = b.variable(b.t_pointer(SpvStorageClassPushConstant, pc_block), SpvStorageClassPushConstant);
+    const Id gid_var = b.variable(b.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+    b.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+
+    const Id fn = b.begin_function(tvoid, b.t_function(tvoid));
+    b.block(b.new_label());
+    const Id tp_pc = b.t_pointer(SpvStorageClassPushConstant, tu), tp_word = b.t_pointer(SpvStorageClassStorageBuffer, tu);
+    auto constant = [&](u32 i) { return b.op(SpvOpLoad, tu, {b.op(SpvOpAccessChain, tp_pc, {pc, b.c_int(static_cast<i32>(i))})}); };
+    auto u = [&](u32 v) { return b.c_uint(v); };
+    auto bin = [&](u32 op, Id type, Id a, Id c) { return b.op(op, type, {a, c}); };
+    auto word_ptr = [&](Id index) { return b.op(SpvOpAccessChain, tp_word, {buffer, b.c_int(0), index}); };
+    auto load_word = [&](Id index) { return b.op(SpvOpLoad, tu, {word_ptr(index)}); };
+    const Id gid = b.op(SpvOpLoad, tv3, {gid_var});
+    const Id x = b.op(SpvOpCompositeExtract, tu, {gid, 0}), yy = b.op(SpvOpCompositeExtract, tu, {gid, 1});
+    const Id width = constant(0), height = constant(1);
+    const Id inside = bin(SpvOpLogicalAnd, tb, bin(SpvOpULessThan, tb, x, width), bin(SpvOpULessThan, tb, yy, height));
+    const Id body = b.new_label(), merge = b.new_label();
+    b.op0(SpvOpSelectionMerge, {merge, SpvSelectionControlMaskNone});
+    b.op0(SpvOpBranchConditional, {inside, body, merge});
+    b.block(body);
+    {
+        const Id planes = constant(4), flags = constant(7);
+        // (a byte of the planes)
+        auto byte = [&](Id at) {
+            const Id word = load_word(bin(SpvOpIAdd, tu, planes, bin(SpvOpShiftRightLogical, tu, at, u(2))));
+            const Id shift = bin(SpvOpShiftLeftLogical, tu, bin(SpvOpBitwiseAnd, tu, at, u(3)), u(3));
+            return bin(SpvOpBitwiseAnd, tu, bin(SpvOpShiftRightLogical, tu, word, shift), u(0xFF));
+        };
+        const Id luma = byte(bin(SpvOpIAdd, tu, bin(SpvOpIMul, tu, yy, constant(2)), x));
+        const Id crow = bin(SpvOpIMul, tu, bin(SpvOpShiftRightLogical, tu, yy, u(1)), constant(3));
+        const Id cx = bin(SpvOpShiftRightLogical, tu, x, u(1));
+        const Id at = bin(SpvOpIAdd, tu, crow, cx);
+        const Id three = bin(SpvOpINotEqual, tb, bin(SpvOpBitwiseAnd, tu, flags, u(1)), u(0));
+        const Id swapped = bin(SpvOpINotEqual, tb, bin(SpvOpBitwiseAnd, tu, flags, u(2)), u(0));
+        // (three planes: U then V at `second` and `third`; two: texels of two bytes at `second`, the low one V)
+        const Id pair = bin(SpvOpIAdd, tu, constant(5), bin(SpvOpShiftLeftLogical, tu, at, u(1)));
+        const Id first = b.op(SpvOpSelect, tu, {three, byte(bin(SpvOpIAdd, tu, constant(5), at)), byte(bin(SpvOpIAdd, tu, pair, u(1)))});
+        const Id last = b.op(SpvOpSelect, tu, {three, byte(bin(SpvOpIAdd, tu, constant(6), at)), byte(pair)});
+        const Id cu = b.op(SpvOpSelect, tu, {swapped, last, first});
+        const Id cv = b.op(SpvOpSelect, tu, {swapped, first, last});
+        auto table = [&](u32 k, Id i) { return b.op(SpvOpBitcast, ti, {load_word(bin(SpvOpIAdd, tu, u(k * 256), i))}); };
+        const Id ys = table(0, luma);
+        auto channel = [&](Id sum) {
+            const Id v = bin(SpvOpShiftRightArithmetic, ti, sum, b.c_int(16));
+            const Id lo = b.op(SpvOpSelect, ti, {bin(SpvOpSLessThan, tb, v, b.c_int(0)), b.c_int(0), v});
+            const Id hi = b.op(SpvOpSelect, ti, {bin(SpvOpSGreaterThan, tb, lo, b.c_int(255)), b.c_int(255), lo});
+            return b.op(SpvOpBitcast, tu, {hi});
+        };
+        const Id r = channel(bin(SpvOpIAdd, ti, ys, table(1, cv)));
+        const Id g = channel(bin(SpvOpIAdd, ti, bin(SpvOpIAdd, ti, ys, table(2, cu)), table(3, cv)));
+        const Id bl = channel(bin(SpvOpIAdd, ti, ys, table(4, cu)));
+        Id rgba = bin(SpvOpBitwiseOr, tu, r, bin(SpvOpShiftLeftLogical, tu, g, u(8)));
+        rgba = bin(SpvOpBitwiseOr, tu, rgba, bin(SpvOpShiftLeftLogical, tu, bl, u(16)));
+        rgba = bin(SpvOpBitwiseOr, tu, rgba, u(0xFF000000u));
+        const Id index = bin(SpvOpIAdd, tu, constant(8), bin(SpvOpIAdd, tu, bin(SpvOpIMul, tu, yy, width), x));
+        b.op0(SpvOpStore, {word_ptr(index), rgba});
+        b.op0(SpvOpBranch, {merge});
+    }
+    b.block(merge);
+    b.op0(SpvOpReturn, {});
+    b.end_function();
+    const Id interface[] = {gid_var};  // (SPIR-V 1.3: the inputs and outputs only)
+    b.entry_point(SpvExecutionModelGLCompute, fn, "main", interface);
+    b.execution_mode(fn, SpvExecutionModeLocalSize, {8, 8, 1});
+    return b.module();
+}
 
 void set_yuv_profile(u32 csc, u32 profile) {
     if (csc < 2 && profile < 4) yuv_profiles[csc].store(profile);
