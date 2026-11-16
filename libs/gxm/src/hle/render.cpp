@@ -780,6 +780,33 @@ bool ensure(Renderer& r) {
     return true;
 }
 
+// Threads compiling pipelines at once: a phone's driver takes up to a tenth of a second for each whose shaders are
+// new, on one core. PSVRECORE_PIPELINE_THREADS sets it (1: on the calling thread only).
+u32 pipeline_threads() {
+    static const u32 n = [] {
+        if (const char* v = std::getenv("PSVRECORE_PIPELINE_THREADS"); v && std::atoi(v) > 0)
+            return static_cast<u32>(std::atoi(v));
+        return nx::clamp<u32>(nx::cpu::logical_core_count() / 2, 1, 4);
+    }();
+    return n;
+}
+
+// fn(0) to fn(count - 1), on up to pipeline_threads() threads (the caller's one of them), returned when all are done.
+void in_parallel(usize count, auto&& fn) {
+    std::atomic<usize> next{0};
+    auto work = [&] {
+        for (usize i; (i = next.fetch_add(1, std::memory_order_relaxed)) < count;) fn(i);
+    };
+    const u32 helpers = static_cast<u32>(nx::min<usize>(pipeline_threads(), count)) - (count ? 1 : 0);
+    nx::vector<nx::thread> threads;
+    threads.reserve(helpers);
+    nx::thread_options options;
+    options.name = "pipelines";
+    for (u32 t = 0; t < helpers; ++t) threads.emplace_back(work, options);
+    work();
+    for (nx::thread& t : threads) t.join();
+}
+
 // A program's shader module for a variant: made from the cache's SPIR-V, else translated (and kept in the cache).
 // `translate` empty: from the cache only (warm_up).
 VkShaderModule module_for(Renderer& r, const ShaderKey& full, auto&& translate) {
@@ -817,6 +844,42 @@ VkShaderModule module_for(Renderer& r, const ShaderKey& full, auto&& translate) 
     r.modules[key] = *m;
     r.module_keys[reinterpret_cast<u64>(*m)] = full;
     return *m;
+}
+
+// A graphics pipeline to make (make_graphics).
+struct GraphicsJob {
+    vk::GraphicsPipelineDesc desc;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    nx::string error;
+    u64 ns = 0;  // (its own time)
+};
+
+// The jobs' pipelines, on several threads. First one for each vertex shader, those with the most SPIR-V first, then
+// the rest: a driver compiles a shader the first time a pipeline has it, and the others with it take a fraction of
+// that (a phone's: 83 ms for a new vertex shader on average, 17 ms for a new fragment shader with one made before).
+void make_graphics(Renderer& r, std::span<GraphicsJob> jobs) {
+    auto words = [&](VkShaderModule m) -> usize {
+        const auto it = r.module_keys.find(reinterpret_cast<u64>(m));
+        if (it == r.module_keys.end()) return 0;
+        const nx::vector<u32>* v = r.cache.spirv(it->second);
+        return v ? v->size() : 0;
+    };
+    nx::vector<usize> first, rest;
+    for (usize i = 0; i < jobs.size(); ++i) {
+        bool seen = false;
+        for (const usize f : first) seen |= jobs[f].desc.vertex == jobs[i].desc.vertex;
+        (seen ? rest : first).push_back(i);
+    }
+    std::stable_sort(first.begin(), first.end(),
+                     [&](usize a, usize b) { return words(jobs[a].desc.vertex) > words(jobs[b].desc.vertex); });
+    auto make = [&](usize i) {
+        const u64 t0 = nx::os::ticks_ns();
+        if (auto p = r.pipelines->graphics(jobs[i].desc)) jobs[i].pipeline = *p;
+        else jobs[i].error = p.error().message;
+        jobs[i].ns = nx::os::ticks_ns() - t0;
+    };
+    in_parallel(first.size(), [&](usize k) { make(first[k]); });
+    in_parallel(rest.size(), [&](usize k) { make(rest[k]); });
 }
 
 // The variants' keys: the program's bytes, and what else its translation reads.
@@ -1502,6 +1565,8 @@ struct SceneProfile {
     u64 colour_uploads = 0;
     u64 began = 0, ns_before[kParts] = {}, misses_before = 0, miss_ns_before = 0;  // (this scene's start)
     u64 pipelines_made = 0, pipeline_ns = 0, pipelines_before = 0, pipeline_ns_before = 0;  // (made while drawing)
+    // (shader modules and secondary programs' compute pipelines made while drawing: translated or from the cache)
+    u64 shaders_made = 0, shader_ns = 0, shaders_before = 0, shader_ns_before = 0;
     u64 finish_wait_before = 0, finish_work_before = 0, finished_before = 0;
     // (the write-back's parts: the colour, the uniform buffers and counters, the depth and stencil, the rest)
     u64 back_ns[4] = {}, back_before[4] = {};
@@ -1539,6 +1604,7 @@ struct SceneProfile {
             began = at;
             std::memcpy(ns_before, ns, sizeof ns);
             misses_before = misses, miss_ns_before = miss_ns, pipelines_before = pipelines_made, pipeline_ns_before = pipeline_ns;
+            shaders_before = shaders_made, shader_ns_before = shader_ns;
             finish_wait_before = finish_wait_ns, finish_work_before = finish_work_ns, finished_before = finished;
             std::memcpy(back_before, back_ns, sizeof back_ns);
         }
@@ -1557,9 +1623,11 @@ struct SceneProfile {
             for (u32 i : kOrder)
                 if (ns[i] - ns_before[i] >= 1'000'000)
                     parts += nx::format(" {} {:.1f};", kNames[i], static_cast<f64>(ns[i] - ns_before[i]) / 1e6);
-            nx::logi(logs::gpu, "gxm profile: a slow scene, {:.1f} ms:{} {} new textures ({:.1f} ms), {} pipelines made ({:.1f} ms), "
-                     "{} earlier scenes finished ({:.1f} ms waiting for the GPU, {:.1f} writing back)",
+            nx::logi(logs::gpu, "gxm profile: a slow scene, {:.1f} ms:{} {} new textures ({:.1f} ms), {} shaders and secondary "
+                     "pipelines made ({:.1f} ms), {} pipelines made ({:.1f} ms), {} earlier scenes finished ({:.1f} ms waiting "
+                     "for the GPU, {:.1f} writing back)",
                      static_cast<f64>(took) / 1e6, parts, misses - misses_before, static_cast<f64>(miss_ns - miss_ns_before) / 1e6,
+                     shaders_made - shaders_before, static_cast<f64>(shader_ns - shader_ns_before) / 1e6,
                      pipelines_made - pipelines_before, static_cast<f64>(pipeline_ns - pipeline_ns_before) / 1e6,
                      finished - finished_before, static_cast<f64>(finish_wait_ns - finish_wait_before) / 1e6,
                      static_cast<f64>(finish_work_ns - finish_work_before) / 1e6);
@@ -2069,6 +2137,7 @@ nx::vector<u8> scale_down_samples(const u8* in, u32 w, u32 h, u32 s) {
 struct DrawPlan {
     const Draw* draw = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    u32 missing = 0;  // (a pipeline not made yet: 1 + its index in the scene's list of them)
     VkPipeline vertex_secondary = VK_NULL_HANDLE, fragment_secondary = VK_NULL_HANDLE;
     nx::vector<std::pair<u32, VkDeviceSize>> streams;  // (binding, offset in the vertex buffer)
     VkDeviceSize index_offset = 0;
@@ -2562,6 +2631,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     indices.clear();
     nx::vector<DrawPlan> plans;
     plans.reserve(draws);
+    nx::vector<GraphicsJob> missing;
     for (u32 i = 0; i < draws; ++i) {
         const Draw& dr = scene.draws[i];
         DrawPlan plan;
@@ -2588,6 +2658,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             continue;
         }
         const bool inline_secondary = tile_secondary(fp);
+        const usize made_before = r.modules.size();
+        const u64 shaders_from = g_profile.on ? nx::os::ticks_ns() : 0;
         plan.vertex_secondary = secondary_pipeline(r, vp);
         plan.fragment_secondary = inline_secondary ? VK_NULL_HANDLE : secondary_pipeline(r, fp);
 
@@ -2634,6 +2706,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             });
             if (fmod) r.quick_modules[fq.value()] = fmod;
         }
+        if (g_profile.on && r.modules.size() != made_before)
+            g_profile.shaders_made += r.modules.size() - made_before, g_profile.shader_ns += nx::os::ticks_ns() - shaders_from;
         if (!vmod || !fmod) continue;
 
         // Indices, and the vertices they reach (each stream from its first vertex to the last one used).
@@ -2748,27 +2822,14 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         pass_formats.color_input = reads_color;
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
-        const usize before = r.pipelines->count();
-        const u64 pipeline_from = g_profile.on ? nx::os::ticks_ns() : 0;
-        auto pipeline = r.pipelines->graphics(desc);
-        if (g_profile.on && r.pipelines->count() != before)
-            ++g_profile.pipelines_made, g_profile.pipeline_ns += nx::os::ticks_ns() - pipeline_from;
-        if (!pipeline) {
-            nx::logw(logs::gpu, "{}", pipeline.error().message);
-            continue;
+        // (one not made yet: made with the scene's others after its draws are planned, on several threads)
+        plan.pipeline = r.pipelines->find(desc);
+        if (!plan.pipeline) {
+            usize m = 0;
+            while (m < missing.size() && !missing[m].desc.same(desc)) ++m;
+            if (m == missing.size()) missing.push_back({desc});
+            plan.missing = static_cast<u32>(m + 1);
         }
-        if (r.pipelines->count() != before) {
-            // (a new one: recorded, to be made before the game starts next time)
-            ShaderCache::Graphics g;
-            g.desc = desc;
-            g.desc.vertex = VK_NULL_HANDLE, g.desc.fragment = VK_NULL_HANDLE, g.desc.layout = VK_NULL_HANDLE;
-            g.vertex = r.module_keys[reinterpret_cast<u64>(vmod)];
-            g.fragment = r.module_keys[reinterpret_cast<u64>(fmod)];
-            r.cache.add_graphics(g);
-            r.made_pipelines.fetch_add(1);
-            r.pipelines_changed.store(true);
-        }
-        plan.pipeline = *pipeline;
 
         DrawConstants& c = plan.constants;
         c.draw = i;
@@ -2796,6 +2857,32 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         const i32 si = static_cast<i32>(scale);
         plan.scissor = {{x0 * si, y0 * si}, {static_cast<u32>(x1 - x0 + 1) * scale, static_cast<u32>(y1 - y0 + 1) * scale}};
         plans.push_back(std::move(plan));
+    }
+    if (!missing.empty()) {
+        // (a phone's driver: up to a tenth of a second for each pipeline whose shaders are new; a scene of a song's
+        // start had 9 of them)
+        const u64 pipeline_from = nx::os::ticks_ns();
+        make_graphics(r, missing);
+        if (g_profile.on)
+            g_profile.pipelines_made += static_cast<u32>(missing.size()), g_profile.pipeline_ns += nx::os::ticks_ns() - pipeline_from;
+        for (const GraphicsJob& m : missing) {
+            if (!m.pipeline) {
+                nx::logw(logs::gpu, "{}", m.error);
+                continue;
+            }
+            // (a new one: recorded, to be made before the game starts next time)
+            ShaderCache::Graphics g;
+            g.desc = m.desc;
+            g.desc.vertex = VK_NULL_HANDLE, g.desc.fragment = VK_NULL_HANDLE, g.desc.layout = VK_NULL_HANDLE;
+            g.vertex = r.module_keys[reinterpret_cast<u64>(m.desc.vertex)];
+            g.fragment = r.module_keys[reinterpret_cast<u64>(m.desc.fragment)];
+            r.cache.add_graphics(g);
+            r.made_pipelines.fetch_add(1);
+            r.pipelines_changed.store(true);
+        }
+        for (DrawPlan& plan : plans)
+            if (plan.missing) plan.pipeline = missing[plan.missing - 1].pipeline;
+        std::erase_if(plans, [](const DrawPlan& plan) { return !plan.pipeline; });
     }
 
     g_profile.mark(1);
@@ -3704,34 +3791,49 @@ WarmUp warm_up() {
     const u64 start = nx::os::ticks_ns();
     r.warming = true;
     auto none = [] { return Result<nx::vector<u32>>(failure("not in the shader cache")); };
+    // (the secondary programs' compute pipelines: their modules, then the pipelines on several threads)
+    nx::vector<std::pair<u64, VkShaderModule>> computes;
     for (const ShaderKey& key : r.cache.compute()) {
         if (r.compute.contains(short_key(key))) continue;
-        const VkShaderModule m = module_for(r, key, none);
-        if (!m) continue;
-        r.compute[short_key(key)] = make_compute(r, m);
+        if (const VkShaderModule m = module_for(r, key, none)) {
+            r.compute[short_key(key)] = VK_NULL_HANDLE;  // (once each)
+            computes.push_back({short_key(key), m});
+        }
+    }
+    nx::vector<VkPipeline> made(computes.size(), VK_NULL_HANDLE);
+    in_parallel(computes.size(), [&](usize k) { made[k] = make_compute(r, computes[k].second); });
+    for (usize k = 0; k < computes.size(); ++k) {
+        r.compute[computes[k].first] = made[k];
         ++w.pipelines;
     }
     const u64 compute_end = nx::os::ticks_ns();
-    u32 graphics = 0;
-    u64 graphics_ns = 0;  // (the graphics pipelines themselves, without their modules)
+    // (the graphics pipelines: their modules, then the pipelines on several threads)
+    nx::vector<const ShaderCache::Graphics*> recorded;
+    nx::vector<GraphicsJob> jobs;
     for (const ShaderCache::Graphics& g : r.cache.graphics()) {
-        vk::GraphicsPipelineDesc desc = g.desc;
-        desc.vertex = module_for(r, g.vertex, none);
-        desc.fragment = module_for(r, g.fragment, none);
-        desc.layout = r.layout;
-        if (!desc.vertex || !desc.fragment) continue;
-        const u64 t0 = nx::os::ticks_ns();
-        if (r.pipelines->graphics(desc)) ++w.pipelines, ++graphics;
-        graphics_ns += nx::os::ticks_ns() - t0;
+        GraphicsJob job{g.desc};
+        job.desc.vertex = module_for(r, g.vertex, none);
+        job.desc.fragment = module_for(r, g.fragment, none);
+        job.desc.layout = r.layout;
+        if (job.desc.vertex && job.desc.fragment) jobs.push_back(job), recorded.push_back(&g);
+    }
+    const u64 modules_end = nx::os::ticks_ns();
+    make_graphics(r, jobs);
+    u32 graphics = 0;
+    u64 graphics_ns = 0;  // (the graphics pipelines' own times, added up: more than the time they took together)
+    auto words = [&](const ShaderKey& k) {
+        const nx::vector<u32>* v = r.cache.spirv(k);
+        return v ? v->size() : usize{0};
+    };
+    for (usize k = 0; k < jobs.size(); ++k) {
+        if (jobs[k].pipeline) ++w.pipelines, ++graphics;
+        graphics_ns += jobs[k].ns;
         // (PSVRECORE_GXM_PROFILE: each pipeline, by its shaders; one whose shaders were compiled together before
         // takes a fraction of a millisecond)
-        if (std::getenv("PSVRECORE_GXM_PROFILE")) {
-            const nx::vector<u32>* vw = r.cache.spirv(g.vertex);
-            const nx::vector<u32>* fw = r.cache.spirv(g.fragment);
+        if (std::getenv("PSVRECORE_GXM_PROFILE"))
             nx::logi(logs::gpu, "gxm profile: warm-up pipeline, {:.1f} ms: vertex shader {:016x} ({} words), fragment {:016x} ({})",
-                     static_cast<f64>(nx::os::ticks_ns() - t0) / 1e6, short_key(g.vertex), vw ? vw->size() : 0,
-                     short_key(g.fragment), fw ? fw->size() : 0);
-        }
+                     static_cast<f64>(jobs[k].ns) / 1e6, short_key(recorded[k]->vertex), words(recorded[k]->vertex),
+                     short_key(recorded[k]->fragment), words(recorded[k]->fragment));
     }
     r.warming = false;
     // (what warm_up could not make is tried again when the game draws with it)
@@ -3742,10 +3844,11 @@ WarmUp warm_up() {
     r.pipelines_changed.store(true);  // (the driver's cache now has them all: saved with the rest)
     // (an empty driver cache, its file removed: how long a phone's driver takes to compile what the game used)
     nx::logi(logs::gpu,
-             "warm-up: {} shaders and {} pipelines from the cache in {:.0f} ms (compute {:.0f}; {} graphics pipelines "
-             "{:.0f}, their modules {:.0f})",
-             w.shaders, w.pipelines, w.ms, static_cast<f64>(compute_end - start) / 1e6, graphics,
-             static_cast<f64>(graphics_ns) / 1e6, static_cast<f64>(end - compute_end - graphics_ns) / 1e6);
+             "warm-up: {} shaders and {} pipelines from the cache in {:.0f} ms (compute {:.0f}; graphics modules {:.0f}; "
+             "{} graphics pipelines {:.0f} on {} threads, {:.0f} one after another)",
+             w.shaders, w.pipelines, w.ms, static_cast<f64>(compute_end - start) / 1e6,
+             static_cast<f64>(modules_end - compute_end) / 1e6, graphics, static_cast<f64>(end - modules_end) / 1e6,
+             pipeline_threads(), static_cast<f64>(graphics_ns) / 1e6);
     return w;
 }
 

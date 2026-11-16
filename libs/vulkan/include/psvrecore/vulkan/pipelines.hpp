@@ -5,11 +5,13 @@
 // compile time), every field is a fixed-size number or handle. Viewport, scissor, stencil reference and masks,
 // depth bias and blend constants are dynamic state.
 
+#include <atomic>
 #include <span>
 
 #include "psvrecore/vulkan/rendering.hpp"
 #include "core/foundation/containers/hash_map.h"
 #include "core/foundation/platform/filesystem.h"
+#include "core/foundation/threading/sync.h"
 
 namespace psvrecore::vulkan {
 
@@ -76,8 +78,12 @@ public:
     Pipelines(const Pipelines&) = delete;
     Pipelines& operator=(const Pipelines&) = delete;
 
+    // Made once for each description, kept; may be called from several threads at once (the driver compiles
+    // outside the lock: a phone's takes up to a tenth of a second for a pipeline whose shaders are new).
     Result<VkPipeline> graphics(const GraphicsPipelineDesc& desc);
-    usize count() const { return count_; }
+    // Made before (VK_NULL_HANDLE: not yet).
+    VkPipeline find(const GraphicsPipelineDesc& desc) const;
+    usize count() const { return count_.load(std::memory_order_relaxed); }
     VkPipelineCache cache() const { return cache_; }  // (for the compute pipelines too)
 
     // The driver's pipeline cache, saved for the next run (a file another driver wrote is ignored).
@@ -85,11 +91,14 @@ public:
     Result<void> load_cache(nx::fs::path_view path);
 
 private:
+    VkPipeline find_locked(const GraphicsPipelineDesc& desc) const;
+
     Device& device_;
     RenderPasses& passes_;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
+    mutable nx::mutex lock_;  // (the pipelines made, and the render passes they are made for)
     nx::hash_map<u64, nx::vector<std::pair<GraphicsPipelineDesc, VkPipeline>>> pipelines_;
-    usize count_ = 0;
+    std::atomic<usize> count_{0};
 };
 
 // A shader module from SPIR-V words.

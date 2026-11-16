@@ -59,11 +59,29 @@ Pipelines::~Pipelines() {
     if (cache_) vkDestroyPipelineCache(device_.device(), cache_, nullptr);
 }
 
+VkPipeline Pipelines::find_locked(const GraphicsPipelineDesc& d) const {
+    if (auto it = pipelines_.find(d.hash()); it != pipelines_.end())
+        for (const auto& [desc, p] : it->second)
+            if (desc.same(d)) return p;
+    return VK_NULL_HANDLE;
+}
+
+VkPipeline Pipelines::find(const GraphicsPipelineDesc& d) const {
+    nx::scoped_lock<nx::mutex> held(lock_);
+    return find_locked(d);
+}
+
 Result<VkPipeline> Pipelines::graphics(const GraphicsPipelineDesc& d) {
-    const u64 h = d.hash();
-    auto& list = pipelines_[h];
-    for (const auto& [desc, p] : list)
-        if (desc.same(d)) return p;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    {
+        nx::scoped_lock<nx::mutex> held(lock_);
+        if (const VkPipeline p = find_locked(d)) return p;
+        if (passes_.uses_render_pass(d.formats)) {
+            auto rp = passes_.compatible(d.formats);
+            if (!rp) return nx::err(rp.error());
+            render_pass = *rp;
+        }
+    }
 
     VkSpecializationMapEntry entries[GraphicsPipelineDesc::kMaxSpecialization];
     for (u32 i = 0; i < d.specialization_count; ++i) entries[i] = {i, i * 4, 4};
@@ -143,10 +161,8 @@ Result<VkPipeline> Pipelines::graphics(const GraphicsPipelineDesc& d) {
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     const VkFormat color_format = d.formats.color;
-    if (passes_.uses_render_pass(d.formats)) {
-        auto rp = passes_.compatible(d.formats);
-        if (!rp) return nx::err(rp.error());
-        info.renderPass = *rp;
+    if (render_pass) {
+        info.renderPass = render_pass;
     } else {
         rendering.colorAttachmentCount = has_color ? 1 : 0;
         rendering.pColorAttachmentFormats = &color_format;
@@ -168,8 +184,14 @@ Result<VkPipeline> Pipelines::graphics(const GraphicsPipelineDesc& d) {
     VkPipeline p = VK_NULL_HANDLE;
     if (const VkResult r = vkCreateGraphicsPipelines(device_.device(), cache_, 1, &info, nullptr, &p); r != VK_SUCCESS)
         return nx::err(vk_error("vkCreateGraphicsPipelines", r));
-    list.push_back({d, p});
-    ++count_;
+    nx::scoped_lock<nx::mutex> held(lock_);
+    // (another thread made the same one meanwhile: its kept, this one dropped)
+    if (const VkPipeline other = find_locked(d)) {
+        vkDestroyPipeline(device_.device(), p, nullptr);
+        return other;
+    }
+    pipelines_[d.hash()].push_back({d, p});
+    count_.fetch_add(1, std::memory_order_relaxed);
     return p;
 }
 
