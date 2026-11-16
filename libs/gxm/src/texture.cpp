@@ -204,37 +204,62 @@ void decode_bc(u32 code, const u8* block, f32 out[16][4]) {
 }
 
 
+u8 to8(f32 v) { return static_cast<u8>(std::lround(nx::clamp(std::isnan(v) ? 0.0f : v, 0.0f, 1.0f) * 255.0f)); }
+
+// decode_bc's colour palettes as 8-bit components, for each pair of 5- or 6-bit components: its floats (the same
+// arithmetic) rounded once, made once. (Its arithmetic for each block took a phone a third of a song's start.)
+struct BcTables {
+    u8 c5[32], c6[64];
+    u8 third5[32][32], third6[64][64];  // (2a + b) / 3; (a + 2b) / 3 is third[b][a]: the sum is the same float
+    u8 half5[32][32], half6[64][64];    // (a + b) / 2
+    BcTables() {
+        for (u32 a = 0; a < 64; ++a) {
+            if (a < 32) c5[a] = to8(unorm(a, 5));
+            c6[a] = to8(unorm(a, 6));
+            for (u32 b = 0; b < 64; ++b) {
+                if (a < 32 && b < 32) {
+                    third5[a][b] = to8((2 * unorm(a, 5) + unorm(b, 5)) / 3);
+                    half5[a][b] = to8((unorm(a, 5) + unorm(b, 5)) / 2);
+                }
+                third6[a][b] = to8((2 * unorm(a, 6) + unorm(b, 6)) / 3);
+                half6[a][b] = to8((unorm(a, 6) + unorm(b, 6)) / 2);
+            }
+        }
+    }
+};
+
+const BcTables& bc_tables() {
+    static const BcTables t;
+    return t;
+}
+
 // A BC1-BC3 block as 8-bit RGBA: decode_bc's palette and alphas (the same arithmetic), each rounded once as the
 // general path rounds each texel's.
 void decode_bc8(u32 code, const u8* block, u8 out[16][4]) {
-    auto to8 = [](f32 v) { return static_cast<u8>(std::lround(nx::clamp(std::isnan(v) ? 0.0f : v, 0.0f, 1.0f) * 255.0f)); };
+    const BcTables& t = bc_tables();
     const u8* color = code == kUBC1 ? block : block + 8;
     const u16 c0 = static_cast<u16>(color[0] | color[1] << 8), c1 = static_cast<u16>(color[2] | color[3] << 8);
-    f32 pal[4][4];
-    auto rgb565 = [](u16 v, f32* o) { o[0] = unorm(v >> 11, 5), o[1] = unorm((v >> 5) & 63, 6), o[2] = unorm(v & 31, 5), o[3] = 1; };
-    rgb565(c0, pal[0]);
-    rgb565(c1, pal[1]);
+    const u32 r0 = c0 >> 11, g0 = (c0 >> 5) & 63, b0 = c0 & 31, r1 = c1 >> 11, g1 = (c1 >> 5) & 63, b1 = c1 & 31;
     const bool four = code != kUBC1 || c0 > c1;
-    for (u32 k = 0; k < 3; ++k) {
-        pal[2][k] = four ? (2 * pal[0][k] + pal[1][k]) / 3 : (pal[0][k] + pal[1][k]) / 2;
-        pal[3][k] = four ? (pal[0][k] + 2 * pal[1][k]) / 3 : 0;
-    }
-    pal[2][3] = 1;
-    pal[3][3] = four ? 1.0f : 0.0f;
-    u8 pal8[4][4];
-    for (u32 i = 0; i < 4; ++i)
-        for (u32 k = 0; k < 4; ++k) pal8[i][k] = to8(pal[i][k]);
+    const u8 pal8[4][4] = {
+        {t.c5[r0], t.c6[g0], t.c5[b0], 255},
+        {t.c5[r1], t.c6[g1], t.c5[b1], 255},
+        {four ? t.third5[r0][r1] : t.half5[r0][r1], four ? t.third6[g0][g1] : t.half6[g0][g1],
+         four ? t.third5[b0][b1] : t.half5[b0][b1], 255},
+        {four ? t.third5[r1][r0] : u8{0}, four ? t.third6[g1][g0] : u8{0}, four ? t.third5[b1][b0] : u8{0},
+         four ? u8{255} : u8{0}},
+    };
     const u32 bits = static_cast<u32>(color[4] | color[5] << 8 | color[6] << 16 | color[7] << 24);
     for (u32 i = 0; i < 16; ++i) std::memcpy(out[i], pal8[(bits >> (2 * i)) & 3], 4);
     if (code == kUBC2) {
-        for (u32 i = 0; i < 16; ++i) out[i][3] = to8(unorm((block[i / 2] >> (4 * (i & 1))) & 15, 4));
+        for (u32 i = 0; i < 16; ++i) out[i][3] = static_cast<u8>(((block[i / 2] >> (4 * (i & 1))) & 15) * 17);  // (n / 15, exact)
     } else if (code == kUBC3) {
         const f32 a0 = unorm(block[0], 8), a1 = unorm(block[1], 8);
-        f32 a[8] = {a0, a1};
+        u8 a8[8] = {block[0], block[1]};  // (n / 255 rounds back to n)
         for (u32 k = 2; k < 8; ++k)
-            a[k] = block[0] > block[1] ? ((8 - k) * a0 + (k - 1) * a1) / 7 : k < 6 ? ((6 - k) * a0 + (k - 1) * a1) / 5 : (k == 6 ? 0.0f : 1.0f);
-        u8 a8[8];
-        for (u32 k = 0; k < 8; ++k) a8[k] = to8(a[k]);
+            a8[k] = to8(block[0] > block[1] ? ((8 - k) * a0 + (k - 1) * a1) / 7
+                        : k < 6             ? ((6 - k) * a0 + (k - 1) * a1) / 5
+                                            : (k == 6 ? 0.0f : 1.0f));
         u64 abits = 0;
         for (u32 k = 0; k < 6; ++k) abits |= u64{block[2 + k]} << (8 * k);
         for (u32 i = 0; i < 16; ++i) out[i][3] = a8[(abits >> (3 * i)) & 7];
@@ -800,6 +825,11 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                         if (bc_bytes) {
                             u8 texels[16][4];
                             decode_bc8(code, block, texels);
+                            if (x * 4 + 4 <= lv.width && y * 4 + 4 <= lv.height) {
+                                for (u32 row = 0; row < 4; ++row)
+                                    std::memcpy(dst + (usize{y * 4 + row} * lv.width + x * 4) * 4, texels[row * 4], 16);
+                                continue;
+                            }
                             for (u32 i = 0; i < 16; ++i) {
                                 const u32 tx = x * 4 + (i & 3), ty = y * 4 + i / 4;
                                 if (tx < lv.width && ty < lv.height) std::memcpy(dst + (usize{ty} * lv.width + tx) * 4, texels[i], 4);
@@ -821,18 +851,50 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                 const u32 texel_bytes = bits / 8, tiles_w = (lv.width + 31) / 32;
                 const u8* end = raw.data() + raw.size();
                 const SwizzleTables sw(is_swizzled(t.type) ? lv.width : 0, is_swizzled(t.type) ? lv.height : 0, pw, ph);
+                // (an output byte: the four bytes read shifted and masked, or a constant 0 or 255)
+                u32 shift[4] = {}, mask[4] = {}, constant = 0;
+                for (u32 k = 0; k < 4; ++k) {
+                    if (byte_of[k] >= 0) shift[k] = 8 * static_cast<u32>(byte_of[k]), mask[k] = 0xFF;
+                    else constant |= static_cast<u32>(-byte_of[k] - 1) << (8 * k);
+                }
+                const bool same = texel_bytes == 4 && shift[0] == 0 && shift[1] == 8 && shift[2] == 16 && shift[3] == 24 &&
+                                  (mask[0] & mask[1] & mask[2] & mask[3]) == 0xFF;
+                auto texel = [&](const u8* p) {
+                    u32 v;
+                    std::memcpy(&v, p, 4);
+                    return ((v >> shift[0]) & mask[0]) | ((v >> shift[1]) & mask[1]) << 8 | ((v >> shift[2]) & mask[2]) << 16 |
+                           ((v >> shift[3]) & mask[3]) << 24 | constant;
+                };
                 for (u32 y = 0; y < lv.height; ++y) {
                     u8* out_row = dst + usize{y} * lv.width * 4;
-                    for (u32 x = 0; x < lv.width; ++x) {
-                        u64 index;
-                        if (is_swizzled(t.type)) index = (sw.xs[x] + sw.ys[y]) * texel_bytes;
-                        else if (t.type == texture_type::kTiled)
-                            index = ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * texel_bytes;
-                        else index = u64{y} * row + u64{x} * texel_bytes;
-                        const u8* p = base + index;
-                        if (p + 4 > end) continue;
-                        u8* o = out_row + usize{x} * 4;
-                        for (u32 k = 0; k < 4; ++k) o[k] = byte_of[k] >= 0 ? p[byte_of[k]] : static_cast<u8>(-byte_of[k] - 1);
+                    if (is_swizzled(t.type)) {
+                        const u64 ys = sw.ys[y];
+                        for (u32 x = 0; x < lv.width; ++x) {
+                            const u8* p = base + (sw.xs[x] + ys) * texel_bytes;
+                            if (p + 4 > end) continue;
+                            const u32 v = texel(p);
+                            std::memcpy(out_row + usize{x} * 4, &v, 4);
+                        }
+                    } else if (t.type == texture_type::kTiled) {
+                        for (u32 x = 0; x < lv.width; ++x) {
+                            const u8* p = base + ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * texel_bytes;
+                            if (p + 4 > end) continue;
+                            const u32 v = texel(p);
+                            std::memcpy(out_row + usize{x} * 4, &v, 4);
+                        }
+                    } else {
+                        const u8* p = base + u64{y} * row;
+                        // (the texels whose four bytes are within the data: the rest left 0, as the general path leaves them)
+                        const u64 left = p + 4 <= end ? static_cast<u64>(end - p - 4) / texel_bytes + 1 : 0;
+                        const u32 n = static_cast<u32>(nx::min<u64>(lv.width, left));
+                        if (same) {
+                            std::memcpy(out_row, p, usize{n} * 4);
+                            continue;
+                        }
+                        for (u32 x = 0; x < n; ++x) {
+                            const u32 v = texel(p + usize{x} * texel_bytes);
+                            std::memcpy(out_row + usize{x} * 4, &v, 4);
+                        }
                     }
                 }
             } else if (paletted) {
@@ -842,18 +904,28 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                 const usize limit = raw.size() - 8 - static_cast<usize>(base - raw.data());
                 const SwizzleTables sw(is_swizzled(t.type) ? lv.width : 0, is_swizzled(t.type) ? lv.height : 0, pw, ph);
                 u32* out_texels = reinterpret_cast<u32*>(dst);
+                // (as the general path: a texel whose 8 bytes from it are past the data and its padding left 0)
+                auto put_texel = [&](u32* o, u64 bit) {
+                    if (bit / 8 > limit) return;
+                    const u32 index = bits == 8 ? base[bit / 8] : (base[bit / 8] >> (bit % 8)) & 15;
+                    std::memcpy(o, &palette8[index], 4);
+                };
                 for (u32 y = 0; y < lv.height; ++y) {
                     u32* out_row = out_texels + usize{y} * lv.width;
-                    const u64 row_bit = u64{y} * row * 8;
-                    for (u32 x = 0; x < lv.width; ++x) {
-                        u64 bit;
-                        if (is_swizzled(t.type)) bit = (sw.xs[x] + sw.ys[y]) * bits;
-                        else if (t.type == texture_type::kTiled)
-                            bit = ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * bits;
-                        else bit = row_bit + u64{x} * bits;
-                        if (bit / 8 > limit) continue;  // (as the general path: 8 bytes from the texel within the data and its padding)
-                        const u32 index = bits == 8 ? base[bit / 8] : (base[bit / 8] >> (bit % 8)) & 15;
-                        std::memcpy(out_row + x, &palette8[index], 4);
+                    if (is_swizzled(t.type)) {
+                        const u64 ys = sw.ys[y];
+                        for (u32 x = 0; x < lv.width; ++x) put_texel(out_row + x, (sw.xs[x] + ys) * bits);
+                    } else if (t.type == texture_type::kTiled) {
+                        for (u32 x = 0; x < lv.width; ++x)
+                            put_texel(out_row + x, ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * bits);
+                    } else if (bits == 8) {
+                        const u64 from = u64{y} * row;
+                        const u32 n = from > limit ? 0 : static_cast<u32>(nx::min<u64>(lv.width, limit - from + 1));
+                        const u8* p = base + from;
+                        for (u32 x = 0; x < n; ++x) std::memcpy(out_row + x, &palette8[p[x]], 4);
+                    } else {
+                        const u64 row_bit = u64{y} * row * 8;
+                        for (u32 x = 0; x < lv.width; ++x) put_texel(out_row + x, row_bit + u64{x} * bits);
                     }
                 }
             } else {

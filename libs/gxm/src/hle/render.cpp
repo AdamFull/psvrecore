@@ -1610,6 +1610,7 @@ struct SceneProfile {
     u64 finish_wait_before = 0, finish_work_before = 0, finished_before = 0;
     // (the write-back's parts: the colour, the uniform buffers and counters, the depth and stencil, the rest)
     u64 back_ns[4] = {}, back_before[4] = {};
+    u64 tex_before[4] = {};  // (hash_ns, decode_ns, create_ns, upload_ns at this scene's start)
     u64 buffer_wait_ns = 0;  // (sceGxmEndScene's wait for the display to let the scene's buffer go)
     bool on = false;
     bool read = false;  // (the switch, read at the first scene: --env sets it after the program starts)
@@ -1648,6 +1649,7 @@ struct SceneProfile {
             shaders_before = shaders_made, shader_ns_before = shader_ns;
             finish_wait_before = finish_wait_ns, finish_work_before = finish_work_ns, finished_before = finished;
             std::memcpy(back_before, back_ns, sizeof back_ns);
+            tex_before[0] = hash_ns, tex_before[1] = decode_ns, tex_before[2] = create_ns, tex_before[3] = upload_ns;
         }
     }
     void mark(u32 i) {
@@ -1672,6 +1674,11 @@ struct SceneProfile {
                      pipelines_made - pipelines_before, static_cast<f64>(pipeline_ns - pipeline_ns_before) / 1e6,
                      finished - finished_before, static_cast<f64>(finish_wait_ns - finish_wait_before) / 1e6,
                      static_cast<f64>(finish_work_ns - finish_work_before) / 1e6);
+            if (ns[3] - ns_before[3] >= 4'000'000)
+                nx::logi(logs::gpu, "gxm profile: its textures: hashed {:.1f} ms, decoded {:.1f}, images made {:.1f}, uploads "
+                         "queued {:.1f}", static_cast<f64>(hash_ns - tex_before[0]) / 1e6,
+                         static_cast<f64>(decode_ns - tex_before[1]) / 1e6, static_cast<f64>(create_ns - tex_before[2]) / 1e6,
+                         static_cast<f64>(upload_ns - tex_before[3]) / 1e6);
             if (finish_work_ns - finish_work_before >= 2'000'000)
                 nx::logi(logs::gpu, "gxm profile: written back: colour {:.1f} ms, buffers and counters {:.1f}, depth {:.1f}, the rest {:.1f}",
                          static_cast<f64>(back_ns[0] - back_before[0]) / 1e6, static_cast<f64>(back_ns[1] - back_before[1]) / 1e6,
@@ -3349,7 +3356,21 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (!misses.empty()) {
             const bool bc = r.device->caps().texture_bc;
             const u64 decode_from = g_profile.on ? nx::os::ticks_ns() : 0;
-            in_parallel(misses.size(), [&](usize k) { misses[k].texels = read_texels(misses[k].info, read_guest_memory, bc); });
+            // (the largest first: the threads finish together, not one of them with a large one left at the end)
+            nx::vector<usize> order(misses.size());
+            for (usize k = 0; k < order.size(); ++k) order[k] = k;
+            std::stable_sort(order.begin(), order.end(), [&](usize a, usize b) { return misses[a].size > misses[b].size; });
+            in_parallel(misses.size(), [&](usize i) {
+                const usize k = order[i];
+                const u64 from = g_profile.on ? nx::os::ticks_ns() : 0;
+                const TextureInfo& info = misses[k].info;
+                misses[k].texels = read_texels(info, read_guest_memory, bc);
+                // (one that took a while to decode: which)
+                if (const u64 took = g_profile.on ? nx::os::ticks_ns() - from : 0; took >= 1'000'000)
+                    std::fprintf(stderr, "gxm profile: a slow decode, %.1f ms: format %08x type %u gamma %u, %u x %u, %u levels, "
+                                 "%u bytes\n", static_cast<f64>(took) / 1e6, info.base_format, info.type, info.gamma,
+                                 info.width, info.height, info.levels, misses[k].size);
+            });
             if (g_profile.on) g_profile.decode_ns += nx::os::ticks_ns() - decode_from;
             for (TextureMiss& m : misses) make_texture(r, m.info, m.size, m.key, m.words_key, &m.texels);
         }

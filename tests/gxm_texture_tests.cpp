@@ -210,7 +210,8 @@ TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted
     struct Format {
         u32 base_format, bits;
     };
-    const Format formats[] = {{0x94000000, 4}, {0x95000000, 8}, {0x85000000, 4}, {0x86000000, 8}, {0x87000000, 8}, {0x0C000000, 32}};
+    const Format formats[] = {{0x94000000, 4}, {0x95000000, 8}, {0x85000000, 4}, {0x86000000, 8}, {0x87000000, 8}, {0x0C000000, 32},
+                              {0x00000000, 8}, {0x07000000, 16}, {0x98000000, 24}};
     const u32 types[] = {texture_type::kSwizzled, texture_type::kLinear, texture_type::kLinearStrided, texture_type::kTiled};
     const u32 sizes[][2] = {{37, 23}, {64, 64}, {128, 32}, {16, 256}, {1, 1}};
     u32 compared = 0;
