@@ -170,7 +170,9 @@ Everything generated stays on the user's machine.
     secondary attributes in a storage buffer. The vertex and fragment forms are the draw's shaders: attributes in
     their formats, outputs and varyings at fixed locations, the GXM viewport applied in the vertex shader, textures
     as combined image samplers found through the program's sampler slots, the colour read in the program's declared
-    output type (the attachment quantizes it). A fragment program whose secondary program reads per-tile registers
+    output type (the attachment quantizes it); a read that is only the program's final blend of the colour with
+    another register (`color_read_blend`) is left to the pipeline's blending instead, the blend's other source
+    written as the output. A fragment program whose secondary program reads per-tile registers
     runs that secondary first, in the fragment shader.
   - Guest memory the programs read (uniform buffers) is copied into one storage buffer per scene; the addresses in
     the secondary attributes point into it. Stores go to it and are copied back.

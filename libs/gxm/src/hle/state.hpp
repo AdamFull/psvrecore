@@ -9,6 +9,7 @@
 #include <atomic>
 
 #include "psvrecore/gxm/hle.hpp"
+#include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "psvrecore/usse/decode.hpp"
@@ -188,6 +189,9 @@ struct Program {
     // (found once, by the renderer: whether it stores to memory, whether its secondary program reads per-tile
     // registers; -1 not yet)
     i8 stores = -1, tile_secondary = -1;
+    // (and whether its read of the colour is a blend the pipeline can do, color_read_blend: that blend)
+    i8 blend_read = -1;
+    ColorReadBlend blend_read_found;
 };
 
 struct VertexProgram {

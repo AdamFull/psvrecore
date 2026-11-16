@@ -17,6 +17,7 @@
 //   (and the samples taken with them) as the program's input records place them, runs the program and writes its
 //   output register as a colour.
 
+#include <optional>
 #include <span>
 
 #include "psvrecore/error.hpp"
@@ -133,7 +134,29 @@ struct FragmentShader {
     bool color_output = true;
     // Programs that read the colour (FRAGCOLOR, with __nativecolor) find it in their output register before they
     // run: from the colour attachment (input attachment kDrawBindingColor), in the output register's format.
+    // With `blend_read`, a program whose colour read color_read_blend finds leaves that blend to the pipeline's
+    // fixed-function blending: its blend writes its other source to the output register, and nothing is read.
+    bool blend_read = false;
 };
+
+// A program's read of the colour that fixed-function blending can do: the program reads it (FRAGCOLOR, with
+// __nativecolor, 8-bit lanes) only in its last write of the output register, a sum of products (sop2, blend) of the
+// colour and another register with factors the pipeline's blending has. Its factors and operations, numbered as
+// VkBlendFactor and VkBlendOp, for the output register's lanes; `lanes` the lanes it writes (the others keep the
+// colour). Without rasterization-order attachment access, the fragments of one draw that read the colour run in no
+// order: where its triangles overlap, they lose each other's writes (a light cone of layers drawn in one draw);
+// blending is ordered.
+struct ColorReadBlend {
+    enum Factor : u8 {
+        kZero = 0, kOne = 1, kSrcColor = 2, kOneMinusSrcColor = 3, kDstColor = 4, kOneMinusDstColor = 5,
+        kSrcAlpha = 6, kOneMinusSrcAlpha = 7, kDstAlpha = 8, kOneMinusDstAlpha = 9, kSrcAlphaSaturate = 14,
+    };
+    enum Operation : u8 { kAdd = 0, kSubtract = 1, kReverseSubtract = 2, kMin = 3, kMax = 4 };
+    u8 color_src = kOne, color_dst = kZero, alpha_src = kOne, alpha_dst = kZero;
+    u8 color_op = kAdd, alpha_op = kAdd;
+    u8 lanes = 0;
+};
+std::optional<ColorReadBlend> color_read_blend(const usse::Gxp& gxp, std::span<const usse::Decoded> program);
 
 Result<nx::vector<u32>> translate_secondary(const usse::Gxp& gxp, std::span<const usse::Decoded> program);
 Result<nx::vector<u32>> translate_vertex(const usse::Gxp& gxp, std::span<const usse::Decoded> program,

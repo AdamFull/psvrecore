@@ -60,6 +60,103 @@ u32 width_of(Type t) {
 
 bool is_float(Type t) { return t == Type::F32 || t == Type::F16; }
 
+// Where a program's colour read is a blend fixed-function blending can do (color_read_blend): the instructions of
+// that blend (the colour lanes', the alpha lane's; ~0u: none), the source of each that is not the colour, and the
+// blend.
+struct BlendRead {
+    u32 at[2] = {~0u, ~0u};
+    u8 source[2] = {0, 0};
+    ColorReadBlend blend;
+};
+
+std::optional<BlendRead> find_blend_read(const usse::Gxp& gxp, std::span<const Decoded> program) {
+    using B = ColorReadBlend;
+    if (!gxp.native_color || !gxp.frag_color || gxp.output_type != usse::ParameterType::U8) return std::nullopt;
+    auto is_colour = [](const Operand& o) {
+        return o.bank == Bank::Output && o.number == 0 && !o.indexed && !o.negate && !o.absolute && o.lanes &&
+               o.swizzle[0] == Comp::X && o.swizzle[1] == Comp::Y && o.swizzle[2] == Comp::Z && o.swizzle[3] == Comp::W;
+    };
+    BlendRead out;
+    bool done = false;  // (the blend seen: nothing may touch the output register after it)
+    for (u32 i = 0; i < program.size(); ++i) {
+        const Decoded& d = program[i];
+        if (!d.executed) continue;
+        const Instruction& in = d.in;
+        if (in.op == Op::Br || in.op == Op::Ba || in.op == Op::Ret) return std::nullopt;
+        if (in.dest.bank == Bank::Output && !in.dest.mask) continue;  // (a half that writes no lane: nothing)
+        bool touches = in.dest.bank == Bank::Output;
+        for (u32 s = 0; s < in.src_count && s < 4; ++s) touches |= in.src[s].bank == Bank::Output;
+        if (!touches) continue;
+        const bool alpha = (in.flags & usse::kCoissued) != 0;
+        if (done || (in.op != Op::Sop2 && in.op != Op::Blend) || in.type != Type::Fx8 || in.pred != Pred::None ||
+            in.complement_a || in.dest.bank != Bank::Output || in.dest.number != 0 || in.dest.indexed ||
+            (in.dest.mask & (alpha ? ~8u : ~7u)) || out.at[alpha ? 1 : 0] != ~0u)
+            return std::nullopt;
+        // (the colour one source, the other anything else, the same register in both halves)
+        const u8 colour = is_colour(in.src[1]) ? 1 : is_colour(in.src[0]) ? 0 : 2;
+        if (colour == 2) return std::nullopt;
+        const Operand& src = in.src[1 - colour];
+        if (src.bank == Bank::Output || src.negate || src.absolute) return std::nullopt;
+        if (out.at[0] != ~0u && alpha) {
+            const Operand& other = program[out.at[0]].in.src[out.source[0]];
+            if (other.bank != src.bank || other.number != src.number || other.indexed != src.indexed ||
+                other.swizzle[3] != src.swizzle[3])
+                return std::nullopt;
+        }
+        // The factors, as the source (src) or the colour (dst) they name.
+        auto role = [&](u32 s) { return s == colour ? 1 : 0; };  // (0: the source, 1: the colour)
+        auto factor = [&](const SopTerm& t) -> std::optional<u8> {
+            u8 f;
+            switch (t.factor) {
+                case Factor::Zero: f = B::kZero; break;
+                case Factor::A: f = alpha ? (role(0) ? B::kDstAlpha : B::kSrcAlpha) : (role(0) ? B::kDstColor : B::kSrcColor); break;
+                case Factor::B: f = alpha ? (role(1) ? B::kDstAlpha : B::kSrcAlpha) : (role(1) ? B::kDstColor : B::kSrcColor); break;
+                case Factor::AAlpha: f = role(0) ? B::kDstAlpha : B::kSrcAlpha; break;
+                case Factor::BAlpha: f = role(1) ? B::kDstAlpha : B::kSrcAlpha; break;
+                case Factor::Sat:
+                    // (min(a's alpha, 1 - b's alpha): the colour lanes of a source over the colour)
+                    if (alpha || t.complement || colour != 1) return std::nullopt;
+                    return B::kSrcAlphaSaturate;
+                default: return std::nullopt;  // (s0: a third register)
+            }
+            return t.complement ? static_cast<u8>(f + 1) : f;
+        };
+        u8 op;
+        switch (in.sop_op) {
+            case Op::Add: op = B::kAdd; break;
+            case Op::Sub: op = colour == 1 ? B::kSubtract : B::kReverseSubtract; break;
+            case Op::Min: op = B::kMin; break;
+            case Op::Max: op = B::kMax; break;
+            default: return std::nullopt;
+        }
+        u8 fs = B::kOne, fd = B::kZero;
+        if (op != B::kMin && op != B::kMax) {
+            const auto f0 = factor(in.term[0]), f1 = factor(in.term[1]);
+            if (!f0 || !f1) return std::nullopt;
+            fs = colour == 1 ? *f0 : *f1, fd = colour == 1 ? *f1 : *f0;
+        }
+        if (alpha) out.blend.alpha_src = fs, out.blend.alpha_dst = fd, out.blend.alpha_op = op;
+        else out.blend.color_src = fs, out.blend.color_dst = fd, out.blend.color_op = op;
+        out.at[alpha ? 1 : 0] = i;
+        out.source[alpha ? 1 : 0] = static_cast<u8>(1 - colour);
+        out.blend.lanes |= in.dest.mask;
+        // (the word's colour half is followed by its alpha half: the blend is done after the word)
+        done = alpha || i + 1 >= program.size() || !(program[i + 1].in.flags & usse::kCoissued);
+    }
+    if (!out.blend.lanes) return std::nullopt;
+    // (the source's alpha named by the colour lanes' factors is what the alpha half writes)
+    auto names_src_alpha = [](u8 f) { return f == B::kSrcAlpha || f == B::kOneMinusSrcAlpha || f == B::kSrcAlphaSaturate; };
+    if (out.at[0] != ~0u && out.at[1] == ~0u && (names_src_alpha(out.blend.color_src) || names_src_alpha(out.blend.color_dst)))
+        return std::nullopt;
+    if (out.at[0] != ~0u && out.at[1] != ~0u) {
+        // (and the colour half's source names, as its alpha, the lane the alpha half writes from)
+        const Operand& c = program[out.at[0]].in.src[out.source[0]];
+        const Operand& a = program[out.at[1]].in.src[out.source[1]];
+        if (c.swizzle[3] != a.swizzle[3]) return std::nullopt;
+    }
+    return out;
+}
+
 std::atomic<HalfConversion> g_half{HalfConversion::Integer};
 
 // A float32's bits rounded to half precision's (in the low 16 bits), as the interpreter's usse::to_half: in integer
@@ -268,6 +365,7 @@ private:
     }
     Id fx_mul(Id a, Id c);
     void sop_op(const Instruction& in);
+    void blend_source_op(const Instruction& in, u32 source);
     void fxmad_op(const Instruction& in);
     Id bitwise(Op op, Id a, Id c, u32 bits);
     void bitwise_op(const Instruction& in);
@@ -307,6 +405,8 @@ private:
     const usse::Gxp& gxp_;
     std::span<const Decoded> program_;
     bool branches_ = false;
+    // (the fragment form with FragmentShader::blend_read: the colour read's blend, left to the pipeline)
+    std::optional<BlendRead> blend_read_;
     nx::vector<Id> interface_;  // (the entry point's inputs and outputs)
     Id push_ = 0, tp_push_f_ = 0, tp_push_u_ = 0;
     Id sa_base_ = 0;  // (the draw forms: the first word of this program's secondary attributes)
@@ -783,6 +883,13 @@ void Translator::sop_op(const Instruction& in) {
         }
         put(d, k, t, fx_raw(r, t));
     }
+}
+
+// A colour read's blend that the pipeline's blending does (FragmentShader::blend_read): its source other than the
+// colour into the output register's lanes it writes, as it is.
+void Translator::blend_source_op(const Instruction& in, u32 source) {
+    for (u32 k = 0; k < 4; ++k)
+        if ((in.dest.mask >> k) & 1) put(in.dest, k, in.type, raw(in.src[source], k, in.type));
 }
 
 void Translator::fxmad_op(const Instruction& in) {
@@ -1283,7 +1390,9 @@ void Translator::emit(usize i) {
     word_ = dec.word;
     if (!dec.executed) return;
     cond_ = predicate(in.pred);
-    switch (in.op) {
+    if (blend_read_ && !in_secondary_ && (i == blend_read_->at[0] || i == blend_read_->at[1]))
+        blend_source_op(in, blend_read_->source[i == blend_read_->at[0] ? 0 : 1]);
+    else switch (in.op) {
         case Op::Hidden:
         case Op::SetIncrements:
         case Op::Nop:
@@ -1643,7 +1752,8 @@ void Translator::fragment_prologue() {
         for (u32 k = 0; k < 256; ++k)
             store(chain(tp_fu_, sa_.var, {u(k)}), load(tu_, buffer_word(sa_buf_, iadd(sa_base_, u(k)))));
     }
-    if (gxp_.native_color && gxp_.frag_color) {
+    if (fragment_shader->blend_read) blend_read_ = find_blend_read(gxp_, program_);
+    if (gxp_.native_color && gxp_.frag_color && !blend_read_) {
         // The colour attachment's value, back in the output register's lanes and format.
         b_.capability(SpvCapabilityInputAttachment);
         const Id image = b_.t_image(tf_, SpvDimSubpassData, 0, 0, 0, 2, SpvImageFormatUnknown);
@@ -2022,6 +2132,11 @@ Result<nx::vector<u32>> translate_vertex(const usse::Gxp& gxp, std::span<const u
     Translator t(Form::Vertex, gxp, program);
     t.vertex_shader = &shader;
     return t.translate();
+}
+
+std::optional<ColorReadBlend> color_read_blend(const usse::Gxp& gxp, std::span<const usse::Decoded> program) {
+    const auto found = find_blend_read(gxp, program);
+    return found ? std::optional<ColorReadBlend>(found->blend) : std::nullopt;
 }
 
 Result<nx::vector<u32>> translate_fragment(const usse::Gxp& gxp, std::span<const usse::Decoded> program,

@@ -76,7 +76,10 @@
 - **No swapchain yet.** Presenting comes with the platform layer (SDL3).
 - **Rasterization-order attachment access** is enabled where a driver has it (`VK_EXT_` or `VK_ARM_`); neither GPU
   tested here does, so draws that read the colour attachment are separated by barriers, which only holds between
-  draws, not between overlapping triangles of one draw.
+  draws, not between overlapping triangles of one draw (whose fragments then lose each other's writes: a light cone
+  of layers drawn in one draw came out blotchy). Programs whose only read of the colour is a final blend of it with
+  another register (sop2 or blend, factors Vulkan has: every such program P4D draws) leave that blend to the
+  pipeline's fixed-function blending, which is ordered, and read no attachment; other colour reads still race.
 
 ## Shader translator (USSE to SPIR-V)
 

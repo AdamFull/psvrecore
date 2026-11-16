@@ -905,6 +905,7 @@ ShaderKey fragment_key(const Program& p, const FragmentShader& fs, bool inline_s
     v.insert(v.end(), reinterpret_cast<const u8*>(&fs.output_format), reinterpret_cast<const u8*>(&fs.output_format) + 4);
     v.insert(v.end(), fs.swizzle, fs.swizzle + 4);
     v.push_back(fs.color_output), v.push_back(fs.fragment_program_enabled), v.push_back(inline_secondary);
+    v.push_back(fs.blend_read);
     return shader_key({p.content, v});
 }
 
@@ -2426,20 +2427,47 @@ u64 vertex_quick(const Program& vp, const VertexShader& vs) {
     return q.value();
 }
 
+// A draw's read of the colour done by the pipeline's blending instead (color_read_blend), or none: a program whose
+// read is such a blend, of an 8-bit colour surface whose alpha is the output register's alpha lane, without the
+// patcher's blending. (Fragments reading the colour run in no order where the device has no rasterization-order
+// attachment access, nor do two reading one pixel in one draw wait for each other; blending is ordered, and the
+// draw then reads no attachment.)
+std::optional<ColorReadBlend> blend_read_of(const Draw& dr, const ColorFormat& cf, bool color) {
+    const Program& p = *dr.fragment->program;
+    if (!color || !p.gxp.native_color || !p.gxp.frag_color || dr.fragment->blend_enabled) return std::nullopt;
+    if (cf.format != VK_FORMAT_R8G8B8A8_UNORM && cf.format != VK_FORMAT_B8G8R8A8_UNORM) return std::nullopt;
+    const u8* z = cf.swizzle;
+    if (z[3] != 3 || z[0] > 2 || z[1] > 2 || z[2] > 2 || z[0] == z[1] || z[0] == z[2] || z[1] == z[2]) return std::nullopt;
+    if (p.blend_read < 0) {
+        const auto found = color_read_blend(p.gxp, p.primary);
+        Program& q = const_cast<Program&>(p);  // (found once a program, as stores())
+        if (found) q.blend_read_found = *found;
+        q.blend_read = found ? 1 : 0;
+    }
+    return p.blend_read == 1 ? std::optional<ColorReadBlend>(p.blend_read_found) : std::nullopt;
+}
+
 // A draw's fragment shader variant, for a colour surface of that format (or none).
 FragmentShader fragment_shader_of(const Draw& dr, const ColorFormat& cf, bool color) {
     FragmentShader fs;
     fs.output_format = dr.fragment->output_format;
     std::memcpy(fs.swizzle, cf.swizzle, 4);
     fs.color_output = color;
+    fs.blend_read = blend_read_of(dr, cf, color).has_value();
     return fs;
+}
+
+// Whether a draw reads the colour attachment (as an input attachment).
+bool reads_attachment(const Draw& dr, const ColorFormat& cf, bool color) {
+    const usse::Gxp& g = dr.fragment->program->gxp;
+    return color && g.native_color && g.frag_color && !blend_read_of(dr, cf, color);
 }
 
 u64 fragment_quick(const Program& fp, const FragmentShader& fs, bool inline_secondary) {
     nx::fnv1a64 q;
     q.combine_bytes(reinterpret_cast<const char*>(fp.content.data()), fp.content.size()).combine('f');
     q.combine_all(fs.output_format, fs.swizzle[0], fs.swizzle[1], fs.swizzle[2], fs.swizzle[3], fs.color_output,
-                  fs.fragment_program_enabled, inline_secondary);
+                  fs.fragment_program_enabled, inline_secondary, fs.blend_read);
     return q.value();
 }
 
@@ -2736,7 +2764,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     // made for that render pass)
     bool reads_color = false;
     for (const Draw& dr : scene.draws)
-        reads_color |= color && dr.fragment->program->gxp.native_color && dr.fragment->program->gxp.frag_color;
+        reads_color |= reads_attachment(dr, cf, color != nullptr);
     nx::vector<u32> sa(usize{nx::max(draws, 1u)} * kDrawSecondaryWords, 0);
     constexpr u32 kMemoryBase = 0x1000;  // (the guest addresses the programs see for the memory buffer's words)
     nx::vector<u8> mem;  // (the memory buffer's words, after its two-word header)
@@ -2959,6 +2987,24 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             desc.blend.dst_color = blend_factor(b.color_dst());
             desc.blend.src_alpha = blend_factor(b.alpha_src());
             desc.blend.dst_alpha = blend_factor(b.alpha_dst());
+        }
+        if (const auto br = blend_read_of(dr, cf, color != nullptr)) {
+            // (the program's read of the colour: its blend, of the output register's lanes, here)
+            static_assert(u32{VK_BLEND_FACTOR_SRC_ALPHA_SATURATE} == u32{ColorReadBlend::kSrcAlphaSaturate} &&
+                          u32{VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA} == u32{ColorReadBlend::kOneMinusDstAlpha} &&
+                          u32{VK_BLEND_OP_MAX} == u32{ColorReadBlend::kMax} &&
+                          u32{VK_BLEND_OP_REVERSE_SUBTRACT} == u32{ColorReadBlend::kReverseSubtract});
+            desc.blend.enable = 1;
+            desc.blend.src_color = static_cast<VkBlendFactor>(br->color_src);
+            desc.blend.dst_color = static_cast<VkBlendFactor>(br->color_dst);
+            desc.blend.color_op = static_cast<VkBlendOp>(br->color_op);
+            desc.blend.src_alpha = static_cast<VkBlendFactor>(br->alpha_src);
+            desc.blend.dst_alpha = static_cast<VkBlendFactor>(br->alpha_dst);
+            desc.blend.alpha_op = static_cast<VkBlendOp>(br->alpha_op);
+            u32 mask = 0;  // (the components whose lanes it writes; the others keep the colour)
+            for (u32 c = 0; c < 4; ++c)
+                if ((br->lanes >> cf.swizzle[c]) & 1) mask |= 1u << c;
+            desc.blend.write_mask = mask;
         }
         if (dr.fragment->blend_enabled) {
             const u8 m = dr.fragment->blend.color_mask;
@@ -3424,9 +3470,9 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         for (usize i = 0; i < plans.size(); ++i) {
             const DrawPlan& p = plans[i];
             const DrawState& st = p.draw->state;
-            const usse::Gxp& fg = p.draw->fragment->program->gxp;
-            if (g_profile.on) ++g_profile.draws, g_profile.colour_reads += fg.native_color && fg.frag_color;
-            if (fg.native_color && fg.frag_color && i > 0 && !d.caps().raster_order_attachment) {
+            const bool reads = reads_attachment(*p.draw, cf, color != nullptr);
+            if (g_profile.on) ++g_profile.draws, g_profile.colour_reads += reads;
+            if (reads && i > 0 && !d.caps().raster_order_attachment) {
                 if (g_profile.on) ++g_profile.barriers;
                 // (what the draws before wrote, for this one to read: the render pass's self-dependency)
                 VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
