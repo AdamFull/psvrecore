@@ -486,8 +486,19 @@ struct Renderer {
     struct VertexRange {
         u32 address = 0, bytes = 0;
         VkDeviceSize offset = 0;
+        u32 repack = ~0u;  // (laid out again: scene_repacks')
     };
     nx::vector<VertexRange> scene_vertex_ranges;
+    // A stream whose attributes are not where Vulkan can read them (an F32 attribute at an offset, or a stride, that
+    // is no multiple of four: what Vulkan reads there is undefined, and drivers read other vertices' bytes), copied
+    // vertex by vertex, each attribute at an aligned offset.
+    struct Repack {
+        u32 count = 0, from_stride = 0, to_stride = 0, fields = 0;
+        struct Field {
+            u32 from, to, bytes;
+        } field[16];
+    };
+    nx::vector<Repack> scene_repacks;
     nx::vector<u8> scene_indices;
     u64 ended = 0, rendered = 0;
     bool worker = false;
@@ -2864,19 +2875,34 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     // range a stream read before in the scene, which holds this one's, is read again, not copied again; guest
     // memory is as it is now for all of the scene's draws)
     nx::vector<Renderer::VertexRange>& vertex_ranges = r.scene_vertex_ranges;
+    nx::vector<Renderer::Repack>& repacks = r.scene_repacks;
     VkDeviceSize vertex_bytes = 0;
     vertex_ranges.clear();
+    repacks.clear();
     auto vertex_range = [&](u32 address, u32 bytes) -> VkDeviceSize {
         const bool readable = address && bytes && memory().valid(address, bytes);
         if (readable) {
+            // (at an offset a multiple of four from the range's: its attributes as aligned as in guest memory)
             for (const Renderer::VertexRange& v : vertex_ranges)
-                if (v.address && address >= v.address && u64{address} + bytes <= u64{v.address} + v.bytes)
+                if (v.address && v.repack == ~0u && address >= v.address && u64{address} + bytes <= u64{v.address} + v.bytes &&
+                    (address - v.address) % 4 == 0)
                     return v.offset + (address - v.address);
             depend(address, bytes);
         }
         const VkDeviceSize at = vertex_bytes;
         vertex_ranges.push_back({readable ? address : 0, bytes, at});  // (address 0: zeros)
         vertex_bytes += (VkDeviceSize{bytes} + 15) & ~VkDeviceSize{15};
+        return at;
+    };
+    auto repacked_range = [&](u32 address, u32 bytes, const Renderer::Repack& p) -> VkDeviceSize {
+        const bool readable = address && bytes && memory().valid(address, bytes);
+        if (readable) depend(address, bytes);
+        u32 out = p.count * p.to_stride;
+        for (u32 f = 0; f < p.fields; ++f) out = nx::max(out, p.field[f].to + p.field[f].bytes);
+        const VkDeviceSize at = vertex_bytes;
+        vertex_ranges.push_back({readable ? address : 0, out, at, static_cast<u32>(repacks.size())});
+        repacks.push_back(p);
+        vertex_bytes += (VkDeviceSize{out} + 15) & ~VkDeviceSize{15};
         return at;
     };
     nx::vector<u8>& indices = r.scene_indices;
@@ -2994,7 +3020,38 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                     reach = nx::max<u32>(reach, dr.vertex->attributes[a].offset + attribute_bytes(vs.inputs[a]));
             const u32 count = instanced ? dr.instances : max_index + 1;
             const u32 bytes = st.stride ? (count - 1) * st.stride + reach : reach;
-            plan.streams.push_back({s, vertex_range(dr.streams[s], bytes)});
+            // (an attribute Vulkan cannot read where it is: the stream laid out again)
+            bool offsets = true, strides = true;  // (aligned)
+            for (usize a = 0; a < vs.inputs.size(); ++a) {
+                if (dr.vertex->attributes[a].stream != s) continue;
+                const u32 align = nx::max<u32>(vertex_input_bits(vs.inputs[a].format) / 8, 1);
+                offsets &= dr.vertex->attributes[a].offset % align == 0;
+                strides &= st.stride % align == 0;
+            }
+            if (offsets && strides) {
+                plan.streams.push_back({s, vertex_range(dr.streams[s], bytes)});
+                continue;
+            }
+            Renderer::Repack p;
+            u32 cursor = 0;
+            if (offsets) {
+                // (only the stride: each vertex copied whole, its stride rounded up to four bytes)
+                p.field[p.fields++] = {0, 0, nx::min<u32>(reach, st.stride ? st.stride : reach)};
+                cursor = nx::max<u32>(reach, st.stride);
+            } else {
+                for (usize a = 0; a < vs.inputs.size() && p.fields < std::size(p.field); ++a) {
+                    if (dr.vertex->attributes[a].stream != s) continue;
+                    const u32 to = (cursor + 3) & ~3u, n = attribute_bytes(vs.inputs[a]);
+                    p.field[p.fields++] = {dr.vertex->attributes[a].offset, to, n};
+                    desc.attributes[a].offset = to;
+                    cursor = to + n;
+                }
+            }
+            p.from_stride = st.stride;
+            p.to_stride = st.stride ? (cursor + 3) & ~3u : 0;
+            p.count = st.stride ? count : 1;
+            desc.bindings[s].stride = p.to_stride;
+            plan.streams.push_back({s, repacked_range(dr.streams[s], bytes, p)});
         }
         switch (dr.primitive) {
             case 0x04000000u: desc.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
@@ -3191,8 +3248,20 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         // (straight from guest memory into the buffer)
         u8* out = static_cast<u8*>(vb->mapped);
         for (const Renderer::VertexRange& v : vertex_ranges) {
-            if (v.address) std::memcpy(out + v.offset, memory().host(v.address), v.bytes);
-            else std::memset(out + v.offset, 0, v.bytes);
+            if (v.address && v.repack != ~0u) {
+                const Renderer::Repack& p = repacks[v.repack];
+                const u8* from = memory().host(v.address);
+                u8* to = out + v.offset;
+                std::memset(to, 0, v.bytes);
+                for (u32 i = 0; i < p.count; ++i)
+                    for (u32 f = 0; f < p.fields; ++f)
+                        std::memcpy(to + usize{i} * p.to_stride + p.field[f].to, from + usize{i} * p.from_stride + p.field[f].from,
+                                    p.field[f].bytes);
+            } else if (v.address) {
+                std::memcpy(out + v.offset, memory().host(v.address), v.bytes);
+            } else {
+                std::memset(out + v.offset, 0, v.bytes);
+            }
         }
         vk::flush(d, *vb);
     }
