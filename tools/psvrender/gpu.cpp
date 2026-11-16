@@ -3,6 +3,7 @@
 #include <bit>
 #include <cstring>
 
+#include "psvrecore/gxm/half_check.hpp"
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/usse/interp.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
@@ -45,6 +46,7 @@ Result<Gpu*> gpu(const GpuOptions& options) {
     if (!created) return nx::err(created.error());
     g.device = std::move(*created);
     vk::Device& d = *g.device;
+    gxm::set_half_conversion(gxm::check_half_conversion(d).conversion);
     g.passes = nx::make_unique<vk::RenderPasses>(d);
     g.pipelines = nx::make_unique<vk::Pipelines>(d, *g.passes);
     g.samplers = nx::make_unique<vk::Samplers>(d);

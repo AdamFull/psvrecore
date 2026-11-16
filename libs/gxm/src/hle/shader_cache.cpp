@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/log.hpp"
 #include "core/foundation/core/sha256.h"
 #include "core/foundation/platform/filesystem.h"
@@ -25,7 +26,7 @@ struct Header {
     char magic[8];
     char translator[64];             // PSVRECORE_TRANSLATOR_ID (hex)
     u32 desc_size;                   // sizeof(GraphicsPipelineDesc): its layout changing drops the file too
-    u32 reserved;
+    u32 half;                        // HalfConversion: the programs translated another way are not these
 };
 
 Header header() {
@@ -34,6 +35,7 @@ Header header() {
     const char* id = PSVRECORE_TRANSLATOR_ID;
     std::memcpy(h.translator, id, std::min<usize>(std::strlen(id), sizeof h.translator));
     h.desc_size = sizeof(vulkan::GraphicsPipelineDesc);
+    h.half = static_cast<u32>(half_conversion());
     return h;
 }
 
@@ -47,6 +49,7 @@ ShaderKey shader_key(std::initializer_list<std::span<const u8>> parts) {
     nx::vector<u8> bytes;
     const char* id = PSVRECORE_TRANSLATOR_ID;
     bytes.insert(bytes.end(), id, id + std::strlen(id));
+    bytes.push_back(static_cast<u8>(half_conversion()));
     for (const auto& p : parts) {
         const u32 n = static_cast<u32>(p.size());  // (lengths too: the parts' borders are part of the key)
         bytes.insert(bytes.end(), reinterpret_cast<const u8*>(&n), reinterpret_cast<const u8*>(&n) + 4);

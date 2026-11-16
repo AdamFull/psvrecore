@@ -2,6 +2,7 @@
 
 #include <cstring>
 
+#include "psvrecore/gxm/half_check.hpp"
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/vulkan/device.hpp"
 #include "core/foundation/strings/format.h"
@@ -22,6 +23,7 @@ Result<vulkan::Device*> device(const GpuOptions& options) {
         auto created = vulkan::Device::create(o);
         if (!created) return nx::err(created.error());
         d = std::move(*created);
+        gxm::set_half_conversion(gxm::check_half_conversion(*d).conversion);
     }
     return d.get();
 }
@@ -31,10 +33,10 @@ Result<vulkan::Device*> device(const GpuOptions& options) {
 Result<void> run_on_gpu(const GpuOptions& options, const usse::Gxp& gxp, std::span<const usse::Decoded> program,
                         usse::Machine& m, std::span<const GpuTexture> textures, u32 memory_base,
                         std::span<const u32> memory) {
-    auto spirv = gxm::translate_compute(gxp, program);
-    if (!spirv) return nx::err(spirv.error());
     auto dev = device(options);
     if (!dev) return nx::err(dev.error());
+    auto spirv = gxm::translate_compute(gxp, program);
+    if (!spirv) return nx::err(spirv.error());
     vulkan::Device& d = **dev;
 
     nx::vector<u32> tex(ComputeLayout::kTextures * 4, 0);

@@ -26,6 +26,27 @@
 
 namespace psvrecore::gxm {
 
+// ---- Half precision ----------------------------------------------------------------------------------------------
+
+// How translated programs round results to half precision (F16 registers) as the interpreter does (to nearest even,
+// subnormals kept, a NaN's top mantissa bits kept and quieted): in integer arithmetic (about 28 instructions each),
+// or with the device's own conversion (GLSL.std.450 PackHalf2x16: 2), where check_half_conversion found it gives
+// the same bits; NaNs then still as the interpreter's where the device's differ (DeviceNaN: 12). A fragment program
+// rounds a hundred results or more, and a phone's driver compiles each.
+enum class HalfConversion : u8 { Integer, Device, DeviceNaN };
+// (process-wide, set before translating: the shader cache keeps what one way translated apart from the others)
+void set_half_conversion(HalfConversion c);
+HalfConversion half_conversion();
+const char* half_conversion_name(HalfConversion c);
+
+// The check: a compute shader (local size 64 x 1 x 1) converting float32 values both ways and counting where they
+// differ. Value i (from the push constant's first word plus the invocation's x, plus its y times 2^18) is, below
+// kHalfCheckValues: each of 2^30 with exponents 96-159 (every value whose rounding matters, with both signs), the
+// 2^24 infinities and NaNs, then 2^21 more over all exponents. In the storage buffer (set 0, binding 0): word 0 set
+// to 1 where a value differs (not a NaN), word 1 where a NaN does, word 2 one such value (not a NaN).
+inline constexpr u64 kHalfCheckValues = (1ull << 30) + (1ull << 24) + (1ull << 21);
+nx::vector<u32> half_check_shader();
+
 // ---- The compute form ----------------------------------------------------------------------------------------------
 
 // Its buffers, in 32-bit words.

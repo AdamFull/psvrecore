@@ -37,6 +37,7 @@
 
 #include "psvrecore/gxm/surface.hpp"
 #include "psvrecore/gxm/texture.hpp"
+#include "psvrecore/gxm/half_check.hpp"
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/io/file.hpp"
 #include "psvrecore/log.hpp"
@@ -632,6 +633,47 @@ void depend(u32 address, u32 bytes, u32 why = 1) {
     if (!r.pending.empty() && pending_writes(r, address, bytes)) g_finish_why = why, finish_pending(r, true);
 }
 
+// How this device's shaders round to half precision: check_half_conversion's answer, kept in the cache folder for
+// this device and driver (the check takes a fifth of a second on a phone), else checked now.
+HalfConversion half_conversion_for(vk::Device& d, const nx::string& folder) {
+    struct Kept {
+        char magic[8];
+        u8 uuid[VK_UUID_SIZE];
+        u32 vendor, device, driver;
+        u32 conversion;
+    };
+    const VkPhysicalDeviceProperties& p = d.properties();
+    Kept want{};
+    std::memcpy(want.magic, "PSVHALF1", 8);
+    std::memcpy(want.uuid, p.pipelineCacheUUID, VK_UUID_SIZE);
+    want.vendor = p.vendorID, want.device = p.deviceID, want.driver = p.driverVersion;
+    const char* forced = std::getenv("PSVRECORE_HALF");
+    const nx::string path = folder.empty() || forced ? nx::string() : folder + "/half.bin";
+    if (!path.empty()) {
+        if (std::FILE* in = std::fopen(path.c_str(), "rb")) {
+            Kept got{};
+            const bool read = std::fread(&got, sizeof got, 1, in) == 1;
+            std::fclose(in);
+            want.conversion = got.conversion;
+            if (read && std::memcmp(&got, &want, sizeof got) == 0 && got.conversion <= u32{2}) {
+                const auto c = static_cast<HalfConversion>(got.conversion);
+                nx::logi(logs::gpu, "half precision: {} (checked on an earlier run)", half_conversion_name(c));
+                return c;
+            }
+        }
+    }
+    const HalfCheck c = check_half_conversion(d);
+    if (!path.empty() && c.ran) {
+        (void)nx::fs::create_directories(nx::fs::path_view(folder));
+        want.conversion = static_cast<u32>(c.conversion);
+        if (std::FILE* out = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(&want, sizeof want, 1, out);
+            std::fclose(out);
+        }
+    }
+    return c.conversion;
+}
+
 bool ensure(Renderer& r) {
     if (r.tried) return static_cast<bool>(r.device);
     r.tried = true;
@@ -681,6 +723,8 @@ bool ensure(Renderer& r) {
     }
     r.passes = nx::make_unique<vk::RenderPasses>(d);
     r.pipelines = nx::make_unique<vk::Pipelines>(d, *r.passes);
+    // (how the shaders round to half precision, before the cache of what they were translated to is opened)
+    set_half_conversion(half_conversion_for(d, state().options->cache_folder));
     // (what an earlier run made, before anything is made now)
     r.cache.open(state().options->cache_folder);
     if (!r.cache.folder().empty()) {
@@ -3667,21 +3711,41 @@ WarmUp warm_up() {
         r.compute[short_key(key)] = make_compute(r, m);
         ++w.pipelines;
     }
+    const u64 compute_end = nx::os::ticks_ns();
+    u32 graphics = 0;
+    u64 graphics_ns = 0;  // (the graphics pipelines themselves, without their modules)
     for (const ShaderCache::Graphics& g : r.cache.graphics()) {
         vk::GraphicsPipelineDesc desc = g.desc;
         desc.vertex = module_for(r, g.vertex, none);
         desc.fragment = module_for(r, g.fragment, none);
         desc.layout = r.layout;
         if (!desc.vertex || !desc.fragment) continue;
-        if (r.pipelines->graphics(desc)) ++w.pipelines;
+        const u64 t0 = nx::os::ticks_ns();
+        if (r.pipelines->graphics(desc)) ++w.pipelines, ++graphics;
+        graphics_ns += nx::os::ticks_ns() - t0;
+        // (PSVRECORE_GXM_PROFILE: each pipeline, by its shaders; one whose shaders were compiled together before
+        // takes a fraction of a millisecond)
+        if (std::getenv("PSVRECORE_GXM_PROFILE")) {
+            const nx::vector<u32>* vw = r.cache.spirv(g.vertex);
+            const nx::vector<u32>* fw = r.cache.spirv(g.fragment);
+            nx::logi(logs::gpu, "gxm profile: warm-up pipeline, {:.1f} ms: vertex shader {:016x} ({} words), fragment {:016x} ({})",
+                     static_cast<f64>(nx::os::ticks_ns() - t0) / 1e6, short_key(g.vertex), vw ? vw->size() : 0,
+                     short_key(g.fragment), fw ? fw->size() : 0);
+        }
     }
     r.warming = false;
     // (what warm_up could not make is tried again when the game draws with it)
     r.failed_programs.clear();
     w.shaders = static_cast<u32>(r.modules.size());
-    w.ms = static_cast<f64>(nx::os::ticks_ns() - start) / 1e6;
+    const u64 end = nx::os::ticks_ns();
+    w.ms = static_cast<f64>(end - start) / 1e6;
     r.pipelines_changed.store(true);  // (the driver's cache now has them all: saved with the rest)
-    nx::logi(logs::gpu, "warm-up: {} shaders and {} pipelines from the cache in {:.0f} ms", w.shaders, w.pipelines, w.ms);
+    // (an empty driver cache, its file removed: how long a phone's driver takes to compile what the game used)
+    nx::logi(logs::gpu,
+             "warm-up: {} shaders and {} pipelines from the cache in {:.0f} ms (compute {:.0f}; {} graphics pipelines "
+             "{:.0f}, their modules {:.0f})",
+             w.shaders, w.pipelines, w.ms, static_cast<f64>(compute_end - start) / 1e6, graphics,
+             static_cast<f64>(graphics_ns) / 1e6, static_cast<f64>(end - compute_end - graphics_ns) / 1e6);
     return w;
 }
 

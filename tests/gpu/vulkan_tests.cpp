@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "nxtest.h"
+#include "psvrecore/gxm/half_check.hpp"
 #include "psvrecore/gxm/spirv.hpp"
 #include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/vulkan/frames.hpp"
@@ -592,5 +593,16 @@ TEST_CASE("vulkan gpu: YUV420 textures converted by a compute shader as on the C
     vkDestroyPipelineLayout(d.device(), layout, nullptr);
     vkDestroyDescriptorSetLayout(d.device(), set_layout, nullptr);
     vkDestroyShaderModule(d.device(), module, nullptr);
+    check_no_validation_errors(*g);
+}
+
+TEST_CASE("vulkan gpu: the device's conversion to half precision checked against the interpreter's") {
+    auto g = open(false);
+    const gxm::HalfCheck c = gxm::check_half_conversion(*g->device);
+    REQUIRE(c.ran);
+    // (which way is used depends on the device; a device's conversion that rounds as the interpreter's is used)
+    CHECK(c.conversion == (c.differ ? gxm::HalfConversion::Integer
+                           : c.nans_differ ? gxm::HalfConversion::DeviceNaN : gxm::HalfConversion::Device));
+    std::printf("half precision: %s\n", gxm::half_conversion_name(c.conversion));
     check_no_validation_errors(*g);
 }

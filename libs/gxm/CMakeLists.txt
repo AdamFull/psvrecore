@@ -1,5 +1,6 @@
 # GXM on Vulkan: the USSE to SPIR-V shader translator (and, later, the GXM API's state and draws).
 add_library(psvrecore_gxm STATIC
+    src/half_check.cpp
     src/spirv.cpp
     src/texture.cpp
     src/translate.cpp
@@ -10,7 +11,7 @@ target_include_directories(psvrecore_gxm
     PUBLIC include
     # SPIRV-Headers (github.com/KhronosGroup/SPIRV-Headers, MIT-style, submodule in third_party/SPIRV-Headers)
     PRIVATE "${PSVRECORE_DIR}/third_party/SPIRV-Headers/include")
-target_link_libraries(psvrecore_gxm PUBLIC psvrecore::usse)
+target_link_libraries(psvrecore_gxm PUBLIC psvrecore::usse psvrecore::vulkan)
 psvrecore_target_defaults(psvrecore_gxm)
 
 # The GXM and display system libraries on the runtime (HLE): what games call.

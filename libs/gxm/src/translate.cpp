@@ -11,6 +11,7 @@
 #include "psvrecore/gxm/translate.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 
 #include "core/foundation/strings/format.h"
@@ -58,6 +59,61 @@ u32 width_of(Type t) {
 }
 
 bool is_float(Type t) { return t == Type::F32 || t == Type::F16; }
+
+std::atomic<HalfConversion> g_half{HalfConversion::Integer};
+
+// A float32's bits rounded to half precision's (in the low 16 bits), as the interpreter's usse::to_half: in integer
+// arithmetic, or with the device's conversion (see HalfConversion). Also the check shader's.
+struct HalfOps {
+    spirv::Builder& b;
+    Id tu, ti, tf, tb;
+
+    Id u(u32 v) { return b.c_uint(v); }
+    Id bin(u32 op, Id type, Id x, Id y) { return b.op(op, type, {x, y}); }
+    Id band(Id x, Id y) { return bin(SpvOpBitwiseAnd, tu, x, y); }
+    Id bor(Id x, Id y) { return bin(SpvOpBitwiseOr, tu, x, y); }
+    Id shr(Id x, Id y) { return bin(SpvOpShiftRightLogical, tu, x, y); }
+    Id iadd(Id x, Id y) { return bin(SpvOpIAdd, tu, x, y); }
+    Id sel(Id c, Id x, Id y) { return b.op(SpvOpSelect, tu, {c, x, y}); }
+
+    // (the same bits as the interpreter's for every f32, checked over all of them; in fewer instructions than its
+    // branches written as selects)
+    Id integer(Id x) {
+        const Id sign = band(shr(x, u(16)), u(0x8000));
+        const Id a = band(x, u(0x7FFFFFFF));
+        const Id a13 = shr(a, u(13));
+        // Normal results: the exponent rebased by subtracting 112 << 23, rounded to nearest even by adding 0xFFF and
+        // the kept mantissa's lowest bit (a carry into the exponent is still right); 0x7C00 or more is infinity.
+        const Id normal =
+            b.ext(tu, GLSLstd450UMin, {shr(iadd(iadd(a, u(0xC8000FFFu)), band(a13, u(1))), u(13)), u(0x7C00)});
+        // Subnormal ones (below 2^-14): the mantissa with its leading one shifted by 126 - exponent, rounded the same
+        // way; from 25 on that leaves zero (the clamp keeps the shift defined where the normal result is taken).
+        const Id sh = b.ext(ti, GLSLstd450SClamp,
+                            {bin(SpvOpISub, ti, b.c_int(126), shr(a, u(23))), b.c_int(14), b.c_int(31)});
+        const Id m = bor(band(a, u(0x7FFFFF)), u(0x800000));
+        const Id sub = shr(iadd(iadd(m, shr(u(0x7FFFFFFF), bin(SpvOpISub, tu, u(32), sh))), band(shr(m, sh), u(1))), sh);
+        const Id h = sel(bin(SpvOpULessThan, tb, a, u(0x38800000)), sub, normal);
+        // NaNs keep their mantissa's top bits, quiet.
+        const Id nan = bor(band(a13, u(0x3FF)), u(0x7E00));
+        return bor(sign, sel(bin(SpvOpUGreaterThan, tb, a, u(0x7F800000)), nan, h));
+    }
+    Id device(Id x) {
+        const Id pair = b.op(SpvOpCompositeConstruct, b.t_vector(tf, 2), {b.op(SpvOpBitcast, tf, {x}), b.c_float(0.0f)});
+        return b.ext(tu, GLSLstd450PackHalf2x16, {pair});
+    }
+    // (a NaN as the interpreter's: its sign, quiet, its mantissa's top bits)
+    Id device_nan(Id x) {
+        const Id nan = bor(band(shr(x, u(16)), u(0x8000)), bor(band(shr(x, u(13)), u(0x3FF)), u(0x7E00)));
+        return sel(bin(SpvOpUGreaterThan, tb, band(x, u(0x7FFFFFFF)), u(0x7F800000)), nan, device(x));
+    }
+    Id convert(HalfConversion c, Id x) {
+        switch (c) {
+            case HalfConversion::Device: return device(x);
+            case HalfConversion::DeviceNaN: return device_nan(x);
+            default: return integer(x);
+        }
+    }
+};
 
 u32 lowest_lane(u8 mask) { return mask ? static_cast<u32>(std::countr_zero(static_cast<u32>(mask))) : 0; }
 
@@ -227,6 +283,7 @@ private:
     void write_sample(const Id rgba[4], u32 format, Id regs[4]);
     void tex_op(const Instruction& in);
     Id memory_read(Id address, u32 size);
+    void memory_read_words(Id address, u32 n, nx::vector<Id>& out);
     void memory_write(Id address, Id value, u32 size);
     void memory_op(const Instruction& in);
     // Translates one instruction; a branch's target block and condition are left to the caller.
@@ -273,26 +330,9 @@ private:
     Id cond_ = 0;
 };
 
+// (as a function called instead, a phone's driver took as long to compile the program: it inlined it)
 Id Translator::to_half(Id x) {
-    const Id sign = band(shr(x, u(16)), u(0x8000));
-    const Id exp = band(shr(x, u(23)), u(0xFF));
-    const Id mant = band(x, u(0x7FFFFF));
-    const Id nan = bor(bor(sign, u(0x7C00)), sel(tu_, ine(mant, u(0)), bor(u(0x200), shr(mant, u(13))), u(0)));
-    const Id e = bin(SpvOpISub, ti_, cast(ti_, exp), s(127 - 15));
-    // Normal results shift the mantissa by 13; subnormal ones (e <= 0) shift it with its leading one by 14 - e,
-    // which at 25 or more leaves zero (the interpreter's "e < -10").
-    const Id small = bin(SpvOpSLessThanEqual, tb_, e, s(0));
-    const Id m = sel(tu_, small, bor(mant, u(0x800000)), mant);
-    const Id shift = sel(tu_, small, cast(tu_, ext(ti_, GLSLstd450SMin, {bin(SpvOpISub, ti_, s(14), e), s(25)})), u(13));
-    const Id base = sel(tu_, small, u(0), shl(cast(tu_, e), u(10)));
-    Id h = bor(base, shr(m, shift));
-    const Id rem = band(m, isub(shl(u(1), shift), u(1)));
-    const Id half = shl(u(1), isub(shift, u(1)));
-    const Id up = lor(bin(SpvOpUGreaterThan, tb_, rem, half), land(ieq(rem, half), ine(band(h, u(1)), u(0))));
-    h = iadd(h, sel(tu_, up, u(1), u(0)));
-    Id r = bor(sign, h);
-    r = sel(tu_, bin(SpvOpSGreaterThanEqual, tb_, e, s(31)), bor(sign, u(0x7C00)), r);
-    return sel(tu_, ieq(exp, u(0xFF)), nan, r);
+    return HalfOps{b_, tu_, ti_, tf_, tb_}.convert(g_half.load(std::memory_order_relaxed), x);
 }
 
 // ---- Registers -------------------------------------------------------------------------------------------------
@@ -1144,6 +1184,35 @@ Id Translator::memory_read(Id address, u32 size) {
     return sel(tu_, land(inside, inside_too), v, u(0));
 }
 
+// `n` consecutive words from a guest address: what memory_read(address + 4i, 4) reads for each, with the address
+// arithmetic done once (a skinning vertex program reads its bones' matrices in bursts: a phone's driver compiled
+// each word's own arithmetic). Word i is inside the buffer when its offset is at most the buffer's bytes less 4.
+void Translator::memory_read_words(Id address, u32 n, nx::vector<Id>& out) {
+    auto data = [&](Id index) { return load(tu_, buffer_word(mem_buf_, index)); };
+    const Id base = data(u(0)), count = data(u(1));
+    const Id offset = isub(address, base);
+    const Id bytes = imul(count, u(4));
+    const Id last = isub(bytes, u(4));
+    const Id nonempty = bin(SpvOpUGreaterThanEqual, tb_, bytes, u(4));
+    const Id index = ext(tu_, GLSLstd450UMin, {shr(offset, u(2)), count});
+    const Id sh = shl(band(offset, u(3)), u(3));
+    const Id aligned = ieq(sh, u(0));
+    const Id back = isub(u(32), sh);
+    // (the words from index on, clamped as memory_read clamps its index: where one is clamped, the words that use it
+    // are outside the buffer)
+    auto at = [&](u32 j) {
+        return data(iadd(j ? ext(tu_, GLSLstd450UMin, {iadd(index, u(j)), count}) : index, u(ComputeLayout::kMemoryHeader)));
+    };
+    Id low = at(0);
+    for (u32 i = 0; i < n; ++i) {
+        const Id high = at(i + 1);
+        const Id v = bor(shr(low, sh), sel(tu_, aligned, u(0), shl(high, back)));
+        const Id inside = land(nonempty, bin(SpvOpULessThanEqual, tb_, i ? iadd(offset, u(4 * i)) : offset, last));
+        out.push_back(sel(tu_, inside, v, u(0)));
+        low = high;
+    }
+}
+
 // `size` bytes (1-4) of `value` at a guest address, under the instruction's predicate; outside the memory buffer
 // (or predicated off) they go to a scratch word past its end. A store of 1 or 2 bytes reads, modifies and writes its
 // word (not atomically: instances storing bytes of one word can race). Stores of 4 bytes are assumed aligned.
@@ -1193,10 +1262,12 @@ void Translator::memory_op(const Instruction& in) {
         }
         return;
     }
+    // (words of 4 or 8 bytes are consecutive: read together)
+    nx::vector<Id> values;
+    if (bytes >= 4) memory_read_words(address, count * words, values);
     for (u32 i = 0; i < count; ++i) {
         for (u32 j = 0; j < words; ++j) {
-            const Id at = iadd(address, u(i * bytes + j * 4));
-            const Id v = memory_read(at, nx::min<u32>(bytes, 4));
+            const Id v = bytes >= 4 ? values[i * words + j] : memory_read(iadd(address, u(i * bytes + j * 4)), bytes);
             Operand d = in.dest;
             d.lanes = 0;
             if (const Id w = word_ptr(d, d.number + i * words + j, true)) writes_.push_back(Pending{Slot{w, 0, 32}, v, cond_});
@@ -1959,6 +2030,87 @@ Result<nx::vector<u32>> translate_fragment(const usse::Gxp& gxp, std::span<const
     t.fragment_shader = &shader;
     t.inline_secondary = secondary;
     return t.translate();
+}
+
+void set_half_conversion(HalfConversion c) { g_half.store(c); }
+HalfConversion half_conversion() { return g_half.load(); }
+const char* half_conversion_name(HalfConversion c) {
+    switch (c) {
+        case HalfConversion::Device: return "the device's";
+        case HalfConversion::DeviceNaN: return "the device's, NaNs as the interpreter's";
+        default: return "integer arithmetic";
+    }
+}
+
+nx::vector<u32> half_check_shader() {
+    spirv::Builder b;
+    b.capability(SpvCapabilityShader);
+    const Id tu = b.t_uint(), ti = b.t_int(), tf = b.t_float(), tb = b.t_bool(), tv3 = b.t_vector(tu, 3);
+    const Id tvoid = b.t_void();
+    const Id words = b.t_runtime_array(tu);
+    b.decorate(words, SpvDecorationArrayStride, {4});
+    const Id block = b.t_struct({words});
+    b.decorate(block, SpvDecorationBlock);
+    b.member_decorate(block, 0, SpvDecorationOffset, {0});
+    const Id buffer = b.variable(b.t_pointer(SpvStorageClassStorageBuffer, block), SpvStorageClassStorageBuffer);
+    b.decorate(buffer, SpvDecorationDescriptorSet, {0});
+    b.decorate(buffer, SpvDecorationBinding, {0});
+    const Id pc_block = b.t_struct({tu});
+    b.decorate(pc_block, SpvDecorationBlock);
+    b.member_decorate(pc_block, 0, SpvDecorationOffset, {0});
+    const Id pc = b.variable(b.t_pointer(SpvStorageClassPushConstant, pc_block), SpvStorageClassPushConstant);
+    const Id gid_var = b.variable(b.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+    b.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+
+    const Id fn = b.begin_function(tvoid, b.t_function(tvoid));
+    b.block(b.new_label());
+    HalfOps h{b, tu, ti, tf, tb};
+    auto u = [&](u32 v) { return b.c_uint(v); };
+    auto shl = [&](Id x, u32 n) { return b.op(SpvOpShiftLeftLogical, tu, {x, u(n)}); };
+    auto bits = [&](u32 n, Id x, u32 at) { return h.band(h.shr(x, u(at)), u((1u << n) - 1)); };
+    auto below = [&](Id x, u32 n) { return h.bin(SpvOpULessThan, tb, x, u(n)); };
+    const Id tp_word = b.t_pointer(SpvStorageClassStorageBuffer, tu);
+    auto word = [&](i32 k) { return b.op(SpvOpAccessChain, tp_word, {buffer, b.c_int(0), b.c_int(k)}); };
+    const Id gid = b.op(SpvOpLoad, tv3, {gid_var});
+    const Id first =
+        b.op(SpvOpLoad, tu, {b.op(SpvOpAccessChain, b.t_pointer(SpvStorageClassPushConstant, tu), {pc, b.c_int(0)})});
+    const Id i = h.iadd(first, h.iadd(b.op(SpvOpCompositeExtract, tu, {gid, 0}),
+                                      shl(b.op(SpvOpCompositeExtract, tu, {gid, 1}), 18)));
+    // (the value: its sign, exponent and mantissa by region)
+    const Id dense = h.bor(h.bor(shl(bits(1, i, 29), 31), shl(h.iadd(bits(6, i, 23), u(96)), 23)), h.band(i, u(0x7FFFFF)));
+    const Id j = h.bin(SpvOpISub, tu, i, u(1u << 30));
+    const Id specials = h.bor(h.bor(shl(bits(1, j, 23), 31), u(0x7F800000u)), h.band(j, u(0x7FFFFF)));
+    const Id k = h.bin(SpvOpISub, tu, j, u(1u << 24));
+    const Id spread = h.bor(h.bor(shl(bits(1, k, 20), 31), shl(bits(8, k, 12), 23)),
+                            h.bor(shl(h.band(k, u(0xFFF)), 11), h.band(k, u(0x7FF))));
+    const Id x = h.sel(below(i, 1u << 30), dense, h.sel(below(j, 1u << 24), specials, spread));
+    const Id differ = h.bin(SpvOpLogicalAnd, tb, below(i, static_cast<u32>(kHalfCheckValues)),
+                            h.bin(SpvOpINotEqual, tb, h.integer(x), h.device(x)));
+    const Id is_nan = h.bin(SpvOpUGreaterThan, tb, h.band(x, u(0x7FFFFFFF)), u(0x7F800000));
+    const Id body = b.new_label(), merge = b.new_label(), number = b.new_label(), nan = b.new_label();
+    const Id counted = b.new_label();
+    b.op0(SpvOpSelectionMerge, {merge, SpvSelectionControlMaskNone});
+    b.op0(SpvOpBranchConditional, {differ, body, merge});
+    b.block(body);
+    b.op0(SpvOpSelectionMerge, {counted, SpvSelectionControlMaskNone});
+    b.op0(SpvOpBranchConditional, {is_nan, nan, number});
+    // (plain stores, not atomics: a device whose NaNs all differ would have every invocation add to one word)
+    b.block(number);
+    b.op0(SpvOpStore, {word(0), u(1)});
+    b.op0(SpvOpStore, {word(2), x});
+    b.op0(SpvOpBranch, {counted});
+    b.block(nan);
+    b.op0(SpvOpStore, {word(1), u(1)});
+    b.op0(SpvOpBranch, {counted});
+    b.block(counted);
+    b.op0(SpvOpBranch, {merge});
+    b.block(merge);
+    b.op0(SpvOpReturn, {});
+    b.end_function();
+    const Id interface[] = {gid_var};
+    b.entry_point(SpvExecutionModelGLCompute, fn, "main", interface);
+    b.execution_mode(fn, SpvExecutionModeLocalSize, {64, 1, 1});
+    return b.module();
 }
 
 void fill_secondary(const usse::Gxp& gxp, std::span<const u32> default_uniforms, std::span<const u32> buffer_addresses,
