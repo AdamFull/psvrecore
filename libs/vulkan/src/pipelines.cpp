@@ -1,5 +1,6 @@
 #include "psvrecore/vulkan/pipelines.hpp"
 
+#include <bit>
 #include <cstring>
 #include <type_traits>
 
@@ -32,7 +33,23 @@ GraphicsPipelineDesc GraphicsPipelineDesc::defaults() {
     return d;
 }
 
-u64 GraphicsPipelineDesc::hash() const { return nx::hash_fnv1a64(reinterpret_cast<const char*>(this), sizeof *this); }
+// (eight bytes at a time: a description is some 500 bytes, looked up for each draw of each scene; byte by byte, the
+// lookups took a twentieth of the thread that ends the game's scenes on a phone)
+u64 GraphicsPipelineDesc::hash() const {
+    constexpr u64 k1 = 0x9E3779B97F4A7C15ull, k2 = 0xC2B2AE3D27D4EB4Full;
+    const auto* p = reinterpret_cast<const unsigned char*>(this);
+    u64 h = k1 ^ sizeof *this;
+    usize i = 0;
+    for (; i + 8 <= sizeof *this; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = std::rotl(h ^ (w * k2), 31) * k1;
+    }
+    for (; i < sizeof *this; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    h ^= h >> 33;
+    h *= 0xFF51AFD7ED558CCDull;
+    return h ^ (h >> 33);
+}
 
 bool GraphicsPipelineDesc::same(const GraphicsPipelineDesc& other) const {
     return std::memcmp(this, &other, sizeof *this) == 0;

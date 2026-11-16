@@ -441,7 +441,8 @@ struct Renderer {
     // textures' texels), for the next scenes: not made and freed six times or more a scene.
     nx::vector<vk::Buffer> free_buffers;
     u64 free_buffer_bytes = 0;
-    nx::vector<VkDescriptorPool> free_pools;  // (of kPoolSets sets, reset: for the next scenes)
+    // (descriptor pools reset, for the next scenes: by size, kPoolSets sets and each power of two above it)
+    nx::vector<VkDescriptorPool> free_pools[4];
     // Scenes submitted to the GPU whose results are not in guest memory yet, oldest first: what each writes there,
     // the surface whose image it draws, and what finishes it (the write-back, the notifications, the clean-up) once
     // the GPU is done. A scene is finished when a later one has been submitted (the GPU runs it while the CPU
@@ -927,9 +928,13 @@ VkPipeline make_compute(Renderer& r, VkShaderModule m) {
 
 // The compute pipeline of a secondary program (VK_NULL_HANDLE: none to run, or not translated).
 VkPipeline secondary_pipeline_keyed(Renderer& r, const Program& p);
+// (a quick key: the program's content, as secondary_key takes it)
+u64 secondary_quick(const Program& p) {
+    return nx::fnv1a64().combine_bytes(reinterpret_cast<const char*>(p.content.data()), p.content.size()).value();
+}
 VkPipeline secondary_pipeline(Renderer& r, const Program& p) {
     if (p.secondary.empty()) return VK_NULL_HANDLE;
-    const u64 quick = nx::fnv1a64().combine_bytes(reinterpret_cast<const char*>(p.content.data()), p.content.size()).value();
+    const u64 quick = secondary_quick(p);
     if (auto it = r.quick_compute.find(quick); it != r.quick_compute.end()) return it->second;
     const VkPipeline pipeline = secondary_pipeline_keyed(r, p);
     r.quick_compute[quick] = pipeline;
@@ -1346,15 +1351,23 @@ Result<vk::Buffer> take_host_buffer(Renderer& r, VkDeviceSize bytes) {
     return vk::create_host_buffer(*r.device, std::bit_ceil(nx::max<VkDeviceSize>(bytes, 65536)), kHostBufferUsage);
 }
 
-// A scene's descriptor pool: of kPoolSets sets (one given back, else new) for up to as many draws, else its own.
+// A scene's descriptor pool: of kPoolSets sets, or the power of two above them its draws need (one given back,
+// else new), else its own. (Made and freed a scene, a pool for a song's scenes of 160 draws took a phone's driver a
+// fifth of the thread that ends the game's scenes: Adreno allocates each in the GPU's memory.)
 constexpr u32 kPoolSets = 128, kFreePools = 16;
+constexpr u32 pool_class(u32 sets) {
+    u32 c = 0;
+    while (c < 4 && sets > kPoolSets << c) ++c;
+    return c;  // (4: none, its own)
+}
 VkDescriptorPool take_descriptor_pool(Renderer& r, u32 sets) {
-    if (sets <= kPoolSets && !r.free_pools.empty()) {
-        const VkDescriptorPool p = r.free_pools.back();
-        r.free_pools.pop_back();
+    const u32 c = pool_class(sets);
+    if (c < 4 && !r.free_pools[c].empty()) {
+        const VkDescriptorPool p = r.free_pools[c].back();
+        r.free_pools[c].pop_back();
         return p;
     }
-    const u32 n = nx::max(sets, kPoolSets);
+    const u32 n = c < 4 ? kPoolSets << c : sets;
     const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * n},
                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (kDrawBindings - 3) * n},
                                           {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, n}};
@@ -1368,9 +1381,9 @@ VkDescriptorPool take_descriptor_pool(Renderer& r, u32 sets) {
 }
 void give_descriptor_pool(Renderer& r, VkDescriptorPool pool, u32 sets) {
     if (!pool) return;
-    if (sets <= kPoolSets && r.free_pools.size() < kFreePools) {
+    if (const u32 c = pool_class(sets); c < 4 && r.free_pools[c].size() < kFreePools) {
         vkResetDescriptorPool(r.device->device(), pool, 0);
-        r.free_pools.push_back(pool);
+        r.free_pools[c].push_back(pool);
     } else {
         vkDestroyDescriptorPool(r.device->device(), pool, nullptr);
     }
@@ -2520,7 +2533,7 @@ void prepare_shaders(Renderer& r, std::span<const Draw> draws, const ColorFormat
         const Program& fp = *dr.fragment->program;
         const bool inline_secondary = tile_secondary(fp);
         for (const Program* p : {&vp, inline_secondary ? nullptr : &fp}) {
-            if (!p || p->secondary.empty()) continue;
+            if (!p || p->secondary.empty() || r.quick_compute.contains(secondary_quick(*p))) continue;
             Task t;
             t.key = secondary_key(*p), t.program = p, t.kind = Kind::Secondary;
             add(std::move(t));
