@@ -404,11 +404,13 @@ struct Renderer {
     nx::hash_map<u64, u64> by_words;
     // Textures made on the GPU from a surface's image (texture_from_target), to be recorded at the start of the
     // scene's commands: the cached texture's key, the surface, and the columns past the surface's width (from guest
-    // memory, in a buffer) when the texture is wider.
+    // memory, in a buffer) when the texture is wider. `scale` above 1: made from the surface's scaled image, at its
+    // scale (the strip's texels repeated over scale x scale blocks).
     struct TargetCopy {
         u64 key = 0;
         Target* from = nullptr;
         u32 width = 0, height = 0;
+        u32 scale = 1;
         vk::Buffer strip{};
         u32 strip_x = 0, strip_w = 0;
     };
@@ -1713,7 +1715,9 @@ u64 content_hash(const u8* p, usize n, u64 seed) {
 // A texture that reads a colour surface whose image holds what guest memory does (the surface drawn and written
 // back, nothing else written there since): made on the GPU from that image instead of being read back, decoded and
 // uploaded (a render target read as a texture each frame). One level, texels as the image holds them, the surface's
-// layout, as tall; wider for a linear surface (its stride's columns past the width come from guest memory).
+// layout, as tall; wider for a linear surface (its stride's columns past the width come from guest memory). A surface
+// drawn at the internal resolution gives a texture at that resolution, from its scaled image (a draw reading the
+// surface it draws into, or wider than the surface, still sees what was drawn there at that resolution).
 //
 // `only`: that surface, which a pending scene draws (its image will hold what guest memory will: not compared).
 CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key, u64 words_key, Target* only = nullptr) {
@@ -1730,10 +1734,11 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
             const Changes changes = surface_changes(*t);
             if (changes.all || changes.pixels) continue;
         }
+        const u32 s = t->scale > 1 && t->scaled.image ? t->scale : 1;
         vk::ImageDesc d;
         d.format = t->image.desc.format;
-        d.width = info.width;
-        d.height = info.height;
+        d.width = info.width * s;
+        d.height = info.height * s;
         CachedTexture c;
         bool reused = false;
         if (auto was = r.by_words.find(words_key); was != r.by_words.end()) {
@@ -1760,6 +1765,7 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         copy.key = key;
         copy.from = t.get();
         copy.width = t->width, copy.height = t->height;
+        copy.scale = s;
         if (info.width > t->width) {
             // (the columns past the surface's width: as they are in guest memory)
             TextureInfo strip = info;
@@ -1770,6 +1776,15 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
                 std::memcpy(out, memory().host(address), bytes);
                 return true;
             });
+            if (texels && s > 1) {
+                // (each texel over an s x s block, as the scaled image's pixels are)
+                const u32 w = strip.width, h = info.height;
+                nx::vector<u8> up(usize{w} * s * h * s * 4);
+                for (u32 y = 0; y < h * s; ++y)
+                    for (u32 x = 0; x < w * s; ++x)
+                        std::memcpy(up.data() + (usize{y} * w * s + x) * 4, texels->data.data() + (usize{y / s} * w + x / s) * 4, 4);
+                texels->data = std::move(up);
+            }
             auto buffer = texels ? vk::create_host_buffer(*r.device, texels->data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
                                  : Result<vk::Buffer>(failure("texture: the columns past the surface"));
             if (!buffer) {
@@ -1838,18 +1853,19 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
         auto it = r.textures.find(c.key);
         if (it == r.textures.end()) continue;
         vk::Image& to = it->second.image;
-        vk::transition(cmd, c.from->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vk::Image& from = c.scale > 1 ? c.from->scaled : c.from->image;
+        vk::transition(cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         vk::transition(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageCopy region{};
         region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.extent = {c.width, c.height, 1};
-        vkCmdCopyImage(cmd, c.from->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to.image,
+        region.extent = {c.width * c.scale, c.height * c.scale, 1};
+        vkCmdCopyImage(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to.image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         if (c.strip_w) {
             VkBufferImageCopy b{};
             b.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            b.imageOffset = {static_cast<i32>(c.strip_x), 0, 0};
-            b.imageExtent = {c.strip_w, c.height, 1};
+            b.imageOffset = {static_cast<i32>(c.strip_x * c.scale), 0, 0};
+            b.imageExtent = {c.strip_w * c.scale, c.height * c.scale, 1};
             vkCmdCopyBufferToImage(cmd, c.strip.buffer, to.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b);
         }
         vk::transition(cmd, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -3360,13 +3376,9 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &b, 0,
                              nullptr, 0, nullptr);
     }
-    record_target_copies(r, *cmd);
-    copies_recorded = true;
-    // (the scaled surfaces the draws read, as textures)
-    for (Target* t : sampled) vk::transition(*cmd, t->scaled, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    for (DepthTarget* t : sampled_depth) vk::transition(*cmd, t->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (scale > 1) {
-        // (the tiles of the surface's colour that changed, scaled up into the scaled image)
+        // (the tiles of the surface's colour that changed, scaled up into the scaled image: before the copies, so a
+        // texture made from the surface this scene draws holds what the scene starts from)
         if (!changes.tiles.empty()) {
             vk::transition(*cmd, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             vk::transition(*cmd, target->scaled, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -3392,6 +3404,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             }
         }
     }
+    record_target_copies(r, *cmd);
+    copies_recorded = true;
+    // (the scaled surfaces the draws read, as textures)
+    for (Target* t : sampled) vk::transition(*cmd, t->scaled, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    for (DepthTarget* t : sampled_depth) vk::transition(*cmd, t->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     const VkBufferImageCopy depth_regions[2] = {
         {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {draw_w, draw_h, 1}},
         {samples * 4, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {draw_w, draw_h, 1}}};
