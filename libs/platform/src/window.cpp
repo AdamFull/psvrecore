@@ -569,10 +569,7 @@ struct Window::Presenter {
         pi.swapchainCount = 1;
         pi.pSwapchains = &swapchain;
         pi.pImageIndices = &index;
-        {
-            nx::scoped_lock<nx::mutex> queue_held(device->queue_lock());
-            r = vkQueuePresentKHR(device->queue(), &pi);
-        }
+        r = device->present(pi);
         // (SUBOPTIMAL is not acted on: Android reports it for every present the compositor rotates)
         if (r == VK_ERROR_OUT_OF_DATE_KHR) out_of_date = true;
         else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)

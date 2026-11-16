@@ -188,12 +188,14 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     d->queue_family_ = static_cast<u32>(family);
     Capabilities& caps = d->caps_;
     caps.vendor_id = props.vendorID;
+    u32 queues = 1;  // (the family's, up to two: the second presents)
     {
         u32 qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(gpu, &qn, nullptr);
         nx::vector<VkQueueFamilyProperties> families(qn);
         vkGetPhysicalDeviceQueueFamilyProperties(gpu, &qn, families.data());
         if (families[d->queue_family_].timestampValidBits) caps.timestamp_period = props.limits.timestampPeriod;
+        queues = nx::min<u32>(families[d->queue_family_].queueCount, 2);
     }
 
     // Extensions: the swapchain when presenting; dynamic rendering where 1.3 does not have it; rasterization-order
@@ -282,11 +284,11 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         }
     }
 
-    const f32 priority = 1.0f;
+    const f32 priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue.queueFamilyIndex = d->queue_family_;
-    queue.queueCount = 1;
-    queue.pQueuePriorities = &priority;
+    queue.queueCount = queues;
+    queue.pQueuePriorities = priorities;
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = chain;
     info.queueCreateInfoCount = 1;
@@ -298,6 +300,9 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         return nx::err(vk_error("vkCreateDevice", r));
     volkLoadDevice(d->device_);
     vkGetDeviceQueue(d->device_, d->queue_family_, 0, &d->queue_);
+    d->present_queue_ = d->queue_;
+    if (queues > 1) vkGetDeviceQueue(d->device_, d->queue_family_, 1, &d->present_queue_);
+    nx::logi(logs::gpu, "Vulkan device: presenting on {}", queues > 1 ? "a second queue" : "the one queue");
     if (caps.dynamic_rendering) {
         d->begin_rendering = core13 ? vkCmdBeginRendering : vkCmdBeginRenderingKHR;
         d->end_rendering = core13 ? vkCmdEndRendering : vkCmdEndRenderingKHR;
@@ -398,7 +403,13 @@ VkResult Device::submit(const VkSubmitInfo& info, VkFence fence) {
 
 void Device::wait_idle() {
     const nx::scoped_lock<nx::mutex> held(queue_lock_);
+    const nx::scoped_lock<nx::mutex> present_held(present_lock_);
     vkDeviceWaitIdle(device_);
+}
+
+VkResult Device::present(const VkPresentInfoKHR& info) {
+    const nx::scoped_lock<nx::mutex> held(present_queue_ == queue_ ? queue_lock_ : present_lock_);
+    return vkQueuePresentKHR(present_queue_, &info);
 }
 
 Result<Buffer> create_host_buffer(Device& device, VkDeviceSize size, VkBufferUsageFlags usage) {

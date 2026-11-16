@@ -82,7 +82,11 @@ public:
 
     // Submits under the queue lock.
     VkResult submit(const VkSubmitInfo& info, VkFence fence);
-    void wait_idle();
+    // Presents on a second queue of the family where it has one, under that queue's own lock: an Adreno driver's
+    // present took 7 ms and up to 24 with the frame's GPU work already done, and scenes' submits waiting for the
+    // one queue's lock waited as long. On the queue where there is only one, under its lock.
+    VkResult present(const VkPresentInfoKHR& info);
+    void wait_idle();  // (both queues' locks held)
 
     // Dynamic rendering's entry points (core or KHR), null without it.
     PFN_vkCmdBeginRendering begin_rendering = nullptr;
@@ -104,13 +108,13 @@ private:
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
-    VkQueue queue_ = VK_NULL_HANDLE;
+    VkQueue queue_ = VK_NULL_HANDLE, present_queue_ = VK_NULL_HANDLE;
     u32 queue_family_ = 0;
     VmaAllocator allocator_ = VK_NULL_HANDLE;
     VmaPool texture_pool_ = VK_NULL_HANDLE, host_pool_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties_{};
     Capabilities caps_;
-    nx::mutex queue_lock_;
+    nx::mutex queue_lock_, present_lock_;
     u32 validation_errors_ = 0;
 };
 
