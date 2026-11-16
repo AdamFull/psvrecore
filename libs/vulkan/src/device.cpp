@@ -7,6 +7,15 @@
 
 namespace psvrecore::vulkan {
 
+namespace {
+// (the host buffers' usage and allocation: their memory type is found once, for the reserved memory)
+constexpr VkBufferUsageFlags kHostBufferUsage =
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+constexpr VmaAllocationCreateFlags kHostBufferFlags =
+    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+}  // namespace
+
 nx::string result_name(VkResult r) {
     switch (r) {
         case VK_SUCCESS: return "VK_SUCCESS";
@@ -311,8 +320,50 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     if (const VkResult r = vmaImportVulkanFunctionsFromVolk(&allocator, &functions); r != VK_SUCCESS)
         return nx::err(vk_error("vmaImportVulkanFunctionsFromVolk", r));
     allocator.pVulkanFunctions = &functions;
+    // (each block of device memory: made while drawing, it may cost a frame)
+    static const VmaDeviceMemoryCallbacks memory_log{
+        [](VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size, void*) {
+            if (size >= 16ull << 20) nx::logi(logs::gpu, "Vulkan memory: a block of {} MiB of type {} made", size >> 20, type);
+            else nx::logd(logs::gpu, "Vulkan memory: {} KiB of type {} allocated", size >> 10, type);
+        },
+        nullptr, nullptr};
+    allocator.pDeviceMemoryCallbacks = &memory_log;
     if (const VkResult r = vmaCreateAllocator(&allocator, &d->allocator_); r != VK_SUCCESS)
         return nx::err(vk_error("vmaCreateAllocator", r));
+    // The textures' and host buffers' memory, made now (kReservedBlocks blocks of each, more when they fill up): a
+    // song of Persona 4: Dancing All Night made a second block of each while it played, of 64 MiB after one of 32.
+    {
+        constexpr VkDeviceSize kBlock = 64ull << 20;
+        constexpr u32 kReservedBlocks = 2;
+        VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image.imageType = VK_IMAGE_TYPE_2D;
+        image.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image.extent = {256, 256, 1};
+        image.mipLevels = image.arrayLayers = 1;
+        image.samples = VK_SAMPLE_COUNT_1_BIT;
+        image.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        buffer.size = 65536;
+        buffer.usage = kHostBufferUsage;
+        VmaAllocationCreateInfo texture_alloc{}, host_alloc{};
+        texture_alloc.usage = host_alloc.usage = VMA_MEMORY_USAGE_AUTO;
+        host_alloc.flags = kHostBufferFlags;
+        u32 texture_type = 0, host_type = 0;
+        VmaPoolCreateInfo pool{};
+        pool.blockSize = kBlock;
+        pool.minBlockCount = kReservedBlocks;
+        if (vmaFindMemoryTypeIndexForImageInfo(d->allocator_, &image, &texture_alloc, &texture_type) == VK_SUCCESS) {
+            pool.memoryTypeIndex = texture_type;
+            if (vmaCreatePool(d->allocator_, &pool, &d->texture_pool_) != VK_SUCCESS) d->texture_pool_ = VK_NULL_HANDLE;
+        }
+        if (vmaFindMemoryTypeIndexForBufferInfo(d->allocator_, &buffer, &host_alloc, &host_type) == VK_SUCCESS) {
+            pool.memoryTypeIndex = host_type;
+            if (vmaCreatePool(d->allocator_, &pool, &d->host_pool_) != VK_SUCCESS) d->host_pool_ = VK_NULL_HANDLE;
+        }
+        nx::logi(logs::gpu, "Vulkan memory: {} MiB reserved for textures, {} MiB for host buffers",
+                 d->texture_pool_ ? kBlock * kReservedBlocks >> 20 : 0, d->host_pool_ ? kBlock * kReservedBlocks >> 20 : 0);
+    }
     nx::logi(logs::gpu, "Vulkan device: {} (API {}.{}.{}, using {}.{}); {}{}{}{}", props.deviceName,
              VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
              VK_API_VERSION_PATCH(props.apiVersion), VK_API_VERSION_MAJOR(caps.api_version),
@@ -331,6 +382,8 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
 
 Device::~Device() {
     if (device_) wait_idle();
+    if (texture_pool_) vmaDestroyPool(allocator_, texture_pool_);
+    if (host_pool_) vmaDestroyPool(allocator_, host_pool_);
     if (allocator_) vmaDestroyAllocator(allocator_);
     if (device_) vkDestroyDevice(device_, nullptr);
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
@@ -355,12 +408,17 @@ Result<Buffer> create_host_buffer(Device& device, VkDeviceSize size, VkBufferUsa
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VmaAllocationCreateInfo alloc{};
     alloc.usage = VMA_MEMORY_USAGE_AUTO;
-    alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    alloc.flags = kHostBufferFlags;
+    alloc.pool = device.host_pool();
     Buffer b;
     VmaAllocationInfo out{};
-    if (const VkResult r = vmaCreateBuffer(device.allocator(), &info, &alloc, &b.buffer, &b.allocation, &out);
-        r != VK_SUCCESS)
-        return nx::err(vk_error("vmaCreateBuffer", r));
+    VkResult r = vmaCreateBuffer(device.allocator(), &info, &alloc, &b.buffer, &b.allocation, &out);
+    // (not in the reserved memory: too big for its blocks, or a usage its memory type does not serve)
+    if (r != VK_SUCCESS && alloc.pool) {
+        alloc.pool = VK_NULL_HANDLE;
+        r = vmaCreateBuffer(device.allocator(), &info, &alloc, &b.buffer, &b.allocation, &out);
+    }
+    if (r != VK_SUCCESS) return nx::err(vk_error("vmaCreateBuffer", r));
     b.mapped = out.pMappedData;
     b.size = info.size;
     return b;

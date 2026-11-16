@@ -66,6 +66,11 @@ public:
     // application is sent to the background and comes back new. VK_NULL_HANDLE: none for now.
     void replace_surface(VkSurfaceKHR surface);
     VmaAllocator allocator() const { return allocator_; }
+    // The memory textures (sampled images filled by copies) and host buffers come from first, its blocks made with
+    // the device (null: none; the allocator's own memory then). A phone's driver took 20 ms and more for each block
+    // of 64 MiB made while a game drew, a frame and more each time.
+    VmaPool texture_pool() const { return texture_pool_; }
+    VmaPool host_pool() const { return host_pool_; }
     const VkPhysicalDeviceProperties& properties() const { return properties_; }
     const Capabilities& caps() const { return caps_; }
     bool int64() const { return caps_.int64; }  // shaderInt64
@@ -102,6 +107,7 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     u32 queue_family_ = 0;
     VmaAllocator allocator_ = VK_NULL_HANDLE;
+    VmaPool texture_pool_ = VK_NULL_HANDLE, host_pool_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties_{};
     Capabilities caps_;
     nx::mutex queue_lock_;

@@ -76,10 +76,17 @@ Result<Image> create_image(Device& device, const ImageDesc& desc) {
     alloc.usage = VMA_MEMORY_USAGE_AUTO;
     // (transient attachments in lazily allocated memory where there is some: tile-based GPUs keep them on chip)
     if (desc.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) alloc.usage = VMA_MEMORY_USAGE_GPU_LAZILY_ALLOCATED;
+    // (a texture: in the memory reserved for them, unless it does not fit there)
+    if (desc.usage == (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) && desc.samples == VK_SAMPLE_COUNT_1_BIT)
+        alloc.pool = device.texture_pool();
     Image im;
     im.desc = desc;
     im.aspect = aspect_of(desc.format);
     VkResult r = vmaCreateImage(device.allocator(), &info, &alloc, &im.image, &im.allocation, nullptr);
+    if (r != VK_SUCCESS && alloc.pool) {
+        alloc.pool = VK_NULL_HANDLE;
+        r = vmaCreateImage(device.allocator(), &info, &alloc, &im.image, &im.allocation, nullptr);
+    }
     if (r != VK_SUCCESS && alloc.usage == VMA_MEMORY_USAGE_GPU_LAZILY_ALLOCATED) {
         alloc.usage = VMA_MEMORY_USAGE_AUTO;
         r = vmaCreateImage(device.allocator(), &info, &alloc, &im.image, &im.allocation, nullptr);
