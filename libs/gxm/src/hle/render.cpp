@@ -857,6 +857,8 @@ struct GraphicsJob {
 // The jobs' pipelines, on several threads. First one for each vertex shader, those with the most SPIR-V first, then
 // the rest: a driver compiles a shader the first time a pipeline has it, and the others with it take a fraction of
 // that (a phone's: 83 ms for a new vertex shader on average, 17 ms for a new fragment shader with one made before).
+// (a phone's driver took two fifths longer for each pipeline with four at once, its threads on the fast cores or
+// not: a scene's new pipelines take their sum over about three)
 void make_graphics(Renderer& r, std::span<GraphicsJob> jobs) {
     auto words = [&](VkShaderModule m) -> usize {
         const auto it = r.module_keys.find(reinterpret_cast<u64>(m));
@@ -2370,6 +2372,139 @@ void capture_draw(u64 number, const Scene& scene) {
              count, d.index_count);
 }
 
+// A draw's vertex shader variant: its inputs, from the vertex program's attributes and the program's parameters.
+VertexShader vertex_shader_of(const Draw& dr) {
+    const Program& vp = *dr.vertex->program;
+    VertexShader vs;
+    for (usize a = 0; a < dr.vertex->attributes.size(); ++a) {
+        const VertexAttribute& attr = dr.vertex->attributes[a];
+        VertexInput in;
+        in.location = static_cast<u32>(a);
+        in.reg = attr.reg;
+        in.format = attr.format;
+        in.components = attr.components;
+        for (const usse::Parameter& p : vp.gxp.parameters)
+            if (p.category == usse::ParameterCategory::Attribute && p.resource == attr.reg) in.raw = p.reg_format;
+        vs.inputs.push_back(in);
+    }
+    return vs;
+}
+
+// (a quick key: the program's content and the inputs, as vertex_key takes them)
+u64 vertex_quick(const Program& vp, const VertexShader& vs) {
+    nx::fnv1a64 q;
+    q.combine_bytes(reinterpret_cast<const char*>(vp.content.data()), vp.content.size()).combine('v');
+    for (const VertexInput& in : vs.inputs) q.combine_all(in.location, in.reg, in.format, in.components, in.raw);
+    return q.value();
+}
+
+// A draw's fragment shader variant, for a colour surface of that format (or none).
+FragmentShader fragment_shader_of(const Draw& dr, const ColorFormat& cf, bool color) {
+    FragmentShader fs;
+    fs.output_format = dr.fragment->output_format;
+    std::memcpy(fs.swizzle, cf.swizzle, 4);
+    fs.color_output = color;
+    return fs;
+}
+
+u64 fragment_quick(const Program& fp, const FragmentShader& fs, bool inline_secondary) {
+    nx::fnv1a64 q;
+    q.combine_bytes(reinterpret_cast<const char*>(fp.content.data()), fp.content.size()).combine('f');
+    q.combine_all(fs.output_format, fs.swizzle[0], fs.swizzle[1], fs.swizzle[2], fs.swizzle[3], fs.color_output,
+                  fs.fragment_program_enabled, inline_secondary);
+    return q.value();
+}
+
+// The shaders the draws need that neither were made nor are in the shader cache: translated on several threads
+// before the draws are planned (a phone took 96 ms for the 24 of a song's first scene, one after another); and the
+// secondary programs' compute pipelines not made yet, made on several threads.
+void prepare_shaders(Renderer& r, std::span<const Draw> draws, const ColorFormat& cf, bool color) {
+    enum class Kind { Vertex, Fragment, Secondary };
+    struct Task {
+        ShaderKey key;
+        const Program* program = nullptr;
+        Kind kind = Kind::Vertex;
+        bool translate = true;
+        VertexShader vs;
+        FragmentShader fs;
+        bool inline_secondary = false;
+        nx::vector<u32> words;
+        nx::string error;
+    };
+    nx::vector<Task> tasks;
+    nx::hash_map<u64, bool> seen;
+    auto add = [&](Task t) {
+        const u64 k = short_key(t.key);
+        if (seen.contains(k) || r.failed_programs.contains(k)) return;
+        seen[k] = true;
+        if (t.kind == Kind::Secondary ? r.compute.contains(k) : r.modules.contains(k)) return;
+        t.translate = !r.modules.contains(k) && !r.cache.spirv(t.key);
+        if (t.kind != Kind::Secondary && !t.translate) return;  // (a module from the cache's SPIR-V: quick, when planned)
+        tasks.push_back(std::move(t));
+    };
+    for (const Draw& dr : draws) {
+        if (!dr.vertex || !dr.fragment || !dr.vertex->program || !dr.fragment->program) continue;
+        const Program& vp = *dr.vertex->program;
+        const Program& fp = *dr.fragment->program;
+        const bool inline_secondary = tile_secondary(fp);
+        for (const Program* p : {&vp, inline_secondary ? nullptr : &fp}) {
+            if (!p || p->secondary.empty()) continue;
+            Task t;
+            t.key = secondary_key(*p), t.program = p, t.kind = Kind::Secondary;
+            add(std::move(t));
+        }
+        VertexShader vs = vertex_shader_of(dr);
+        if (!r.quick_modules.contains(vertex_quick(vp, vs))) {
+            Task t;
+            t.key = vertex_key(vp, vs), t.program = &vp, t.kind = Kind::Vertex;
+            t.vs = std::move(vs);
+            add(std::move(t));
+        }
+        const FragmentShader fs = fragment_shader_of(dr, cf, color);
+        if (!r.quick_modules.contains(fragment_quick(fp, fs, inline_secondary))) {
+            Task t;
+            t.key = fragment_key(fp, fs, inline_secondary), t.program = &fp, t.kind = Kind::Fragment;
+            t.fs = fs;
+            t.inline_secondary = inline_secondary;
+            add(std::move(t));
+        }
+    }
+    if (tasks.empty()) return;
+    in_parallel(tasks.size(), [&](usize i) {
+        Task& t = tasks[i];
+        if (!t.translate) return;
+        const Program& p = *t.program;
+        const std::span<const usse::Decoded> inlined =
+            t.inline_secondary ? std::span<const usse::Decoded>(p.secondary) : std::span<const usse::Decoded>{};
+        auto spirv = t.kind == Kind::Secondary ? translate_secondary(p.gxp, p.secondary)
+                     : t.kind == Kind::Vertex  ? translate_vertex(p.gxp, p.primary, t.vs)
+                                               : translate_fragment(p.gxp, p.primary, t.fs, inlined);
+        if (spirv) t.words = std::move(*spirv);
+        else t.error = spirv.error().message;
+    });
+    // (the modules, one after another: they are kept in the renderer's maps and the shader cache)
+    nx::vector<std::pair<usize, VkShaderModule>> computes;
+    for (usize i = 0; i < tasks.size(); ++i) {
+        Task& t = tasks[i];
+        const VkShaderModule m = module_for(r, t.key, [&]() -> Result<nx::vector<u32>> {
+            if (!t.error.empty()) return failure(t.error);
+            return std::move(t.words);
+        });
+        if (m && t.kind == Kind::Secondary) computes.push_back({i, m});
+    }
+    nx::vector<VkPipeline> made(computes.size(), VK_NULL_HANDLE);
+    in_parallel(computes.size(), [&](usize k) { made[k] = make_compute(r, computes[k].second); });
+    for (usize k = 0; k < computes.size(); ++k) {
+        const ShaderKey& key = tasks[computes[k].first].key;
+        if (made[k]) {
+            r.cache.add_compute(key);
+            r.made_pipelines.fetch_add(1);
+            r.pipelines_changed.store(true);
+        }
+        r.compute[short_key(key)] = made[k];
+    }
+}
+
 }  // namespace
 
 bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 number) {
@@ -2629,6 +2764,13 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     };
     nx::vector<u8>& indices = r.scene_indices;
     indices.clear();
+    {
+        const usize made_before = r.modules.size();
+        const u64 shaders_from = g_profile.on ? nx::os::ticks_ns() : 0;
+        prepare_shaders(r, scene.draws, cf, color != nullptr);
+        if (g_profile.on && r.modules.size() != made_before)
+            g_profile.shaders_made += r.modules.size() - made_before, g_profile.shader_ns += nx::os::ticks_ns() - shaders_from;
+    }
     nx::vector<DrawPlan> plans;
     plans.reserve(draws);
     nx::vector<GraphicsJob> missing;
@@ -2663,40 +2805,20 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         plan.vertex_secondary = secondary_pipeline(r, vp);
         plan.fragment_secondary = inline_secondary ? VK_NULL_HANDLE : secondary_pipeline(r, fp);
 
-        // The shaders.
-        VertexShader vs;
-        for (usize a = 0; a < dr.vertex->attributes.size(); ++a) {
-            const VertexAttribute& attr = dr.vertex->attributes[a];
-            VertexInput in;
-            in.location = static_cast<u32>(a);
-            in.reg = attr.reg;
-            in.format = attr.format;
-            in.components = attr.components;
-            for (const usse::Parameter& p : vp.gxp.parameters)
-                if (p.category == usse::ParameterCategory::Attribute && p.resource == attr.reg) in.raw = p.reg_format;
-            vs.inputs.push_back(in);
-        }
-        // (by a quick key first: the program's content and the inputs, as vertex_key takes them)
-        nx::fnv1a64 vq;
-        vq.combine_bytes(reinterpret_cast<const char*>(vp.content.data()), vp.content.size()).combine('v');
-        for (const VertexInput& in : vs.inputs) vq.combine_all(in.location, in.reg, in.format, in.components, in.raw);
+        // The shaders (by a quick key first).
+        const VertexShader vs = vertex_shader_of(dr);
+        const u64 vq = vertex_quick(vp, vs);
         VkShaderModule vmod = VK_NULL_HANDLE;
-        if (auto it = r.quick_modules.find(vq.value()); it != r.quick_modules.end()) {
+        if (auto it = r.quick_modules.find(vq); it != r.quick_modules.end()) {
             vmod = it->second;
         } else {
             vmod = module_for(r, vertex_key(vp, vs), [&] { return translate_vertex(vp.gxp, vp.primary, vs); });
-            if (vmod) r.quick_modules[vq.value()] = vmod;
+            if (vmod) r.quick_modules[vq] = vmod;
         }
-        FragmentShader fs;
-        fs.output_format = dr.fragment->output_format;
-        std::memcpy(fs.swizzle, cf.swizzle, 4);
-        fs.color_output = color != nullptr;
-        nx::fnv1a64 fq;
-        fq.combine_bytes(reinterpret_cast<const char*>(fp.content.data()), fp.content.size()).combine('f');
-        fq.combine_all(fs.output_format, fs.swizzle[0], fs.swizzle[1], fs.swizzle[2], fs.swizzle[3], fs.color_output,
-                       fs.fragment_program_enabled, inline_secondary);
+        const FragmentShader fs = fragment_shader_of(dr, cf, color != nullptr);
+        const u64 fq = fragment_quick(fp, fs, inline_secondary);
         VkShaderModule fmod = VK_NULL_HANDLE;
-        if (auto it = r.quick_modules.find(fq.value()); it != r.quick_modules.end()) {
+        if (auto it = r.quick_modules.find(fq); it != r.quick_modules.end()) {
             fmod = it->second;
         } else {
             fmod = module_for(r, fragment_key(fp, fs, inline_secondary), [&] {
@@ -2704,7 +2826,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                     inline_secondary ? std::span<const usse::Decoded>(fp.secondary) : std::span<const usse::Decoded>{};
                 return translate_fragment(fp.gxp, fp.primary, fs, secondary);
             });
-            if (fmod) r.quick_modules[fq.value()] = fmod;
+            if (fmod) r.quick_modules[fq] = fmod;
         }
         if (g_profile.on && r.modules.size() != made_before)
             g_profile.shaders_made += r.modules.size() - made_before, g_profile.shader_ns += nx::os::ticks_ns() - shaders_from;
