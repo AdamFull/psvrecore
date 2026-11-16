@@ -1677,13 +1677,13 @@ void Translator::vertex_epilogue() {
         return var;
     };
     // The position, as GXM's viewport transform puts it on the render target, back in Vulkan's clip space (w kept
-    // for clipping and perspective-correct interpolation).
+    // for clipping and perspective-correct interpolation). GXM's W clamp is not applied: the GPU clips primitives
+    // before its viewport transform, which clamps the w of what is left; clamping each vertex's w here, before
+    // Vulkan clips, put vertices behind the eye in front of it, and their triangles across the screen.
     const Id position = output(tv4_, [&](Id v) { b_.decorate(v, SpvDecorationBuiltIn, {SpvBuiltInPosition}); });
     const Id point_size = output(tf_, [&](Id v) { b_.decorate(v, SpvDecorationBuiltIn, {SpvBuiltInPointSize}); });
     Id cx = f(0.0f), cy = f(0.0f), cz = f(0.0f), cw = f(1.0f);
     if (l.position >= 0) cx = o(l.position), cy = o(l.position + 1), cz = o(l.position + 2), cw = o(l.position + 3);
-    const Id clamp = push_constant(4, tf_);
-    cw = sel(tf_, land(bin(SpvOpFOrdGreaterThan, tb_, clamp, f(0.0f)), bin(SpvOpFOrdLessThan, tb_, cw, clamp)), clamp, cw);
     auto vp = [&](u32 k) { return load(tf_, chain(tp_push_f_, push_, {u(3), u(k)})); };
     const Id width = load(tf_, chain(tp_push_f_, push_, {u(2), u(0)})), height = load(tf_, chain(tp_push_f_, push_, {u(2), u(1)}));
     const Id flags = push_constant(1, tu_);
