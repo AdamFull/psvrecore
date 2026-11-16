@@ -1881,10 +1881,28 @@ void finish_target_copies(Renderer& r, bool recorded) {
     r.target_copies.clear();
 }
 
+// A texture to decode (texture_for, collecting): decoded on several threads, then made (make_texture).
+struct TextureMiss {
+    TextureInfo info;
+    u32 size = 0;
+    u64 key = 0, words_key = 0;
+    Result<Texels> texels = Texels{};
+};
+
+bool read_guest_memory(u32 address, void* out, u32 bytes) {
+    if (!memory().valid(address, bytes)) return false;
+    std::memcpy(out, memory().host(address), bytes);
+    return true;
+}
+
+CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 key, u64 words_key, Result<Texels>* given);
+
 // The texture whose control words these are, decoded and uploaded once per content (cached by the words and a hash
 // of the texels and palette). `seen` remembers, for a scene, each set of words' content key: a texture used by many
-// draws is hashed once a scene.
-CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<u64, u64>& seen) {
+// draws is hashed once a scene. `misses`: one whose texels are to be decoded is added there instead (none returned;
+// `seen` has its key, for when it is made).
+CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<u64, u64>& seen,
+                           nx::vector<TextureMiss>* misses = nullptr) {
     ++g_profile.lookups;
     nx::fnv1a64 wh;
     for (u32 w : words.words) wh.combine(w);
@@ -1921,6 +1939,18 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         if (g_profile.on) ++g_profile.from_targets;
         return c;
     }
+    if (misses && !(r.yuv.pipeline && is_yuv420(info))) {
+        bool listed = false;
+        for (const TextureMiss& m : *misses) listed |= m.key == key;
+        if (!listed) misses->push_back(TextureMiss{info, size, key, wh.value()});
+        return nullptr;
+    }
+    return make_texture(r, info, size, key, wh.value(), nullptr);
+}
+
+// A texture not cached, made: its texels decoded here, unless `given` (or a movie frame's planes read for the GPU to
+// convert), an image made (or the one these words showed before reused) and the upload queued.
+CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 key, u64 words_key, Result<Texels>* given) {
     const u64 miss_start = g_profile.on ? nx::os::ticks_ns() : 0;
     struct MissTime {
         u64 start;
@@ -1942,18 +1972,16 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     if (g_profile.on && g_profile.misses % 50 == 0)
         std::fprintf(stderr, "gxm profile: new texture at %08x: format %08x type %u, %u x %u, %u levels, %u bytes\n",
                      info.address, info.base_format, info.type, info.width, info.height, info.levels, size);
-    auto read_guest = [](u32 address, void* out, u32 bytes) {
-        if (!memory().valid(address, bytes)) return false;
-        std::memcpy(out, memory().host(address), bytes);
-        return true;
-    };
+    auto read_guest = read_guest_memory;
     // (a movie's frame: its planes, for the GPU to convert; else the texels, decoded here)
     std::optional<Yuv420> yuv;
-    if (r.yuv.pipeline && is_yuv420(info)) {
+    if (!given && r.yuv.pipeline && is_yuv420(info)) {
         if (auto planes = read_yuv420(info, read_guest)) yuv = std::move(*planes);
     }
     Result<Texels> texels = Texels{};
-    if (yuv) {
+    if (given) {
+        texels = std::move(*given);
+    } else if (yuv) {
         texels->width = yuv->width, texels->height = yuv->height;
     } else {
         texels = read_texels(info, read_guest, r.device->caps().texture_bc);
@@ -1991,7 +2019,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     };
     const u64 texel_bytes = u64{d.width} * d.height * 4;  // (both forms: RGBA8, one level)
     // (the image these words showed before, when no draw of this scene samples it and it has this size and format)
-    if (auto was = r.by_words.find(wh.value()); was != r.by_words.end()) {
+    if (auto was = r.by_words.find(words_key); was != r.by_words.end()) {
         auto old = r.textures.find(was->second);
         if (old != r.textures.end() && old->second.used != r.scenes) {
             const vk::ImageDesc& od = old->second.image.desc;
@@ -2002,12 +2030,12 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
                 if (!queue()) {
                     r.texture_bytes -= c.bytes;
                     vk::destroy_image(*r.device, c.image);
-                    r.by_words.erase(wh.value());
+                    r.by_words.erase(words_key);
                     return nullptr;
                 }
                 if (g_profile.on) g_profile.upload_ns += nx::os::ticks_ns() - decoded_at;
                 c.used = r.scenes;
-                r.by_words[wh.value()] = key;
+                r.by_words[words_key] = key;
                 auto [it, added] = r.textures.emplace(key, c);
                 return &it->second;
             }
@@ -2028,7 +2056,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     c.used = r.scenes;
     c.bytes = yuv ? texel_bytes : texels->data.size();
     r.texture_bytes += c.bytes;
-    r.by_words[wh.value()] = key;
+    r.by_words[words_key] = key;
     auto [it, added] = r.textures.emplace(key, c);
     return &it->second;
 }
@@ -3111,6 +3139,45 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         Target* color;
     };
     nx::hash_map<u64, Scaled> scaled_of;
+    auto scaled_for = [&](const TextureWords& words) {
+        nx::fnv1a64 wh;
+        for (u32 w : words.words) wh.combine(w);
+        if (auto it = scaled_of.find(wh.value()); it != scaled_of.end()) return it->second;
+        const TextureInfo info = decode_texture(words.words);
+        Scaled sc{nullptr, nullptr};
+        sc.depth = scaled_depth_texture(r, info, depth_target);
+        sc.color = sc.depth ? nullptr : scaled_texture(r, info, target);
+        scaled_of[wh.value()] = sc;
+        return sc;
+    };
+    // The textures the draws sample, looked up as the sets below do, in their order: those to decode are decoded on
+    // several threads, then made, and the sets find them made (a song's start decoded about 50 new ones, 40-65 ms on
+    // a phone one after another).
+    {
+        nx::vector<TextureMiss> misses;
+        for (usize i = 0; i < plans.size(); ++i) {
+            const Draw& dr = *plans[i].draw;
+            for (u32 stage = 0; stage < 2; ++stage) {
+                const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
+                for (const usse::Parameter& q : p.gxp.parameters) {
+                    if (q.category != usse::ParameterCategory::Sampler || q.resource >= (stage ? 16u : 4u)) continue;
+                    const TextureWords& words = stage ? dr.fragment_textures[q.resource] : dr.vertex_textures[q.resource];
+                    if (state().options->render_scale > 1 && !q.sampler_cube) {
+                        const Scaled sc = scaled_for(words);
+                        if (sc.depth || sc.color) continue;
+                    }
+                    texture_for(r, words, seen_textures, &misses);
+                }
+            }
+        }
+        if (!misses.empty()) {
+            const bool bc = r.device->caps().texture_bc;
+            const u64 decode_from = g_profile.on ? nx::os::ticks_ns() : 0;
+            in_parallel(misses.size(), [&](usize k) { misses[k].texels = read_texels(misses[k].info, read_guest_memory, bc); });
+            if (g_profile.on) g_profile.decode_ns += nx::os::ticks_ns() - decode_from;
+            for (TextureMiss& m : misses) make_texture(r, m.info, m.size, m.key, m.words_key, &m.texels);
+        }
+    }
     for (usize i = 0; i < plans.size(); ++i) {
         VkDescriptorBufferInfo bi[2] = {{sa_buf->buffer, 0, VK_WHOLE_SIZE}, {mem_buf->buffer, 0, VK_WHOLE_SIZE}};
         // The units each program declares: the draw's texture there, or a white texel of the declared kind.
@@ -3128,19 +3195,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 const u32 binding = (stage ? kDrawBindingFragmentTextures : kDrawBindingVertexTextures) + unit;
                 ii[binding].imageView = q.sampler_cube ? r.white_cube.view : r.white.view;
                 const TextureWords& words = stage ? dr.fragment_textures[unit] : dr.vertex_textures[unit];
-                Scaled sc{nullptr, nullptr};
-                if (state().options->render_scale > 1 && !q.sampler_cube) {
-                    nx::fnv1a64 wh;
-                    for (u32 w : words.words) wh.combine(w);
-                    if (auto it = scaled_of.find(wh.value()); it != scaled_of.end()) {
-                        sc = it->second;
-                    } else {
-                        const TextureInfo info = decode_texture(words.words);
-                        sc.depth = scaled_depth_texture(r, info, depth_target);
-                        sc.color = sc.depth ? nullptr : scaled_texture(r, info, target);
-                        scaled_of[wh.value()] = sc;
-                    }
-                }
+                const Scaled sc = state().options->render_scale > 1 && !q.sampler_cube ? scaled_for(words) : Scaled{nullptr, nullptr};
                 // (a depth surface stored at the internal resolution: its depth read there)
                 if (DepthTarget* dt = sc.depth) {
                     const TextureInfo info = decode_texture(words.words);
