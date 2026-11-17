@@ -67,7 +67,7 @@ def strip_comments(text):
 
 TABLE_RE = re.compile(r'\bconst\s+(?:[\w:]*::)?(Function|Variable)\s+(\w+)\s*\[\s*\]\s*=\s*\{')
 ENTRY_RE = re.compile(r'(?:\b\w+\s*\(|\{)\s*(0x[0-9A-Fa-f]+)\s*,\s*(?:"([^"]+)"|([A-Za-z_]\w*))')
-REGISTER_RE = re.compile(r'register_library\s*\(\s*\{\s*"(\w+)"\s*,\s*([\w:]+)\s*,\s*(\w+)\s*(?:,\s*(\w+)\s*)?\}')
+REGISTER_RE = re.compile(r'register_library\s*\(\s*\{\s*"(\w+)"\s*,\s*([\w:]+)\s*,\s*(\w+|\{\s*\})\s*(?:,\s*(\w+)\s*)?\}')
 CONSTANT_RE = re.compile(r'\b(k\w+)\s*=\s*(0x[0-9A-Fa-f]+)')
 LIBRARY_NIDS = {}  # (filled by read_hle: library -> the NIDs it is registered with)
 
@@ -106,7 +106,7 @@ def read_hle(root):
             if nid is not None:
                 LIBRARY_NIDS.setdefault(m.group(1), set()).add(nid)
             for table in (m.group(3), m.group(4)):
-                if not table:
+                if not table or table.startswith('{'):  # (no functions, only variables)
                     continue
                 if table not in tables:
                     sys.exit('%s: register_library uses %s, which is not a table in that file' % (path, table))
