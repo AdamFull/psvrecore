@@ -149,10 +149,19 @@ i32 sceCtrlGetWirelessControllerInfo(Ptr<u32> info) {
     return 0;
 }
 
-// System modules are part of the runtime: loading one succeeds, and every one is loaded.
-i32 sceSysmoduleLoadModule(u32) { return 0; }
-i32 sceSysmoduleUnloadModule(u32) { return 0; }
-i32 sceSysmoduleIsLoaded(u32) { return 0; }
+// System modules are part of the runtime: loading one succeeds, and every one is loaded, but for those the runtime
+// does not provide, which are never loaded and fail to load (a game then goes its own way without them):
+// - SceMp4 (0x2D), the MP4 demuxer of firmware 1.x that statically linked players use (not implemented: its
+//   functions are known only by NID).
+constexpr i32 kSysmoduleUnloaded = err::code(0x805A1001), kSysmoduleFatal = err::code(0x805A10FF);
+bool provided(u32 id) { return id != 0x2D; }
+i32 sceSysmoduleLoadModule(u32 id) {
+    if (provided(id)) return 0;
+    nx::logw(logs::hle, "system module 0x{:04x}: not provided by this runtime (not loaded)", id);
+    return kSysmoduleFatal;
+}
+i32 sceSysmoduleUnloadModule(u32 id) { return provided(id) ? 0 : kSysmoduleUnloaded; }
+i32 sceSysmoduleIsLoaded(u32 id) { return provided(id) ? 0 : kSysmoduleUnloaded; }
 
 const Function kCtrl[] = {
     HLE_FUNCTION(0xA9C3CED6, sceCtrlPeekBufferPositive),
