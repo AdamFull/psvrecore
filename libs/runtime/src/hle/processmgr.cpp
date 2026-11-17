@@ -135,8 +135,14 @@ const Function kProcessmgr[] = {
     HLE_FUNCTION(0xEB6E50BB, sceKernelCallAbortHandler),
 };
 
+// (the system music player's port: nothing else plays over the game here)
+i32 sceAppMgrAcquireBgmPort() { return 0; }
+i32 sceAppMgrReleaseBgmPort() { return 0; }
+
 const Function kAppMgr[] = {
     HLE_FUNCTION(0xFFF8F7F0, sceAppMgrIsGameProgram),
+    HLE_FUNCTION(0xAFCEAB96, sceAppMgrAcquireBgmPort),
+    HLE_FUNCTION(0xF3717E37, sceAppMgrReleaseBgmPort),
 };
 
 }  // namespace

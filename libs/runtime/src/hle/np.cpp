@@ -5,6 +5,8 @@
 // answers "already unlocked". Authentication (SceNpCommon's NpAuth), friends and presence (SceNpBasic) and user
 // lookups (SceNpUtility) start, and what would reach PSN answers "signed out".
 
+#include <cstring>
+
 #include "hle_common.hpp"
 #include "core/foundation/containers/hash_map.h"
 
@@ -142,12 +144,29 @@ const Function kNpActivity[] = {
     HLE_FUNCTION(0x9EA4901F, sceNpActivityTerm),
     HLE_FUNCTION(0xBC7FDC77, sceNpActivityPostStatus),
 };
+i32 sceNpTrophyDestroyContext(i32) { return 0; }
+i32 sceNpTrophyTerm() { return 0; }
+// SceNpTrophyFlagArray (128 bits): the trophies unlocked in this run; `count` is the set's size, unknown here (0).
+i32 sceNpTrophyGetTrophyUnlockState(i32 /*context*/, i32 /*handle*/, Ptr<u32> flags, Ptr<u32> count) {
+    if (!flags || !count || !writable(flags.address, 16) || !writable(count.address, 4)) return kTrophyInvalidArgument;
+    u32 bits[4] = {};
+    nx::scoped_lock<nx::mutex> held(np().lock);
+    for (const auto& [trophy, on] : np().unlocked)
+        if (on && trophy >= 0 && trophy < 128) bits[trophy >> 5] |= 1u << (trophy & 31);
+    std::memcpy(flags.get(), bits, sizeof bits);
+    *count = 0;
+    return 0;
+}
+
 const Function kNpTrophy[] = {
     HLE_FUNCTION(0x34516838, sceNpTrophyInit),
     HLE_FUNCTION(0xC49FD33F, sceNpTrophyCreateContext),
     HLE_FUNCTION(0x4EBC6977, sceNpTrophyCreateHandle),
     HLE_FUNCTION(0xFF142071, sceNpTrophyDestroyHandle),
     HLE_FUNCTION(0xB397AA24, sceNpTrophyUnlockTrophy),
+    HLE_FUNCTION(0x56F5CBA5, sceNpTrophyDestroyContext),
+    HLE_FUNCTION(0xBFE0F28F, sceNpTrophyTerm),
+    HLE_FUNCTION(0xC8D2A4DE, sceNpTrophyGetTrophyUnlockState),
 };
 
 }  // namespace

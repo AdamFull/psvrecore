@@ -45,6 +45,11 @@ i32 sceFiosOverlayResolveWithRangeSync02(i32 /*process*/, i32 flags, Ptr<const c
 
 thread_local bool g_overlays_disabled = false;  // (guest threads are host threads)
 
+// The scheduler a path's I/O goes to: the first (only a development kit's host0: paths go to another).
+i32 sceFiosOverlayGetRecommendedScheduler02(i32 /*scheduler_count*/, Ptr<const char> /*path*/, Ptr<void> /*args*/) {
+    return 0;
+}
+
 i32 sceFiosOverlayThreadSetDisabled02(i32 disabled) {
     nx::logd(logs::io, "fios overlays for this thread {}", disabled ? "off" : "on");
     g_overlays_disabled = disabled != 0;
@@ -140,6 +145,7 @@ const Function kFios2User[] = {
     HLE_FUNCTION(0x1DD808D1, sceFiosOverlayGetList02),
     HLE_FUNCTION(0x61C4AAC4, sceFiosOverlayResolveWithRangeSync02),
     HLE_FUNCTION(0x70321220, sceFiosOverlayThreadSetDisabled02),
+    HLE_FUNCTION(0xF5C1F928, sceFiosOverlayGetRecommendedScheduler02),
     HLE_FUNCTION(0x6C4BE9CD, sceFiosOverlayAddForProcess02),
     HLE_FUNCTION(0xCA388053, sceFiosOverlayModifyForProcess02),
     HLE_FUNCTION(0xE5D1B6F5, sceFiosOverlayRemoveForProcess02),

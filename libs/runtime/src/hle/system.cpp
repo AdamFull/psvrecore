@@ -6,6 +6,7 @@
 // - the development kit's debug LEDs (SceDebugLed): a retail console has none, so setting them does nothing;
 // - the system's screenshots (SceScreenShot: the PS button and Start): the host has none of its own, so what a game
 //   sets for them (titles, an overlay picture, screenshots allowed or not) is checked and kept nowhere;
+// - the camera's shutter sound (SceShutterSound): not played;
 // - the cameras (SceCamera): none, as on a PlayStation TV: opening one answers "not mounted", and what needs one open
 //   "not open".
 
@@ -20,7 +21,7 @@ namespace {
 
 constexpr u32 kSceAppMgrUser = 0xA6605D6F, kScePower = 0x1082DA7F, kSceNet = 0x6BF8B2A2, kSceNetCtl = 0xC6083AE1,
               kSceHttp = 0xE8F15CDE, kSceSsl = 0xCAF5F2E9, kSceDebugLed = 0xAE004C0A,
-              kSceScreenShot = 0xF26FC97D, kSceCamera = 0xDA91B3ED;
+              kSceScreenShot = 0xF26FC97D, kSceCamera = 0xDA91B3ED, kSceShutterSound = 0x877181ED;
 constexpr i32 kScreenShotInvalid = err::code(0x80102F01);
 constexpr i32 kAppMgrNullPointer = err::code(0x80802016), kAppMgrInvalid = err::code(0x8080201A),
               kAppMgrState = err::code(0x80802013);
@@ -96,6 +97,11 @@ i32 sceCameraGetReverse(i32 device, Ptr<i32>) { return not_open(device); }
 i32 sceCameraSetReverse(i32 device, i32) { return not_open(device); }
 i32 sceCameraSetWhiteBalance(i32 device, i32) { return not_open(device); }
 i32 sceCameraSetBacklight(i32 device, i32) { return not_open(device); }
+i32 sceCameraIsActive(i32 device) { return device < 0 || device > 1 ? kCameraParam : 0; }  // (none is)
+i32 sceCameraSetAutoControlHold(i32 device, i32) { return not_open(device); }
+i32 sceCameraSetISO(i32 device, i32) { return not_open(device); }
+i32 sceCameraSetNightmode(i32 device, i32) { return not_open(device); }
+i32 sceCameraSetAntiFlicker(i32 device, i32) { return not_open(device); }
 
 i32 started(const char* what) {
     nx::logi(logs::hle, "{}: started (offline: nothing connects)", what);
@@ -233,6 +239,16 @@ i32 sceNetCtlAdhocDisconnect() { return netctl_ready(); }
 i32 sceHttpInit(u32) { return started("SceHttp"); }
 i32 sceSslInit(u32) { return started("SceSsl"); }
 
+i32 sceNetCtlGetPhoneMaxDownloadableSize(Ptr<u32> size) {
+    if (!size || !writable(size.address, 4)) return kNetCtlInvalidAddr;
+    *size = 0;
+    return 0;
+}
+i32 sceSslTerm() { return 0; }
+i32 sceSslGetSerialNumber(u32, u32, u32, u32) { return kNetCtlNotConnected; }
+i32 sceShutterSoundPlay(u32 /*type*/) { return 0; }
+
+
 const Function kAppMgrUser[] = {
     HLE_FUNCTION(0x5E86319A, _sceAppMgrGetAppState),
     HLE_FUNCTION(0x10B5765F, sceAppMgrReceiveSystemEvent),
@@ -264,8 +280,14 @@ const Function kNetCtl[] = {
     HLE_FUNCTION(0x7118C99D, sceNetCtlAdhocGetInAddr),
     HLE_FUNCTION(0xED43B79A, sceNetCtlAdhocDisconnect),
 };
+const Function kNetCtlMore[] = {HLE_FUNCTION(0x4FB4BEA1, sceNetCtlGetPhoneMaxDownloadableSize)};
 const Function kHttp[] = {HLE_FUNCTION(0x214926D9, sceHttpInit)};
-const Function kSsl[] = {HLE_FUNCTION(0x3C733316, sceSslInit)};
+const Function kSsl[] = {
+    HLE_FUNCTION(0x3C733316, sceSslInit),
+    HLE_FUNCTION(0x03CE6E3A, sceSslTerm),
+    HLE_FUNCTION(0x901C5C15, sceSslGetSerialNumber),
+};
+const Function kShutterSound[] = {HLE_FUNCTION(0x7FFB6D79, sceShutterSoundPlay)};
 const Function kDebugLed[] = {HLE_FUNCTION(0x78E702D3, sceKernelSetGPO)};
 const Function kCamera[] = {
     HLE_FUNCTION(0xA462F801, sceCameraOpen),
@@ -277,6 +299,11 @@ const Function kCamera[] = {
     HLE_FUNCTION(0x1175F477, sceCameraSetReverse),
     HLE_FUNCTION(0x4D4514AC, sceCameraSetWhiteBalance),
     HLE_FUNCTION(0xAE071044, sceCameraSetBacklight),
+    HLE_FUNCTION(0x103A75B8, sceCameraIsActive),
+    HLE_FUNCTION(0x3A0DABBD, sceCameraSetAutoControlHold),
+    HLE_FUNCTION(0x3CF630A1, sceCameraSetISO),
+    HLE_FUNCTION(0x3F26233E, sceCameraSetNightmode),
+    HLE_FUNCTION(0xE312958A, sceCameraSetAntiFlicker),
 };
 const Function kScreenShot[] = {
     HLE_FUNCTION(0x05DB59C7, sceScreenShotSetParam),
@@ -297,6 +324,8 @@ void register_system() {
     register_library({"SceDebugLed", kSceDebugLed, kDebugLed});
     register_library({"SceScreenShot", kSceScreenShot, kScreenShot});
     register_library({"SceCamera", kSceCamera, kCamera});
+    register_library({"SceShutterSound", kSceShutterSound, kShutterSound});
+    register_library({"SceNetCtl", kSceNetCtl, kNetCtlMore});
 }
 
 }  // namespace psvrecore::runtime::hle
