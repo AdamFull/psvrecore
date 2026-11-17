@@ -134,6 +134,62 @@ i32 sceRtcSetTime64_t(Ptr<io::DateTime> out, u64 seconds) {
     return err::kOk;
 }
 
+// No network clock: the console's own (the system's clock is the host's).
+i32 sceRtcGetCurrentNetworkTick(Ptr<u64> tick) { return sceRtcGetCurrentTick(tick); }
+
+i32 sceRtcConvertUtcToLocalTime(Ptr<const u64> utc, Ptr<u64> local) {
+    if (!utc || !writable(local.address, 8)) return err::kIllegalAddress;
+    u64 t;
+    std::memcpy(&t, utc.get(), 8);
+    t = static_cast<u64>(static_cast<i64>(t) + local_offset_minutes() * 60'000'000);
+    std::memcpy(local.get(), &t, 8);
+    return err::kOk;
+}
+
+// out = in + add units (out and in may be the same tick).
+i32 tick_add(Ptr<u64> out, Ptr<const u64> in, i64 add, i64 unit_us) {
+    if (!in || !writable(out.address, 8)) return err::kIllegalAddress;
+    u64 t;
+    std::memcpy(&t, in.get(), 8);
+    t = static_cast<u64>(static_cast<i64>(t) + add * unit_us);
+    std::memcpy(out.get(), &t, 8);
+    return err::kOk;
+}
+i32 sceRtcTickAddMinutes(Ptr<u64> out, Ptr<const u64> in, i64 add) { return tick_add(out, in, add, 60'000'000); }
+i32 sceRtcTickAddHours(Ptr<u64> out, Ptr<const u64> in, i32 add) { return tick_add(out, in, add, 3'600'000'000); }
+i32 sceRtcTickAddDays(Ptr<u64> out, Ptr<const u64> in, i32 add) {
+    return tick_add(out, in, add, static_cast<i64>(kMicrosPerDay));
+}
+// The same month and day that many years on (29 February becomes the 28th in a year without it).
+i32 sceRtcTickAddYears(Ptr<u64> out, Ptr<const u64> in, i32 add) {
+    if (!in || !writable(out.address, 8)) return err::kIllegalAddress;
+    u64 t;
+    std::memcpy(&t, in.get(), 8);
+    io::DateTime d = date_of(t);
+    const i64 year = i64{d.year} + add;
+    if (year < 1 || year > 9999) return err::kInvalidArgument;
+    d.year = static_cast<u16>(year);
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (d.month == 2 && d.day == 29 && !leap) d.day = 28;
+    t = tick_of(d);
+    std::memcpy(out.get(), &t, 8);
+    return err::kOk;
+}
+
+// RFC 3339 in local time: "YYYY-MM-DDThh:mm:ss.ss+hh:mm" (hundredths of a second).
+i32 sceRtcFormatRFC3339LocalTime(Ptr<char> text, Ptr<const u64> utc) {
+    if (!utc || !writable(text.address, 32)) return err::kIllegalAddress;
+    u64 t;
+    std::memcpy(&t, utc.get(), 8);
+    const i64 offset = local_offset_minutes();
+    const io::DateTime d = date_of(static_cast<u64>(static_cast<i64>(t) + offset * 60'000'000));
+    const i64 a = offset < 0 ? -offset : offset;
+    const nx::string s = nx::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:02}{}{:02}:{:02}", d.year, d.month, d.day, d.hour,
+                                    d.minute, d.second, d.microsecond / 10'000, offset < 0 ? '-' : '+', a / 60, a % 60);
+    std::memcpy(text.get(), s.c_str(), s.size() + 1);
+    return err::kOk;
+}
+
 i32 sceDbgAssertionHandler(Ptr<const char> file, i32 line, i32 /*unknown*/, Ptr<const char> component, Ptr<const char> message) {
     nx::loge(logs::hle, "guest assertion failed: {}:{} [{}] {}", str(file, 256), line, str(component, 64), str(message, 512));
     return err::kOk;
@@ -148,6 +204,13 @@ const Function kRtc[] = {
     HLE_FUNCTION(0xCD89F464, sceRtcSetTick),
     HLE_FUNCTION(0xC995DE02, sceRtcGetTime64_t),
     HLE_FUNCTION(0xA6C36B6A, sceRtcSetTime64_t),
+    HLE_FUNCTION(0xCDDD25FE, sceRtcGetCurrentNetworkTick),
+    HLE_FUNCTION(0x1282C436, sceRtcConvertUtcToLocalTime),
+    HLE_FUNCTION(0x4C358871, sceRtcTickAddMinutes),
+    HLE_FUNCTION(0x6F193F55, sceRtcTickAddHours),
+    HLE_FUNCTION(0x58DE3C70, sceRtcTickAddDays),
+    HLE_FUNCTION(0xDF6C3E1B, sceRtcTickAddYears),
+    HLE_FUNCTION(0x742250A9, sceRtcFormatRFC3339LocalTime),
 };
 
 const Function kDbg[] = {
