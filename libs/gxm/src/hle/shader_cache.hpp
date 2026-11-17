@@ -47,6 +47,10 @@ public:
     void add_spirv(const ShaderKey& key, std::span<const u32> words);
     void add_graphics(const Graphics& g);
     void add_compute(const ShaderKey& key);
+    // Shaders compiled ahead into the driver's pipeline cache (as libraries) in a run before, their SPIR-V not kept
+    // (only what draws used is): not compiled ahead again.
+    bool prepared(const ShaderKey& key);
+    void add_prepared(const ShaderKey& key);
     nx::vector<Graphics> graphics();
     nx::vector<ShaderKey> compute();
     usize spirv_count();
@@ -58,6 +62,7 @@ private:
     nx::string folder_;
     std::FILE* file_ = nullptr;
     nx::hash_map<u64, std::pair<ShaderKey, nx::vector<u32>>> spirv_;
+    nx::hash_map<u64, bool> prepared_;
     nx::vector<Graphics> graphics_;
     nx::hash_map<u64, bool> graphics_seen_;  // (by the description's hash and its shaders)
     nx::vector<ShaderKey> compute_;

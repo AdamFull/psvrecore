@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "psvrecore/log.hpp"
+#include "prefetch.hpp"
 #include "state.hpp"
 #include "core/foundation/core/sha256.h"
 #include "core/foundation/strings/format.h"
@@ -278,6 +279,7 @@ i32 sceGxmShaderPatcherCreateVertexProgram(u32 patcher, u32 id, Ptr<const Vertex
     v->streams = std::move(strs);
     *reinterpret_cast<u32*>(memory().host(guest)) = r->gxp_address;
     p->vertex_programs.push_back(v.get());
+    pipeline_ahead(guest, 0);  // (its shader compiled ahead)
     s.vertex_programs[guest] = std::move(v);
     *out = guest;
     return 0;
@@ -316,6 +318,7 @@ i32 sceGxmShaderPatcherCreateFragmentProgram(u32 patcher, u32 id, u32 output_for
     f->vertex_gxp = vertex_gxp;
     *reinterpret_cast<u32*>(memory().host(guest)) = r->gxp_address;
     p->fragment_programs.push_back(f.get());
+    pipeline_ahead(0, guest);  // (its shader compiled ahead)
     s.fragment_programs[guest] = std::move(f);
     *out = guest;
     return 0;

@@ -455,6 +455,9 @@ struct Renderer {
         bool watched = false;
     };
     nx::hash_map<u64, ContentMemo> content_memo;
+    // (shaders compiled ahead whose SPIR-V the cache does not have: kept here, packed, and added to it when a draw
+    // uses them; the others are only marked prepared there)
+    nx::hash_map<u64, std::pair<ShaderKey, nx::vector<u8>>> unsaved;
     // (descriptor pools reset, for the next scenes: by size, kPoolSets sets and each power of two above it)
     nx::vector<VkDescriptorPool> free_pools[4];
     // Scenes submitted to the GPU whose results are not in guest memory yet, oldest first: what each writes there,
@@ -888,6 +891,9 @@ struct GraphicsJob {
 // that (a phone's: 83 ms for a new vertex shader on average, 17 ms for a new fragment shader with one made before).
 // (a phone's driver took two fifths longer for each pipeline with four at once, its threads on the fast cores or
 // not: a scene's new pipelines take their sum over about three)
+void pipeline_whole(const vk::GraphicsPipelineDesc& desc);
+nx::vector<u32> unpack_words(std::span<const u8> bytes);
+
 void make_graphics(Renderer& r, std::span<GraphicsJob> jobs) {
     auto words = [&](VkShaderModule m) -> usize {
         const auto it = r.module_keys.find(reinterpret_cast<u64>(m));
@@ -903,14 +909,20 @@ void make_graphics(Renderer& r, std::span<GraphicsJob> jobs) {
     }
     std::stable_sort(first.begin(), first.end(),
                      [&](usize a, usize b) { return words(jobs[a].desc.vertex) > words(jobs[b].desc.vertex); });
+    // (with pipeline libraries, a scene's new ones linked: quick when their shaders were compiled before; the whole
+    // pipeline then made on the threads ahead, in its place, warm_up's own made whole)
+    const bool link = r.device->caps().pipeline_library && !r.warming;
     auto make = [&](usize i) {
         const u64 t0 = nx::os::ticks_ns();
-        if (auto p = r.pipelines->graphics(jobs[i].desc)) jobs[i].pipeline = *p;
+        if (auto p = link ? r.pipelines->linked(jobs[i].desc) : r.pipelines->graphics(jobs[i].desc)) jobs[i].pipeline = *p;
         else jobs[i].error = p.error().message;
         jobs[i].ns = nx::os::ticks_ns() - t0;
     };
     in_parallel(first.size(), [&](usize k) { make(first[k]); });
     in_parallel(rest.size(), [&](usize k) { make(rest[k]); });
+    if (link)
+        for (const GraphicsJob& j : jobs)
+            if (j.pipeline) pipeline_whole(j.desc);
 }
 
 // The variants' keys: the program's bytes, and what else its translation reads.
@@ -2669,6 +2681,302 @@ void prepare_shaders(Renderer& r, std::span<const Draw> draws, const ColorFormat
 
 }  // namespace
 
+namespace {
+
+// ---- Shaders compiled ahead ------------------------------------------------------------------------------------
+// A phone's driver compiles a whole pipeline's shaders together, once for each pair of them (25-630 ms; a song's first
+// scenes with an empty shader cache waited 0.2-0.47 s for 6-21 new pairs at once), and the game pairs a fragment
+// program with vertex programs other than the one it was made for. With VK_EXT_graphics_pipeline_library a shader is
+// compiled once on its own (its library: 20-70 ms), and a pipeline of any pair of compiled shaders is linked in a
+// millisecond or two (make_graphics; the whole pipeline made after, on these threads, in its place). The game makes
+// its programs seconds before it draws with them (a song's at the start, some 40 s before): each program made is
+// translated here as a draw would translate it (the colour of the last scene drawn), on threads of its own, and its
+// shader's library made, into the driver's cache; the shader cache marks it prepared (its SPIR-V kept only once a
+// draw uses it), and the next runs skip it.
+struct AheadPair {
+    u32 vertex = 0, fragment = 0;  // (the guest's handles; 0: a program of that kind to compile it with, any)
+};
+struct Ahead {
+    nx::mutex lock;
+    nx::vector<AheadPair> queue;
+    nx::vector<vk::GraphicsPipelineDesc> whole;  // (linked pipelines a scene used: made whole, in their place)
+    nx::hash_map<u64, bool> vertex, fragment;  // (shaders compiled in a pipeline, by quick key and the formats)
+    ColorFormat cf;                // (the last scene's colour)
+    bool cf_known = false, off = false;
+    std::atomic<bool> started{false};
+    u64 made = 0, ns = 0;  // (programs whose shaders were compiled, and their time added up)
+};
+Ahead& ahead() {
+    static Ahead* a = new Ahead;  // (its threads run to the process's end)
+    return *a;
+}
+
+// A pair copied out of the game's state (its programs may be released meanwhile).
+struct AheadWork {
+    Program vp, fp;
+    nx::vector<VertexAttribute> attributes;
+    nx::vector<VertexStream> streams;
+    u32 output_format = 0;
+    bool blend_enabled = false;
+    BlendInfo blend{};
+};
+
+bool ahead_copy(const AheadPair& pair, AheadWork& w) {
+    State& s = state();
+    nx::scoped_lock<nx::mutex> held(s.lock);
+    const VertexProgram* vp = nullptr;
+    const FragmentProgram* fp = nullptr;
+    if (auto v = s.vertex_programs.find(pair.vertex); v != s.vertex_programs.end()) vp = v->second.get();
+    if (auto f = s.fragment_programs.find(pair.fragment); f != s.fragment_programs.end()) fp = f->second.get();
+    if ((pair.vertex && !vp) || (pair.fragment && !fp)) return false;  // (released meanwhile)
+    // (the other: the one a fragment program was made for, or one made for the vertex program's; else any)
+    if (!vp) {
+        for (const auto& [guest, v] : s.vertex_programs) {
+            if (!v->program) continue;
+            if (!vp || v->program->gxp_address == fp->vertex_gxp) vp = v.get();
+            if (v->program->gxp_address == fp->vertex_gxp) break;
+        }
+    }
+    if (!fp) {
+        for (const auto& [guest, f] : s.fragment_programs) {
+            if (f->mask_update || !f->program) continue;
+            if (!fp || f->vertex_gxp == vp->program->gxp_address) fp = f.get();
+            if (f->vertex_gxp == vp->program->gxp_address) break;
+        }
+    }
+    if (!vp || !fp || fp->mask_update || !vp->program || !fp->program) return false;
+    w.vp = *vp->program, w.fp = *fp->program;
+    w.attributes = vp->attributes, w.streams = vp->streams;
+    w.output_format = fp->output_format, w.blend_enabled = fp->blend_enabled, w.blend = fp->blend;
+    return true;
+}
+
+// SPIR-V words as LEB128 bytes (most of its words are small: half the size), and back.
+nx::vector<u8> pack_words(std::span<const u32> words) {
+    nx::vector<u8> out;
+    out.reserve(words.size() * 2);
+    for (u32 w : words) {
+        while (w >= 0x80) out.push_back(static_cast<u8>(w | 0x80)), w >>= 7;
+        out.push_back(static_cast<u8>(w));
+    }
+    return out;
+}
+nx::vector<u32> unpack_words(std::span<const u8> bytes) {
+    nx::vector<u32> out;
+    u32 w = 0, shift = 0;
+    for (u8 b : bytes) {
+        w |= static_cast<u32>(b & 0x7F) << shift;
+        if (b & 0x80) {
+            shift += 7;
+        } else {
+            out.push_back(w);
+            w = 0, shift = 0;
+        }
+    }
+    return out;
+}
+
+// A shader's module for compiling ahead: the renderer's, else made from the cache's SPIR-V or translated (outside its
+// lock), and kept in its maps; translated SPIR-V kept unsaved until a draw uses it.
+VkShaderModule ahead_module(Renderer& r, const ShaderKey& key, u64 quick, auto&& translate) {
+    {
+        TargetsHeld held(r);
+        if (auto it = r.modules.find(short_key(key)); it != r.modules.end()) return it->second;
+        if (r.failed_programs.contains(short_key(key))) return VK_NULL_HANDLE;
+    }
+    nx::vector<u32> words;
+    const bool cached = static_cast<bool>(r.cache.spirv(key));
+    if (cached) {
+        words = *r.cache.spirv(key);
+    } else {
+        auto spirv = translate();
+        if (!spirv) return VK_NULL_HANDLE;
+        words = std::move(*spirv);
+    }
+    auto m = vk::create_shader(*r.device, words);
+    if (!m) return VK_NULL_HANDLE;
+    TargetsHeld held(r);
+    if (auto it = r.modules.find(short_key(key)); it != r.modules.end()) {
+        vkDestroyShaderModule(r.device->device(), *m, nullptr);
+        return it->second;
+    }
+    r.modules[short_key(key)] = *m;
+    r.module_keys[reinterpret_cast<u64>(*m)] = key;
+    r.quick_modules[quick] = *m;
+    if (!cached) r.unsaved[short_key(key)] = {key, pack_words(words)};
+    return *m;
+}
+
+void ahead_make(Renderer& r, const AheadPair& pair, const ColorFormat& cf) {
+    AheadWork w;
+    if (!ahead_copy(pair, w)) return;
+    // The shaders, as a draw of the last scene's colour would have them (vertex_shader_of, fragment_shader_of).
+    VertexShader vs;
+    for (usize a = 0; a < w.attributes.size(); ++a) {
+        const VertexAttribute& attr = w.attributes[a];
+        VertexInput in;
+        in.location = static_cast<u32>(a);
+        in.reg = attr.reg;
+        in.format = attr.format;
+        in.components = attr.components;
+        for (const usse::Parameter& p : w.vp.gxp.parameters)
+            if (p.category == usse::ParameterCategory::Attribute && p.resource == attr.reg) in.raw = p.reg_format;
+        vs.inputs.push_back(in);
+    }
+    std::optional<ColorReadBlend> br;
+    const bool rgba8 = cf.format == VK_FORMAT_R8G8B8A8_UNORM || cf.format == VK_FORMAT_B8G8R8A8_UNORM;
+    const u8* z = cf.swizzle;
+    if (w.fp.gxp.native_color && w.fp.gxp.frag_color && !w.blend_enabled && rgba8 && z[3] == 3 && z[0] <= 2 && z[1] <= 2 &&
+        z[2] <= 2 && z[0] != z[1] && z[0] != z[2] && z[1] != z[2])
+        br = color_read_blend(w.fp.gxp, w.fp.primary);
+    FragmentShader fs;
+    fs.output_format = w.output_format;
+    std::memcpy(fs.swizzle, cf.swizzle, 4);
+    fs.color_output = true;
+    fs.blend_read = br.has_value();
+    const bool inline_secondary = tile_secondary_scan(w.fp);
+    const bool reads_color = w.fp.gxp.native_color && w.fp.gxp.frag_color && !br;
+    const u64 vq = vertex_quick(w.vp, vs), fq = fragment_quick(w.fp, fs, inline_secondary);
+    vk::PassFormats formats;
+    formats.color = cf.format;
+    formats.depth = r.device->caps().depth_stencil_format;
+    formats.color_input = reads_color ? 1 : 0;
+    nx::fnv1a64 vk_, fk;
+    vk_.combine_all(vq, static_cast<u32>(formats.color), static_cast<u32>(formats.depth));
+    fk.combine_all(fq, static_cast<u32>(formats.color), static_cast<u32>(formats.depth), formats.color_input);
+    {
+        Ahead& a = ahead();
+        const nx::scoped_lock<nx::mutex> held(a.lock);
+        if (a.vertex.contains(vk_.value()) && a.fragment.contains(fk.value())) return;
+        a.vertex[vk_.value()] = true, a.fragment[fk.value()] = true;
+    }
+    // (a shader compiled ahead in a run before: in the driver's cache, its library made quickly when a draw needs it)
+    const ShaderKey vkey = vertex_key(w.vp, vs), fkey = fragment_key(w.fp, fs, inline_secondary);
+    const bool need_v = !r.cache.prepared(vkey), need_f = !r.cache.prepared(fkey);
+    if (!need_v && !need_f) return;
+    const u64 from = nx::os::ticks_ns();
+    const VkShaderModule vm = need_v ? ahead_module(r, vkey, vq, [&] { return translate_vertex(w.vp.gxp, w.vp.primary, vs); })
+                                     : VK_NULL_HANDLE;
+    const VkShaderModule fm = need_f ? ahead_module(r, fkey, fq, [&] {
+        const std::span<const usse::Decoded> inlined =
+            inline_secondary ? std::span<const usse::Decoded>(w.fp.secondary) : std::span<const usse::Decoded>{};
+        return translate_fragment(w.fp.gxp, w.fp.primary, fs, inlined);
+    }) : VK_NULL_HANDLE;
+    if (!vm && !fm) return;  // (not translated: the draw finds the error again, and reports it)
+    // The shaders' libraries: their state as any draw's (the driver compiles a shader once for all of them).
+    auto desc = vk::GraphicsPipelineDesc::defaults();
+    desc.vertex = vm, desc.fragment = fm, desc.layout = r.layout;
+    desc.depth_test = 1, desc.depth_write = 1, desc.depth_compare = VK_COMPARE_OP_LESS_OR_EQUAL;
+    desc.formats = formats;
+    if (!r.pipelines->prepare(desc)) return;
+    if (vm) r.cache.add_prepared(vkey);
+    if (fm) r.cache.add_prepared(fkey);
+    r.pipelines_changed.store(true);  // (the driver's cache has them now: saved with the rest)
+    Ahead& a = ahead();
+    const nx::scoped_lock<nx::mutex> held(a.lock);
+    ++a.made, a.ns += nx::os::ticks_ns() - from;
+}
+
+void ahead_run(Renderer& r) {
+    Ahead& a = ahead();
+    u64 reported = 0;
+    for (;;) {
+        nx::this_thread::sleep_for(std::chrono::milliseconds(20));
+        AheadPair pair;
+        ColorFormat cf;
+        // (the whole pipelines first: scenes draw with their linked ones meanwhile)
+        for (;;) {
+            vk::GraphicsPipelineDesc desc;
+            {
+                const nx::scoped_lock<nx::mutex> held(a.lock);
+                if (a.whole.empty()) break;
+                desc = a.whole.front();
+                a.whole.erase(a.whole.begin());
+            }
+            if (r.pipelines->graphics(desc)) r.pipelines_changed.store(true);
+        }
+        {
+            const nx::scoped_lock<nx::mutex> held(a.lock);
+            if (a.queue.empty() || !a.cf_known) {
+                if (a.queue.empty() && a.made != reported) {
+                    nx::logi(logs::gpu, "shaders compiled ahead: {} programs' so far ({:.0f} ms of their threads)", a.made,
+                             static_cast<f64>(a.ns) / 1e6);
+                    reported = a.made;
+                }
+                continue;
+            }
+            pair = a.queue.front();
+            a.queue.erase(a.queue.begin());
+            cf = a.cf;
+        }
+        ahead_make(r, pair, cf);
+        // (the next at once: the queue is drained without the pause)
+        for (;;) {
+            {
+                const nx::scoped_lock<nx::mutex> held(a.lock);
+                if (a.queue.empty()) break;
+                pair = a.queue.front();
+                a.queue.erase(a.queue.begin());
+                cf = a.cf;
+            }
+            ahead_make(r, pair, cf);
+        }
+    }
+}
+
+// The threads start (once warm_up is done with the renderer's maps). PSVRECORE_PIPELINES_AHEAD=0 turns it off;
+// without pipeline libraries it is off (a pair compiled ahead helps only that pair, and the game pairs a fragment
+// program with vertex programs other than the one it was made for).
+void ahead_start(Renderer& r) {
+    Ahead& a = ahead();
+    if (a.started.exchange(true)) return;
+    if (!r.device->caps().pipeline_library) {
+        const nx::scoped_lock<nx::mutex> held(a.lock);
+        a.off = true;
+        a.queue.clear();
+        return;
+    }
+    if (const char* v = std::getenv("PSVRECORE_PIPELINES_AHEAD"); v && std::atoi(v) == 0) {
+        const nx::scoped_lock<nx::mutex> held(a.lock);
+        a.off = true;
+        a.queue.clear();
+        nx::logi(logs::gpu, "pipelines: not made ahead (PSVRECORE_PIPELINES_AHEAD=0)");
+        return;
+    }
+    const u32 threads = nx::max<u32>(pipeline_threads() - 1, 1);
+    for (u32 t = 0; t < threads; ++t) {
+        nx::thread_options options;
+        options.name = "pipelines ahead";
+        options.priority = nx::thread_priority::BelowNormal;  // (the game's threads first)
+        nx::thread worker([&r] { ahead_run(r); }, options);
+        worker.detach();
+    }
+}
+
+void ahead_color(const ColorFormat& cf) {
+    Ahead& a = ahead();
+    const nx::scoped_lock<nx::mutex> held(a.lock);
+    a.cf = cf, a.cf_known = true;
+}
+
+// (a linked pipeline a scene used: made whole on the threads ahead)
+void pipeline_whole(const vk::GraphicsPipelineDesc& desc) {
+    Ahead& a = ahead();
+    const nx::scoped_lock<nx::mutex> held(a.lock);
+    for (const vk::GraphicsPipelineDesc& d : a.whole)
+        if (d.same(desc)) return;
+    a.whole.push_back(desc);
+}
+
+}  // namespace
+
+void pipeline_ahead(u32 vertex_program, u32 fragment_program) {
+    Ahead& a = ahead();
+    const nx::scoped_lock<nx::mutex> held(a.lock);
+    if (a.off || a.queue.size() >= 8192) return;
+    a.queue.push_back({vertex_program, fragment_program});
+}
+
 bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 number) {
     g_profile.start();
     Renderer& r = renderer();
@@ -2734,6 +3042,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             return false;
         }
         width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
+        ahead_color(cf);
+        ahead_start(r);  // (once: warm_up, when there is one, is done by now)
         layout.kind = cs.modes & 3;
         if (layout.kind > SurfaceLayout::kSwizzled) {
             nx::logw(logs::gxm, "colour surface type {} not implemented: scene not rendered", layout.kind);
@@ -3224,6 +3534,12 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             g.desc.vertex = VK_NULL_HANDLE, g.desc.fragment = VK_NULL_HANDLE, g.desc.layout = VK_NULL_HANDLE;
             g.vertex = r.module_keys[reinterpret_cast<u64>(m.desc.vertex)];
             g.fragment = r.module_keys[reinterpret_cast<u64>(m.desc.fragment)];
+            // (shaders compiled ahead: their SPIR-V saved now, for warm_up to make this one next time)
+            for (const ShaderKey* k : {&g.vertex, &g.fragment})
+                if (auto it = r.unsaved.find(short_key(*k)); it != r.unsaved.end()) {
+                    r.cache.add_spirv(*k, unpack_words(it->second.second));
+                    r.unsaved.erase(it);
+                }
             r.cache.add_graphics(g);
             r.made_pipelines.fetch_add(1);
             r.pipelines_changed.store(true);

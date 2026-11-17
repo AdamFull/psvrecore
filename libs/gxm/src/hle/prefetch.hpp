@@ -29,4 +29,9 @@ struct PrefetchStats {
 };
 PrefetchStats prefetch_stats();
 
+// A vertex program or a fragment program made (the guest's handle, the other 0; the game's thread, the state's lock
+// held): its shader translated and compiled as a pipeline library on threads of the renderer's (render.cpp), so that
+// a scene drawing with it links its pipelines quickly. Only with VK_EXT_graphics_pipeline_library.
+void pipeline_ahead(u32 vertex_program, u32 fragment_program);
+
 }  // namespace psvrecore::gxm::hle

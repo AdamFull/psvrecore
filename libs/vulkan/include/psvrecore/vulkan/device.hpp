@@ -44,6 +44,7 @@ struct Capabilities {
     // Reading the destination colour in the fragment shader (GXM's programmable blending): input attachments
     // with rasterization-order access (VK_EXT_ or VK_ARM_rasterization_order_attachment_access).
     bool raster_order_attachment = false;
+    bool pipeline_library = false;  // VK_EXT_graphics_pipeline_library
     VkFormat depth_stencil_format = VK_FORMAT_UNDEFINED;  // D32_SFLOAT_S8_UINT or D24_UNORM_S8_UINT
     u32 vendor_id = 0;
     f32 timestamp_period = 0.0f;  // nanoseconds per timestamp tick (0: the queue has no timestamps)

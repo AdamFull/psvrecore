@@ -79,10 +79,20 @@ public:
     Pipelines& operator=(const Pipelines&) = delete;
 
     // Made once for each description, kept; may be called from several threads at once (the driver compiles
-    // outside the lock: a phone's takes up to a tenth of a second for a pipeline whose shaders are new).
+    // outside the lock: a phone's takes up to a tenth of a second for a pipeline whose shaders are new). It takes the
+    // place of one linked() made for the description before.
     Result<VkPipeline> graphics(const GraphicsPipelineDesc& desc);
-    // Made before (VK_NULL_HANDLE: not yet).
-    VkPipeline find(const GraphicsPipelineDesc& desc) const;
+    // With VK_EXT_graphics_pipeline_library: the pipeline linked from libraries of its parts (each made once: its
+    // vertex input, its vertex shader with the rasterization state, its fragment shader with the depth and stencil
+    // state, its blending and formats), without link-time optimization; else graphics(). A phone's driver compiles a
+    // shader for its library (20-70 ms), then once for every library of it (0.1 ms), and links in a millisecond or
+    // two, where a whole pipeline's shaders are compiled together for each pair (25-630 ms).
+    Result<VkPipeline> linked(const GraphicsPipelineDesc& desc);
+    // The libraries of its shaders made, without a pipeline (the vertex shader's if it has one, the fragment shader's
+    // if it has one): the driver compiles them into its cache. Nothing without pipeline libraries.
+    Result<void> prepare(const GraphicsPipelineDesc& desc);
+    // Made before (VK_NULL_HANDLE: not yet); `linked`, whether it is one linked() made.
+    VkPipeline find(const GraphicsPipelineDesc& desc, bool* linked = nullptr) const;
     usize count() const { return count_.load(std::memory_order_relaxed); }
     VkPipelineCache cache() const { return cache_; }  // (for the compute pipelines too)
 
@@ -91,13 +101,23 @@ public:
     Result<void> load_cache(nx::fs::path_view path);
 
 private:
-    VkPipeline find_locked(const GraphicsPipelineDesc& desc) const;
+    struct Entry {
+        GraphicsPipelineDesc desc;
+        VkPipeline pipeline;
+        bool linked;
+    };
+    const Entry* find_locked(const GraphicsPipelineDesc& desc) const;
+    Result<VkPipeline> library(u32 part, const GraphicsPipelineDesc& desc);
 
     Device& device_;
     RenderPasses& passes_;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
     mutable nx::mutex lock_;  // (the pipelines made, and the render passes they are made for)
-    nx::hash_map<u64, nx::vector<std::pair<GraphicsPipelineDesc, VkPipeline>>> pipelines_;
+    nx::hash_map<u64, nx::vector<Entry>> pipelines_;
+    // (the libraries, by part: their descriptions hold only what the part reads; and linked pipelines whose place
+    // graphics() took, destroyed at the end: scenes recorded with them may still be in flight)
+    nx::hash_map<u64, nx::vector<std::pair<GraphicsPipelineDesc, VkPipeline>>> libraries_[4];
+    nx::vector<VkPipeline> replaced_;
     std::atomic<usize> count_{0};
 };
 

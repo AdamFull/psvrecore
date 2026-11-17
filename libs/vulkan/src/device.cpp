@@ -284,6 +284,22 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         }
     }
 
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+    if (has_ext(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &gpl;
+        vkGetPhysicalDeviceFeatures2(gpu, &query);
+        if (gpl.graphicsPipelineLibrary) {
+            gpl = VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+            gpl.graphicsPipelineLibrary = VK_TRUE;
+            gpl.pNext = chain;
+            chain = &gpl;
+            extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+            caps.pipeline_library = true;
+        }
+    }
+
     const f32 priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue.queueFamilyIndex = d->queue_family_;
@@ -369,11 +385,12 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         nx::logi(logs::gpu, "Vulkan memory: {} MiB reserved for textures, {} MiB for host buffers",
                  d->texture_pool_ ? kBlock * kReservedBlocks >> 20 : 0, d->host_pool_ ? kBlock * kReservedBlocks >> 20 : 0);
     }
-    nx::logi(logs::gpu, "Vulkan device: {} (API {}.{}.{}, using {}.{}); {}{}{}{}", props.deviceName,
+    nx::logi(logs::gpu, "Vulkan device: {} (API {}.{}.{}, using {}.{}); {}{}{}{}{}", props.deviceName,
              VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
              VK_API_VERSION_PATCH(props.apiVersion), VK_API_VERSION_MAJOR(caps.api_version),
              VK_API_VERSION_MINOR(caps.api_version), caps.dynamic_rendering ? "dynamic rendering" : "render passes",
              caps.raster_order_attachment ? ", rasterization-order attachments" : "", caps.int64 ? ", int64" : "",
+             caps.pipeline_library ? ", pipeline libraries" : "",
              d->messenger_ ? "; validation layer on" : "");
     // (what the device offers that faster paths could use: not enabled)
     nx::string offered;

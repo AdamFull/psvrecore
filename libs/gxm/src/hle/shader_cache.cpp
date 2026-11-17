@@ -20,7 +20,7 @@ namespace {
 
 // The file: this header, then records (a type byte, a length, the payload).
 constexpr char kMagic[8] = {'P', 'S', 'V', 'S', 'H', 'C', 0, 1};
-constexpr u8 kSpirv = 1, kGraphics = 2, kCompute = 3;
+constexpr u8 kSpirv = 1, kGraphics = 2, kCompute = 3, kPrepared = 4;
 
 struct Header {
     char magic[8];
@@ -104,6 +104,10 @@ void ShaderCache::open(const nx::string& folder) {
                         graphics_seen_[graphics_hash(g)] = true;
                         graphics_.push_back(g);
                     }
+                } else if (type == kPrepared && size == 16) {
+                    ShaderKey key;
+                    std::memcpy(key.data(), payload.data(), 16);
+                    prepared_[short_key(key)] = true;
                 } else if (type == kCompute && size == 16) {
                     ShaderKey key;
                     std::memcpy(key.data(), payload.data(), 16);
@@ -175,6 +179,18 @@ void ShaderCache::add_compute(const ShaderKey& key) {
     compute_seen_[short_key(key)] = true;
     compute_.push_back(key);
     append(kCompute, key);
+}
+
+bool ShaderCache::prepared(const ShaderKey& key) {
+    nx::scoped_lock<nx::mutex> held(lock_);
+    return prepared_.contains(short_key(key));
+}
+
+void ShaderCache::add_prepared(const ShaderKey& key) {
+    nx::scoped_lock<nx::mutex> held(lock_);
+    if (prepared_.contains(short_key(key))) return;
+    prepared_[short_key(key)] = true;
+    append(kPrepared, key);
 }
 
 nx::vector<ShaderCache::Graphics> ShaderCache::graphics() {
