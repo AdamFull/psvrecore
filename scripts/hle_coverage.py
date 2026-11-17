@@ -67,7 +67,9 @@ def strip_comments(text):
 
 TABLE_RE = re.compile(r'\bconst\s+(?:[\w:]*::)?(Function|Variable)\s+(\w+)\s*\[\s*\]\s*=\s*\{')
 ENTRY_RE = re.compile(r'(?:\b\w+\s*\(|\{)\s*(0x[0-9A-Fa-f]+)\s*,\s*(?:"([^"]+)"|([A-Za-z_]\w*))')
-REGISTER_RE = re.compile(r'register_library\s*\(\s*\{\s*"(\w+)"\s*,\s*[\w:]+\s*,\s*(\w+)\s*(?:,\s*(\w+)\s*)?\}')
+REGISTER_RE = re.compile(r'register_library\s*\(\s*\{\s*"(\w+)"\s*,\s*([\w:]+)\s*,\s*(\w+)\s*(?:,\s*(\w+)\s*)?\}')
+CONSTANT_RE = re.compile(r'\b(k\w+)\s*=\s*(0x[0-9A-Fa-f]+)')
+LIBRARY_NIDS = {}  # (filled by read_hle: library -> the NIDs it is registered with)
 
 
 def table_body(text, start):
@@ -97,9 +99,13 @@ def read_hle(root):
             for e in ENTRY_RE.finditer(table_body(text, m.end())):
                 entries[int(e.group(1), 16)] = e.group(2) or e.group(3)
             tables[m.group(2)] = (m.group(1).lower(), entries)
+        constants = {c.group(1): int(c.group(2), 16) for c in CONSTANT_RE.finditer(text)}
         for m in REGISTER_RE.finditer(text):
             files += 1
-            for table in (m.group(2), m.group(3)):
+            nid = constants.get(m.group(2).split('::')[-1])
+            if nid is not None:
+                LIBRARY_NIDS.setdefault(m.group(1), set()).add(nid)
+            for table in (m.group(3), m.group(4)):
                 if not table:
                     continue
                 if table not in tables:
@@ -262,8 +268,9 @@ def main():
     ap.add_argument('--imports-out', help='the per-game import survey (needs games)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--check', action='store_true',
-                    help='only check the tables: every entry whose name the reference gives another NID, or whose NID '
-                         'the reference names otherwise (exit status 1 if any)')
+                    help='only check the tables: every library registered with another NID than the SDK has, every entry '
+                         'whose name the reference gives another NID, or whose NID the reference names otherwise '
+                         '(exit status 1 if any)')
     ap.add_argument('games', nargs='*', help='[Name=]path: a game folder, executable or module')
     args = ap.parse_args()
 
@@ -272,11 +279,11 @@ def main():
         sys.exit('psvinfo not found (build psvrecore\'s tools or pass --psvinfo)')
 
     hle = read_hle(ROOT)
-    sdk, _ = read_stubs(psvinfo, args.sdk)
+    sdk, lib_nids = read_stubs(psvinfo, args.sdk)
     db, modules = read_db(args.db)
 
     if args.check:
-        sys.exit(check_names(hle, sdk, db))
+        sys.exit(check_names(hle, sdk, db, lib_nids))
 
     games = []  # (name, {(lib, nid): (name, kind)}, own libs, files read, unreadable)
     if args.games:
@@ -394,11 +401,16 @@ def main():
             f.write(imports_report(games, hle, name_of, imported_by, import_names))
 
 
-def check_names(hle, sdk, db):
+def check_names(hle, sdk, db, lib_nids):
     """Entries whose name and NID disagree with the reference (the SDK's, else the database's): a NID mistyped, or a
     function registered under another's name. Names are compared without a leading underscore; an entry whose
     function is also registered at the reference's NID is an alias (an older NID of it) and is not reported."""
     problems = 0
+    for lib, nids in sorted(LIBRARY_NIDS.items()):
+        if lib in lib_nids and lib_nids[lib] not in nids:
+            print('%s: the library is 0x%08X in the reference, registered as %s' % (
+                lib, lib_nids[lib], ', '.join('0x%08X' % n for n in sorted(nids))))
+            problems += 1
     for lib in sorted(hle):
         ref = sdk.get(lib) or db.get(lib) or {}
         by_name = {}

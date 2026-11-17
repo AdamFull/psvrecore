@@ -72,6 +72,88 @@ i32 sceHttpUriUnescape(Ptr<char> out, Ptr<u32> required, u32 prepare, Ptr<const 
     return put_text(s, out, required, prepare);
 }
 
+// The pool given to sceHttpInit: what sceHttpGetMemoryPoolStats reports (nothing of it in use).
+std::atomic<u32> g_http_pool{0};
+i32 sceHttpInit(u32 pool_size) {
+    g_http_pool = pool_size;
+    nx::logi(logs::hle, "SceHttp: started (offline: nothing connects)");
+    return 0;
+}
+// SceHttpMemoryPoolStats: the pool's size, the most of it ever in use, in use now.
+i32 sceHttpGetMemoryPoolStats(Ptr<u32> stats) {
+    if (!stats || !writable(stats.address, 16)) return kHttpInvalidValue;
+    const u32 v[4] = {g_http_pool.load(), 0, 0, 0};
+    std::memcpy(stats.get(), v, sizeof v);
+    return 0;
+}
+
+// sceHttpParseResponseHeader(header, length, field, &value, &value length): the field's value in a block of response
+// headers ("Name: value" lines, CRLF or LF), the name matched without regard to case, the value's leading spaces
+// skipped; a pointer into the block. Needs no network.
+constexpr i32 kHttpParseNotFound = err::code(0x80432025), kHttpParseInvalidValue = err::code(0x804321FE);
+i32 sceHttpParseResponseHeader(Ptr<const char> header, u32 length, Ptr<const char> field, Ptr<u32> value,
+                               Ptr<u32> value_length) {
+    if (!header || !field || !value || !value_length || !readable(header.address, length) ||
+        !writable(value.address, 4) || !writable(value_length.address, 4))
+        return kHttpParseInvalidValue;
+    const nx::string name = str(field, 256);
+    const char* h = header.get();
+    u32 at = 0;
+    while (at < length) {
+        u32 end = at;
+        while (end < length && h[end] != 0x0A) ++end;
+        u32 line_end = end;
+        if (line_end > at && h[line_end - 1] == 0x0D) --line_end;
+        u32 colon = at;
+        while (colon < line_end && h[colon] != ':') ++colon;
+        if (colon < line_end && colon - at == name.size()) {
+            bool same = true;
+            for (u32 i = 0; i < name.size() && same; ++i) {
+                const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+                same = lower(h[at + i]) == lower(name[i]);
+            }
+            if (same) {
+                u32 v = colon + 1;
+                while (v < line_end && (h[v] == ' ' || h[v] == 0x09)) ++v;
+                *value = header.address + v;
+                *value_length = line_end - v;
+                return static_cast<i32>(line_end - v);
+            }
+        }
+        at = end + 1;
+    }
+    return kHttpParseNotFound;
+}
+
+// sceHttpUriBuild(out, &required, out's size, element, which parts): a URI from its parts (SceHttpUriElement: opaque,
+// scheme, user name, password, host, path, query, fragment, port), those `option` asks for that are given. The size
+// needed (with the terminator) goes to `required`; written when `out` is given and large enough. Needs no network.
+struct UriElement {
+    u32 opaque;
+    Ptr<const char> scheme, username, password, hostname, path, query, fragment;
+    u16 port;
+    u8 reserved[10];
+};
+static_assert(sizeof(UriElement) == 44);
+i32 sceHttpUriBuild(Ptr<char> out, Ptr<u32> required, u32 prepare, Ptr<const UriElement> element, u32 option) {
+    if (!element || !readable(element.address, sizeof(UriElement))) return kHttpInvalidValue;
+    const UriElement e = *element;
+    const auto part = [](Ptr<const char> p) { return p ? str(p, 4096) : nx::string(); };
+    nx::string s;
+    if ((option & 0x01) && e.scheme) s += part(e.scheme) + (e.opaque ? ":" : "://");
+    if ((option & 0x10) && e.username && !part(e.username).empty()) {
+        s += part(e.username);
+        if ((option & 0x20) && e.password) s += ":" + part(e.password);
+        s += "@";
+    }
+    if ((option & 0x02) && e.hostname) s += part(e.hostname);
+    if ((option & 0x04) && e.port) s += nx::format(":{}", e.port);
+    if ((option & 0x08) && e.path) s += part(e.path);
+    if ((option & 0x40) && e.query) s += part(e.query);
+    if ((option & 0x80) && e.fragment) s += part(e.fragment);
+    return put_text(s, out, required, prepare);
+}
+
 #define DONE(nid, name) Function{nid, name, &entry<&done>}
 #define NEW_ID(nid, name) Function{nid, name, &entry<&new_id>}
 #define SIGNED_OUT(nid, name) Function{nid, name, &entry<&signed_out>}
@@ -157,6 +239,24 @@ const Function kHttp[] = {
     NETWORK(0x2B79BDE0, "sceHttpsGetSslError"),
     HLE_FUNCTION(0x1DA2A673, sceHttpUriEscape),
     HLE_FUNCTION(0x1274D318, sceHttpUriUnescape),
+    HLE_FUNCTION(0x214926D9, sceHttpInit),
+    HLE_FUNCTION(0xF98CDFA9, sceHttpGetMemoryPoolStats),
+    HLE_FUNCTION(0x03A6C89E, sceHttpParseResponseHeader),
+    HLE_FUNCTION(0x47664424, sceHttpUriBuild),
+    NEW_ID(0xAEB3307E, "sceHttpCreateConnection"),
+    NEW_ID(0xB0284270, "sceHttpCreateRequest"),
+    DONE(0x5EB5F548, "sceHttpRemoveRequestHeader"),
+    DONE(0x11EC42D0, "sceHttpSetAuthEnabled"),
+    DONE(0xE0A3A88D, "sceHttpSetAuthInfoCallback"),
+    DONE(0xAEE573A3, "sceHttpSetCookieEnabled"),
+    DONE(0x4E08167D, "sceHttpSetRedirectCallback"),
+    DONE(0x37C30C90, "sceHttpSetRequestContentLength"),
+    DONE(0x9AB56EA7, "sceHttpSetResolveRetry"),
+    DONE(0x8455B5B3, "sceHttpSetResolveTimeOut"),
+    DONE(0x8577833F, "sceHttpsUnloadCert"),
+    NETWORK(0x11F6C27F, "sceHttpGetAllResponseHeaders"),
+    NETWORK(0x9A68C3DE, "sceHttpGetLastErrno"),
+    NETWORK(0xA9A39BA1, "(SceHttp 0xA9A39BA1)"),  // (known only by NID: a game's network module imports it)
 };
 
 }  // namespace

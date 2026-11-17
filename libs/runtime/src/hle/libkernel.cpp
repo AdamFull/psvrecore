@@ -345,6 +345,7 @@ void register_system_libraries() {
     register_fiber();
     register_np();
     register_online();
+    register_net();
     register_videodec();
     register_commondialog();
 }

@@ -53,6 +53,7 @@ void register_jpegenc();
 void register_fiber();
 void register_np();
 void register_online();
+void register_net();
 void register_videodec();
 void register_commondialog();
 

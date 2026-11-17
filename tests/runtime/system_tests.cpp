@@ -134,3 +134,44 @@ TEST_CASE("fiber: options zeroed; a fiber without context memory given one and r
     CHECK(call32(ctx, kSceFiber, kPush, {guest_string("mark"), 0, 0}) == 0);
     CHECK(call32(ctx, kSceFiber, kPop, {}) == 0);
 }
+
+TEST_CASE("appmgr, screenshots, debug switches, fios overlays: what has nothing to do on the host answers so") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceAppMgrUser = 0xA6605D6F, kSceDebugLed = 0xAE004C0A, kSceScreenShot = 0xF26FC97D,
+                  kSceFios2User = 0xC2ED82D7, kSceFios2Kernel = 0x8757B742;
+    // Another executable in place of this one: refused (one executable a game); its path checked first.
+    constexpr u32 kLoadExec = 0xE6774ABC, kDisconnectionWarning = 0xE352B29C;
+    CHECK(u(call32(ctx, kSceAppMgrUser, kLoadExec, {0, 0, 0})) == 0x80802016u);
+    CHECK(u(call32(ctx, kSceAppMgrUser, kLoadExec, {guest_string("ux0:data/a.self"), 0, 0})) == 0x8080201Eu);
+    CHECK(u(call32(ctx, kSceAppMgrUser, kLoadExec, {guest_string("app0:sub/a.self"), 0, 0})) == 0x8080201Eu);
+    CHECK(u(call32(ctx, kSceAppMgrUser, kLoadExec, {guest_string("app0:other.self"), 0, 0})) == 0x80802013u);
+    CHECK(call32(ctx, kSceAppMgrUser, kDisconnectionWarning, {1}) == 0);
+    CHECK(call32(ctx, kSceDebugLed, 0x14F582CF /*sceKernelGetGPI*/, {}) == 0);
+
+    constexpr u32 kDisable = 0x50AE9FF9, kEnable = 0x76E674D1, kDisableNotification = 0xDA80A228,
+                  kEnableNotification = 0x816633FE, kCapture = 0xD509FB08, kGetParam = 0xBAE9E534;
+    const u32 file_info = scratch(1024), info = scratch(1024);
+    CHECK(call32(ctx, kSceScreenShot, kDisableNotification, {}) == 0);
+    CHECK(call32(ctx, kSceScreenShot, kEnableNotification, {}) == 0);
+    CHECK(u(call32(ctx, kSceScreenShot, kCapture, {0, file_info, 0, 0})) == 0x80102F0Bu);  // (no photo storage)
+    CHECK(call32(ctx, kSceScreenShot, kDisable, {}) == 0);
+    CHECK(u(call32(ctx, kSceScreenShot, kCapture, {0, file_info, 0, 0})) == 0x80102F07u);  // (disallowed)
+    CHECK(u(call32(ctx, kSceScreenShot, kCapture, {1, file_info, 0, 0})) == 0x80102F0Bu);  // (forced)
+    CHECK(call32(ctx, kSceScreenShot, kEnable, {}) == 0);
+    CHECK(u(call32(ctx, kSceScreenShot, kCapture, {2, file_info, 0, 0})) == 0x80102F01u);
+    CHECK(u(call32(ctx, kSceScreenShot, kGetParam, {guest_string("ux0:picture/a.jpg"), info})) == 0x80102F03u);
+
+    // FIOS overlays: none, so a path resolves to itself; overlays off for this thread, and on again.
+    constexpr u32 kResolveSync = 0x9C3AAAF0, kSetDisabled = 0x70321220, kIsDisabled = 0x23B8DB1D;
+    const u32 out = scratch(64);
+    REQUIRE(call32(ctx, kSceFios2User, kResolveSync, {0, 0, guest_string("app0:data/x.bin"), out, 64}) == 0);
+    CHECK(nx::string(reinterpret_cast<const char*>(t.rt.memory().host(out))) == "app0:data/x.bin");
+    CHECK(call32(ctx, kSceFios2User, kIsDisabled, {}) == 0);
+    CHECK(call32(ctx, kSceFios2User, kSetDisabled, {1}) == 0);
+    CHECK(call32(ctx, kSceFios2User, kIsDisabled, {}) == 1);
+    CHECK(call32(ctx, kSceFios2User, kSetDisabled, {0}) == 0);
+    // (the overlay directory handles: refused as overlays are)
+    for (u32 nid : {0x5D6A1CCEu, 0x2F06ADC6u, 0x021B4AF7u, 0x759EBEE6u, 0xF6A3E335u, 0x2A9724C9u})
+        CHECK(call32(ctx, kSceFios2Kernel, nid, {0, 0, 0, 0}) == err::kUnsupported);
+}

@@ -43,7 +43,12 @@ i32 sceFiosOverlayResolveWithRangeSync02(i32 /*process*/, i32 flags, Ptr<const c
     return resolve_to_itself(flags, in, out, max_length);
 }
 
+i32 sceFiosOverlayResolveSync02(i32 /*process*/, i32 flags, Ptr<const char> in, Ptr<char> out, u32 max_length) {
+    return resolve_to_itself(flags, in, out, max_length);
+}
+
 thread_local bool g_overlays_disabled = false;  // (guest threads are host threads)
+i32 sceFiosOverlayThreadIsDisabled02() { return g_overlays_disabled ? 1 : 0; }
 
 // The scheduler a path's I/O goes to: the first (only a development kit's host0: paths go to another).
 i32 sceFiosOverlayGetRecommendedScheduler02(i32 /*scheduler_count*/, Ptr<const char> /*path*/, Ptr<void> /*args*/) {
@@ -122,8 +127,15 @@ i32 _sceFiosKernelOverlayRemove() { return unsupported("_sceFiosKernelOverlayRem
 i32 _sceFiosKernelOverlayRemoveForProcess() { return unsupported("_sceFiosKernelOverlayRemoveForProcess"); }
 i32 _sceFiosKernelOverlayGetInfo() { return unsupported("_sceFiosKernelOverlayGetInfo"); }
 i32 _sceFiosKernelOverlayGetInfoForProcess() { return unsupported("_sceFiosKernelOverlayGetInfoForProcess"); }
+// The overlay directory handles (DH*: a folder listed through the overlays, merged): their argument blocks are not
+// known yet and nothing has called them, so each is refused as overlays are, naming itself.
+i32 _sceFiosKernelOverlayDHOpenSync() { return unsupported("_sceFiosKernelOverlayDHOpenSync"); }
+i32 _sceFiosKernelOverlayDHReadSync() { return unsupported("_sceFiosKernelOverlayDHReadSync"); }
+i32 _sceFiosKernelOverlayDHCloseSync() { return unsupported("_sceFiosKernelOverlayDHCloseSync"); }
+i32 _sceFiosKernelOverlayDHStatSync() { return unsupported("_sceFiosKernelOverlayDHStatSync"); }
+i32 _sceFiosKernelOverlayDHChstatSync() { return unsupported("_sceFiosKernelOverlayDHChstatSync"); }
+i32 _sceFiosKernelOverlayDHSyncSync() { return unsupported("_sceFiosKernelOverlayDHSyncSync"); }
 
-// (the overlay directory functions, DH*, are not implemented: nothing has called them)
 const Function kFios2Kernel[] = {
     HLE_FUNCTION(0x9379E2D5, _sceFiosKernelOverlayGetList),
     HLE_FUNCTION(0xE9AE60FB, _sceFiosKernelOverlayResolveSync),
@@ -139,6 +151,12 @@ const Function kFios2Kernel[] = {
     HLE_FUNCTION(0xF8277E07, _sceFiosKernelOverlayRemoveForProcess),
     HLE_FUNCTION(0xF44F3505, _sceFiosKernelOverlayGetInfo),
     HLE_FUNCTION(0xBC6B3CC5, _sceFiosKernelOverlayGetInfoForProcess),
+    HLE_FUNCTION(0x5D6A1CCE, _sceFiosKernelOverlayDHOpenSync),
+    HLE_FUNCTION(0x2F06ADC6, _sceFiosKernelOverlayDHReadSync),
+    HLE_FUNCTION(0x021B4AF7, _sceFiosKernelOverlayDHCloseSync),
+    HLE_FUNCTION(0x759EBEE6, _sceFiosKernelOverlayDHStatSync),
+    HLE_FUNCTION(0xF6A3E335, _sceFiosKernelOverlayDHChstatSync),
+    HLE_FUNCTION(0x2A9724C9, _sceFiosKernelOverlayDHSyncSync),
 };
 
 const Function kFios2User[] = {
@@ -150,6 +168,8 @@ const Function kFios2User[] = {
     HLE_FUNCTION(0xCA388053, sceFiosOverlayModifyForProcess02),
     HLE_FUNCTION(0xE5D1B6F5, sceFiosOverlayRemoveForProcess02),
     HLE_FUNCTION(0xAB7B4213, sceFiosOverlayGetInfoForProcess02),
+    HLE_FUNCTION(0x9C3AAAF0, sceFiosOverlayResolveSync02),
+    HLE_FUNCTION(0x23B8DB1D, sceFiosOverlayThreadIsDisabled02),
 };
 
 }  // namespace

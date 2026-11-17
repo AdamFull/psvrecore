@@ -17,6 +17,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/modulemgr.cpp
     src/hle/motion.cpp
     src/hle/mspace.cpp
+    src/hle/net.cpp
     src/hle/ngs.cpp
     src/hle/np.cpp
     src/hle/online.cpp
