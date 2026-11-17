@@ -251,7 +251,8 @@ TEST_CASE("pvf: the system fonts: listed, found, opened and drawn, across and do
     constexpr u32 kScePvf = 0x68D59260, kNewLib = 0x72E58672, kDoneLib = 0xE17717EC, kNumList = 0xF6C4A855,
                   kList = 0x66F2D767, kOptimum = 0x2761FEAC, kFind = 0x984E5BFE, kOpen = 0xE35434BB,
                   kJapanese = 0xFEEE373A, kClose = 0xD282C23C, kCharSize = 0xF17ADE4D, kCharInfo = 0xA88EEDB0,
-                  kFontInfo = 0xAB0C7CF2, kGlyphImage = 0x37DA496A, kVertImage = 0x8AE8433A, kOutline = 0x17A7873B;
+                  kFontInfo = 0xAB0C7CF2, kGlyphImage = 0x37DA496A, kVertImage = 0x8AE8433A, kOutline = 0x17A7873B,
+                  kIsElement = 0x9F018F25;
     GuestCode code;
     const u32 alloc = code.add(&font_alloc), free = code.add(&font_free);
     code.install();
@@ -264,20 +265,26 @@ TEST_CASE("pvf: the system fonts: listed, found, opened and drawn, across and do
     const u32 lib = u(call32(ctx, kScePvf, kNewLib, {init, error}));
     REQUIRE(lib != 0);
 
-    CHECK(call32(ctx, kScePvf, kNumList, {lib, error}) == 2);
-    const u32 list = scratch(216 * 2), style = scratch(216);
-    REQUIRE(call32(ctx, kScePvf, kList, {lib, list, 2}) == 0);
+    CHECK(call32(ctx, kScePvf, kNumList, {lib, error}) == 3);
+    const u32 list = scratch(216 * 3), style = scratch(216);
+    REQUIRE(call32(ctx, kScePvf, kList, {lib, list, 3}) == 0);
     CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 16))) == "Roboto");
     CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 216 + 80))) == "Bold");
     CHECK(psv_ld16(list + 216 + 6) == 5);
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 432 + 16))) == "Noto Sans JP");
+    CHECK(psv_ld16(list + 432 + 10) == 1);  // (Japanese)
     std::memset(t.rt.memory().host(style), 0, 216);
     psv_st16(style + 6, 5);  // (bold)
     CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 1);
     CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == 1);
-    psv_st16(style + 10, 1);  // (Japanese: none exactly)
+    psv_st16(style + 10, 1);  // (Japanese bold: none exactly, the Japanese regular the closest)
     CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == -1);
     CHECK(psv_ld32(error) == 0x80460004u);
-    CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 1);
+    CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 2);
+    psv_st16(style + 6, 1);  // (Japanese regular)
+    CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == 2);
+    psv_st16(style + 10, 3);  // (Korean: none)
+    CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == -1);
 
     const u32 font = u(call32(ctx, kScePvf, kOpen, {lib, 0, 0, error}));
     REQUIRE(font != 0);
@@ -319,8 +326,32 @@ TEST_CASE("pvf: the system fonts: listed, found, opened and drawn, across and do
     CHECK(std::abs(static_cast<i32>(down[0] + down[2]) - 32) <= 2);
     CHECK(down[1] >= 2);
 
+    // The default Japanese font: Noto Sans JP, kana and kanji drawn ('漢' across, an em of 20 pixels).
     const u32 japanese = u(call32(ctx, kScePvf, kJapanese, {lib, error}));
-    CHECK(japanese != 0);
+    REQUIRE(japanese != 0);
+    REQUIRE(call32(ctx, kScePvf, kFontInfo, {japanese, font_info}) == 0);
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(font_info + 84 + 16))) == "Noto Sans JP");
+    CHECK(psv_ld32(font_info + 80) > 10000);  // (glyphs)
+    CHECK(call32(ctx, kScePvf, kIsElement, {japanese, 0x3042 /*あ*/}) == 1);
+    CHECK(call32(ctx, kScePvf, kIsElement, {japanese, 0x6F22 /*漢*/}) == 1);
+    CHECK(call32(ctx, kScePvf, kIsElement, {font, 0x3042}) == 0);  // (Roboto: no kana)
+    ctx->vfp.s[0] = std::bit_cast<u32>(20.0f);
+    ctx->vfp.s[1] = std::bit_cast<u32>(20.0f);
+    REQUIRE(call32(ctx, kScePvf, kCharSize, {japanese}) == 0);
+    REQUIRE(call32(ctx, kScePvf, kCharInfo, {japanese, 0x6F22, info}) == 0);
+    CHECK(psv_ld32(info) >= 16);  // (a kanji: nearly an em wide and high)
+    CHECK(psv_ld32(info) <= 20);
+    CHECK(psv_ld32(info + 4) >= 16);
+    CHECK(psv_ld32(info + 52) == 20 * 64);  // (advance: a full em)
+    std::memset(t.rt.memory().host(pixels), 0, 64 * 64);
+    psv_st32(image, 2);
+    psv_st32(image + 4, 4 * 64);
+    psv_st32(image + 8, 24 * 64);
+    psv_st32(image + 20, pixels);
+    REQUIRE(call32(ctx, kScePvf, kGlyphImage, {japanese, 0x6F22, image}) == 0);
+    u32 ink = 0;
+    for (u32 i = 0; i < 64 * 64; ++i) ink += t.rt.memory().host(pixels)[i] > 128;
+    CHECK(ink > 60);
     CHECK(call32(ctx, kScePvf, kClose, {japanese}) == 0);
     CHECK(call32(ctx, kScePvf, kClose, {font}) == 0);
     CHECK(call32(ctx, kScePvf, kDoneLib, {lib}) == 0);
