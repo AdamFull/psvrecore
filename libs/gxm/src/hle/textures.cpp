@@ -1,6 +1,7 @@
 // Textures (SceGxmTexture): the control words in the hardware's layout (gxm/texture.hpp), set up and read back.
 
 #include "psvrecore/gxm/texture.hpp"
+#include "prefetch.hpp"
 #include "state.hpp"
 
 namespace psvrecore::gxm::hle {
@@ -34,6 +35,7 @@ i32 init(Ptr<Words> out, u32 data, u32 format, u32 width, u32 height, u32 mips, 
     t.levels = nx::max(mips, 1u);
     t.stride = type == texture_type::kLinearStrided ? stride : ((width + 7) & ~7u) * texel_bits(t.base_format) / 8;
     encode_texture(t, out->words);
+    prefetch_texture(out.address);  // (decoded ahead, once the game has set it up)
     return 0;
 }
 
@@ -82,12 +84,14 @@ u32 sceGxmTextureGetFormat(Ptr<const Words> t) {
     return i.base_format | i.swizzle << 12;
 }
 i32 sceGxmTextureSetFormat(Ptr<Words> t, u32 format) {
-    return change(t, [&](TextureInfo& i) {
+    const i32 e = change(t, [&](TextureInfo& i) {
         if (!texel_bits(base_of(format))) return err::kInvalidValue;
         i.base_format = base_of(format);
         i.swizzle = swizzle_of(format);
         return 0;
     });
+    if (!e) prefetch_texture(t.address);
+    return e;
 }
 u32 sceGxmTextureGetWidth(Ptr<const Words> t) { return info_of(t).width; }
 u32 sceGxmTextureGetHeight(Ptr<const Words> t) { return info_of(t).height; }
@@ -144,7 +148,9 @@ i32 sceGxmTextureSetLodMin(Ptr<Words> t, u32 lod) {
 }
 u32 sceGxmTextureGetGammaMode(Ptr<const Words> t) { return info_of(t).gamma << 27; }
 i32 sceGxmTextureSetGammaMode(Ptr<Words> t, u32 mode) {
-    return change(t, [&](TextureInfo& i) { return i.gamma = (mode >> 27) & 3, 0; });
+    const i32 e = change(t, [&](TextureInfo& i) { return i.gamma = (mode >> 27) & 3, 0; });
+    if (!e) prefetch_texture(t.address);
+    return e;
 }
 u32 sceGxmTextureGetNormalizeMode(Ptr<const Words> t) { return info_of(t).normalize ? 0x80000000u : 0; }
 i32 sceGxmTextureSetNormalizeMode(Ptr<Words> t, u32 mode) {
@@ -152,7 +158,9 @@ i32 sceGxmTextureSetNormalizeMode(Ptr<Words> t, u32 mode) {
 }
 u32 sceGxmTextureGetPalette(Ptr<const Words> t) { return info_of(t).palette; }
 i32 sceGxmTextureSetPalette(Ptr<Words> t, u32 palette) {
-    return change(t, [&](TextureInfo& i) { return palette & 63 ? err::kInvalidAlignment : (i.palette = palette, 0); });
+    const i32 e = change(t, [&](TextureInfo& i) { return palette & 63 ? err::kInvalidAlignment : (i.palette = palette, 0); });
+    if (!e) prefetch_texture(t.address);
+    return e;
 }
 
 const runtime::hle::Function kFunctions[] = {

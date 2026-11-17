@@ -43,6 +43,7 @@
 #include "psvrecore/log.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
+#include "prefetch.hpp"
 #include "shader_cache.hpp"
 #include "core/foundation/platform/os.h"
 #include "state.hpp"
@@ -360,11 +361,13 @@ struct CachedTexture {
     u64 bytes = 0;  // (its texels)
 };
 
-// How long a texture no scene uses is kept (scenes: a second or two at a game's usual 2-4 a frame), and the most the
-// cache holds (the least recently used go first past it): a texture's content changing every frame (a render target
-// read back as a texture) makes a new one each time.
-constexpr u64 kTextureUnusedScenes = 180;
-constexpr u64 kTextureBudget = 256ull << 20;
+// How long a texture no scene uses is kept (scenes: at a game's usual 2-4 a frame), and the most the cache holds (the
+// least recently used go first past it): a texture's content changing every frame (a render target read back as a
+// texture) makes a new one each time. Under kTextureKeep, kept a minute: a song in Persona 4: Dancing All Night
+// went back to a stage of 44 textures 45 s after, and kept for a second or two they were decoded again each time
+// (10-18 ms of that scene on a phone); past it, a second or two.
+constexpr u64 kTextureUnusedScenes = 180, kTextureKeptScenes = 3600;
+constexpr u64 kTextureKeep = 96ull << 20, kTextureBudget = 256ull << 20;
 
 struct Renderer {
     bool tried = false;
@@ -446,7 +449,7 @@ struct Renderer {
     // ends them, on a phone). One written each time it is looked at, three times running, is hashed each time for
     // a while (a frame's CPU writes would fault for each page); a movie's frames are.
     struct ContentMemo {
-        u64 key = 0, writes = 0, hash_until = 0;  // (hash_until: a scene number)
+        u64 key = 0, contents = 0, writes = 0, hash_until = 0;  // (contents: texture_contents; hash_until: a scene number)
         u32 address = 0, size = 0, palette = 0;
         u8 strikes = 0;
         bool watched = false;
@@ -714,6 +717,7 @@ bool ensure(Renderer& r) {
         r.device = r.owned.get();
     }
     vk::Device& d = *r.device;
+    prefetch_start(d.caps().texture_bc);
     if (!r.flusher) {
         // (the scenes the GPU is done with finished when nothing else has a while after: their notifications written
         // for a game that polls them. Not at once: the game's next scene or frame finishes them, and this, finishing
@@ -1610,7 +1614,7 @@ struct SceneProfile {
     u64 finish_wait_before = 0, finish_work_before = 0, finished_before = 0;
     // (the write-back's parts: the colour, the uniform buffers and counters, the depth and stencil, the rest)
     u64 back_ns[4] = {}, back_before[4] = {};
-    u64 tex_before[4] = {};  // (hash_ns, decode_ns, create_ns, upload_ns at this scene's start)
+    u64 tex_before[5] = {};  // (hash_ns, decode_ns, create_ns, upload_ns, ahead at this scene's start)
     u64 buffer_wait_ns = 0;  // (sceGxmEndScene's wait for the display to let the scene's buffer go)
     bool on = false;
     bool read = false;  // (the switch, read at the first scene: --env sets it after the program starts)
@@ -1631,6 +1635,7 @@ struct SceneProfile {
     u64 why_count[kWhys] = {}, why_wait_ns[kWhys] = {};
 
     u64 unchanged = 0, write_faults = 0;  // (textures found unwritten; writes to watched pages, by the process)
+    u64 ahead = 0;  // (new textures whose texels were decoded ahead)
     u64 from_targets = 0, lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
     u64 at = 0;
     u32 part = 0, scenes = 0;
@@ -1650,6 +1655,7 @@ struct SceneProfile {
             finish_wait_before = finish_wait_ns, finish_work_before = finish_work_ns, finished_before = finished;
             std::memcpy(back_before, back_ns, sizeof back_ns);
             tex_before[0] = hash_ns, tex_before[1] = decode_ns, tex_before[2] = create_ns, tex_before[3] = upload_ns;
+            tex_before[4] = ahead;
         }
     }
     void mark(u32 i) {
@@ -1675,10 +1681,10 @@ struct SceneProfile {
                      finished - finished_before, static_cast<f64>(finish_wait_ns - finish_wait_before) / 1e6,
                      static_cast<f64>(finish_work_ns - finish_work_before) / 1e6);
             if (ns[3] - ns_before[3] >= 4'000'000)
-                nx::logi(logs::gpu, "gxm profile: its textures: hashed {:.1f} ms, decoded {:.1f}, images made {:.1f}, uploads "
-                         "queued {:.1f}", static_cast<f64>(hash_ns - tex_before[0]) / 1e6,
-                         static_cast<f64>(decode_ns - tex_before[1]) / 1e6, static_cast<f64>(create_ns - tex_before[2]) / 1e6,
-                         static_cast<f64>(upload_ns - tex_before[3]) / 1e6);
+                nx::logi(logs::gpu, "gxm profile: its textures: hashed {:.1f} ms, decoded {:.1f} ({} decoded ahead), images "
+                         "made {:.1f}, uploads queued {:.1f}", static_cast<f64>(hash_ns - tex_before[0]) / 1e6,
+                         static_cast<f64>(decode_ns - tex_before[1]) / 1e6, ahead - tex_before[4],
+                         static_cast<f64>(create_ns - tex_before[2]) / 1e6, static_cast<f64>(upload_ns - tex_before[3]) / 1e6);
             if (finish_work_ns - finish_work_before >= 2'000'000)
                 nx::logi(logs::gpu, "gxm profile: written back: colour {:.1f} ms, buffers and counters {:.1f}, depth {:.1f}, the rest {:.1f}",
                          static_cast<f64>(back_ns[0] - back_before[0]) / 1e6, static_cast<f64>(back_ns[1] - back_before[1]) / 1e6,
@@ -1719,6 +1725,14 @@ struct SceneProfile {
                      static_cast<f64>(misses) / scenes, static_cast<f64>(miss_bytes) / 1024.0 / scenes,
                      static_cast<f64>(miss_ns) / 1e6 / scenes, static_cast<f64>(decode_ns) / 1e6 / scenes,
                      static_cast<f64>(create_ns) / 1e6 / scenes, static_cast<f64>(upload_ns) / 1e6 / scenes);
+        {
+            const PrefetchStats ps = prefetch_stats();
+            std::fprintf(stderr, "gxm profile: textures decoded ahead: %llu, %llu taken (%llu in these scenes), %llu changed "
+                         "while decoded, %llu dropped; %.0f MiB kept\n", static_cast<unsigned long long>(ps.decoded),
+                         static_cast<unsigned long long>(ps.taken), static_cast<unsigned long long>(ahead),
+                         static_cast<unsigned long long>(ps.changed), static_cast<unsigned long long>(ps.dropped),
+                         static_cast<f64>(ps.bytes) / 1048576.0);
+        }
         const u64 last_end = gpu_last_end;
         *this = SceneProfile{};
         on = read = true;
@@ -1756,6 +1770,16 @@ u64 content_hash(const u8* p, usize n, u64 seed) {
     h *= 0xC4CEB9FE1A85EC53ull;
     return h ^ (h >> 33);
 }
+
+}  // namespace
+
+u64 texture_contents(const TextureInfo& info, u32 size, u32 palette) {
+    u64 h = content_hash(static_cast<const u8*>(memory().host(info.address)), size, 0);
+    if (palette) h = content_hash(static_cast<const u8*>(memory().host(palette)), 1024, h);
+    return h;
+}
+
+namespace {
 
 // A texture that reads a colour surface whose image holds what guest memory does (the surface drawn and written
 // back, nothing else written there since): made on the GPU from that image instead of being read back, decoded and
@@ -1948,7 +1972,9 @@ struct TextureMiss {
     TextureInfo info;
     u32 size = 0;
     u64 key = 0, words_key = 0;
+    u64 contents = 0;  // (texture_for's: what the texels decoded ahead are found by)
     Result<Texels> texels = Texels{};
+    bool ahead = false;  // (its texels decoded ahead: taken)
 };
 
 bool read_guest_memory(u32 address, void* out, u32 bytes) {
@@ -1988,10 +2014,11 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     const u32 palette = info.palette && memory().valid(info.palette, 1024) ? info.palette : 0;
     auto writes = [&] { return memory().writes(info.address, size) + (palette ? memory().writes(palette, 1024) : 0); };
     Renderer::ContentMemo& memo = r.content_memo[wh.value()];
-    u64 key = 0;
+    u64 key = 0, contents = 0;
     if (memo.watched && memo.address == info.address && memo.size == size && memo.palette == palette &&
         writes() == memo.writes) {
         key = memo.key;
+        contents = memo.contents;
         memo.strikes = 0;
         if (g_profile.on) ++g_profile.unchanged;
     } else {
@@ -2001,10 +2028,9 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         const bool watched = !is_yuv420(info) && memo.hash_until <= r.scenes && memory().watch_writes(info.address, size) &&
                              (!palette || memory().watch_writes(palette, 1024));
         const u64 seen_writes = watched ? writes() : 0;
-        key = content_hash(reinterpret_cast<const u8*>(words.words), sizeof words.words, 0);
-        key = content_hash(static_cast<const u8*>(memory().host(info.address)), size, key);
-        if (palette) key = content_hash(static_cast<const u8*>(memory().host(palette)), 1024, key);
-        memo.key = key, memo.writes = seen_writes, memo.watched = watched;
+        contents = texture_contents(info, size, palette);
+        key = content_hash(reinterpret_cast<const u8*>(words.words), sizeof words.words, contents);
+        memo.key = key, memo.contents = contents, memo.writes = seen_writes, memo.watched = watched;
         memo.address = info.address, memo.size = size, memo.palette = palette;
         if (r.content_memo.size() > 8192) r.content_memo.clear();  // (the words of textures long gone)
         if (g_profile.on) ++g_profile.hashed, g_profile.hash_ns += nx::os::ticks_ns() - hash_start;
@@ -2022,7 +2048,7 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     if (misses && !(r.yuv.pipeline && is_yuv420(info))) {
         bool listed = false;
         for (const TextureMiss& m : *misses) listed |= m.key == key;
-        if (!listed) misses->push_back(TextureMiss{info, size, key, wh.value()});
+        if (!listed) misses->push_back(TextureMiss{info, size, key, wh.value(), contents});
         return nullptr;
     }
     return make_texture(r, info, size, key, wh.value(), nullptr);
@@ -2149,7 +2175,8 @@ void evict_textures(Renderer& r) {
     for (const auto& [key, t] : r.textures) by_age.push_back({t.used, key});
     std::sort(by_age.begin(), by_age.end());
     for (const auto& [used, key] : by_age) {
-        if (used + kTextureUnusedScenes >= r.scenes && r.texture_bytes <= kTextureBudget) break;
+        const u64 kept = r.texture_bytes > kTextureKeep ? kTextureUnusedScenes : kTextureKeptScenes;
+        if (used + kept >= r.scenes && r.texture_bytes <= kTextureBudget) break;
         auto it = r.textures.find(key);
         r.texture_bytes -= it->second.bytes;
         vk::destroy_image(*r.device, it->second.image);
@@ -3356,11 +3383,20 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (!misses.empty()) {
             const bool bc = r.device->caps().texture_bc;
             const u64 decode_from = g_profile.on ? nx::os::ticks_ns() : 0;
+            // (those decoded ahead, as they were set up, taken; the rest decoded here)
+            nx::vector<usize> order;
+            for (usize k = 0; k < misses.size(); ++k) {
+                if (std::optional<Texels> t = take_prefetched(misses[k].info, misses[k].contents)) {
+                    misses[k].texels = std::move(*t);
+                    misses[k].ahead = true;
+                    if (g_profile.on) ++g_profile.ahead;
+                } else {
+                    order.push_back(k);
+                }
+            }
             // (the largest first: the threads finish together, not one of them with a large one left at the end)
-            nx::vector<usize> order(misses.size());
-            for (usize k = 0; k < order.size(); ++k) order[k] = k;
             std::stable_sort(order.begin(), order.end(), [&](usize a, usize b) { return misses[a].size > misses[b].size; });
-            in_parallel(misses.size(), [&](usize i) {
+            in_parallel(order.size(), [&](usize i) {
                 const usize k = order[i];
                 const u64 from = g_profile.on ? nx::os::ticks_ns() : 0;
                 const TextureInfo& info = misses[k].info;
