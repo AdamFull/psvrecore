@@ -246,10 +246,13 @@ void display_queue_main() {
         {
             nx::scoped_lock<nx::mutex> held(s.queue_lock);
             s.queue_data_free.push_back(entry.data);
-            if (auto it = s.display_holds.find(entry.old_buffer); it != s.display_holds.end() && it->second) {
-                if (--it->second == 0) s.display_holds.erase(it);
-                ++s.holds_released[entry.old_buffer];
-            }
+            // (the old buffer released: drawn into again from now on; a frame shown again (the old buffer the new
+            // one) releases its own hold with it, as the console's flip signals the buffer it leaves)
+            for (u32 k = entry.old_buffer == entry.new_buffer ? 2 : 1; k; --k)
+                if (auto it = s.display_holds.find(entry.old_buffer); it != s.display_holds.end() && it->second) {
+                    if (--it->second == 0) s.display_holds.erase(it);
+                    ++s.holds_released[entry.old_buffer];
+                }
             s.queue_busy = 0;
         }
         s.queue_changed.notify_all();
