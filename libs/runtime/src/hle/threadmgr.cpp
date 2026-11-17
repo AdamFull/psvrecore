@@ -388,6 +388,7 @@ i32 sceKernelGetProcessTime(Ptr<u64> clock) {
 u32 sceKernelGetProcessTimeLow() { return static_cast<u32>(kernel().process_time()); }
 u64 sceKernelGetProcessTimeWide() { return kernel().process_time(); }
 u64 sceKernelGetSystemTimeWide() { return kernel().process_time(); }
+u32 sceKernelGetSystemTimeLow() { return static_cast<u32>(kernel().process_time()); }
 
 // ---- timers: counters of microseconds of the process's time, counting while started
 
@@ -564,7 +565,11 @@ const Function kLibKernelObjects[] = {
     HLE_FUNCTION(0x120F03AF, sceKernelWaitEvent),
     HLE_FUNCTION(0xA0490795, sceKernelWaitEventCB),
 };
+// (two NIDs firmware 1.x's libraries import from SceThreadmgr, which vita-headers knows only as the kernel's
+// ksceKernelGetThreadCurrentPriority and ksceKernelGetSystemTimeLow: the same functions on the user side)
 const Function kThreadmgrObjects[] = {
+    Function{0x01414F0B, "sceKernelGetThreadCurrentPriority", &entry<&sceKernelGetThreadCurrentPriority>},
+    Function{0x47F6DE49, "sceKernelGetSystemTimeLow", &entry<&sceKernelGetSystemTimeLow>},
     HLE_FUNCTION(0xE73649CA, sceKernelDeleteRWLock),
     HLE_FUNCTION(0xEFDDA456, sceKernelTryLockReadRWLock),
     HLE_FUNCTION(0x206CBB66, sceKernelTryLockWriteRWLock),

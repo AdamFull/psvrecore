@@ -863,3 +863,12 @@ TEST_CASE("kernel: an openable object is found by its name; others are not") {
     CHECK(call32(ctx, kSceThreadmgr, kCloseSema, {u(shared)}) == 0);
     CHECK(call32(ctx, kSceThreadmgr, kCloseSema, {0x1234}) == err::kUnknownSemaphoreId);
 }
+
+TEST_CASE("kernel: firmware 1.x's NIDs for the current priority and the system time's low word") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    CHECK(call32(ctx, kSceThreadmgr, 0x01414F0B, {}) == call32(ctx, kSceLibKernel, 0xC53A9848, {}));
+    const u32 low = u(call32(ctx, kSceThreadmgr, 0x47F6DE49, {}));
+    CHECK(low <= static_cast<u32>(t.rt.kernel().process_time()));
+    CHECK(low > 0);
+}
