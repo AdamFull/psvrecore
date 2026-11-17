@@ -352,11 +352,12 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     allocator.pDeviceMemoryCallbacks = &memory_log;
     if (const VkResult r = vmaCreateAllocator(&allocator, &d->allocator_); r != VK_SUCCESS)
         return nx::err(vk_error("vmaCreateAllocator", r));
-    // The textures' and host buffers' memory, made now (kReservedBlocks blocks of each, more when they fill up): a
-    // song of Persona 4: Dancing All Night made a second block of each while it played, of 64 MiB after one of 32.
+    // The textures' and host buffers' memory, made now (blocks of 64 MiB, more when they fill up): a song of Persona 4:
+    // Dancing All Night made a second block of each while it played, of 64 MiB after one of 32; with textures kept a
+    // minute (gxm's evict_textures), a third for textures at a song's start.
     {
         constexpr VkDeviceSize kBlock = 64ull << 20;
-        constexpr u32 kReservedBlocks = 2;
+        constexpr u32 kTextureBlocks = 3, kHostBlocks = 2;
         VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         image.imageType = VK_IMAGE_TYPE_2D;
         image.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -374,17 +375,18 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         u32 texture_type = 0, host_type = 0;
         VmaPoolCreateInfo pool{};
         pool.blockSize = kBlock;
-        pool.minBlockCount = kReservedBlocks;
+        pool.minBlockCount = kTextureBlocks;
         if (vmaFindMemoryTypeIndexForImageInfo(d->allocator_, &image, &texture_alloc, &texture_type) == VK_SUCCESS) {
             pool.memoryTypeIndex = texture_type;
             if (vmaCreatePool(d->allocator_, &pool, &d->texture_pool_) != VK_SUCCESS) d->texture_pool_ = VK_NULL_HANDLE;
         }
         if (vmaFindMemoryTypeIndexForBufferInfo(d->allocator_, &buffer, &host_alloc, &host_type) == VK_SUCCESS) {
             pool.memoryTypeIndex = host_type;
+            pool.minBlockCount = kHostBlocks;
             if (vmaCreatePool(d->allocator_, &pool, &d->host_pool_) != VK_SUCCESS) d->host_pool_ = VK_NULL_HANDLE;
         }
         nx::logi(logs::gpu, "Vulkan memory: {} MiB reserved for textures, {} MiB for host buffers",
-                 d->texture_pool_ ? kBlock * kReservedBlocks >> 20 : 0, d->host_pool_ ? kBlock * kReservedBlocks >> 20 : 0);
+                 d->texture_pool_ ? kBlock * kTextureBlocks >> 20 : 0, d->host_pool_ ? kBlock * kHostBlocks >> 20 : 0);
     }
     nx::logi(logs::gpu, "Vulkan device: {} (API {}.{}.{}, using {}.{}); {}{}{}{}{}", props.deviceName,
              VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
