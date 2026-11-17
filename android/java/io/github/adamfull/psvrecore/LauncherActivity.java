@@ -3,6 +3,7 @@ package io.github.adamfull.psvrecore;
 import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
@@ -21,20 +22,28 @@ import java.io.InputStream;
 import java.io.OutputStream;
 
 /**
- * Where a game built on psvrecore starts on Android: Play (the game, PsvrecoreActivity), Settings
- * (SettingsActivity), and the game's application folder chosen with the system's folder picker and copied into the
- * application's own folder (game/), which Play needs. With an "args" extra (a test's command line) it goes straight on
- * to the game.
+ * Where a game built on psvrecore starts on Android. With the game's files in place it goes straight on to the game
+ * (PsvrecoreActivity), as it does with an "args" extra (a test's command line). Without them, or with some missing,
+ * it shows a menu: the game's folder chosen with the system's folder picker and copied into the application's own
+ * folder (game/), Settings (SettingsActivity), and Play once the files are there.
+ *
+ * The files the game needs are the manifest's to say, as this activity's meta-data "psvrecore.required": paths in a
+ * copy of the console's ux0: folders, separated by ';' (app/PCSB00867/eboot.bin;patch/PCSB00867/eboot.bin). In an
+ * application folder (eboot.bin at its top) the same files are looked for without their first two parts. Without
+ * the meta-data, any eboot.bin will do. A folder with a file named .incomplete in it (a copy under way, or cut
+ * short) is not the game's either.
  *
  * The files are copied, not read where they are: the application may read only files it made itself (the ones adb
  * or a computer puts in its folder belong to someone else).
  */
 public class LauncherActivity extends Activity {
     private static final int PICK_FOLDER = 1;
+    private static final String INCOMPLETE = ".incomplete";
 
     private TextView message;
     private Button play, settings, choose;
     private volatile boolean copying;
+    private String[] required;
 
     private File gameFolder() {
         return new File(getExternalFilesDir(null), "game");
@@ -46,10 +55,42 @@ public class LauncherActivity extends Activity {
         return new File(getFilesDir(), "game");
     }
 
-    // Whether a folder holds the game's files: an application folder (eboot.bin at its top), or a copy of the
-    // console's ux0: folders (app/<title ID>/eboot.bin, with patch/ and addcont/ beside it).
-    private static boolean holdsGame(File folder) {
-        if (new File(folder, "eboot.bin").isFile()) return true;
+    private String[] required() {
+        if (required != null) return required;
+        String list = null;
+        try {
+            Bundle meta = getPackageManager().getActivityInfo(getComponentName(), PackageManager.GET_META_DATA).metaData;
+            if (meta != null) list = meta.getString("psvrecore.required");
+        } catch (PackageManager.NameNotFoundException e) {
+            // (this activity is the package's own)
+        }
+        required = list == null ? new String[0] : list.split(";");
+        return required;
+    }
+
+    // What the game's files in a folder are missing: null when nothing, the first missing file's path otherwise, ""
+    // when there is no game there at all.
+    private String missing(File folder) {
+        if (!folder.isDirectory()) return "";
+        boolean application = new File(folder, "eboot.bin").isFile();
+        if (!application && !anyApplication(folder)) return "";
+        if (new File(folder, INCOMPLETE).exists()) return INCOMPLETE;
+        for (String path : required()) {
+            path = path.trim();
+            if (path.isEmpty()) continue;
+            String relative = path;
+            if (application) {
+                String[] parts = path.split("/", 3);
+                if (parts.length == 3) relative = parts[2];
+            }
+            File f = new File(folder, relative);
+            if (!f.isFile() || f.length() == 0) return path;
+        }
+        return null;
+    }
+
+    // (a copy of the console's ux0: folders: app/<title ID>/eboot.bin)
+    private static boolean anyApplication(File folder) {
         File[] titles = new File(folder, "app").listFiles();
         if (titles != null)
             for (File t : titles)
@@ -58,13 +99,13 @@ public class LauncherActivity extends Activity {
     }
 
     private boolean gamePresent() {
-        return holdsGame(gameFolder()) || holdsGame(deployedFolder());
+        return missing(gameFolder()) == null || missing(deployedFolder()) == null;
     }
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        if (getIntent().hasExtra("args")) {
+        if (getIntent().hasExtra("args") || gamePresent()) {
             startGame();
             return;
         }
@@ -130,9 +171,21 @@ public class LauncherActivity extends Activity {
         settings.setEnabled(!copying);
         choose.setEnabled(!copying);
         choose.setText(present ? "Choose the game's folder again" : "Choose the game's folder");
-        message.setText(present ? "The game's files are in place."
-                                : "The game's files are not here yet: choose the game's application folder (the one "
-                                  + "that holds eboot.bin and sce_module). It is copied into this app's storage.");
+        if (present) {
+            message.setText("The game's files are in place.");
+            return;
+        }
+        String lack = missing(gameFolder());
+        if (lack == null || lack.isEmpty()) lack = missing(deployedFolder());
+        String where = "Choose the game's folder: a copy of the console's folders (the one that holds app, patch and "
+                       + "addcont), or the game's application folder (the one that holds eboot.bin and sce_module). "
+                       + "It is copied into this app's storage.";
+        if (lack == null || lack.isEmpty())
+            message.setText("The game's files are not here yet. " + where);
+        else if (lack.equals(INCOMPLETE))
+            message.setText("The game's files were not all copied here. " + where);
+        else
+            message.setText("The game's files are incomplete: " + lack + " is missing. " + where);
     }
 
     private void pick() {
@@ -165,9 +218,13 @@ public class LauncherActivity extends Activity {
             String root = DocumentsContract.getTreeDocumentId(tree);
             long[] counts = new long[2];  // (files, bytes)
             copyTree(getContentResolver(), tree, root, staging, counts);
-            if (!new File(staging, "eboot.bin").isFile()) {
+            String lack = missing(staging);
+            if (lack != null) {
                 deleteTree(staging);
-                outcome = "That folder has no eboot.bin: it is not a game's application folder. Choose another.";
+                outcome = lack.isEmpty()
+                    ? "That folder has no eboot.bin, nor app/<title ID>/eboot.bin: it is not the game's. Choose "
+                      + "another."
+                    : "That folder does not have all of the game's files: " + lack + " is missing. Choose another.";
             } else {
                 deleteTree(gameFolder());
                 if (!staging.renameTo(gameFolder())) throw new IOException("could not move the copy in place");
@@ -238,7 +295,7 @@ public class LauncherActivity extends Activity {
         Intent intent = new Intent(this, PsvrecoreActivity.class);
         if (getIntent().getExtras() != null) intent.putExtras(getIntent().getExtras());
         // (the game a computer put in internal storage, when the shared folder has none: named on the command line)
-        if (!intent.hasExtra("args") && !holdsGame(gameFolder()) && holdsGame(deployedFolder()))
+        if (!intent.hasExtra("args") && missing(gameFolder()) != null && missing(deployedFolder()) == null)
             intent.putExtra("args", new String[] {"--game", deployedFolder().getAbsolutePath()});
         startActivity(intent);
         finish();
