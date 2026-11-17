@@ -79,6 +79,29 @@ target_link_libraries(psvrecore_runtime PRIVATE psvrecore_libatrac9)
 # SceAudiodecUser's MP3 decoder (src/media/mp3.cpp holds its implementation).
 target_include_directories(psvrecore_runtime SYSTEM PRIVATE "${PSVRECORE_DIR}/third_party/minimp3")
 
+# Roboto (SIL OFL 1.1, third_party/roboto): ScePvf's system fonts, built in as byte arrays.
+set(_psvrecore_fonts_cpp "${CMAKE_CURRENT_BINARY_DIR}/generated/system_fonts.cpp")
+set(_psvrecore_fonts Roboto-Regular Roboto-Bold)
+set(_psvrecore_fonts_text "// Generated from third_party/roboto by libs/runtime/CMakeLists.txt.
+#include <cstdint>
+#include <span>
+namespace psvrecore::runtime::hle {
+")
+foreach(_font IN LISTS _psvrecore_fonts)
+    set(_path "${PSVRECORE_DIR}/third_party/roboto/${_font}.ttf")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_path}")
+    file(READ "${_path}" _hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _bytes "${_hex}")
+    string(REPLACE "-" "_" _symbol "${_font}")
+    string(APPEND _psvrecore_fonts_text "extern const std::uint8_t k${_symbol}[] = {${_bytes}};
+extern const std::size_t k${_symbol}Size = sizeof k${_symbol};
+")
+endforeach()
+string(APPEND _psvrecore_fonts_text "}  // namespace psvrecore::runtime::hle
+")
+file(CONFIGURE OUTPUT "${_psvrecore_fonts_cpp}" CONTENT "${_psvrecore_fonts_text}" @ONLY)
+target_sources(psvrecore_runtime PRIVATE "${_psvrecore_fonts_cpp}")
+
 # openh264 (github.com/cisco/openh264, BSD-2-Clause, submodule in third_party/openh264): AvPlayer's H.264 decoder,
 # its C++ only (no assembly).
 set(PSVRECORE_OPENH264 "${PSVRECORE_DIR}/third_party/openh264/codec")

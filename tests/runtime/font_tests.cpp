@@ -2,6 +2,7 @@
 // and through ScePvf; and, when PSVRECORE_FONT_DIR names a folder of fonts with reference renders made by another
 // rasterizer (FreeType, by scripts kept outside the repository), the glyphs of those fonts against them.
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -241,6 +242,89 @@ TEST_CASE("pvf: a font in memory, sized in points, its metrics and its glyphs dr
     CHECK(call32(ctx, kScePvf, kDoneLib, {lib}) == 0);
     CHECK(g_font_allocs == 2);
     CHECK(g_font_frees == 2);
+}
+
+
+TEST_CASE("pvf: the system fonts: listed, found, opened and drawn, across and down") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kScePvf = 0x68D59260, kNewLib = 0x72E58672, kDoneLib = 0xE17717EC, kNumList = 0xF6C4A855,
+                  kList = 0x66F2D767, kOptimum = 0x2761FEAC, kFind = 0x984E5BFE, kOpen = 0xE35434BB,
+                  kJapanese = 0xFEEE373A, kClose = 0xD282C23C, kCharSize = 0xF17ADE4D, kCharInfo = 0xA88EEDB0,
+                  kFontInfo = 0xAB0C7CF2, kGlyphImage = 0x37DA496A, kVertImage = 0x8AE8433A, kOutline = 0x17A7873B;
+    GuestCode code;
+    const u32 alloc = code.add(&font_alloc), free = code.add(&font_free);
+    code.install();
+    g_font_allocs = g_font_frees = 0;
+    const u32 init = scratch(28), error = scratch(4);
+    std::memset(t.rt.memory().host(init), 0, 28);
+    psv_st32(init + 4, 4);
+    psv_st32(init + 16, alloc);
+    psv_st32(init + 24, free);
+    const u32 lib = u(call32(ctx, kScePvf, kNewLib, {init, error}));
+    REQUIRE(lib != 0);
+
+    CHECK(call32(ctx, kScePvf, kNumList, {lib, error}) == 2);
+    const u32 list = scratch(216 * 2), style = scratch(216);
+    REQUIRE(call32(ctx, kScePvf, kList, {lib, list, 2}) == 0);
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 16))) == "Roboto");
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 216 + 80))) == "Bold");
+    CHECK(psv_ld16(list + 216 + 6) == 5);
+    std::memset(t.rt.memory().host(style), 0, 216);
+    psv_st16(style + 6, 5);  // (bold)
+    CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 1);
+    CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == 1);
+    psv_st16(style + 10, 1);  // (Japanese: none exactly)
+    CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == -1);
+    CHECK(psv_ld32(error) == 0x80460004u);
+    CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 1);
+
+    const u32 font = u(call32(ctx, kScePvf, kOpen, {lib, 0, 0, error}));
+    REQUIRE(font != 0);
+    CHECK(psv_ld32(error) == 0);
+    ctx->vfp.s[0] = std::bit_cast<u32>(20.0f);
+    ctx->vfp.s[1] = std::bit_cast<u32>(20.0f);
+    REQUIRE(call32(ctx, kScePvf, kCharSize, {font}) == 0);  // (20 pixels an em at 72 dpi)
+    const u32 info = scratch(64), font_info = scratch(304);
+    REQUIRE(call32(ctx, kScePvf, kCharInfo, {font, 0x48 /*H*/, info}) == 0);
+    CHECK(psv_ld32(info + 4) >= 13);  // (a capital's height: about 0.71 em)
+    CHECK(psv_ld32(info + 4) <= 16);
+    REQUIRE(call32(ctx, kScePvf, kFontInfo, {font, font_info}) == 0);
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(font_info + 84 + 16))) == "Roboto");
+    CHECK(psv_ld32(font_info + 80) > 1000);  // (glyphs)
+    CHECK(u(call32(ctx, kScePvf, kOutline, {font, 0x48, scratch(64)})) == 0x8046000Eu);
+
+    // 'H' across at (4, 24) and down at (16, 2): both ink the buffer, the vertical one centred on x = 16.
+    const u32 image = scratch(24), pixels = scratch(64 * 64);
+    const auto draw = [&](u32 nid, i32 x, i32 y) {
+        std::memset(t.rt.memory().host(pixels), 0, 64 * 64);
+        psv_st32(image, 2);
+        psv_st32(image + 4, u(x * 64));
+        psv_st32(image + 8, u(y * 64));
+        psv_st16(image + 12, 64), psv_st16(image + 14, 64), psv_st16(image + 16, 64), psv_st16(image + 18, 0);
+        psv_st32(image + 20, pixels);
+        REQUIRE(call32(ctx, kScePvf, nid, {font, 0x48, image}) == 0);
+        u32 x0 = 64, x1 = 0, y0 = 64, y1 = 0;
+        const u8* p = t.rt.memory().host(pixels);
+        for (u32 j = 0; j < 64; ++j)
+            for (u32 i = 0; i < 64; ++i)
+                if (p[j * 64 + i] > 128) x0 = std::min(x0, i), x1 = std::max(x1, i), y0 = std::min(y0, j), y1 = std::max(y1, j);
+        return std::array<u32, 4>{x0, y0, x1, y1};
+    };
+    const auto across = draw(kGlyphImage, 4, 24);
+    CHECK(across[0] >= 4);
+    CHECK(across[0] <= 7);
+    CHECK(across[3] == 23);  // (on the baseline)
+    const auto down = draw(kVertImage, 16, 2);
+    CHECK(std::abs(static_cast<i32>(down[0] + down[2]) - 32) <= 2);
+    CHECK(down[1] >= 2);
+
+    const u32 japanese = u(call32(ctx, kScePvf, kJapanese, {lib, error}));
+    CHECK(japanese != 0);
+    CHECK(call32(ctx, kScePvf, kClose, {japanese}) == 0);
+    CHECK(call32(ctx, kScePvf, kClose, {font}) == 0);
+    CHECK(call32(ctx, kScePvf, kDoneLib, {lib}) == 0);
+    CHECK(g_font_allocs == g_font_frees);
 }
 
 // Reference renders: <font>.ref beside each font: records of a character (u32), its advance (26.6), the bitmap's

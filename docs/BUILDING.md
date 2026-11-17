@@ -12,7 +12,8 @@ third-party code, vita-headers (whose NID database the tools read at run time), 
 Vulkan-Headers, SPIRV-Headers, volk and VulkanMemoryAllocator. Nothing links against a Vulkan SDK; the loader is
 opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used by the local checks only. The
 media decoders come the same way: LibAtrac9 (MIT) and openh264 (BSD-2-Clause) as submodules; the PacketVideo AAC
-decoder (Apache-2.0) is vendored in `third_party/pvaacdec`, and minimp3 (CC0) in `third_party/minimp3` (their READMEs say
+decoder (Apache-2.0) is vendored in `third_party/pvaacdec`, minimp3 (CC0) in `third_party/minimp3`, and ScePvf's system fonts, Roboto
+(SIL OFL 1.1), in `third_party/roboto` (their READMEs say
 where from). The platform layer's SDL3 (zlib) is a submodule as well, built as a static library. (CMake 3.27 for the shared runtime library on
 Windows and Linux; with `PSVRECORE_SHARED=OFF`, 3.25 is enough.)
 

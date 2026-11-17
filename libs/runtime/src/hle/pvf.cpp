@@ -2,10 +2,14 @@
 // points at a resolution (pixels = points x dpi / 72; 72 dpi until set), their metrics in 26.6 pixels and their
 // glyphs drawn into the game's buffer (8-bit, or 4-bit with the left pixel in the low nibble) at a 26.6 position,
 // each pixel the brighter of what is there and the glyph's coverage. The em value is kept but changes nothing
-// here. There are no system fonts (the system's own font files are not available): opening one fails, and the font
-// list is empty. A character the font lacks is drawn as the alternative character when one is set, else NOGLYPH.
-// Kerning is 0; emboldening and skew are kept, not applied. The library and font handles are allocated through the
-// game's allocator.
+// here. The system's own fonts are not available: the system fonts here are Roboto Regular and Bold
+// (third_party/roboto, SIL OFL 1.1, built in), the font list holds those two (Latin sans-serif), every search finds
+// one of them, and the default Japanese font is Roboto too (no Japanese glyphs). Fonts open from the game's memory or
+// a file. A character the font lacks is drawn as the alternative character when one is set, else NOGLYPH. Vertical
+// layout: these fonts have no vertical forms (IsVertElement false); the vertical calls place the same glyph centred
+// on the vertical line, a line's height apart. Kerning is 0; emboldening and skew are kept, not applied. The glyph
+// outline calls (absent from the SDK's header: their records are unknown) answer NOSUPPORT; the FreeType hooks are
+// accepted and unused. The library and font handles are allocated through the game's allocator.
 
 #include "../media/font.hpp"
 #include "hle_common.hpp"
@@ -17,6 +21,12 @@
 #include <memory>
 
 namespace psvrecore::runtime::hle {
+
+// The system fonts' files (generated/system_fonts.cpp, from third_party/roboto).
+extern const u8 kRoboto_Regular[];
+extern const usize kRoboto_RegularSize;
+extern const u8 kRoboto_Bold[];
+extern const usize kRoboto_BoldSize;
 
 namespace {
 
@@ -37,6 +47,7 @@ struct FontState {
     media::Font font;
     f32 hsize = 12.0f, vsize = 12.0f;
     f32 embolden = 0.0f, skew_x = 0.0f, skew_y = 0.0f;
+    const struct SystemFont* system = nullptr;
 };
 struct Pvf {
     nx::mutex lock;
@@ -48,6 +59,37 @@ Pvf& pvf() {
     return p;
 }
 using Lock = nx::scoped_lock<nx::mutex>;
+
+struct SystemFont {
+    const u8* data;
+    const usize* size;
+    const char* style_name;
+    const char* file_name;
+    f32 weight;
+    u16 style;  // (SCE_PVF_STYLE_REGULAR, _BOLD)
+};
+const SystemFont kSystemFonts[] = {
+    {kRoboto_Regular, &kRoboto_RegularSize, "Regular", "Roboto-Regular.ttf", 400.0f, 1},
+    {kRoboto_Bold, &kRoboto_BoldSize, "Bold", "Roboto-Bold.ttf", 700.0f, 5},
+};
+constexpr i32 kSystemFontCount = 2;
+
+// ScePvf_t_fontStyleInfo (216 bytes): weight, family, style, sub-style, language, region, country (u16 each), the font,
+// style and file names (64 bytes each), extra attributes, expiry date.
+void write_style(u32 at, const SystemFont& f) {
+    std::memset(memory().host(at), 0, 216);
+    u32 weight;
+    std::memcpy(&weight, &f.weight, 4);
+    psv_st32(at, weight);
+    psv_st16(at + 4, 1);  // (sans-serif)
+    psv_st16(at + 6, f.style);
+    psv_st16(at + 10, 2);  // (Latin)
+    std::memcpy(memory().host(at + 16), "Roboto", 7);
+    std::memcpy(memory().host(at + 80), f.style_name, std::strlen(f.style_name) + 1);
+    std::memcpy(memory().host(at + 144), f.file_name, std::strlen(f.file_name) + 1);
+}
+// (the bold styles: bold, bold oblique, black, black oblique, and the heavier weights)
+bool bold_style(u32 style) { return style == 5 || style == 6 || style == 7 || style == 8 || (style >= 104 && style <= 106); }
 
 void set_error(u32 at, i32 code) {
     if (at && writable(at, 4)) psv_st32(at, static_cast<u32>(code));
@@ -138,12 +180,36 @@ i32 scePvfSetAltCharacterCode(u32 lib, u32 code) {
 i32 scePvfGetNumFontList(u32 lib, u32 error) {
     const i32 r = with_lib(lib, [](Lib&) { return 0; });
     set_error(error, r);
-    return 0;  // (no system fonts)
+    return r < 0 ? 0 : kSystemFontCount;
 }
-u32 scePvfOpen(u32 lib, i32 /*index*/, u32 /*mode*/, u32 error) {
-    const i32 r = with_lib(lib, [](Lib&) { return kNoFile; });
+i32 scePvfGetFontList(u32 lib, u32 styles, i32 count) {
+    if (count < 0 || (count && (!styles || !writable(styles, static_cast<u32>(count) * 216)))) return kArg;
+    return with_lib(lib, [&](Lib&) {
+        for (i32 i = 0; i < count && i < kSystemFontCount; ++i) write_style(styles + 216 * static_cast<u32>(i), kSystemFonts[i]);
+        return 0;
+    });
+}
+i32 scePvfGetFontInfoByIndexNumber(u32 lib, u32 style, i32 index) {
+    if (!style || !writable(style, 216) || index < 0 || index >= kSystemFontCount) return kArg;
+    return with_lib(lib, [&](Lib&) { return write_style(style, kSystemFonts[index]), 0; });
+}
+// The closest font: bold for the bold styles, else regular.
+i32 scePvfFindOptimumFont(u32 lib, u32 style, u32 error) {
+    if (!style || !memory().valid(style, 216)) return set_error(error, kArg), -1;
+    const i32 r = with_lib(lib, [](Lib&) { return 0; });
     set_error(error, r);
-    return 0;
+    return r < 0 ? -1 : bold_style(psv_ld16(style + 6)) ? 1 : 0;
+}
+// A font exactly as asked (the family, style and language given, or 0 for any): one of the two, or -1 and NOFILE.
+i32 scePvfFindFont(u32 lib, u32 style, u32 error) {
+    if (!style || !memory().valid(style, 216)) return set_error(error, kArg), -1;
+    const i32 r = with_lib(lib, [](Lib&) { return 0; });
+    if (r < 0) return set_error(error, r), -1;
+    const u32 family = psv_ld16(style + 4), wanted = psv_ld16(style + 6), language = psv_ld16(style + 10);
+    if ((family != 0 && family != 1) || (language != 0 && language != 2)) return set_error(error, kNoFile), -1;
+    for (i32 i = 0; i < kSystemFontCount; ++i)
+        if (wanted == 0 || wanted == kSystemFonts[i].style) return set_error(error, 0), i;
+    return set_error(error, kNoFile), -1;
 }
 
 f32 convert(u32 lib, f32 v, u32 error, bool to_pixels, bool horizontal) {
@@ -161,10 +227,9 @@ f32 scePvfPointToPixelV(u32 lib, f32 v, u32 error) { return convert(lib, v, erro
 f32 scePvfPixelToPointH(u32 lib, f32 v, u32 error) { return convert(lib, v, error, false, true); }
 f32 scePvfPixelToPointV(u32 lib, f32 v, u32 error) { return convert(lib, v, error, false, false); }
 
-u32 open_memory(PsvContext* ctx, u32 lib, u32 address, u32 size, u32 index, u32 error) {
-    if (!address || !size || !memory().valid(address, size)) return set_error(error, kArg), 0;
+u32 open_data(PsvContext* ctx, u32 lib, std::span<const u8> data, u32 index, u32 error) {
     auto state = std::make_unique<FontState>();
-    if (!state->font.load(std::span<const u8>(memory().host(address), size), index)) return set_error(error, kNoSupport), 0;
+    if (!state->font.load(data, index)) return set_error(error, kNoSupport), 0;
     Lib l;
     {
         Pvf& p = pvf();
@@ -183,9 +248,52 @@ u32 open_memory(PsvContext* ctx, u32 lib, u32 address, u32 size, u32 index, u32 
         ++p.libs[lib].open_fonts;
         p.fonts[handle] = std::move(state);
     }
-    nx::logi(logs::hle, "ScePvf: a font from memory (0x{:x} bytes) opened", size);
+    nx::logi(logs::hle, "ScePvf: a font (0x{:x} bytes) opened", data.size());
     set_error(error, 0);
     return handle;
+}
+u32 open_memory(PsvContext* ctx, u32 lib, u32 address, u32 size, u32 index, u32 error) {
+    if (!address || !size || !memory().valid(address, size)) return set_error(error, kArg), 0;
+    return open_data(ctx, lib, std::span<const u8>(memory().host(address), size), index, error);
+}
+u32 open_system(PsvContext* ctx, u32 lib, i32 index, u32 error) {
+    if (index < 0 || index >= kSystemFontCount) return set_error(error, kArg), 0;
+    const u32 handle = open_data(ctx, lib, std::span<const u8>(kSystemFonts[index].data, *kSystemFonts[index].size), 0, error);
+    if (handle) {
+        Pvf& p = pvf();
+        Lock held(p.lock);
+        if (auto it = p.fonts.find(handle); it != p.fonts.end()) it->second->system = &kSystemFonts[index];
+    }
+    return handle;
+}
+u32 scePvfOpen(PsvContext* ctx, u32 lib, i32 index, u32 /*mode*/, u32 error) { return open_system(ctx, lib, index, error); }
+u32 scePvfOpenDefaultLatinFontOnSharedMemory(PsvContext* ctx, u32 lib, u32 error) { return open_system(ctx, lib, 0, error); }
+u32 scePvfOpenDefaultJapaneseFontOnSharedMemory(PsvContext* ctx, u32 lib, u32 error) {
+    nx::logw(logs::hle, "ScePvf: the default Japanese font is Roboto here (no Japanese glyphs)");
+    return open_system(ctx, lib, 0, error);
+}
+// A font file by its path (read whole, through the game's file system).
+u32 open_file(PsvContext* ctx, u32 lib, u32 path, u32 index, u32 error) {
+    nx::string name;
+    for (u32 i = 0; path && i < 1024 && memory().valid(path + i, 1); ++i) {
+        const char c = static_cast<char>(memory().host(path + i)[0]);
+        if (!c) break;
+        name.push_back(c);
+    }
+    if (name.empty()) return set_error(error, kArg), 0;
+    FileSystem& files = runtime().files();
+    const i32 fd = files.open(name, 1, 0);
+    if (fd < 0) return set_error(error, kNoFile), 0;
+    const i64 size = files.seek(fd, 0, 2);
+    nx::vector<u8> data(size > 0 ? static_cast<usize>(size) : 0);
+    const bool ok = size > 0 && files.pread(fd, data.data(), static_cast<u32>(size), 0) == size;
+    files.close(fd);
+    if (!ok) return set_error(error, kNoFile), 0;
+    return open_data(ctx, lib, data, index, error);
+}
+u32 scePvfOpenUserFile(PsvContext* ctx, u32 lib, u32 path, u32 /*mode*/, u32 error) { return open_file(ctx, lib, path, 0, error); }
+u32 scePvfOpenUserFileWithSubfontIndex(PsvContext* ctx, u32 lib, u32 path, u32 /*mode*/, u32 index, u32 error) {
+    return open_file(ctx, lib, path, index, error);
 }
 u32 scePvfOpenUserMemory(PsvContext* ctx, u32 lib, u32 address, u32 size, u32 error) {
     return open_memory(ctx, lib, address, size, 0, error);
@@ -296,7 +404,8 @@ i32 scePvfGetCharImageRect(u32 font, u32 code, u32 rect) {
 
 // ScePvf_t_userImageBufferRec: pixel format, x and y of the origin (26.6), width and height (u16), bytes a line
 // (u16), reserved, the buffer.
-i32 draw(u32 font, u32 code, u32 image, i32 clip_x, i32 clip_y, u32 clip_w, u32 clip_h) {
+// (vertical: the origin is on the vertical line at the line's top; the glyph is placed by its vertical bearings)
+i32 draw(u32 font, u32 code, u32 image, i32 clip_x, i32 clip_y, u32 clip_w, u32 clip_h, bool vertical) {
     if (!image || !memory().valid(image, 24)) return kArg;
     const u32 format = psv_ld32(image);
     const i32 x64 = static_cast<i32>(psv_ld32(image + 4)), y64 = static_cast<i32>(psv_ld32(image + 8));
@@ -309,8 +418,16 @@ i32 draw(u32 font, u32 code, u32 image, i32 clip_x, i32 clip_y, u32 clip_w, u32 
         f32 sx, sy;
         scales(f, l, &sx, &sy);
         media::FontBitmap b;
-        const i32 ox = x64 >> 6, oy = y64 >> 6;
-        f.font.rasterize(g, sx, sy, static_cast<f32>(x64 & 63) / 64.0f, static_cast<f32>(y64 & 63) / 64.0f, &b);
+        i32 vx = x64, vy = y64;
+        if (vertical) {
+            // (to the horizontal origin: half the glyph's width left of the line, the ascender below its top)
+            f32 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+            f.font.bounds(g, &x0, &y0, &x1, &y1);
+            vx -= to64((x0 + (x1 - x0) / 2) * sx);
+            vy += to64(static_cast<f32>(f.font.ascender()) * sy);
+        }
+        const i32 ox = vx >> 6, oy = vy >> 6;
+        f.font.rasterize(g, sx, sy, static_cast<f32>(vx & 63) / 64.0f, static_cast<f32>(vy & 63) / 64.0f, &b);
         const i64 cx0 = std::max<i64>(0, clip_x), cy0 = std::max<i64>(0, clip_y);
         const i64 cx1 = std::min<i64>(width, i64{clip_x} + clip_w), cy1 = std::min<i64>(height, i64{clip_y} + clip_h);
         u8* out = memory().host(buffer);
@@ -333,10 +450,23 @@ i32 draw(u32 font, u32 code, u32 image, i32 clip_x, i32 clip_y, u32 clip_w, u32 
         return 0;
     });
 }
-i32 scePvfGetCharGlyphImage(u32 font, u32 code, u32 image) { return draw(font, code, image, 0, 0, 0xFFFF, 0xFFFF); }
+i32 scePvfGetCharGlyphImage(u32 font, u32 code, u32 image) { return draw(font, code, image, 0, 0, 0xFFFF, 0xFFFF, false); }
 i32 scePvfGetCharGlyphImage_Clip(u32 font, u32 code, u32 image, i32 x, i32 y, u32 w, u32 h) {
-    return draw(font, code, image, x, y, w, h);
+    return draw(font, code, image, x, y, w, h, false);
 }
+i32 scePvfGetVertCharGlyphImage(u32 font, u32 code, u32 image) { return draw(font, code, image, 0, 0, 0xFFFF, 0xFFFF, true); }
+i32 scePvfGetVertCharGlyphImage_Clip(u32 font, u32 code, u32 image, i32 x, i32 y, u32 w, u32 h) {
+    return draw(font, code, image, x, y, w, h, true);
+}
+
+// Vertical character info: the same glyph and metrics (the vertical bearings and advance are set in both).
+i32 scePvfGetVertCharInfo(u32 font, u32 code, u32 info) { return scePvfGetCharInfo(font, code, info); }
+i32 scePvfGetVertCharImageRect(u32 font, u32 code, u32 rect) { return scePvfGetCharImageRect(font, code, rect); }
+u32 scePvfIsVertElement(u32 font, u32) {
+    return 0;  // (no vertical forms)
+}
+i32 outline_unsupported() { return kNoSupport; }
+i32 hook_accepted() { return 0; }
 
 u32 scePvfIsElement(u32 font, u32 code) {
     u32 present = 0;
@@ -368,6 +498,9 @@ i32 scePvfGetFontInfo(u32 font, u32 info) {
         u32 bits;
         std::memcpy(&bits, &weight, 4);
         psv_st32(info + 84, bits);
+        // (a system font: its style information)
+        for (const SystemFont& sf : kSystemFonts)
+            if (t.glyph_count() && f.system == &sf) write_style(info + 84, sf);
         return 0;
     });
 }
@@ -388,6 +521,24 @@ const Function kFunctions[] = {
     HLE_FUNCTION(0x830625C2, scePvfSetAltCharacterCode),
     HLE_FUNCTION(0xF6C4A855, scePvfGetNumFontList),
     HLE_FUNCTION(0xE35434BB, scePvfOpen),
+    HLE_FUNCTION(0x66F2D767, scePvfGetFontList),
+    HLE_FUNCTION(0xF3E1E8BD, scePvfGetFontInfoByIndexNumber),
+    HLE_FUNCTION(0x2761FEAC, scePvfFindOptimumFont),
+    HLE_FUNCTION(0x984E5BFE, scePvfFindFont),
+    HLE_FUNCTION(0x9CBC1A46, scePvfOpenDefaultLatinFontOnSharedMemory),
+    HLE_FUNCTION(0xFEEE373A, scePvfOpenDefaultJapaneseFontOnSharedMemory),
+    HLE_FUNCTION(0xD535520F, scePvfOpenUserFile),
+    HLE_FUNCTION(0x10452B86, scePvfOpenUserFileWithSubfontIndex),
+    HLE_FUNCTION(0xB8D01915, scePvfGetVertCharInfo),
+    HLE_FUNCTION(0x64E0EA8B, scePvfGetVertCharImageRect),
+    HLE_FUNCTION(0x8AE8433A, scePvfGetVertCharGlyphImage),
+    HLE_FUNCTION(0xEEDAB884, scePvfGetVertCharGlyphImage_Clip),
+    HLE_FUNCTION(0xE676A888, scePvfIsVertElement),
+    Function{0x17A7873B, "scePvfGetCharGlyphOutline", &entry<&outline_unsupported>},
+    Function{0xECCB0CEE, "scePvfGetVertCharGlyphOutline", &entry<&outline_unsupported>},
+    Function{0xB6CE89E1, "scePvfReleaseCharGlyphOutline", &entry<&outline_unsupported>},
+    Function{0x997161C3, "__scePvfSetFt2LibCHook", &entry<&hook_accepted>},
+    Function{0x58142D71, "__scePvfSetFt2DoneLibCHook", &entry<&hook_accepted>},
     HLE_FUNCTION(0x91F02F9A, scePvfPointToPixelH),
     HLE_FUNCTION(0x35465BD7, scePvfPointToPixelV),
     HLE_FUNCTION(0xF56B5B9B, scePvfPixelToPointH),
