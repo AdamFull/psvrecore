@@ -937,7 +937,7 @@ TEST_CASE("audiodec: ATRAC9 frames decode as at9tool decodes them; the library's
     PsvContext* ctx = t.ctx();
     constexpr u32 kSceAudiodecUser = 0x2AA62046, kInit = 0x445C2CEF, kTerm = 0x45719B9D, kCreate = 0x4DFD3AAA,
                   kDelete = 0xE7A24E16, kDecode = 0xCCDABA04, kDecodeN = 0x8018AA9B, kClear = 0xF72F9B64;
-    constexpr u32 kAt9 = 0x1003, kAac = 0x1005, kMp3 = 0x1004;
+    constexpr u32 kAt9 = 0x1003, kAac = 0x1005, kCelp = 0x1006;
     const u32 init = scratch(8), ctrl = scratch(40), info = scratch(32);
     psv_st32(init, 8), psv_st32(init + 4, 4);
     const auto make_ctrl = [&] {
@@ -954,7 +954,7 @@ TEST_CASE("audiodec: ATRAC9 frames decode as at9tool decodes them; the library's
     std::memset(t.rt.memory().host(info), 0, 32);
     psv_st32(info, 28);
     CHECK(u(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kAt9})) == 0x807F2000u);  // (no configuration)
-    // AAC: channels checked; MP3: no decoder here.
+    // AAC: channels checked; CELP: no decoder here.
     REQUIRE(call32(ctx, kSceAudiodecUser, kInit, {kAac, init}) == 0);
     make_ctrl();
     psv_st32(info, 20), psv_st32(info + 4, 1), psv_st32(info + 8, 3), psv_st32(info + 12, 48000), psv_st32(info + 16, 0);
@@ -964,9 +964,9 @@ TEST_CASE("audiodec: ATRAC9 frames decode as at9tool decodes them; the library's
     CHECK(psv_ld32(ctrl + 28) == 2048 * 2 * 2);  // (the most PCM a call writes)
     CHECK(call32(ctx, kSceAudiodecUser, kDelete, {ctrl}) == 0);
     CHECK(u(call32(ctx, kSceAudiodecUser, kDelete, {ctrl})) == 0x807F0009u);
-    REQUIRE(call32(ctx, kSceAudiodecUser, kInit, {kMp3, init}) == 0);
-    CHECK(u(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kMp3})) == 0x807F000Eu);
-    CHECK(call32(ctx, kSceAudiodecUser, kTerm, {kMp3}) == 0);
+    REQUIRE(call32(ctx, kSceAudiodecUser, kInit, {kCelp, init}) == 0);
+    CHECK(u(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kCelp})) == 0x807F000Eu);
+    CHECK(call32(ctx, kSceAudiodecUser, kTerm, {kCelp}) == 0);
     CHECK(call32(ctx, kSceAudiodecUser, kTerm, {kAac}) == 0);
 
     const auto dir = nx::os::environment_variable("PSVRECORE_AT9_DIR");
@@ -1195,4 +1195,122 @@ TEST_CASE("sas: ADPCM and PCM voices play, loop, end and are shaped and mixed as
     REQUIRE(call32(ctx, kSceSas, kExit, {back, back_size}) == 0);
     CHECK(psv_ld32(back) == work);
     CHECK(u(call32(ctx, kSceSas, kExit, {back, back_size})) == 0x80420100u);
+}
+
+// MP3 through the audio decoder library: silent MPEG-1 layer III frames built here (a mono decoder, and a stereo one
+// given mono frames: each sample doubled); and, when PSVRECORE_MP3_DIR names a folder of <name>.mp3 with <name>.wav
+// (another decoder's output, e.g. ffmpeg's, made locally from the SDK's sample sounds), every frame of each file
+// against it, after the delay the other decoder trims (found as the offset where they agree).
+TEST_CASE("audiodec: MP3 frames decode, mono and stereo, and match another decoder's output") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceAudiodecUser = 0x2AA62046, kInit = 0x445C2CEF, kTerm = 0x45719B9D, kCreate = 0x4DFD3AAA,
+                  kDelete = 0xE7A24E16, kDecode = 0xCCDABA04, kClear = 0xF72F9B64;
+    constexpr u32 kMp3 = 0x1004;
+    const u32 init = scratch(8), ctrl = scratch(40), info = scratch(32), pcm = scratch(1152 * 2 * 2);
+    psv_st32(init, 8), psv_st32(init + 4, 4);
+    REQUIRE(call32(ctx, kSceAudiodecUser, kInit, {kMp3, init}) == 0);
+    const auto make = [&](u32 channels, u32 version) {
+        std::memset(t.rt.memory().host(ctrl), 0, 40);
+        psv_st32(ctrl, 40);
+        psv_st32(ctrl + 32, 16);
+        psv_st32(ctrl + 36, info);
+        psv_st32(ctrl + 20, pcm);
+        psv_st32(info, 12), psv_st32(info + 4, channels), psv_st32(info + 8, version);
+        return call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kMp3});
+    };
+    CHECK(u(make(3, 3)) == 0x807F2800u);
+    CHECK(u(make(1, 1)) == 0x807F2801u);
+
+    // 128 kbit/s, 44.1 kHz, mono: 417-byte frames; side information and data all zero (silence).
+    constexpr u32 kFrame = 417, kFrames = 4;
+    const u32 es = scratch(kFrame * kFrames + 1441);
+    std::memset(t.rt.memory().host(es), 0, kFrame * kFrames + 1441);
+    for (u32 f = 0; f < kFrames; ++f) {
+        u8* h = t.rt.memory().host(es + f * kFrame);
+        h[0] = 0xFF, h[1] = 0xFB, h[2] = 0x90, h[3] = 0xC0;
+    }
+    for (u32 channels : {1u, 2u}) {
+        REQUIRE(make(channels, 3) == 0);
+        CHECK(psv_ld32(ctrl + 16) == 1441);
+        CHECK(psv_ld32(ctrl + 28) == 1152 * channels * 2);
+        for (u32 f = 0; f + 1 < kFrames; ++f) {
+            std::memset(t.rt.memory().host(pcm), 0x55, 1152 * 4);
+            psv_st32(ctrl + 8, es + f * kFrame);
+            REQUIRE(call32(ctx, kSceAudiodecUser, kDecode, {ctrl}) == 0);
+            CHECK(psv_ld32(ctrl + 12) == kFrame);
+            CHECK(psv_ld32(ctrl + 24) == 1152 * channels * 2);
+            const u8* out = t.rt.memory().host(pcm);
+            CHECK(std::all_of(out, out + 1152 * channels * 2, [](u8 b) { return b == 0; }));
+        }
+        CHECK(call32(ctx, kSceAudiodecUser, kClear, {ctrl}) == 0);
+        CHECK(call32(ctx, kSceAudiodecUser, kDelete, {ctrl}) == 0);
+    }
+
+    const auto dir = nx::os::environment_variable("PSVRECORE_MP3_DIR");
+    if (!dir) {
+        std::printf("(PSVRECORE_MP3_DIR not set: no MP3 data to check)\n");
+        CHECK(call32(ctx, kSceAudiodecUser, kTerm, {kMp3}) == 0);
+        return;
+    }
+    auto entries = nx::fs::directory_entries(nx::fs::path_view(*dir));
+    REQUIRE(entries.has_value());
+    u32 checked = 0;
+    for (const auto& e : *entries) {
+        const nx::string path(e.path);
+        if (path.size() < 4 || path.substr(path.size() - 4) != ".mp3") continue;
+        nx::vector<u8> mp3 = read_file(path);
+        // (an ID3v2 tag before the frames: a game's own demuxer leaves it out, as here; the decoder gets frames)
+        if (mp3.size() > 10 && mp3[0] == 'I' && mp3[1] == 'D' && mp3[2] == '3') {
+            const usize tag = 10 + ((usize{mp3[6]} << 21) | (usize{mp3[7]} << 14) | (usize{mp3[8]} << 7) | mp3[9]);
+            mp3.erase(mp3.begin(), mp3.begin() + static_cast<isize>(std::min(tag, mp3.size())));
+        }
+        const nx::vector<u8> wav = read_file(path.substr(0, path.size() - 4) + ".wav");
+        const auto fmt = riff_chunk(wav, "fmt "), ref = riff_chunk(wav, "data");
+        REQUIRE(fmt.size() >= 16);
+        u16 channels;
+        std::memcpy(&channels, fmt.data() + 2, 2);
+        REQUIRE(make(channels, 3) == 0);
+        const u32 stream = scratch(static_cast<u32>(mp3.size()) + 1441);
+        std::memset(t.rt.memory().host(stream), 0, static_cast<u32>(mp3.size()) + 1441);
+        std::memcpy(t.rt.memory().host(stream), mp3.data(), mp3.size());
+        nx::vector<i16> ours;
+        for (u32 at = 0, guard = 0; at < mp3.size() && guard < 100000; ++guard) {
+            psv_st32(ctrl + 8, stream + at);
+            if (call32(ctx, kSceAudiodecUser, kDecode, {ctrl}) < 0) break;
+            const u32 used = psv_ld32(ctrl + 12), written = psv_ld32(ctrl + 24);
+            if (!used) break;
+            const i16* p = reinterpret_cast<const i16*>(t.rt.memory().host(pcm));
+            ours.insert(ours.end(), p, p + written / 2);
+            at += used;
+        }
+        CHECK(call32(ctx, kSceAudiodecUser, kDelete, {ctrl}) == 0);
+        nx::vector<i16> theirs(ref.size() / 2);
+        std::memcpy(theirs.data(), ref.data(), theirs.size() * 2);
+        // the offset (in frames of samples) of theirs within ours: the one where they differ least, over a stretch
+        // from the middle (a file may open with silence, where every offset agrees)
+        const usize n = std::min<usize>(theirs.size() / 2, 8192);
+        const usize mid = theirs.size() / 2 / channels * channels;
+        usize best = 0;
+        i64 best_error = -1;
+        for (usize off = 0; off <= 4096 && (off * channels + mid + n) <= ours.size(); ++off) {
+            i64 error = 0;
+            for (usize i = 0; i < n; ++i) error += std::abs(ours[off * channels + mid + i] - theirs[mid + i]);
+            if (best_error < 0 || error < best_error) best_error = error, best = off;
+        }
+        const usize count = std::min(theirs.size(), ours.size() - best * channels);
+        u32 worst = 0, off_by_more = 0;
+        for (usize i = 0; i < count; ++i) {
+            const u32 d = static_cast<u32>(std::abs(ours[best * channels + i] - theirs[i]));
+            worst = std::max(worst, d);
+            off_by_more += d > 2;
+        }
+        std::printf("%s: %zu samples, %u channels, delay %zu, most apart %u, %u off by more than 2\n", path.c_str(), count,
+                    channels, best, worst, off_by_more);
+        CHECK(count + 2 * 1152 * channels >= theirs.size());
+        CHECK(off_by_more <= count / 1000);
+        ++checked;
+    }
+    CHECK(checked > 0);
+    CHECK(call32(ctx, kSceAudiodecUser, kTerm, {kMp3}) == 0);
 }

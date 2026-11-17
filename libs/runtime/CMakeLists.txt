@@ -48,6 +48,7 @@ add_library(psvrecore_runtime STATIC
     src/media/mp4.cpp
     src/media/jpeg.cpp
     src/media/font.cpp
+    src/media/mp3.cpp
     src/ngs/modules.cpp
     src/runtime.cpp
     src/savedata.cpp
@@ -72,6 +73,10 @@ target_include_directories(psvrecore_libatrac9 SYSTEM PUBLIC "${PSVRECORE_DIR}/t
 # (its header declares the functions for a DLL under MSVC-style compilers; as a static library they are defined here)
 target_compile_definitions(psvrecore_libatrac9 PUBLIC COMPILING_DLL)
 target_link_libraries(psvrecore_runtime PRIVATE psvrecore_libatrac9)
+
+# minimp3 (github.com/lieff/minimp3 at 9f1f7c67d596, CC0, the header and licence copied into third_party/minimp3):
+# SceAudiodecUser's MP3 decoder (src/media/mp3.cpp holds its implementation).
+target_include_directories(psvrecore_runtime SYSTEM PRIVATE "${PSVRECORE_DIR}/third_party/minimp3")
 
 # openh264 (github.com/cisco/openh264, BSD-2-Clause, submodule in third_party/openh264): AvPlayer's H.264 decoder,
 # its C++ only (no assembly).

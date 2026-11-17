@@ -12,8 +12,8 @@ third-party code, vita-headers (whose NID database the tools read at run time), 
 Vulkan-Headers, SPIRV-Headers, volk and VulkanMemoryAllocator. Nothing links against a Vulkan SDK; the loader is
 opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used by the local checks only. The
 media decoders come the same way: LibAtrac9 (MIT) and openh264 (BSD-2-Clause) as submodules; the PacketVideo AAC
-decoder (Apache-2.0) is vendored in `third_party/pvaacdec` (its README says where from). The platform layer's
-SDL3 (zlib) is a submodule as well, built as a static library. (CMake 3.27 for the shared runtime library on
+decoder (Apache-2.0) is vendored in `third_party/pvaacdec`, and minimp3 (CC0) in `third_party/minimp3` (their READMEs say
+where from). The platform layer's SDL3 (zlib) is a submodule as well, built as a static library. (CMake 3.27 for the shared runtime library on
 Windows and Linux; with `PSVRECORE_SHARED=OFF`, 3.25 is enough.)
 
 ## Presets
@@ -66,7 +66,7 @@ discrete GPU.
 On Windows and Linux the runtime is one shared library, `psvrecore.dll` / `libpsvrecore.so.<ABI version>`, and each
 game is an executable linked to it; on Android it is linked into each game's `libmain.so` (`PSVRECORE_SHARED=OFF`).
 The library holds the runtime (kernel, system libraries, loader), gxm, vulkan, platform and frontend, nx-foundation and
-its allocator, and the third-party code they use (SDL3, openh264, LibAtrac9, the AAC decoder, volk, VMA, zlib), which
+its allocator, and the third-party code they use (SDL3, openh264, LibAtrac9, the AAC and MP3 decoders, volk, VMA, zlib), which
 stays internal. The tests and the tools link the same code as static libraries, as before.
 
 A game links two targets: `psvrecore::game` for its executable (the frontend, nx-foundation's headers) and

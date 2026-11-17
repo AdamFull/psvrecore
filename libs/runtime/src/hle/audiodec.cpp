@@ -1,10 +1,12 @@
-// The audio decoders (SceAudiodecUser): ATRAC9 (LibAtrac9, as NGS's player) and AAC (the PacketVideo decoder, as
-// AvPlayer's), raw or ADTS; 16-bit PCM, interleaved. MP3 and CELP have no decoder here yet: their libraries start,
-// but a decoder of theirs is refused (SCE_AUDIODEC_ERROR_UNSUPPORTED), named in the log.
+// The audio decoders (SceAudiodecUser): ATRAC9 (LibAtrac9, as NGS's player), MP3 (minimp3: MPEG-1, 2 and 2.5) and
+// AAC (the PacketVideo decoder, as AvPlayer's), raw or ADTS; 16-bit PCM, interleaved, in the channels the decoder was
+// made for (a mono stream doubled for stereo; stereo's left for mono). CELP has no decoder here: its library starts,
+// but a decoder of its is refused (SCE_AUDIODEC_ERROR_UNSUPPORTED), named in the log.
 //
 // The game's SceAudiodecCtrl: its size, the decoder's handle, the stream (pointer, bytes used, the most a call
 // reads), the PCM (pointer, bytes written, the most a call writes), the word length (16) and its SceAudiodecInfo,
-// which CreateDecoder reads (ATRAC9: the 4 configuration bytes; AAC: ADTS or not, channels, rate, SBR) and fills in
+// which CreateDecoder reads (ATRAC9: the 4 configuration bytes; MP3: channels, MPEG version; AAC: ADTS or not, channels,
+// rate, SBR) and fills in
 // (ATRAC9: channels, rate, superframe size, frames in it). A decode call decodes one frame (ATRAC9: up to 8, with
 // DecodeNFrames; the last frame of a superframe uses the bytes up to its end); the decoder's context lives here, not in the game's memory (the "external" calls take it and give
 // it back unused).
@@ -12,6 +14,7 @@
 #include <cstring>
 
 #include "../media/decoders.hpp"
+#include "../media/mp3.hpp"
 #include "hle_common.hpp"
 #include "core/foundation/containers/hash_map.h"
 #include "libatrac9.h"
@@ -28,7 +31,8 @@ constexpr i32 kInvalidType = err::code(0x807F0001), kInvalidInitParam = err::cod
               kInvalidHandle = err::code(0x807F0009), kInvalidWordLength = err::code(0x807F000C),
               kInvalidSize = err::code(0x807F000D), kUnsupported = err::code(0x807F000E),
               kInvalidNFrames = err::code(0x807F000F), kApiFail = err::code(0x807F0000),
-              kAt9InvalidConfig = err::code(0x807F2000), kAacInvalidCh = err::code(0x807F3000);
+              kAt9InvalidConfig = err::code(0x807F2000), kAacInvalidCh = err::code(0x807F3000),
+              kMp3InvalidCh = err::code(0x807F2800), kMp3InvalidVersion = err::code(0x807F2801);
 constexpr u32 kContextSize = 0x10000;
 
 struct Ctrl {
@@ -51,6 +55,7 @@ struct Decoder {
     i32 frame_in_superframe = 0;  // (ATRAC9: the next frame's place in its superframe, and its bytes so far)
     u32 superframe_used = 0;
     nx::unique_ptr<media::AacDecoder> aac;
+    nx::unique_ptr<media::Mp3Decoder> mp3;
     bool adts = false;
     u32 aac_samples = 1024;
     i32 last_error = 0;
@@ -150,8 +155,16 @@ i32 create(Ptr<Ctrl> ctrl, u32 type) {
         d->aac_samples = info[4] ? 2048 : 1024;
         c.es_max = 1792;
         c.pcm_max = 2048 * d->channels * 2;
+    } else if (type == kTypeMp3) {
+        // (SceAudiodecInfoMp3: size, channels, MPEG version: 3 MPEG-1, 2 MPEG-2, 0 MPEG-2.5)
+        d->channels = info[1];
+        if (d->channels < 1 || d->channels > 2) return kMp3InvalidCh;
+        if (info[2] != 0 && info[2] != 2 && info[2] != 3) return kMp3InvalidVersion;
+        d->mp3 = nx::make_unique<media::Mp3Decoder>();
+        c.es_max = 1441;
+        c.pcm_max = 1152 * d->channels * 2;
     } else {
-        nx::logw(logs::hle, "audio decoder for {}: not supported here", type == kTypeMp3 ? "MP3" : "CELP");
+        nx::logw(logs::hle, "audio decoder for CELP: not supported here");
         return kUnsupported;
     }
     if (a.used[t] + cost > a.limit[t]) return kAllHandlesInUse;
@@ -206,6 +219,16 @@ i32 decode_frame(Decoder& d, const u8* es, u32 available, i16* pcm, u32* used, u
             d.superframe_used = 0;
         }
         *written = static_cast<u32>(d.at9_info.frameSamples) * d.channels * 2;
+        return 0;
+    }
+    if (d.type == kTypeMp3) {
+        i16 frame[1152 * 2];
+        const media::Mp3Decoder::Frame f = d.mp3->decode(std::span<const u8>(es, available), frame);
+        if (!f.used) return d.last_error = kApiFail;  // (no whole frame in the bytes given)
+        *used = f.used;
+        for (u32 i = 0; i < f.samples; ++i)
+            for (u32 ch = 0; ch < d.channels; ++ch) pcm[i * d.channels + ch] = frame[i * f.channels + (f.channels == 2 ? ch : 0)];
+        *written = f.samples * d.channels * 2;
         return 0;
     }
     u32 offset = 0, size = available;
@@ -267,6 +290,7 @@ i32 sceAudiodecClearContext(Ptr<Ctrl> ctrl) {
     if (it == a.decoders.end()) return kInvalidHandle;
     Decoder& d = *it->second;
     if (d.aac) d.aac->reset();
+    if (d.mp3) d.mp3->reset();
     if (d.at9) {
         u8 config[4];
         std::memcpy(config, d.at9_info.configData, 4);
