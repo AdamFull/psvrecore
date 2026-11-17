@@ -5,7 +5,9 @@
 //   would connect is not implemented;
 // - the development kit's debug LEDs (SceDebugLed): a retail console has none, so setting them does nothing;
 // - the system's screenshots (SceScreenShot: the PS button and Start): the host has none of its own, so what a game
-//   sets for them (titles, an overlay picture, screenshots allowed or not) is checked and kept nowhere.
+//   sets for them (titles, an overlay picture, screenshots allowed or not) is checked and kept nowhere;
+// - the cameras (SceCamera): none, as on a PlayStation TV: opening one answers "not mounted", and what needs one open
+//   "not open".
 
 #include "hle_common.hpp"
 
@@ -18,7 +20,7 @@ namespace {
 
 constexpr u32 kSceAppMgrUser = 0xA6605D6F, kScePower = 0x1082DA7F, kSceNet = 0x6BF8B2A2, kSceNetCtl = 0xC6083AE1,
               kSceHttp = 0xE8F15CDE, kSceSsl = 0xCAF5F2E9, kSceDebugLed = 0xAE004C0A,
-              kSceScreenShot = 0xF26FC97D;
+              kSceScreenShot = 0xF26FC97D, kSceCamera = 0xDA91B3ED;
 constexpr i32 kScreenShotInvalid = err::code(0x80102F01);
 constexpr i32 kAppMgrNullPointer = err::code(0x80802016), kAppMgrInvalid = err::code(0x8080201A),
               kAppMgrState = err::code(0x80802013);
@@ -77,6 +79,23 @@ i32 sceScreenShotEnable() {
     nx::logd(logs::hle, "screenshots: allowed");
     return 0;
 }
+
+constexpr i32 kCameraParam = err::code(0x802E0000), kCameraNotOpen = err::code(0x802E0004),
+              kCameraNotMounted = err::code(0x802E0010);
+i32 sceCameraOpen(i32 device, Ptr<void> info) {
+    if (device < 0 || device > 1 || !info) return kCameraParam;
+    nx::logi(logs::hle, "camera {}: none on the host (not mounted)", device);
+    return kCameraNotMounted;
+}
+i32 not_open(i32 device) { return device < 0 || device > 1 ? kCameraParam : kCameraNotOpen; }
+i32 sceCameraClose(i32 device) { return not_open(device); }
+i32 sceCameraStart(i32 device) { return not_open(device); }
+i32 sceCameraStop(i32 device) { return not_open(device); }
+i32 sceCameraRead(i32 device, Ptr<void>) { return not_open(device); }
+i32 sceCameraGetReverse(i32 device, Ptr<i32>) { return not_open(device); }
+i32 sceCameraSetReverse(i32 device, i32) { return not_open(device); }
+i32 sceCameraSetWhiteBalance(i32 device, i32) { return not_open(device); }
+i32 sceCameraSetBacklight(i32 device, i32) { return not_open(device); }
 
 i32 started(const char* what) {
     nx::logi(logs::hle, "{}: started (offline: nothing connects)", what);
@@ -248,6 +267,17 @@ const Function kNetCtl[] = {
 const Function kHttp[] = {HLE_FUNCTION(0x214926D9, sceHttpInit)};
 const Function kSsl[] = {HLE_FUNCTION(0x3C733316, sceSslInit)};
 const Function kDebugLed[] = {HLE_FUNCTION(0x78E702D3, sceKernelSetGPO)};
+const Function kCamera[] = {
+    HLE_FUNCTION(0xA462F801, sceCameraOpen),
+    HLE_FUNCTION(0xCD6E1CFC, sceCameraClose),
+    HLE_FUNCTION(0xA8FEAE35, sceCameraStart),
+    HLE_FUNCTION(0x1DD9C9CE, sceCameraStop),
+    HLE_FUNCTION(0x79B5C2DE, sceCameraRead),
+    HLE_FUNCTION(0x44F6043F, sceCameraGetReverse),
+    HLE_FUNCTION(0x1175F477, sceCameraSetReverse),
+    HLE_FUNCTION(0x4D4514AC, sceCameraSetWhiteBalance),
+    HLE_FUNCTION(0xAE071044, sceCameraSetBacklight),
+};
 const Function kScreenShot[] = {
     HLE_FUNCTION(0x05DB59C7, sceScreenShotSetParam),
     HLE_FUNCTION(0x7061665B, sceScreenShotSetOverlayImage),
@@ -266,6 +296,7 @@ void register_system() {
     register_library({"SceSsl", kSceSsl, kSsl});
     register_library({"SceDebugLed", kSceDebugLed, kDebugLed});
     register_library({"SceScreenShot", kSceScreenShot, kScreenShot});
+    register_library({"SceCamera", kSceCamera, kCamera});
 }
 
 }  // namespace psvrecore::runtime::hle

@@ -328,6 +328,7 @@ void register_system_libraries() {
     register_touch();
     register_systemgesture();
     register_mspace();
+    register_jpegenc();
     register_motion();
     register_apputil();
     register_ngs();

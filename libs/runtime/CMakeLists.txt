@@ -12,6 +12,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/fiber.cpp
     src/hle/fios2.cpp
     src/hle/iofilemgr.cpp
+    src/hle/jpegenc.cpp
     src/hle/libkernel.cpp
     src/hle/modulemgr.cpp
     src/hle/motion.cpp
