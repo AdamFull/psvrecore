@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <random>
 
 #include "hle_common.hpp"
 
@@ -9,7 +10,7 @@ namespace psvrecore::runtime::hle {
 
 namespace {
 
-constexpr u32 kSceLibKernel = 0xCAE9ACE6;
+constexpr u32 kSceLibKernel = 0xCAE9ACE6, kSceLibRng = 0xF9AC7CF8;
 
 // Reads the arguments of a formatted-output call: from a variadic call's registers and stack, or from a guest
 // va_list (a pointer into the argument area; 8-byte values 8-byte aligned).
@@ -204,6 +205,23 @@ u32 sceClibMemchr(u32 p, i32 c, u32 n) {
 const char* cstr(u32 p) { return reinterpret_cast<const char*>(memory().host(p)); }
 char* mstr(u32 p) { return reinterpret_cast<char*>(memory().host(p)); }
 
+// The calling thread's call frames: not walked here (guest code runs as host code; its frames are not the guest's),
+// so none are reported.
+i32 sceKernelBacktraceSelf(Ptr<u8> /*frames*/, u32 /*size*/, Ptr<u32> count, i32 /*mode*/) {
+    if (count && writable(count.address, 4)) *count = 0;
+    return 0;
+}
+// Random bytes (at most 64 at a time, as the console's), from the host's random device.
+i32 sceKernelGetRandomNumber(Ptr<u8> out, u32 size) {
+    if (size > 64) return err::kInvalidArgument;
+    if (size && (!out || !writable(out.address, size))) return err::kIllegalAddress;
+    static nx::mutex lock;
+    static std::random_device device;
+    nx::scoped_lock<nx::mutex> held(lock);
+    for (u32 i = 0; i < size; ++i) out.get()[i] = static_cast<u8>(device());
+    return 0;
+}
+
 u32 sceClibStrncpy(u32 dst, u32 src, u32 n) {
     std::strncpy(mstr(dst), cstr(src), n);
     return dst;
@@ -219,6 +237,50 @@ i32 sceClibStrncasecmp(u32 a, u32 b, u32 n) {
     }
     return 0;
 }
+// A character's class bits (the C library's table: 0x01 upper, 0x02 lower, 0x04 digit, 0x08 space, 0x10
+// punctuation, 0x20 control, 0x40 hexadecimal digit, 0x80 blank), for the 7-bit characters; 0 above.
+u32 sceClibLookCtypeTable(u32 c) {
+    c &= 0xFF;
+    if (c > 0x7F) return 0;
+    u32 bits = 0;
+    if (c >= 'A' && c <= 'Z') bits |= 0x01;
+    if (c >= 'a' && c <= 'z') bits |= 0x02;
+    if (c >= '0' && c <= '9') bits |= 0x04;
+    if (c == ' ' || (c >= 0x09 && c <= 0x0D)) bits |= 0x08;
+    if (c > 0x20 && c < 0x7F && !(bits & 0x07)) bits |= 0x10;
+    if (c < 0x20 || c == 0x7F) bits |= 0x20;
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) bits |= 0x40;
+    if (c == ' ' || c == 0x09) bits |= 0x80;
+    return bits;
+}
+// strtoll: base 0 (the prefix decides), or 2-36; the end in *end; out of range, the nearest limit.
+i64 sceClibStrtoll(u32 text, Ptr<u32> end, i32 base) {
+    const char* s = cstr(text);
+    u32 i = 0;
+    while (s[i] == ' ' || (s[i] >= 0x09 && s[i] <= 0x0D)) ++i;
+    bool negative = false;
+    if (s[i] == '+' || s[i] == '-') negative = s[i++] == '-';
+    if ((base == 0 || base == 16) && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        const char h = s[i + 2];
+        if ((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F')) i += 2, base = 16;
+    }
+    if (base == 0) base = s[i] == '0' ? 8 : 10;
+    u64 value = 0;
+    bool any = false, over = false;
+    const u64 limit = negative ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull;
+    for (;; ++i) {
+        const char c = s[i];
+        const i32 d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10 : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+        if (base < 2 || base > 36 || d >= base) break;
+        any = true;
+        if (value > (limit - static_cast<u64>(d)) / static_cast<u64>(base)) over = true;
+        else value = value * static_cast<u64>(base) + static_cast<u64>(d);
+    }
+    if (end && writable(end.address, 4)) *end = any ? text + i : text;
+    if (over) return negative ? static_cast<i64>(0x8000000000000000ull) : 0x7FFFFFFFFFFFFFFFll;
+    return negative ? static_cast<i64>(0 - value) : static_cast<i64>(value);
+}
+
 u32 sceClibStrnlen(u32 s, u32 max) {
     u32 n = 0;
     while (n < max && cstr(s)[n]) ++n;
@@ -300,6 +362,9 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0xA2FB4D9D, sceClibStrcmp),
     HLE_FUNCTION(0x660D1F6D, sceClibStrncmp),
     HLE_FUNCTION(0xB54C0BE4, sceClibStrncasecmp),
+    HLE_FUNCTION(0xD8EBBB7E, sceClibLookCtypeTable),
+    HLE_FUNCTION(0x2E581B88, sceClibStrtoll),
+    HLE_FUNCTION(0xD16C03B0, sceKernelBacktraceSelf),
     HLE_FUNCTION(0x5EA3B6CE, sceClibVprintf),
     HLE_FUNCTION(0xAC595E68, sceClibStrnlen),
     HLE_FUNCTION(0x614076B7, sceClibStrchr),
@@ -314,13 +379,18 @@ const Function kLibKernel[] = {
     Function{0xFB235848, "__sce_aeabi_ldiv0", &entry<&sce_aeabi_ldiv0>},
 };
 
+const Function kLibRng[] = {HLE_FUNCTION(0xB2700165, sceKernelGetRandomNumber)};
+
 const Variable kLibKernelVariables[] = {
     {0x93B8AA67, "__stack_chk_guard", 4, &init_stack_guard},
 };
 
 }  // namespace
 
-void register_libkernel() { register_library({"SceLibKernel", kSceLibKernel, kLibKernel, kLibKernelVariables}); }
+void register_libkernel() {
+    register_library({"SceLibKernel", kSceLibKernel, kLibKernel, kLibKernelVariables});
+    register_library({"SceLibRng", kSceLibRng, kLibRng});
+}
 
 void register_system_libraries() {
     register_threadmgr();
@@ -347,6 +417,7 @@ void register_system_libraries() {
     register_online();
     register_net();
     register_psn();
+    register_services();
     register_videodec();
     register_commondialog();
 }

@@ -533,6 +533,70 @@ i32 sceAppUtilDrmClose(Ptr<const DrmAddcontId> id, Ptr<const MountPoint> mp) {
     return 0;
 }
 
+// ---- what the host has none of: application events of other kinds, background downloads, another title's add-ons,
+// the music and photo libraries, the web browser and the store
+
+constexpr i32 kNoPermission = err::code(0x80100605), kParseInvalidData = err::code(0x80100620),
+              kNoEntitlement = err::code(0x80100660), kPhotoDeviceNotFound = err::code(0x80100680),
+              kMusicDeviceNotFound = err::code(0x80100685);
+
+// (sceAppUtilReceiveAppEvent never gives these kinds of event, so there is never one to parse)
+i32 parse_event(Ptr<const AppEventParam> event, Ptr<void> out) {
+    if (!apputil().initialized) return kNotInitialized;
+    if (!event || !out) return kParameter;
+    return kParseInvalidData;
+}
+i32 sceAppUtilAppEventParseNpInviteMessage(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseNpAppDataMessage(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseNpBasicJoinablePresence(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseNearGift(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseLiveArea(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseSessionInvitation(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+// SceAppUtilBgdlStatus: no background download (its fields all 0).
+i32 sceAppUtilBgdlGetStatus(Ptr<u8> status) {
+    if (!apputil().initialized) return kNotInitialized;
+    if (!status || !writable(status.address, 4)) return kParameter;
+    std::memset(status.get(), 0, 4);
+    return 0;
+}
+i32 sceAppUtilAddcontMount(u32 /*drm_id*/, Ptr<const void> mount_point) {
+    if (!apputil().initialized) return kNotInitialized;
+    return mount_point ? kNoEntitlement : kParameter;
+}
+i32 sceAppUtilAddcontUmount() { return apputil().initialized ? kNotMounted : kNotInitialized; }
+i32 sceAppUtilMusicMount() { return apputil().initialized ? kMusicDeviceNotFound : kNotInitialized; }
+i32 sceAppUtilMusicUmount() { return apputil().initialized ? kNotMounted : kNotInitialized; }
+i32 sceAppUtilPhotoMount() { return apputil().initialized ? kPhotoDeviceNotFound : kNotInitialized; }
+i32 sceAppUtilPhotoUmount() { return apputil().initialized ? kNotMounted : kNotInitialized; }
+i32 sceAppUtilLaunchWebBrowser(Ptr<const void> param) {
+    if (!apputil().initialized) return kNotInitialized;
+    nx::logi(logs::hle, "the game asks for the web browser: there is none");
+    return param ? kNoPermission : kParameter;
+}
+i32 sceAppUtilStoreBrowse(Ptr<const void> param) {
+    if (!apputil().initialized) return kNotInitialized;
+    nx::logi(logs::hle, "the game asks for the PlayStation Store: not reachable offline");
+    return param ? kNoPermission : kParameter;
+}
+
+const Function kFunctionsMore[] = {
+    HLE_FUNCTION(0xA2496814, sceAppUtilAppEventParseNpInviteMessage),
+    HLE_FUNCTION(0x6BED9B58, sceAppUtilAppEventParseNpAppDataMessage),
+    HLE_FUNCTION(0x28C7D4F6, sceAppUtilAppEventParseNpBasicJoinablePresence),
+    HLE_FUNCTION(0x77380601, sceAppUtilAppEventParseNearGift),
+    HLE_FUNCTION(0x0F4EE55F, sceAppUtilAppEventParseLiveArea),
+    HLE_FUNCTION(0xA58E6FCE, sceAppUtilAppEventParseSessionInvitation),
+    HLE_FUNCTION(0x96F478D6, sceAppUtilBgdlGetStatus),
+    HLE_FUNCTION(0x53B2C020, sceAppUtilAddcontMount),
+    HLE_FUNCTION(0x1B36AF8C, sceAppUtilAddcontUmount),
+    HLE_FUNCTION(0xB5EDCBFF, sceAppUtilMusicMount),
+    HLE_FUNCTION(0xA7FE1BF7, sceAppUtilMusicUmount),
+    HLE_FUNCTION(0xEE85804D, sceAppUtilPhotoMount),
+    HLE_FUNCTION(0x9651B941, sceAppUtilPhotoUmount),
+    HLE_FUNCTION(0xF19D0423, sceAppUtilLaunchWebBrowser),
+    HLE_FUNCTION(0x85FA94EE, sceAppUtilStoreBrowse),
+};
+
 const Function kFunctions[] = {
     HLE_FUNCTION(0xDAFFE671, sceAppUtilInit),
     HLE_FUNCTION(0xB220B00B, sceAppUtilShutdown),
@@ -567,6 +631,7 @@ void register_apputil() {
     a.addcont_open = 0;
     std::memset(a.safe_memory, 0, sizeof a.safe_memory);
     register_library({"SceAppUtil", kSceAppUtil, kFunctions});
+    register_library({"SceAppUtil", kSceAppUtil, kFunctionsMore});
 }
 
 }  // namespace psvrecore::runtime::hle

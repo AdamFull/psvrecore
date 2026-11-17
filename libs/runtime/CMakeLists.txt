@@ -24,6 +24,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/processmgr.cpp
     src/hle/psn.cpp
     src/hle/rtc.cpp
+    src/hle/services.cpp
     src/hle/sysmem.cpp
     src/hle/system.cpp
     src/hle/systemgesture.cpp

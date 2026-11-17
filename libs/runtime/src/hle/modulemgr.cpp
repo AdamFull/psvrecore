@@ -38,6 +38,42 @@ i32 sceKernelLoadStartModule(Ptr<const char> path, u32 args, u32 argp, u32 /*fla
     return *uid;
 }
 
+// Loaded (and linked), not started: its UID.
+i32 sceKernelLoadModule(Ptr<const char> path, u32 /*flags*/, Ptr<const void> /*opt*/) {
+    const nx::string guest_path = str(path, 1024);
+    Loader& loader = runtime().loader();
+    if (const LoadedModule* m = loader.find_by_path(guest_path)) return m->uid;
+    nx::string host_path;
+    if (runtime().files().resolve(guest_path, &host_path, nullptr, true) < 0) return kModuleNotFound;
+    Result<i32> uid = [&] {
+        Kernel::Blocking blocking(kernel());
+        return loader.load(host_path, guest_path);
+    }();
+    if (!uid) {
+        nx::loge(logs::loader, "{}", uid.error().message);
+        return kStartFailed;
+    }
+    loader.link();
+    return *uid;
+}
+// A loaded module started: module_start's result in `result`.
+i32 sceKernelStartModule(i32 uid, u32 args, u32 argp, u32 /*flags*/, Ptr<const void> /*opt*/, Ptr<i32> result) {
+    Loader& loader = runtime().loader();
+    if (!loader.find(uid)) return kModuleNotFound;
+    const i32 status = loader.start(uid, args, argp);
+    if (result && writable(result.address, 4)) *result = status;
+    return status == kStartFailedResult ? kStartFailed : 0;
+}
+// (stopping and unloading: not supported, as for sceKernelStopUnloadModule below)
+i32 sceKernelStopModule(i32 uid, u32, u32, u32, Ptr<const void>, Ptr<i32>) {
+    nx::logw(logs::loader, "sceKernelStopModule(0x{:08x}) not supported", static_cast<u32>(uid));
+    return err::kUnsupported;
+}
+i32 sceKernelUnloadModule(i32 uid, u32, Ptr<const void>) {
+    nx::logw(logs::loader, "sceKernelUnloadModule(0x{:08x}) not supported", static_cast<u32>(uid));
+    return err::kUnsupported;
+}
+
 i32 sceKernelStopUnloadModule(i32 uid, u32, u32, u32, Ptr<const void>, Ptr<i32>) {
     // Modules stay where their code was generated for: unloading one is not supported.
     nx::logw(logs::loader, "sceKernelStopUnloadModule(0x{:08x}) not supported", static_cast<u32>(uid));
@@ -95,6 +131,10 @@ i32 sceKernelGetModuleInfoByAddr(u32 address, Ptr<u8> info) {
 const Function kLibKernel[] = {
     HLE_FUNCTION(0x2DCC4AFA, sceKernelLoadStartModule),
     HLE_FUNCTION(0x2415F8A4, sceKernelStopUnloadModule),
+    HLE_FUNCTION(0xBBE82155, sceKernelLoadModule),
+    HLE_FUNCTION(0x702425D5, sceKernelStartModule),
+    HLE_FUNCTION(0x3B2CBA09, sceKernelStopModule),
+    HLE_FUNCTION(0x1987920E, sceKernelUnloadModule),
     HLE_FUNCTION(0x15E2A45D, sceKernelCallModuleExit),
     HLE_FUNCTION(0xD11A5103, sceKernelGetModuleInfoByAddr),
 };
