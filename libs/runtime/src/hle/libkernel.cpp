@@ -316,6 +316,27 @@ u32 sceClibStrlcat(u32 dst, u32 src, u32 size) {
     return static_cast<u32>(dlen + slen);
 }
 
+// ---- known only by NID (roles from their callers)
+
+// 0x023EAA62: the game's libc calls it with a message when a standard stream does not open ("stdin : open failed"),
+// before printing its own summary: a debug output of a string. Logged.
+void debug_put_string(u32 text) {
+    nx::string s;
+    for (u32 i = 0; text && i < 1024 && memory().valid(text + i, 1); ++i) {
+        const char c = static_cast<char>(memory().host(text + i)[0]);
+        if (!c) break;
+        s.push_back(c);
+    }
+    nx::logw(logs::kernel, "guest (SceLibKernel 0x023EAA62): {}", s);
+}
+
+// 0x9F793F84: no arguments; Killzone's network module compares the result with 0x01800000 and 0x01500000 to choose
+// behaviours: the SDK version the program was built with, from its process parameters (0 without them).
+u32 process_sdk_version() {
+    const u32 param = runtime().process_param;
+    return param && memory().valid(param, 16) ? psv_ld32(param + 12) : 0;
+}
+
 // ---- failures
 
 // The console's OpenPSID (16 bytes identifying it): one fixed value here, the same on every run.
@@ -375,6 +396,8 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0x2F2C6046, sceClibAbort),
     HLE_FUNCTION(0x261E2C34, sceKernelGetOpenPsId),
     Function{0x37691BF8, "__stack_chk_fail", &entry<&stack_chk_fail>},
+    Function{0x023EAA62, "(SceLibKernel 0x023EAA62: debug output)", &entry<&debug_put_string>},
+    Function{0x9F793F84, "(SceLibKernel 0x9F793F84: the program's SDK version)", &entry<&process_sdk_version>},
     Function{0x4373B548, "__sce_aeabi_idiv0", &entry<&sce_aeabi_idiv0>},
     Function{0xFB235848, "__sce_aeabi_ldiv0", &entry<&sce_aeabi_ldiv0>},
 };
@@ -385,9 +408,18 @@ const Variable kLibKernelVariables[] = {
     {0x93B8AA67, "__stack_chk_guard", 4, &init_stack_guard},
 };
 
+// SceLibcParam's one variable (0xDF084DFA): the game's libc reads the process's libc parameters and falls back to this
+// block only when the process has none (its parameters older than version 5, or none given): a SceLibcParam whose size
+// is read first. Here an empty one (size 0): the libc's defaults.
+constexpr u32 kSceLibcParam = 0x5AD9C136;
+const Variable kLibcParamVariables[] = {
+    {0xDF084DFA, "(SceLibcParam 0xDF084DFA: default libc parameters)", 0x40, [](u8* host, u32) { std::memset(host, 0, 0x40); }},
+};
+
 }  // namespace
 
 void register_libkernel() {
+    register_library({"SceLibcParam", kSceLibcParam, {}, kLibcParamVariables});
     register_library({"SceLibKernel", kSceLibKernel, kLibKernel, kLibKernelVariables});
     register_library({"SceLibRng", kSceLibRng, kLibRng});
 }
@@ -426,6 +458,7 @@ void register_system_libraries() {
     register_sas();
     register_json();
     register_pvf();
+    register_mp4lib();
     register_commondialog();
 }
 

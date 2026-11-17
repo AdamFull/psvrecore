@@ -1,7 +1,10 @@
 // The audio decoders (SceAudiodecUser): ATRAC9 (LibAtrac9, as NGS's player), MP3 (minimp3: MPEG-1, 2 and 2.5) and
 // AAC (the PacketVideo decoder, as AvPlayer's), raw or ADTS; 16-bit PCM, interleaved, in the channels the decoder was
 // made for (a mono stream doubled for stereo; stereo's left for mono). CELP has no decoder here: its library starts,
-// but a decoder of its is refused (SCE_AUDIODEC_ERROR_UNSUPPORTED), named in the log.
+// but a decoder of its is refused (SCE_AUDIODEC_ERROR_UNSUPPORTED), named in the log. (It is MPEG-4 CELP, ISO/IEC
+// 14496-3: MPE excitation, 8 or 16 kHz, frames of up to 27 bytes for 320 samples. Decoding it needs the standard's
+// LSP and gain codebooks, which are not freely available and cannot be recovered from the one encoded sample the SDK
+// ships, without a decoded reference to check against; no surveyed game creates a CELP decoder.)
 //
 // The game's SceAudiodecCtrl: its size, the decoder's handle, the stream (pointer, bytes used, the most a call
 // reads), the PCM (pointer, bytes written, the most a call writes), the word length (16) and its SceAudiodecInfo,

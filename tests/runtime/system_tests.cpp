@@ -761,3 +761,18 @@ TEST_CASE("json: parsed text reads back through values, arrays and objects, and 
     CHECK(g_json_frees == g_json_allocs);
     CHECK(call32(ctx, kJson, kTerminate, {init}) == 0);
 }
+
+TEST_CASE("NID-only imports: SceMp4 answers as no MP4 reader, the kernel's debug output and SDK version, libc's parameters") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceMp4 = 0x8FEACABD;
+    CHECK(call32(ctx, kSceMp4, 0x05474AF0 /*open*/, {guest_string("app0:movie.mp4"), 0, 0, 0}) == 0);
+    for (u32 nid : {0x30E49E4Du, 0x8BE0E3D3u, 0xD5B26179u, 0x609E57ADu, 0x20A01112u, 0x920623C8u, 0xA7C09746u})
+        CHECK(u(call32(ctx, kSceMp4, nid, {0, 0, 0, 0})) == 0x80020004u);
+    call32(ctx, kSceLibKernel, 0x023EAA62, {guest_string("stdin : open failed")});
+    CHECK(call32(ctx, kSceLibKernel, 0x9F793F84, {}) == 0);  // (no process parameters in a test)
+    u32 at = 0;
+    REQUIRE(hle::find_variable(0x5AD9C136, "SceLibcParam", 0xDF084DFA, &at) != nullptr);
+    REQUIRE(at != 0);
+    CHECK(psv_ld32(at) == 0);  // (an empty block: the libc's defaults)
+}
