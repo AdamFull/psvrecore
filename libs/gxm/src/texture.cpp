@@ -286,6 +286,109 @@ void decode_bc8(u32 code, const u8* block, u8 out[16][4]) {
     }
 }
 
+// PVRTC 4bpp, the first and second generation (PVRTC-I, PVRTC-II): blocks of 4x4 texels, 64 bits each: the texels'
+// 2-bit modulation indices in the low word (row by row), and in the high word two colours C0 and C1 and the flags:
+// bit 32 M (the modulation mode); PVRTC-I: bit 47 C0 opaque, bit 63 C1 opaque; PVRTC-II: bit 47 H, bit 63 both
+// colours opaque. Opaque colours are R5G5B4 (C0) and R5G5B5 (C1), translucent ones A3R4G4B3 and A3R4G4B4, widened
+// to 8 bits (PVRTC-II gives C1's alpha a low bit of 1, so it reaches 255).
+//
+// A texel's colours come from the four blocks around it (P, Q, R, S: their centres the corners of the square the
+// texel lies in, wrapping at the edges), at (s, t) from P's centre. What it is depends on its own block's H and M:
+// - 0, 0: C0 and C1 interpolated between the four blocks, mixed by the index's weight (0, 3/8, 5/8, 1);
+// - 0, 1: the same colours, the index 0 C0, 1 their mean, 2 their mean with alpha 0 (PVRTC-II: transparent black),
+//   3 C1;
+// - 1, 0 (PVRTC-II): not interpolated: P's C0 and C1, mixed by the weight;
+// - 1, 1 (PVRTC-II): a local palette for each place in the square, from P, Q, R and S's colours.
+struct PvrtcColours {
+    i32 c[2][4];  // C0, C1 as 8-bit RGBA
+};
+
+PvrtcColours pvrtc_colours(u64 block, bool second) {
+    const u32 hi = static_cast<u32>(block >> 32);
+    const bool opaque1 = (hi >> 31) & 1, opaque0 = second ? opaque1 : ((hi >> 15) & 1);
+    const auto x5 = [](u32 v) { return static_cast<i32>((v << 3) | (v >> 2)); };
+    const auto x4 = [](u32 v) { return static_cast<i32>((v << 4) | v); };
+    const auto w4 = [](u32 v) { return (v << 1) | (v >> 3); };  // (4 bits to 5)
+    PvrtcColours out;
+    const u32 a = (hi >> 1) & 0x3FFF, b = (hi >> 16) & 0x7FFF;
+    if (opaque0) {
+        out.c[0][0] = x5(a >> 9), out.c[0][1] = x5((a >> 4) & 31), out.c[0][2] = x4(a & 15), out.c[0][3] = 255;
+    } else {
+        out.c[0][0] = x5(w4((a >> 7) & 15)), out.c[0][1] = x5(w4((a >> 3) & 15));
+        out.c[0][2] = x5(((a & 7) << 2) | ((a & 7) >> 1)), out.c[0][3] = x4(((a >> 11) & 7) << 1);
+    }
+    if (opaque1) {
+        out.c[1][0] = x5(b >> 10), out.c[1][1] = x5((b >> 5) & 31), out.c[1][2] = x5(b & 31), out.c[1][3] = 255;
+    } else {
+        out.c[1][0] = x5(w4((b >> 8) & 15)), out.c[1][1] = x5(w4((b >> 4) & 15)), out.c[1][2] = x5(w4(b & 15));
+        out.c[1][3] = x4((((b >> 12) & 7) << 1) | (second ? 1u : 0u));
+    }
+    return out;
+}
+
+// Mode 3's palette (PVRTC-II): for each index and place (t, s) in the square, the colour: P, Q, R or S (bits 0-1)
+// and C0 or C1 (bit 2), or P's 5/8 C0 + 3/8 C1 (8) or 3/8 C0 + 5/8 C1 (9).
+constexpr u8 kPvrtcPalette[4][4][4] = {
+    {{0, 0, 0, 0}, {0, 0, 0, 3}, {0, 0, 0, 3}, {0, 0, 3, 3}},
+    {{8, 4, 4, 4}, {4, 4, 4, 4}, {4, 4, 7, 7}, {4, 7, 7, 7}},
+    {{9, 1, 1, 1}, {2, 1, 1, 1}, {2, 2, 2, 1}, {2, 2, 2, 2}},
+    {{4, 5, 5, 5}, {6, 6, 5, 5}, {6, 6, 5, 5}, {6, 6, 6, 5}},
+};
+
+// A level's texels (RGBA in [0, 1]) from its blocks (bx x by, in rows).
+template <class Put>
+void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32 height, bool second, Put&& put) {
+    nx::vector<PvrtcColours> colours(blocks.size());
+    for (usize i = 0; i < blocks.size(); ++i) colours[i] = pvrtc_colours(blocks[i], second);
+    static constexpr i32 kWeight[4] = {0, 3, 5, 8};  // (eighths)
+    for (u32 y = 0; y < height; ++y) {
+        const u32 py = ((y + 4 * by - 2) / 4) % by, ry = (py + 1) % by, t = (y + 2) % 4;
+        for (u32 x = 0; x < width; ++x) {
+            const u32 px = ((x + 4 * bx - 2) / 4) % bx, qx = (px + 1) % bx, s = (x + 2) % 4;
+            const u64 block = blocks[usize{y / 4} * bx + x / 4];
+            const u32 index = static_cast<u32>(block >> (2 * ((y % 4) * 4 + x % 4))) & 3;
+            const bool m = (block >> 32) & 1, h = second && ((block >> 47) & 1);
+            const PvrtcColours* corner[4] = {&colours[usize{py} * bx + px], &colours[usize{py} * bx + qx],
+                                             &colours[usize{ry} * bx + px], &colours[usize{ry} * bx + qx]};
+            i32 out[4];
+            if (h && m) {
+                const u8 e = kPvrtcPalette[index][t][s];
+                const PvrtcColours& p = *corner[0];
+                for (u32 k = 0; k < 4; ++k)
+                    out[k] = e == 8   ? (5 * p.c[0][k] + 3 * p.c[1][k] + 4) / 8
+                             : e == 9 ? (3 * p.c[0][k] + 5 * p.c[1][k] + 4) / 8
+                                      : corner[e & 3]->c[e >> 2][k];
+            } else {
+                // (C0 and C1 at this texel, times 16)
+                i32 c[2][4];
+                const i32 wp = static_cast<i32>((4 - s) * (4 - t)), wq = static_cast<i32>(s * (4 - t)),
+                          wr = static_cast<i32>((4 - s) * t), ws = static_cast<i32>(s * t);
+                for (u32 j = 0; j < 2; ++j)
+                    for (u32 k = 0; k < 4; ++k)
+                        c[j][k] = h ? 16 * corner[0]->c[j][k]
+                                    : wp * corner[0]->c[j][k] + wq * corner[1]->c[j][k] + wr * corner[2]->c[j][k] +
+                                          ws * corner[3]->c[j][k];
+                if (m) {
+                    for (u32 k = 0; k < 4; ++k) {
+                        const i32 v = index == 0 ? c[0][k] : index == 3 ? c[1][k] : (c[0][k] + c[1][k]) / 2;
+                        out[k] = (v + 8) / 16;
+                    }
+                    if (index == 2) {
+                        out[3] = 0;
+                        if (second) out[0] = out[1] = out[2] = 0;
+                    }
+                } else {
+                    const i32 w = kWeight[index];
+                    for (u32 k = 0; k < 4; ++k) out[k] = ((8 - w) * c[0][k] + w * c[1][k] + 64) / 128;
+                }
+            }
+            f32 rgba[4];
+            for (u32 k = 0; k < 4; ++k) rgba[k] = static_cast<f32>(nx::clamp(out[k], 0, 255)) / 255.0f;
+            put(x, y, rgba);
+        }
+    }
+}
+
 // Swizzled addressing as two tables: swizzled_index(x, y, w, h) is a part from x's bits and a part from y's that do
 // not overlap, so the index of (x, y) is xs[x] + ys[y].
 struct SwizzleTables {
@@ -729,7 +832,7 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     const u32 code = code_of(t.base_format);
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
-    if (code >= kPVRT2 && code <= kPVRTII4) return failure("texture: PVRTC formats not implemented");
+    if (code == kPVRT2 || code == kPVRTII2) return failure("texture: PVRTC 2bpp formats not implemented");
     if (code >= kYUV420P2 && code <= kYUV422) return read_yuv(t, code, read);
     if (code >= kUBC4 && code <= kSBC5) return failure("texture: format not implemented");
     if (code == kX8S8S8U8 || code == kX8U24 || code == kU32 || code == kS32 || code == kSE5M9M9M9 ||
@@ -830,6 +933,24 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
             if (block_format(code)) {
                 // Blocks of 4x4 texels, in Morton order (swizzled layouts) or in rows of blocks.
                 const u32 bx = (lv.width + 3) / 4, by = (lv.height + 3) / 4;
+                if (code == kPVRT4 || code == kPVRTII4) {
+                    // (a texel needs the blocks around it: the level's blocks gathered first)
+                    const u32 pbx = nx::max(pw / 4, 1u), pby = nx::max(ph / 4, 1u);
+                    const SwizzleTables sw(is_swizzled(t.type) ? bx : 0, is_swizzled(t.type) ? by : 0, pbx, pby);
+                    nx::vector<u64> blocks(usize{bx} * by, 0);
+                    for (u32 y = 0; y < by; ++y)
+                        for (u32 x = 0; x < bx; ++x) {
+                            const u64 index = is_swizzled(t.type) ? sw.xs[x] + sw.ys[y] : u64{y} * bx + x;
+                            const u8* block = base + index * 8;
+                            if (block + 8 <= raw.data() + raw.size()) std::memcpy(&blocks[usize{y} * bx + x], block, 8);
+                        }
+                    decode_pvrtc4(blocks, bx, by, lv.width, lv.height, code == kPVRTII4, [&](u32 x, u32 y, const f32* rgba) {
+                        f32 v[4] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+                        put(dst + (usize{y} * lv.width + x) * out_bytes, v);
+                    });
+                    at += usize{lv.width} * lv.height * out_bytes;
+                    continue;
+                }
                 const u32 block_bytes = code == kUBC1 ? 8 : 16;
                 const u32 pbx = nx::max(pw / 4, 1u), pby = nx::max(ph / 4, 1u);
                 const SwizzleTables sw(is_swizzled(t.type) ? bx : 0, is_swizzled(t.type) ? by : 0, pbx, pby);

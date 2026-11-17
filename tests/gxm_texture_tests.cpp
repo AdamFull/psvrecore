@@ -318,3 +318,42 @@ TEST_CASE("gxm textures: unsigned packed floats (U2F10F10F10, F11F11F10) come ou
     CHECK(c[2] == 0x4400);
     CHECK(c[3] == 0x3C00);
 }
+
+TEST_CASE("gxm textures: PVRTC 4bpp (I and II): the weights, punch-through, and the alpha each generation reaches") {
+    // An 8 x 8 texture of four identical blocks (so every texel's four blocks are the same): texels 0-3 of the
+    // first row with indices 0-3, the rest 0.
+    auto texels = [](u32 base_format, u32 hi) {
+        Memory m;
+        const u64 block = (u64{hi} << 32) | (0u << 0) | (1u << 2) | (2u << 4) | (3u << 6);
+        m.bytes.resize(4 * 8);
+        for (u32 i = 0; i < 4; ++i) std::memcpy(m.bytes.data() + 8 * i, &block, 8);
+        TextureInfo t;
+        t.base_format = base_format;
+        t.type = texture_type::kSwizzled;
+        t.width = t.height = 8;
+        auto out = read_texels(t, [&](u32 address, void* o, u32 size) { return m.read(address, o, size); });
+        REQUIRE(out);
+        REQUIRE(out->bytes == 4);
+        nx::vector<u32> row(4);
+        std::memcpy(row.data(), out->data.data(), 16);
+        return row;
+    };
+    constexpr u32 kPvrtcII = 0x83000000, kPvrtcI = 0x81000000;
+    // Opaque (bit 63): C0 black, C1 white (R5G5B5 31, 31, 31): the weights 0, 3/8, 5/8, 1.
+    const u32 opaque = 0x80000000u | (0x7FFFu << 16);
+    auto a = texels(kPvrtcII, opaque);
+    CHECK(a[0] == 0xFF000000u);
+    CHECK(a[1] == 0xFF606060u);  // (96)
+    CHECK(a[2] == 0xFF9F9F9Fu);  // (159)
+    CHECK(a[3] == 0xFFFFFFFFu);
+    // Mode 1 (M, bit 32): index 1 the mean, index 2 transparent black in PVRTC-II.
+    auto b = texels(kPvrtcII, opaque | 1u);
+    CHECK(b[1] == 0xFF808080u);
+    CHECK(b[2] == 0x00000000u);
+    // Translucent C1 with alpha 7 (A3R4G4B4 0x7FFF): PVRTC-II's reaches 255, PVRTC-I's 0xEE (and in PVRTC-I, bit 63
+    // is C1's own flag: C0 stays opaque with bit 47 set).
+    const u32 translucent = 0x7FFFu << 16;
+    CHECK((texels(kPvrtcII, translucent)[3] >> 24) == 0xFFu);
+    CHECK((texels(kPvrtcI, translucent | 0x8000u)[3] >> 24) == 0xEEu);
+    CHECK((texels(kPvrtcI, translucent | 0x8000u)[0] >> 24) == 0xFFu);
+}
