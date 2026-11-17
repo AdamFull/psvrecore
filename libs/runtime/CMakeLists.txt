@@ -27,6 +27,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/online.cpp
     src/hle/processmgr.cpp
     src/hle/psn.cpp
+    src/hle/pvf.cpp
     src/hle/rtc.cpp
     src/hle/sas.cpp
     src/hle/services.cpp
@@ -46,6 +47,7 @@ add_library(psvrecore_runtime STATIC
     src/media/decoders.cpp
     src/media/mp4.cpp
     src/media/jpeg.cpp
+    src/media/font.cpp
     src/ngs/modules.cpp
     src/runtime.cpp
     src/savedata.cpp
