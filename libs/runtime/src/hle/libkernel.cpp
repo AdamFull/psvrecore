@@ -424,6 +424,7 @@ void register_system_libraries() {
     register_ime();
     register_voice();
     register_sas();
+    register_json();
     register_commondialog();
 }
 

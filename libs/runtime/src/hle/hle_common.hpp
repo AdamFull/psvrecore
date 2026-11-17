@@ -62,6 +62,7 @@ void register_codecengine();
 void register_ime();
 void register_voice();
 void register_sas();
+void register_json();
 void register_commondialog();
 
 }  // namespace psvrecore::runtime::hle

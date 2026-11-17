@@ -638,3 +638,126 @@ TEST_CASE("voice: PCM written to an input port reaches the PCM output ports conn
     CHECK(call32(ctx, kSceVoice, kEnd, {}) == 0);
     CHECK(u(call32(ctx, kSceVoice, kEnd, {})) == 0x804E0801u);
 }
+
+namespace {
+u32 g_json_allocs = 0, g_json_frees = 0, g_json_user = 0;
+void json_allocate(PsvContext* ctx, u32) {
+    g_json_user = ctx->r[2];
+    ctx->r[0] = scratch(ctx->r[1]);
+    ++g_json_allocs;
+}
+void json_deallocate(PsvContext* ctx, u32) {
+    if (ctx->r[1]) ++g_json_frees;
+}
+nx::string guest_text(u32 at) { return nx::string(reinterpret_cast<const char*>(current_runtime()->memory().host(at))); }
+}  // namespace
+
+TEST_CASE("json: parsed text reads back through values, arrays and objects, and everything allocated is freed") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kJson = 0x0854B69C;
+    constexpr u32 kInitC1 = 0x5405EE04, kInitialize = 0xA3EA44E9, kTerminate = 0x30AD8C6A, kAllocC2 = 0x5EC4F6CB;
+    constexpr u32 kStrC1 = 0x692125B6, kStrC1Text = 0x70703FC7, kStrD1 = 0xB70F12A8, kStrSize = 0xA15F63C1,
+                  kCStr = 0x327D74CE, kCompare = 0x267A86A3;
+    constexpr u32 kValC1 = 0x7A9DECC0, kValC1Int = 0x1B23D989, kValC1Obj = 0xE1DFAB01, kValD1 = 0xE07648EC,
+                  kValAssign = 0x705ED2BB, kType = 0xA95EF0EC, kGetString = 0xBC3391BE, kGetArray = 0x000926DB,
+                  kGetObject = 0xF793E30D, kGetInt = 0x6861C3CC, kGetUInt = 0x35EAAEDA, kGetReal = 0xFC0C699A,
+                  kGetBool = 0x7DDFCAE2, kKey = 0xD5B3E509, kCount = 0xF14E07A2, kSerialize = 0xCFC4D75F;
+    constexpr u32 kArrBegin = 0x82074D93, kArrEnd = 0x0F533297, kArrSize = 0x9DC07B95, kArrItNext = 0x24413A1E,
+                  kArrItDeref = 0x81EF83DC, kArrItNe = 0x5467A38D;
+    constexpr u32 kObjC1 = 0xB669382C, kObjD1 = 0x3CF6AF04, kObjIndex = 0x8F2E1720, kObjBegin = 0x192FE2BF,
+                  kObjEnd = 0xCB50C919, kObjItNext = 0xAEC3AD59, kObjItNe = 0x7B74D109, kObjItArrow = 0x8FA78056;
+    constexpr u32 kParse = 0x59B1A5B8;
+
+    GuestCode code;
+    const u32 allocate = code.add(&json_allocate), deallocate = code.add(&json_deallocate);
+    code.install();
+    g_json_allocs = g_json_frees = 0;
+    // The game's allocator: an object whose virtual table has allocate and deallocate after the two destructors.
+    const u32 vtable = scratch(20), allocator = scratch(4), init = scratch(4), param = scratch(12);
+    std::memset(t.rt.memory().host(vtable), 0, 20);
+    psv_st32(vtable + 8, allocate);
+    psv_st32(vtable + 12, deallocate);
+    call32(ctx, kJson, kAllocC2, {allocator});
+    psv_st32(allocator, vtable);  // (as the derived class's constructor does)
+    psv_st32(param, allocator), psv_st32(param + 4, 0x55), psv_st32(param + 8, 0);
+    const u32 v = scratch(24), text = guest_string(
+        "{\"name\":\"Steve\",\"n\":-5,\"big\":18446744073709551615,\"pi\":3.5,\"ok\":true,\"list\":[1,2,3],\"o\":{\"k\":\"v\\u00e9\"}}");
+    const u32 text_size = static_cast<u32>(guest_text(text).size());
+    call32(ctx, kJson, kValC1, {v});
+    CHECK(u(call32(ctx, kJson, kParse, {v, text, text_size})) == 0x80920110u);  // (not initialized)
+    call32(ctx, kJson, kInitC1, {init});
+    REQUIRE(call32(ctx, kJson, kInitialize, {init, param}) == 0);
+    CHECK(u(call32(ctx, kJson, kInitialize, {init, param})) == 0x80920111u);
+    REQUIRE(call32(ctx, kJson, kParse, {v, text, text_size}) == 0);
+    CHECK(g_json_user == 0x55);
+    CHECK(call32(ctx, kJson, kType, {v}) == 7);
+    CHECK(call32(ctx, kJson, kCount, {v}) == 7);
+    const auto key = [&](u32 value, const char* k) { return u(call32(ctx, kJson, kKey, {value, guest_string(k)})); };
+    CHECK(guest_text(u(call32(ctx, kJson, kCStr, {u(call32(ctx, kJson, kGetString, {key(v, "name")}))}))) == "Steve");
+    CHECK(static_cast<i64>(psv_ld64(u(call32(ctx, kJson, kGetInt, {key(v, "n")})))) == -5);
+    CHECK(call32(ctx, kJson, kType, {key(v, "big")}) == 3);
+    CHECK(psv_ld64(u(call32(ctx, kJson, kGetUInt, {key(v, "big")}))) == 0xFFFFFFFFFFFFFFFFull);
+    CHECK(std::bit_cast<f64>(psv_ld64(u(call32(ctx, kJson, kGetReal, {key(v, "pi")})))) == 3.5);
+    CHECK(t.rt.memory().host(u(call32(ctx, kJson, kGetBool, {key(v, "ok")})))[0] == 1);
+    CHECK(call32(ctx, kJson, kType, {key(v, "missing")}) == 0);
+    CHECK(psv_ld64(u(call32(ctx, kJson, kGetInt, {key(v, "name")}))) == 0);  // (not a number: the null integer)
+    const u32 inner = key(key(v, "o"), "k");
+    CHECK(guest_text(u(call32(ctx, kJson, kCStr, {u(call32(ctx, kJson, kGetString, {inner}))}))) == "v\xC3\xA9");
+
+    // The array, by its iterators.
+    const u32 list = u(call32(ctx, kJson, kGetArray, {key(v, "list")}));
+    CHECK(call32(ctx, kJson, kArrSize, {list}) == 3);
+    const u32 it = scratch(4), end = scratch(4);
+    call32(ctx, kJson, kArrBegin, {it, list});
+    call32(ctx, kJson, kArrEnd, {end, list});
+    i64 sum = 0;
+    for (u32 guard = 0; guard < 10 && call32(ctx, kJson, kArrItNe, {it, end}); ++guard) {
+        sum += static_cast<i64>(psv_ld64(u(call32(ctx, kJson, kGetInt, {u(call32(ctx, kJson, kArrItDeref, {it}))}))));
+        call32(ctx, kJson, kArrItNext, {it});
+    }
+    CHECK(sum == 6);
+    // The object's keys, in order.
+    const u32 object = u(call32(ctx, kJson, kGetObject, {v}));
+    call32(ctx, kJson, kObjBegin, {it, object});
+    call32(ctx, kJson, kObjEnd, {end, object});
+    nx::string keys;
+    for (u32 guard = 0; guard < 10 && call32(ctx, kJson, kObjItNe, {it, end}); ++guard) {
+        const u32 pair = u(call32(ctx, kJson, kObjItArrow, {it}));
+        keys += guest_text(u(call32(ctx, kJson, kCStr, {pair}))) + ",";
+        call32(ctx, kJson, kObjItNext, {it});
+    }
+    CHECK(keys == "name,n,big,pi,ok,list,o,");
+
+    // Built: an object holding x = 7, as a value, written out.
+    const u32 obj = scratch(4), name = scratch(4), seven = scratch(24), built = scratch(24), out = scratch(4);
+    call32(ctx, kJson, kObjC1, {obj});
+    call32(ctx, kJson, kStrC1Text, {name, guest_string("x")});
+    CHECK(call32(ctx, kJson, kStrSize, {name}) == 1);
+    CHECK(call32(ctx, kJson, kCompare, {name, guest_string("x")}) == 0);
+    CHECK(call32(ctx, kJson, kCompare, {name, guest_string("y")}) < 0);
+    call32(ctx, kJson, kValC1Int, {seven, 0, 7, 0});
+    call32(ctx, kJson, kValAssign, {u(call32(ctx, kJson, kObjIndex, {obj, name})), seven});
+    call32(ctx, kJson, kValC1Obj, {built, obj});
+    call32(ctx, kJson, kStrC1, {out});
+    REQUIRE(call32(ctx, kJson, kSerialize, {built, out}) == 0);
+    CHECK(guest_text(u(call32(ctx, kJson, kCStr, {out}))) == "{\"x\":7}");
+    // (a parse of what was written gives it again)
+    REQUIRE(call32(ctx, kJson, kSerialize, {v, out}) == 0);
+    const nx::string written = guest_text(u(call32(ctx, kJson, kCStr, {out})));
+    const u32 again = scratch(24), out2 = scratch(4);
+    call32(ctx, kJson, kValC1, {again});
+    REQUIRE(call32(ctx, kJson, kParse, {again, guest_string(written.c_str()), static_cast<u32>(written.size())}) == 0);
+    call32(ctx, kJson, kStrC1, {out2});
+    REQUIRE(call32(ctx, kJson, kSerialize, {again, out2}) == 0);
+    CHECK(guest_text(u(call32(ctx, kJson, kCStr, {out2}))) == written);
+    CHECK(u(call32(ctx, kJson, kParse, {again, guest_string("{\"a\":}"), 6})) == 0x80920101u);
+    CHECK(call32(ctx, kJson, kType, {again}) == 0);
+
+    for (u32 x : {v, seven, built, again}) call32(ctx, kJson, kValD1, {x});
+    call32(ctx, kJson, kObjD1, {obj});
+    for (u32 s : {name, out, out2}) call32(ctx, kJson, kStrD1, {s});
+    CHECK(g_json_allocs > 20);
+    CHECK(g_json_frees == g_json_allocs);
+    CHECK(call32(ctx, kJson, kTerminate, {init}) == 0);
+}
