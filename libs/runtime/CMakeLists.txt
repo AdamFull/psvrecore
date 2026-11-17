@@ -40,6 +40,7 @@ add_library(psvrecore_runtime STATIC
     src/memory.cpp
     src/media/decoders.cpp
     src/media/mp4.cpp
+    src/media/jpeg.cpp
     src/ngs/modules.cpp
     src/runtime.cpp
     src/savedata.cpp

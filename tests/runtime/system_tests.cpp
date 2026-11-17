@@ -1,6 +1,8 @@
 // System functions with little state of their own: memory block ranges, local time, I/O priorities, fibers' context
 // attachment, renaming and options.
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 
@@ -394,4 +396,86 @@ TEST_CASE("audio in, motion sensors, cameras, video decoder memory: silence at t
     CHECK(psv_ld32(mem) == 0);
     CHECK(call32(ctx, kSceVideodecUser, 0x230A78FF /*InitLibraryWithUnmapMem*/, {0x1001, ctrl, info}) == 0);
     CHECK(call32(ctx, kSceVideodecUser, 0x3A5F4924 /*TermLibrary*/, {0x1001}) == 0);
+}
+
+TEST_CASE("jpeg: an encoded picture decodes back to close to the colours given, as planes and as RGBA") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceJpegEncUser = 0x3748BFD3, kSceJpegUser = 0x880BF710;
+    constexpr u32 kEncSize = 0x2B55844D, kEncInitParam = 0x2E8FE45D, kEncCsc = 0x824A7D4F, kEncEncode = 0xC60DE94C,
+                  kEncHeader = 0x2F58B12C, kEncEnd = 0xC87AA849;
+    constexpr u32 kInit = 0xB030773B, kFinish = 0x62842598, kInfo = 0x353BA9B0, kYCbCr = 0x2A769BD8, kRgba = 0x6215B095,
+                  kCsc = 0xC2380E3A;
+    constexpr u32 w = 40, h = 24;  // (not whole 16 x 16 MCUs)
+    // Four flat areas: red, green, blue, grey.
+    const u32 rgba = scratch(w * h * 4);
+    u8* px = t.rt.memory().host(rgba);
+    const auto colour = [](u32 x, u32 y, u32 c) -> u8 {
+        static constexpr u8 k[4][3] = {{200, 30, 30}, {30, 200, 30}, {30, 30, 200}, {128, 128, 128}};
+        return k[(y >= 16) * 2 + (x >= 16)][c];  // (edges on 16 x 16 MCUs: no block straddles one)
+    };
+    for (u32 y = 0; y < h; ++y)
+        for (u32 x = 0; x < w; ++x)
+            for (u32 c = 0; c < 4; ++c) px[(y * w + x) * 4 + c] = c == 3 ? 255 : colour(x, y, c);
+
+    const u32 ctx_size = u(call32(ctx, kSceJpegEncUser, kEncSize, {}));
+    const u32 enc = scratch(ctx_size), planes = scratch(w * h * 2), out = scratch(0x10000), param = scratch(28);
+    const u32 p[7] = {28, w, h, 8 /*YCbCr 4:2:0*/, out, 0x10000, 0};
+    std::memcpy(t.rt.memory().host(param), p, 28);
+    REQUIRE(call32(ctx, kSceJpegEncUser, kEncInitParam, {enc, param}) == 0);
+    CHECK(u(call32(ctx, kSceJpegEncUser, kEncHeader, {enc, 2})) == 0x80650204u);
+    REQUIRE(call32(ctx, kSceJpegEncUser, kEncCsc, {enc, planes, rgba, w, 0}) == 0);
+    const i32 size = call32(ctx, kSceJpegEncUser, kEncEncode, {enc, planes});
+    REQUIRE(size > 0);
+    const u8* file = t.rt.memory().host(out);
+    CHECK(file[0] == 0xFF);
+    CHECK(file[1] == 0xD8);
+    CHECK(file[size - 2] == 0xFF);
+    CHECK(file[size - 1] == 0xD9);
+    // (motion JPEG headers: smaller, the Huffman tables left out)
+    REQUIRE(call32(ctx, kSceJpegEncUser, kEncHeader, {enc, 1}) == 0);
+    const u32 mjpeg = scratch(0x10000);
+    std::memcpy(t.rt.memory().host(mjpeg), file, static_cast<usize>(size));
+    const i32 mjpeg_size = call32(ctx, kSceJpegEncUser, kEncEncode, {enc, planes});
+    CHECK(mjpeg_size > 0);
+    CHECK(mjpeg_size < size);
+    CHECK(call32(ctx, kSceJpegEncUser, kEncEnd, {enc}) == 0);
+
+    const u32 info = scratch(52);
+    CHECK(u(call32(ctx, kSceJpegUser, kInfo, {mjpeg, u(size), u(-1), 0, info})) == 0x80650039u);  // (not started)
+    REQUIRE(call32(ctx, kSceJpegUser, kInit, {1}) == 0);
+    REQUIRE(call32(ctx, kSceJpegUser, kInfo, {mjpeg, u(size), u(-1), 0, info}) == 0);
+    CHECK(psv_ld32(info) == ((2u << 16) | 0x202));
+    CHECK(psv_ld32(info + 4) == (h << 16 | w));
+    CHECK(psv_ld32(info + 20) == 48);  // (Y padded to 16 x 16 MCUs)
+    CHECK(psv_ld32(info + 24) == 32);
+    CHECK(psv_ld32(info + 28) == 24);
+    CHECK(psv_ld32(info + 32) == 16);
+    const u32 planes_size = psv_ld32(info + 8);
+    CHECK(planes_size == 48 * 32 + 2 * 24 * 16);
+
+    const u32 ycbcr = scratch(planes_size), decoded = scratch(48 * 32 * 4), converted = scratch(w * h * 4);
+    CHECK(u(call32(ctx, kSceJpegUser, kYCbCr, {mjpeg, u(size), ycbcr, 16, 0, 0, 0})) == 0x80650041u);
+    REQUIRE(u(call32(ctx, kSceJpegUser, kYCbCr, {mjpeg, u(size), ycbcr, planes_size, 0, 0, 0})) == (w << 16 | h));
+    REQUIRE(u(call32(ctx, kSceJpegUser, kRgba, {mjpeg, u(size), decoded, 48 * 32 * 4, 0, 0, 0, 0, 0})) == (w << 16 | h));
+    REQUIRE(call32(ctx, kSceJpegUser, kCsc, {converted, ycbcr, w << 16 | h, w, 0, 0x202}) == 0);
+    // The motion JPEG frame (no Huffman tables) decodes the same.
+    const u32 ycbcr2 = scratch(planes_size);
+    REQUIRE(u(call32(ctx, kSceJpegUser, kYCbCr, {out, u(mjpeg_size), ycbcr2, planes_size, 1, 0, 0, 0})) == (w << 16 | h));
+    CHECK(std::memcmp(t.rt.memory().host(ycbcr), t.rt.memory().host(ycbcr2), planes_size) == 0);
+
+    // Each colour within a few steps of the original.
+    u32 worst = 0;
+    const u8* a = t.rt.memory().host(decoded);
+    const u8* b = t.rt.memory().host(converted);
+    for (u32 y : {3u, 8u, 15u, 16u, 20u, 23u})
+        for (u32 x : {0u, 4u, 12u, 15u, 16u, 25u, 34u, 39u})
+            for (u32 c = 0; c < 3; ++c) {
+                const i32 want = colour(x, y, c);
+                worst = std::max(worst, static_cast<u32>(std::abs(a[(y * 48 + x) * 4 + c] - want)));
+                worst = std::max(worst, static_cast<u32>(std::abs(b[(y * w + x) * 4 + c] - want)));
+            }
+    CHECK(worst <= 12);
+    CHECK(a[3] == 255);
+    CHECK(call32(ctx, kSceJpegUser, kFinish, {}) == 0);
 }

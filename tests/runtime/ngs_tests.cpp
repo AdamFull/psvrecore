@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "nxtest.h"
@@ -1028,6 +1029,50 @@ TEST_CASE("audiodec: ATRAC9 frames decode as at9tool decodes them; the library's
                     best_differ);
         CHECK(call32(ctx, kSceAudiodecUser, kClear, {ctrl}) == 0);
         CHECK(call32(ctx, kSceAudiodecUser, kDelete, {ctrl}) == 0);
+        ++checked;
+    }
+    CHECK(checked > 0);
+}
+
+// JPEG pictures and their luma as another decoder (libjpeg) decodes them, from PSVRECORE_JPEG_DIR (<name>.jpg and
+// <name>.y, made locally from the SDK's sample pictures: not in the repository). The luma within a step or two
+// (the IDCTs' rounding differs).
+TEST_CASE("jpeg: pictures decode to the luma another decoder gives") {
+    const auto dir = nx::os::environment_variable("PSVRECORE_JPEG_DIR");
+    if (!dir) {
+        std::printf("(PSVRECORE_JPEG_DIR not set: no JPEG pictures to check)\n");
+        return;
+    }
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceJpegUser = 0x880BF710, kInit = 0xB030773B, kInfo = 0x353BA9B0, kYCbCr = 0x2A769BD8;
+    REQUIRE(call32(ctx, kSceJpegUser, kInit, {1}) == 0);
+    auto entries = nx::fs::directory_entries(nx::fs::path_view(*dir));
+    REQUIRE(entries.has_value());
+    u32 checked = 0;
+    for (const auto& e : *entries) {
+        const nx::string path(e.path);
+        if (path.size() < 4 || path.substr(path.size() - 4) != ".jpg") continue;
+        const nx::vector<u8> jpg = read_file(path);
+        const nx::vector<u8> luma = read_file(path.substr(0, path.size() - 4) + ".y");
+        const u32 in = scratch(static_cast<u32>(jpg.size())), info = scratch(52);
+        std::memcpy(t.rt.memory().host(in), jpg.data(), jpg.size());
+        REQUIRE(call32(ctx, kSceJpegUser, kInfo, {in, static_cast<u32>(jpg.size()), 0xFFFFFFFF, 3, info}) == 0);
+        const u32 w = psv_ld32(info + 4) & 0xFFFF, h = psv_ld32(info + 4) >> 16, pitch = psv_ld32(info + 20);
+        REQUIRE(luma.size() == static_cast<usize>(w) * h);
+        const u32 size = psv_ld32(info + 8), out = scratch(size);
+        REQUIRE(static_cast<u32>(call32(ctx, kSceJpegUser, kYCbCr, {in, static_cast<u32>(jpg.size()), out, size, 3, 0, 0})) ==
+                (w << 16 | h));
+        const u8* y = t.rt.memory().host(out);
+        u32 worst = 0, off = 0;
+        for (u32 j = 0; j < h; ++j)
+            for (u32 i = 0; i < w; ++i) {
+                const u32 d = static_cast<u32>(std::abs(y[j * pitch + i] - luma[j * w + i]));
+                worst = std::max(worst, d);
+                off += d > 1;
+            }
+        std::printf("%s: %ux%u, luma off by %u at most (%u pixels by more than 1)\n", path.c_str(), w, h, worst, off);
+        CHECK(worst <= 2);
         ++checked;
     }
     CHECK(checked > 0);
