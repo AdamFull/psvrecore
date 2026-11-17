@@ -108,3 +108,13 @@ add_test(NAME psvrecore_platform_tests COMMAND psvrecore_platform_tests)
 
 # (nxtest exits with 77 when every case was skipped: no Vulkan device, no window)
 set_tests_properties(psvrecore_tests psvrecore_runtime_tests psvrecore_gpu_tests psvrecore_platform_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+# A program linked as a game's executable is, on the shared runtime library (PSVRECORE_SHARED): the start-up check
+# and what crosses the library's interface. Built next to the library, which it loads.
+if(PSVRECORE_SHARED)
+    add_executable(psvrecore_shared_tests shared/shared_tests.cpp)
+    target_link_libraries(psvrecore_shared_tests PRIVATE psvrecore::game)
+    psvrecore_target_defaults(psvrecore_shared_tests)
+    set_target_properties(psvrecore_shared_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    add_test(NAME psvrecore_shared_tests COMMAND psvrecore_shared_tests WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+endif()

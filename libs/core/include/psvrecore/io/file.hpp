@@ -6,6 +6,7 @@
 
 #include <span>
 
+#include "psvrecore/abi.h"
 #include "psvrecore/error.hpp"
 #include "core/foundation/core/foundation.h"
 #include "core/foundation/containers/blob.h"
@@ -14,10 +15,10 @@
 
 namespace psvrecore::io {
 
-Result<nx::blob<u8>> read_file(nx::fs::path_view path);
-Result<nx::string> read_text_file(nx::fs::path_view path);
-Result<void> write_file(nx::fs::path_view path, std::span<const u8> data);
-Result<void> write_text_file(nx::fs::path_view path, nx::string_view text);
+PSVRECORE_API Result<nx::blob<u8>> read_file(nx::fs::path_view path);
+PSVRECORE_API Result<nx::string> read_text_file(nx::fs::path_view path);
+PSVRECORE_API Result<void> write_file(nx::fs::path_view path, std::span<const u8> data);
+PSVRECORE_API Result<void> write_text_file(nx::fs::path_view path, nx::string_view text);
 
 // The bytes of a blob as a span (the blob keeps them).
 inline std::span<const u8> view(const nx::blob<u8>& data) { return {data.data(), data.size()}; }

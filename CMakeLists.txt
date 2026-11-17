@@ -26,6 +26,22 @@ endif()
 option(PSVRECORE_BUILD_TOOLS "Build host-side tools" ${_psvrecore_host_default})
 option(PSVRECORE_BUILD_TESTS "Build unit tests (no game data or SDK files required)" ${_psvrecore_host_default})
 option(PSVRECORE_PROFILER "Build Tracy into nx-foundation and compile its profiler zones" OFF)
+# The runtime as one shared library (psvrecore.dll, libpsvrecore.so.<ABI version>) that each game's executable links,
+# or (off) static libraries linked into the game. Static on Android, where each APK carries its runtime anyway. The
+# tests and tools link the static libraries either way.
+if(ANDROID)
+    set(_psvrecore_shared_default OFF)
+else()
+    set(_psvrecore_shared_default ON)
+endif()
+option(PSVRECORE_SHARED "Build the runtime as a shared library that games link (psvrecore::game)" ${_psvrecore_shared_default})
+if(PSVRECORE_SHARED)
+    if(CMAKE_VERSION VERSION_LESS 3.27)
+        message(FATAL_ERROR "PSVRECORE_SHARED needs CMake 3.27 or newer ($<COMPILE_ONLY>); or set PSVRECORE_SHARED=OFF")
+    endif()
+    # (everything that goes into the library, third-party code included, is compiled position-independent)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(PsvrecoreCompilerOptions)
@@ -63,6 +79,8 @@ endif()
 # the system libraries' functions. Tools load it at run time from here unless told otherwise.
 set(PSVRECORE_NID_DB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vita-headers/db/360" CACHE PATH
     "NID database the tools load by default")
+
+include(PsvrecoreShared)
 
 if(PSVRECORE_BUILD_TOOLS)
     add_subdirectory(tools/psvinfo)

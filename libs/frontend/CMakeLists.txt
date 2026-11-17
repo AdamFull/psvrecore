@@ -2,6 +2,7 @@
 # runtime with the GXM layer running the game's recompiled code.
 
 add_library(psvrecore_frontend STATIC
+    src/abi.cpp
     src/frontend.cpp
     src/layout.cpp
     src/script.cpp

@@ -430,7 +430,7 @@ Result<Settings> resolve_settings(const CommandLine& command_line, const nx::str
     return settings;
 }
 
-int run(const Game& game, int argc, char** argv) {
+int run_game(const Game& game, int argc, char** argv) {
     auto command_line = parse_command_line(game, argc, argv);
     const nx::string title(game.title);
     auto fail = [&](const nx::string& message, bool hidden) {

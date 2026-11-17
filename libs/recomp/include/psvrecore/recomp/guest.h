@@ -18,6 +18,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "psvrecore/abi.h"
+
 #ifdef __cplusplus
 extern "C" {
 #define PSV_RESTRICT __restrict
@@ -70,15 +72,15 @@ enum {
     PSV_TRAP_BIG_ENDIAN,         /* setend be */
 };
 
-PSV_NORETURN void psv_trap(PsvContext* ctx, uint32_t pc, uint32_t kind);
+PSVRECORE_API PSV_NORETURN void psv_trap(PsvContext* ctx, uint32_t pc, uint32_t kind);
 /* Calls the function at a code address (blx rN, and calls into the middle of nowhere). */
-void psv_call(PsvContext* ctx, uint32_t target, uint32_t ret);
+PSVRECORE_API void psv_call(PsvContext* ctx, uint32_t target, uint32_t ret);
 /* A jump through a register that is not a return: a tail call of the function at `target`, or a diagnostic. */
-void psv_jump(PsvContext* ctx, uint32_t target, uint32_t ret, uint32_t from);
+PSVRECORE_API void psv_jump(PsvContext* ctx, uint32_t target, uint32_t ret, uint32_t from);
 /* svc #imm */
-void psv_svc(PsvContext* ctx, uint32_t pc, uint32_t imm);
+PSVRECORE_API void psv_svc(PsvContext* ctx, uint32_t pc, uint32_t imm);
 /* wfe, yield: the thread may let others run. */
-void psv_yield(PsvContext* ctx);
+PSVRECORE_API void psv_yield(PsvContext* ctx);
 
 /* An imported function: the loader fills in `function` (a system library implementation, or another module's
  * export). */
@@ -89,7 +91,7 @@ typedef struct PsvImport {
     PsvFunction function;
 } PsvImport;
 
-void psv_import_missing(PsvContext* ctx, const PsvImport* import, uint32_t ret);
+PSVRECORE_API void psv_import_missing(PsvContext* ctx, const PsvImport* import, uint32_t ret);
 
 PSV_INLINE void psv_call_import(PsvContext* PSV_RESTRICT ctx, const PsvImport* import, uint32_t ret) {
     if (__builtin_expect(import->function == 0, 0)) {
@@ -133,7 +135,7 @@ typedef struct PsvModuleCode {
 /* ---- Guest memory ---------------------------------------------------------------------------------------------- */
 
 /* The host address of guest address 0: the runtime reserves the whole 32-bit guest space there. */
-extern uint8_t* psv_membase;
+extern PSVRECORE_API uint8_t* psv_membase;
 
 #ifdef PSV_ADDRESS_MASK /* (tests: every access folded into a small buffer) */
 #define PSV_HOST(a) (psv_membase + ((uint32_t)(a) & (uint32_t)PSV_ADDRESS_MASK))

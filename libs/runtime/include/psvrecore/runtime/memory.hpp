@@ -12,6 +12,7 @@
 #include <atomic>
 #include <span>
 
+#include "psvrecore/abi.h"
 #include "core/foundation/containers/map.h"
 #include "core/foundation/core/foundation.h"
 #include "core/foundation/strings/utf8_string.h"
@@ -91,7 +92,7 @@ public:
     u64 mapped_bytes(BlockKind kind, const Region& region) const;
 
     // True if [address, address + size) lies in mapped blocks (with write access if `write`).
-    bool valid(u32 address, u32 size, bool write = false) const;
+    PSVRECORE_API bool valid(u32 address, u32 size, bool write = false) const;
 
     // A guest NUL-terminated string at `address` (at most `max` bytes; empty if it is not in mapped memory).
     nx::string string(u32 address, u32 max = 4096) const;

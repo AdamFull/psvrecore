@@ -11,6 +11,7 @@
 
 #include <span>
 
+#include "psvrecore/abi.h"
 #include "psvrecore/error.hpp"
 #include "psvrecore/frontend/settings.hpp"
 #include "psvrecore/recomp/guest.h"
@@ -52,14 +53,21 @@ struct CommandLine {
     nx::string help_text;
 };
 
-Result<CommandLine> parse_command_line(const Game& game, int argc, const char* const* argv);
+PSVRECORE_API Result<CommandLine> parse_command_line(const Game& game, int argc, const char* const* argv);
 
 // The settings: defaults, then the settings file, then the command line. A missing settings file is written with
 // the defaults when it is the default one (so it can be edited); one named on the command line must exist.
-Result<Settings> resolve_settings(const CommandLine& command_line, const nx::string& default_file,
-                                  nx::string* file_used);
+PSVRECORE_API Result<Settings> resolve_settings(const CommandLine& command_line, const nx::string& default_file,
+                                                nx::string* file_used);
 
 // Runs the game; returns the program's exit code (the process may also end in it: guest threads are not joined).
-int run(const Game& game, int argc, char** argv);
+// run() is compiled into the game's executable: it first checks that the psvrecore it runs on is the one it was
+// built for (abi.h; with a shared psvrecore, another build of the library may sit next to the executable), then
+// runs the game in the library (run_game).
+PSVRECORE_API int run_game(const Game& game, int argc, char** argv);
+inline int run(const Game& game, int argc, char** argv) {
+    if (!psvrecore_check_abi(PSVRECORE_ABI_VERSION, PSVRECORE_BUILD_SIGNATURE, argc, argv)) return 2;
+    return run_game(game, argc, argv);
+}
 
 }  // namespace psvrecore::frontend

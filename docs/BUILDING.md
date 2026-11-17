@@ -5,7 +5,7 @@
 | | Windows | Linux | Android |
 | --- | --- | --- | --- |
 | Compiler | LLVM/Clang (clang-cl, MSVC ABI) with Visual Studio 2022's C++ tools and Windows SDK | Clang | Clang from the NDK (r27 or newer) |
-| Build | CMake ≥ 3.25, Ninja (Visual Studio's bundled ones work) | CMake ≥ 3.25, Ninja | CMake ≥ 3.25, Ninja |
+| Build | CMake ≥ 3.27, Ninja (Visual Studio's bundled ones work) | CMake ≥ 3.27, Ninja | CMake ≥ 3.25, Ninja |
 
 Submodules are required: `git submodule update --init --recursive`. That checks out nx-foundation and its own
 third-party code, vita-headers (whose NID database the tools read at run time), and the Vulkan side:
@@ -13,7 +13,8 @@ Vulkan-Headers, SPIRV-Headers, volk and VulkanMemoryAllocator. Nothing links aga
 opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used by the local checks only. The
 media decoders come the same way: LibAtrac9 (MIT) and openh264 (BSD-2-Clause) as submodules; the PacketVideo AAC
 decoder (Apache-2.0) is vendored in `third_party/pvaacdec` (its README says where from). The platform layer's
-SDL3 (zlib) is a submodule as well, built as a static library.
+SDL3 (zlib) is a submodule as well, built as a static library. (CMake 3.27 for the shared runtime library on
+Windows and Linux; with `PSVRECORE_SHARED=OFF`, 3.25 is enough.)
 
 ## Presets
 
@@ -53,11 +54,61 @@ discrete GPU.
 | --- | --- | --- |
 | `PSVRECORE_BUILD_TOOLS` | ON (OFF on Android) | Host tools |
 | `PSVRECORE_BUILD_TESTS` | ON (OFF on Android) | Unit tests |
+| `PSVRECORE_SHARED` | ON (OFF on Android) | The runtime as one shared library games link (`psvrecore.dll`, `libpsvrecore.so.<ABI version>`): see [The shared runtime library](#the-shared-runtime-library). OFF links it into each game statically |
 | `PSVRECORE_PROFILER` | OFF | Builds Tracy into nx-foundation and compiles profiler zones |
 | `PSVRECORE_NID_DB_DIR` | `third_party/vita-headers/db/360` | The NID database the tools load by default |
 | `PSVRECORE_FUZZ_SEED`, `PSVRECORE_FUZZ_BLOCKS` | `0x9E3779B97F4A7C15`, `2000` | Corpus of the generator-versus-interpreter test. A larger or different corpus, for example `scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000`, is a stress run |
 | `PSVRECORE_PROBES_DIR` | empty | Set by `scripts/probe_check.py` to build the probe runners from the code it generated. Leave it empty otherwise |
 | `PSVRECORE_PROGRAMS_DIR` | empty | The same for `scripts/program_check.py` and its program runners |
+
+## The shared runtime library
+
+On Windows and Linux the runtime is one shared library, `psvrecore.dll` / `libpsvrecore.so.<ABI version>`, and each
+game is an executable linked to it; on Android it is linked into each game's `libmain.so` (`PSVRECORE_SHARED=OFF`).
+The library holds the runtime (kernel, system libraries, loader), gxm, vulkan, platform and frontend, nx-foundation and
+its allocator, and the third-party code they use (SDL3, openh264, LibAtrac9, the AAC decoder, volk, VMA, zlib), which
+stays internal. The tests and the tools link the same code as static libraries, as before.
+
+A game links two targets: `psvrecore::game` for its executable (the frontend, nx-foundation's headers) and
+`psvrecore::generated_code` for its recompiled modules (`guest.h`). With `PSVRECORE_SHARED=OFF` they are the static
+libraries, so a game's CMake is the same either way. The generated code stays in the game's executable; it reaches
+the runtime through the functions `guest.h` declares and `psv_membase`.
+
+```cmake
+add_subdirectory(psvrecore)
+add_executable(mygame src/main.cpp)
+target_link_libraries(mygame PRIVATE psvrecore::game)
+add_library(mygame_code STATIC ${generated_sources})
+target_link_libraries(mygame_code PUBLIC psvrecore::generated_code)
+psvrecore_generated_code(mygame_code)
+target_link_libraries(mygame PRIVATE mygame_code)
+```
+
+The library is written to the top of the build folder, next to the game's executable (`build/<preset>/`), where
+Windows finds the DLL and the Linux build's run path points.
+
+What it exports is marked `PSVRECORE_API` (`psvrecore/abi.h`): the frontend's entry, the services generated code
+calls, the function registry (`recomp/support.hpp`), whole-file I/O and the few runtime calls a game's own additions
+make. nx-foundation's and mimalloc's functions are exported too: a game's executable uses nx-foundation's strings,
+containers and log through psvrecore's interface, and the process has one heap and one log. On Windows a module
+definition file lists them (`cmake/PsvrecoreExports.cmake`), with SDL_RunApp (the `main` that SDL_main.h gives a
+Windows executable calls it); on Linux psvrecore's own code is compiled with `-fvisibility=hidden` and the archives
+linked in are hidden (`--exclude-libs`).
+
+**The rule: a game and the psvrecore it runs on are built with the same compiler version and the same settings**
+(the same Clang, the same C++ library and C runtime, both release or both debug), from the same psvrecore sources.
+The interface is C++ (nx-foundation's types cross it), and only that makes their layouts agree. Building a game in
+the same build tree as psvrecore (its submodule, `add_subdirectory`) gives that by construction; a Linux distribution
+packaging `libpsvrecore` builds the games with the same toolchain.
+
+**The ABI version.** `PSVRECORE_ABI_VERSION` (in `abi.h`) changes whenever an exported function's parameters, a type
+passed through the interface (`frontend::Game`, `PsvContext`, `PsvModuleCode`, ...) or what generated code expects of
+the runtime changes. A game's executable carries the version and the build signature (compiler, C++ library, debug
+or release) it was compiled with: `frontend::run`, compiled into the executable, hands them to the library before
+anything else, and the library refuses to start a game built for another version, or with another compiler or
+settings, saying which and what to do (on standard error, and in a message box unless `--hidden`). On Linux the ABI
+version is also the library's `SOVERSION`: a game asks for `libpsvrecore.so.<its version>`, so the libraries of
+different versions can be installed side by side.
 
 ## Probes (needs the PS Vita SDK)
 

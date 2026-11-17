@@ -30,7 +30,8 @@ components (M5 and later) are not written yet.
 user's game files ─► extraction / decryption (keys supplied by the user) ─► executable modules + data
 modules ─► analysis (module info, imports/exports, relocations, functions, control flow) ─► C sources
 shader programs ─► translation ─► SPIR-V
-C sources + runtime + game code ─► Clang ─► native executable (Windows, Linux) or libmain.so (Android)
+C sources + game code ─► Clang ─► native executable on the runtime library psvrecore.dll / libpsvrecore.so.N
+                                  (Windows, Linux), or libmain.so with the runtime linked in (Android)
 ```
 
 Everything generated stays on the user's machine.
@@ -53,8 +54,22 @@ Everything generated stays on the user's machine.
 | `platform` | SDL3: a window and its Vulkan swapchain (the frames a game displays, scaled to fit), the audio device (a stream per port), and gamepads, keyboard, mouse and touch for the runtime's input; on Android, landscape full screen; later an ImGui overlay and on-screen controls |
 | `frontend` | The program a game becomes: the game's description (`frontend::Game`), the settings file and the command line over it, scripted controls for smoke tests, and the run loop (window, sound, runtime, GXM) |
 
+One shared library, `psvrecore` (`psvrecore.dll`, `libpsvrecore.so.<ABI version>`), holds `core`, `formats`, `arm`,
+`analysis`, `recomp`'s support code, `runtime`, `usse`, `gxm`, `vulkan`, `platform` and `frontend`, with
+nx-foundation and the third-party code inside it; each game is an executable with its recompiled code on it. On
+Android (and with `PSVRECORE_SHARED=OFF`) the same libraries are linked statically. The tests and tools link the
+static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
+
 ## Key design points
 
+- **The runtime library's interface.** What a game's executable and its generated code call is exported
+  (`PSVRECORE_API`, `psvrecore/abi.h`): the frontend's entry, `guest.h`'s services and `psv_membase`, the function
+  registry, whole-file I/O, and nx-foundation (its strings, containers, log and allocator: one heap and one log in
+  the process); nothing else. The interface is C++, kept sound by one rule: game and runtime are built with the same
+  compiler version and settings. A versioned check enforces it at start-up: the executable passes the ABI version
+  and build signature it was compiled with, and the library refuses a mismatch with a message saying what to
+  rebuild. State that must exist once (the HLE registry, the kernel, the function registry, the log) is in the
+  library, so it exists once as before. If the C++ boundary proves fragile, the exported surface can become plain C.
 - **Instruction model.** The decoder turns ARM and Thumb encodings into one description: an operation, a condition,
   flags and up to six typed operands. The same operation decodes to the same description whichever instruction set
   and encoding it comes from, so the code generator implements each operation once.
