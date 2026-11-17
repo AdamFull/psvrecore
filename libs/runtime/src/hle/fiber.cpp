@@ -206,24 +206,59 @@ i32 sceFiberReturnToThread(PsvContext* ctx, u32 arg_on_return, Ptr<u32> arg_on_r
     return 0;
 }
 
-// Gives a fiber made without context memory its memory, then resumes it as sceFiberRun (from a thread) or
-// sceFiberSwitch (from a fiber) would.
-i32 _sceFiberAttachContextAndSwitch(PsvContext* ctx, Ptr<u8> fiber, u32 context, u32 context_size, u32 arg_on_run_to,
-                                    Ptr<u32> arg_on_run) {
+// Gives a fiber made without context memory its memory, then resumes it as sceFiberRun (from a thread: `from_thread`)
+// or sceFiberSwitch (from a fiber) would.
+i32 attach_and_resume(PsvContext* ctx, Ptr<u8> fiber, u32 context, u32 context_size, u32 arg_on_run_to, Ptr<u32> arg_back,
+                      bool from_thread) {
     if (!fiber || !context) return kNull;
     if ((context & 7) || (context_size & 7)) return kAlignment;
     if (context_size < kContextMinimum) return kRange;
     if (!writable(context, context_size)) return kInvalid;
     ThreadFibers& t = this_thread(ctx);
+    if (from_thread && t.current) return kPermission;
     Fiber* f = find(fiber.address);
     if (!f) return kInvalid;
     if (f->running || f->started) return kState;
     f->context = context, f->context_size = context_size;
     nx::logd(logs::hle, "fiber '{}' (0x{:08x}): context 0x{:08x}, 0x{:x} bytes attached", f->name, f->guest, context, context_size);
     const u32 back = resume(t, f, arg_on_run_to);
-    if (arg_on_run && writable(arg_on_run.address, 4)) *arg_on_run = back;
+    if (arg_back && writable(arg_back.address, 4)) *arg_back = back;
     return 0;
 }
+i32 _sceFiberAttachContextAndSwitch(PsvContext* ctx, Ptr<u8> fiber, u32 context, u32 context_size, u32 arg_on_run_to,
+                                    Ptr<u32> arg_on_run) {
+    return attach_and_resume(ctx, fiber, context, context_size, arg_on_run_to, arg_on_run, false);
+}
+i32 _sceFiberAttachContextAndRun(PsvContext* ctx, Ptr<u8> fiber, u32 context, u32 context_size, u32 arg_on_run_to,
+                                 Ptr<u32> arg_on_return) {
+    return attach_and_resume(ctx, fiber, context, context_size, arg_on_run_to, arg_on_return, true);
+}
+
+// SceFiberOptParam: 128 reserved bytes, zeroed.
+i32 sceFiberOptParamInitialize(Ptr<u8> opt) {
+    if (!opt) return kNull;
+    if (opt.address & 7) return kAlignment;
+    if (!writable(opt.address, 128)) return kInvalid;
+    std::memset(opt.get(), 0, 128);
+    return 0;
+}
+
+// The running fiber's name (what sceFiberGetInfo reports).
+i32 sceFiberRenameSelf(PsvContext* ctx, Ptr<const char> name) {
+    if (!name) return kNull;
+    ThreadFibers& t = this_thread(ctx);
+    if (!t.current) return kPermission;
+    Fibers& fs = fibers();
+    nx::scoped_lock<nx::mutex> held(fs.lock);
+    t.current->name = str(name, 31);
+    return 0;
+}
+
+// The context memory's use is not measured (sceFiberGetInfo's margin stays 0); profiler markers are not recorded.
+i32 sceFiberStartContextSizeCheck(u32 /*flags*/) { return 0; }
+i32 sceFiberStopContextSizeCheck() { return 0; }
+i32 sceFiberPushUserMarkerWithHud(Ptr<const char> /*name*/, u32 /*color*/, u32 /*flags*/) { return 0; }
+i32 sceFiberPopUserMarkerWithHud() { return 0; }
 
 // SceFiberInfo (128 bytes): the entry, its argument, the context memory and its size, the name (32 bytes), and the
 // context's unused margin (not measured: 0).
@@ -260,6 +295,13 @@ const Function kFiber[] = {
     HLE_FUNCTION(0xC6A3F9BB, _sceFiberInitializeWithInternalOptionImpl),
     HLE_FUNCTION(0xE00B9AFE, _sceFiberAttachContextAndSwitch),
     HLE_FUNCTION(0x189599B4, sceFiberGetInfo),
+    HLE_FUNCTION(0x7D0C7DDB, _sceFiberAttachContextAndRun),
+    HLE_FUNCTION(0x801AB334, sceFiberOptParamInitialize),
+    HLE_FUNCTION(0xDD50DF3D, sceFiberRenameSelf),
+    HLE_FUNCTION(0xCD543A71, sceFiberStartContextSizeCheck),
+    HLE_FUNCTION(0x67F70867, sceFiberStopContextSizeCheck),
+    HLE_FUNCTION(0x9C414B09, sceFiberPushUserMarkerWithHud),
+    HLE_FUNCTION(0x4EC01F9C, sceFiberPopUserMarkerWithHud),
 };
 
 // libult's hooks into the system's user-level object manager, its debugger support and the Razor profiler: nothing

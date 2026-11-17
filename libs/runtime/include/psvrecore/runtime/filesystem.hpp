@@ -116,6 +116,8 @@ public:
     i32 rmdir(nx::string_view path);
     i32 remove(nx::string_view path);
     i32 rename(nx::string_view from, nx::string_view to);
+    // Whether a file or folder descriptor is open.
+    bool is_open(i32 fd) const { return handle(fd) != nullptr; }
 
 private:
     static constexpr i32 kStdin = 1, kStdout = 2, kStderr = 3;

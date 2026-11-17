@@ -4,6 +4,8 @@
 
 #include <cstring>
 
+#include "core/foundation/containers/hash_map.h"
+
 namespace psvrecore::runtime::hle {
 
 namespace {
@@ -22,7 +24,9 @@ i32 sceIoOpen(Ptr<const char> path, i32 flags, i32 mode) {
     nx::logd(logs::io, "sceIoOpen('{}', 0x{:x}) = 0x{:08x}", p, static_cast<u32>(flags), static_cast<u32>(r));
     return r;
 }
+void forget_priority(i32 fd);
 i32 sceIoClose(i32 fd) {
+    forget_priority(fd);
     const i32 r = files().close(fd);
     nx::logd(logs::io, "sceIoClose(0x{:x}) = 0x{:08x}", fd, static_cast<u32>(r));
     return r;
@@ -136,7 +140,76 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0x54ABACFA, sceIoIoctl),
 };
 
+// I/O priorities (1 highest to 15 lowest): kept, as nothing here schedules I/O by them. A file's priority is the one
+// set for it, else its opener's thread default, else the process default; a thread's default of 0 is "the process's".
+constexpr i32 kIoPriorityHighest = 1, kIoPriorityLowest = 15, kIoPriorityProcessDefault = 14;
+struct IoPriorities {
+    nx::mutex lock;
+    i32 process = kIoPriorityProcessDefault;
+    nx::hash_map<i32, i32> threads, files;
+};
+IoPriorities& io_priorities() {
+    static IoPriorities p;
+    return p;
+}
+void forget_priority(i32 fd) {
+    IoPriorities& p = io_priorities();
+    nx::scoped_lock<nx::mutex> held(p.lock);
+    p.files.erase(fd);
+}
+bool valid_priority(i32 p) { return p >= kIoPriorityHighest && p <= kIoPriorityLowest; }
+i32 default_priority(IoPriorities& p) {
+    auto it = p.threads.find(kernel().current_thread_id());
+    return it != p.threads.end() && it->second ? it->second : p.process;
+}
+i32 sceIoSetPriority(i32 fd, i32 priority) {
+    if (!valid_priority(priority)) return err::kInvalidArgument;
+    if (!files().is_open(fd)) return err::kBadFile;
+    IoPriorities& p = io_priorities();
+    nx::scoped_lock<nx::mutex> held(p.lock);
+    p.files[fd] = priority;
+    return 0;
+}
+i32 sceIoGetPriority(i32 fd) {
+    if (!files().is_open(fd)) return err::kBadFile;
+    IoPriorities& p = io_priorities();
+    nx::scoped_lock<nx::mutex> held(p.lock);
+    auto it = p.files.find(fd);
+    return it != p.files.end() ? it->second : default_priority(p);
+}
+i32 sceIoSetProcessDefaultPriority(i32 priority) {
+    if (!valid_priority(priority)) return err::kInvalidArgument;
+    IoPriorities& p = io_priorities();
+    nx::scoped_lock<nx::mutex> held(p.lock);
+    p.process = priority;
+    return 0;
+}
+i32 sceIoGetProcessDefaultPriority() {
+    IoPriorities& p = io_priorities();
+    nx::scoped_lock<nx::mutex> held(p.lock);
+    return p.process;
+}
+i32 sceIoSetThreadDefaultPriority(i32 priority) {
+    if (priority != 0 && !valid_priority(priority)) return err::kInvalidArgument;
+    IoPriorities& p = io_priorities();
+    nx::scoped_lock<nx::mutex> held(p.lock);
+    p.threads[kernel().current_thread_id()] = priority;
+    return 0;
+}
+i32 sceIoGetThreadDefaultPriority() {
+    IoPriorities& p = io_priorities();
+    nx::scoped_lock<nx::mutex> held(p.lock);
+    auto it = p.threads.find(kernel().current_thread_id());
+    return it != p.threads.end() ? it->second : 0;
+}
+
 const Function kIofilemgr[] = {
+    HLE_FUNCTION(0x14B2D56C, sceIoSetPriority),
+    HLE_FUNCTION(0xF2A472A1, sceIoGetPriority),
+    HLE_FUNCTION(0x7F2ABBAF, sceIoSetProcessDefaultPriority),
+    HLE_FUNCTION(0x0DC4F1BB, sceIoGetProcessDefaultPriority),
+    HLE_FUNCTION(0x49312108, sceIoSetThreadDefaultPriority),
+    HLE_FUNCTION(0xA176CD03, sceIoGetThreadDefaultPriority),
     HLE_FUNCTION(0xC70B8886, sceIoClose),
     HLE_FUNCTION(0xFDB32293, sceIoRead),
     HLE_FUNCTION(0x34EFD876, sceIoWrite),
@@ -148,6 +221,13 @@ const Function kIofilemgr[] = {
 }  // namespace
 
 void register_iofilemgr() {
+    {
+        IoPriorities& p = io_priorities();
+        nx::scoped_lock<nx::mutex> held(p.lock);
+        p.process = kIoPriorityProcessDefault;
+        p.threads.clear();
+        p.files.clear();
+    }
     register_library({"SceLibKernel", kSceLibKernel, kLibKernel});
     register_library({"SceIofilemgr", kSceIofilemgr, kIofilemgr});
 }

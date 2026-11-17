@@ -114,6 +114,24 @@ u32 time_tm(Ptr<const u32> t, Ptr<Tm> out, bool local) {
     put_tm(out.get(), tm);
     return out.address;
 }
+// A local time (tm, the full year) to seconds since 1970, with tm normalized as mktime does it (its fields brought
+// into range, the week day and year day set); -1 when it cannot be represented.
+u32 sceKernelLibcMktime(Ptr<Tm> in) {
+    if (!in || !writable(in.address, sizeof(Tm))) return ~0u;
+    std::tm tm{};
+    tm.tm_sec = in->sec;
+    tm.tm_min = in->min;
+    tm.tm_hour = in->hour;
+    tm.tm_mday = in->mday;
+    tm.tm_mon = in->mon;
+    tm.tm_year = in->year - 1900;
+    tm.tm_isdst = in->isdst > 0 ? 1 : in->isdst < 0 ? -1 : 0;
+    const std::time_t t = std::mktime(&tm);
+    if (t == static_cast<std::time_t>(-1) || t < 0 || t > 0xFFFFFFFE) return ~0u;
+    put_tm(in.get(), tm);
+    return static_cast<u32>(t);
+}
+
 u32 sceKernelLibcGmtime_r(Ptr<const u32> t, Ptr<Tm> out) { return time_tm(t, out, false); }
 u32 sceKernelLibcLocaltime_r(Ptr<const u32> t, Ptr<Tm> out) { return time_tm(t, out, true); }
 
@@ -131,6 +149,7 @@ const Function kProcessmgr[] = {
     HLE_FUNCTION(0x9E45DA09, sceKernelLibcClock),
     HLE_FUNCTION(0xBCA437CD, sceKernelLibcGmtime_r),
     HLE_FUNCTION(0x94F041ED, sceKernelLibcLocaltime_r),
+    HLE_FUNCTION(0x890BDC39, sceKernelLibcMktime),
     HLE_FUNCTION(0x2252890C, sceKernelPowerTick),
     HLE_FUNCTION(0xEB6E50BB, sceKernelCallAbortHandler),
 };
@@ -139,7 +158,11 @@ const Function kProcessmgr[] = {
 i32 sceAppMgrAcquireBgmPort() { return 0; }
 i32 sceAppMgrReleaseBgmPort() { return 0; }
 
+// (the system's information bar over the game: none is drawn here)
+i32 sceAppMgrSetInfobarState(i32 /*state*/, i32 /*color*/, i32 /*transparency*/) { return 0; }
+
 const Function kAppMgr[] = {
+    HLE_FUNCTION(0xAD9022A1, sceAppMgrSetInfobarState),
     HLE_FUNCTION(0xFFF8F7F0, sceAppMgrIsGameProgram),
     HLE_FUNCTION(0xAFCEAB96, sceAppMgrAcquireBgmPort),
     HLE_FUNCTION(0xF3717E37, sceAppMgrReleaseBgmPort),

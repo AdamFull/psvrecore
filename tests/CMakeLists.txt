@@ -66,6 +66,7 @@ add_executable(psvrecore_runtime_tests
     runtime/ngs_tests.cpp
     runtime/savedata_tests.cpp
     runtime/kernel_tests.cpp
+    runtime/system_tests.cpp
 )
 target_include_directories(psvrecore_runtime_tests PRIVATE "${_nxtest_dir}" runtime)
 target_link_libraries(psvrecore_runtime_tests PRIVATE psvrecore::runtime psvrecore_runtime_test_guest nx::foundation)

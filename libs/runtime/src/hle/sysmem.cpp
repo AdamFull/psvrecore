@@ -102,10 +102,7 @@ i32 sceKernelFindMemBlockByAddr(u32 address, u32 size) {
     return b.uid;
 }
 
-i32 sceKernelGetMemBlockInfoByAddr(u32 address, Ptr<MemBlockInfo> out) {
-    if (!writable(out.address, 4)) return err::kIllegalAddress;
-    Block b;
-    if (!memory().find(address, &b) || b.kind != BlockKind::MemBlock) return err::kUnknownUid;
+i32 block_info(const Block& b, Ptr<MemBlockInfo> out) {
     MemBlockInfo info{};
     info.size = out->size;
     info.mapped_base = b.base;
@@ -115,6 +112,22 @@ i32 sceKernelGetMemBlockInfoByAddr(u32 address, Ptr<MemBlockInfo> out) {
     info.type = b.type;
     std::memcpy(out.get(), &info, std::min<u32>(info.size ? info.size : sizeof info, sizeof info));
     return err::kOk;
+}
+
+i32 sceKernelGetMemBlockInfoByAddr(u32 address, Ptr<MemBlockInfo> out) {
+    if (!writable(out.address, 4)) return err::kIllegalAddress;
+    Block b;
+    if (!memory().find(address, &b) || b.kind != BlockKind::MemBlock) return err::kUnknownUid;
+    return block_info(b, out);
+}
+
+// The same for a range, which must lie within one block.
+i32 sceKernelGetMemBlockInfoByRange(u32 address, u32 size, Ptr<MemBlockInfo> out) {
+    if (!writable(out.address, 4)) return err::kIllegalAddress;
+    Block b;
+    if (!memory().find(address, &b) || b.kind != BlockKind::MemBlock) return err::kUnknownUid;
+    if (u64{address} + size > u64{b.base} + b.size) return err::kUnknownUid;
+    return block_info(b, out);
 }
 
 i32 sceKernelGetFreeMemorySize(Ptr<FreeMemorySizeInfo> out) {
@@ -139,6 +152,7 @@ const Function kSysmem[] = {
     HLE_FUNCTION(0xB8EF5818, sceKernelGetMemBlockBase),
     HLE_FUNCTION(0xA33B99D1, sceKernelFindMemBlockByAddr),
     HLE_FUNCTION(0x4010AD65, sceKernelGetMemBlockInfoByAddr),
+    HLE_FUNCTION(0x006F3DB4, sceKernelGetMemBlockInfoByRange),
     HLE_FUNCTION(0x87CC580B, sceKernelGetFreeMemorySize),
     HLE_FUNCTION(0x1453A5E5, sceKernelIsPSVitaTV),
 };

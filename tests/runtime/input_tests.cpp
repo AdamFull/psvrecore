@@ -107,6 +107,39 @@ TEST_CASE("ctrl: a press and release between two blanks still shows; a slow read
     CHECK(call32(ctx, kSceCtrl, kPeek, {5, buf, 1}) < 0);
 }
 
+TEST_CASE("ctrl: a rapid-fire rule presses its target on and off while its trigger is held, after its delay") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Kernel& k = t.rt.kernel();
+    constexpr u32 kSetRapidFire = 0xE9CB69C8, kClearRapidFire = 0xD8294C9C;
+    const u32 buf = scratch(64 * 32), rule = scratch(24);
+    const u32 words[6] = {kCross, kCross, kCircle, 2, 2, 1};  // mask, trigger, target, delay, make, break
+    std::memcpy(t.rt.memory().host(rule), words, sizeof words);
+    CHECK(call32(ctx, kSceCtrl, kSetRapidFire, {1, 0, rule}) < 0);   // (port 0 only)
+    CHECK(call32(ctx, kSceCtrl, kSetRapidFire, {0, 16, rule}) < 0);  // (16 rules)
+    CHECK(call32(ctx, kSceCtrl, kSetRapidFire, {0, 0, 0}) < 0);
+    REQUIRE(call32(ctx, kSceCtrl, kSetRapidFire, {0, 3, rule}) == 0);
+    REQUIRE(call32(ctx, kSceCtrl, kRead, {0, buf, 64}) >= 1);
+    PadState held;
+    held.buttons = kCross;
+    t.rt.input().set_pad(held, k.clock_ns());
+    k.delay_thread(static_cast<u32>(9.5 * period_us(t)), false);
+    const i32 n = call32(ctx, kSceCtrl, kRead, {0, buf, 64});
+    REQUIRE(n >= 8);
+    nx::string seen;
+    for (i32 i = 0; i < 8; ++i) {
+        CHECK((data(t, buf, i).buttons & kCross) != 0);
+        seen += (data(t, buf, i).buttons & kCircle) ? '1' : '0';
+    }
+    CHECK(seen == "00110110");  // (two samples' delay, then two on and one off)
+    // Cleared: the target reads as it is.
+    REQUIRE(call32(ctx, kSceCtrl, kClearRapidFire, {0, 3}) == 0);
+    CHECK(call32(ctx, kSceCtrl, kClearRapidFire, {0, 99}) < 0);
+    k.delay_thread(static_cast<u32>(3.5 * period_us(t)), false);
+    const i32 m = call32(ctx, kSceCtrl, kRead, {0, buf, 64});
+    for (i32 i = 1; i < m; ++i) CHECK(data(t, buf, i).buttons == kCross);
+}
+
 TEST_CASE("touch: panel information, sampling state, reports") {
     TestRuntime t;
     PsvContext* ctx = t.ctx();

@@ -4,6 +4,9 @@
 // (Runtime::input); timestamps are the blank's process time. Port 0 is the system's buttons and sticks; ports 1-4
 // (wireless controllers on a PlayStation TV) read as controllers doing nothing. The *2 functions report L and R as
 // L1 and R1, with a pressure of 255 for each pressed button. In the buttons-only mode the sticks read as centred.
+// Rapid-fire rules (up to 16 a port) apply to port 0's samples as they are taken: while the buttons under a rule's
+// mask are its trigger, its target buttons go on as pressed for `make` samples and released for `break` samples,
+// after the trigger has been held for `delay` samples (until then they read as they are).
 
 #include "sampling.hpp"
 
@@ -39,15 +42,46 @@ struct Sample {
     PadState state;
 };
 
+struct RapidFireRule {
+    u32 mask, trigger, target, delay, make, release;
+};
+static_assert(sizeof(RapidFireRule) == 24);
+constexpr u32 kRapidFireRules = 16;
+
+struct RapidFire {
+    bool set = false;
+    RapidFireRule rule{};
+    u32 held = 0;  // (samples the trigger has been held)
+};
+
 struct Ctrl {
     nx::mutex lock;
     u32 mode = 0;  // SCE_CTRL_MODE_DIGITALONLY
     SampleHistory<Sample> history;
+    RapidFire rapid_fire[kRapidFireRules];
 };
 
 Ctrl& ctrl() {
     static Ctrl c;
     return c;
+}
+
+// (each sample once, in order: the rules count samples; called with the lock held)
+void apply_rapid_fire(u32& buttons) {
+    const u32 pressed = buttons;
+    for (RapidFire& f : ctrl().rapid_fire) {
+        if (!f.set) continue;
+        const RapidFireRule& r = f.rule;
+        if ((pressed & r.mask) != r.trigger) {
+            f.held = 0;
+            continue;
+        }
+        const u32 n = f.held++;
+        if (n < r.delay) continue;
+        const u32 period = r.make + r.release;
+        const bool on = period == 0 || (n - r.delay) % period < r.make;
+        buttons = on ? buttons | r.target : buttons & ~r.target;
+    }
 }
 
 Sample sample_of(u64 n) {
@@ -56,6 +90,7 @@ Sample sample_of(u64 n) {
     Sample s;
     s.timestamp = t / 1000;
     s.state = rt.input().pad_sample(n ? rt.vblank_ns(n - 1) : 0, t);
+    apply_rapid_fire(s.state.buttons);
     return s;
 }
 
@@ -141,6 +176,23 @@ i32 sceCtrlGetSamplingMode(Ptr<u32> mode) {
     return 0;
 }
 
+i32 sceCtrlSetRapidFire(i32 port, i32 index, Ptr<const RapidFireRule> rule) {
+    if (port != 0 || index < 0 || index >= static_cast<i32>(kRapidFireRules) || !rule ||
+        !readable(rule.address, sizeof(RapidFireRule)))
+        return kCtrlInvalidArg;
+    Ctrl& c = ctrl();
+    nx::scoped_lock<nx::mutex> held(c.lock);
+    c.rapid_fire[index] = RapidFire{true, *rule, 0};
+    return 0;
+}
+i32 sceCtrlClearRapidFire(i32 port, i32 index) {
+    if (port != 0 || index < 0 || index >= static_cast<i32>(kRapidFireRules)) return kCtrlInvalidArg;
+    Ctrl& c = ctrl();
+    nx::scoped_lock<nx::mutex> held(c.lock);
+    c.rapid_fire[index] = RapidFire{};
+    return 0;
+}
+
 // (one PlayStation Vita controller; no wireless controllers)
 i32 sceCtrlIsMultiControllerSupported() { return 0; }
 i32 sceCtrlGetWirelessControllerInfo(Ptr<u32> info) {
@@ -176,6 +228,8 @@ const Function kCtrl[] = {
     HLE_FUNCTION(0xEC752AAF, sceCtrlGetSamplingMode),
     HLE_FUNCTION(0x1FFFD965, sceCtrlIsMultiControllerSupported),
     HLE_FUNCTION(0xB8844141, sceCtrlGetWirelessControllerInfo),
+    HLE_FUNCTION(0xE9CB69C8, sceCtrlSetRapidFire),
+    HLE_FUNCTION(0xD8294C9C, sceCtrlClearRapidFire),
 };
 const Function kSysmodule[] = {
     HLE_FUNCTION(0x79A0160A, sceSysmoduleLoadModule),
@@ -190,6 +244,7 @@ void register_ctrl() {
     Ctrl& c = ctrl();
     c.mode = 0;
     c.history = SampleHistory<Sample>{};
+    for (RapidFire& f : c.rapid_fire) f = RapidFire{};
     register_library({"SceCtrl", kSceCtrl, kCtrl});
     register_library({"SceSysmodule", kSceSysmodule, kSysmodule});
 }
