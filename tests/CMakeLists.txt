@@ -29,6 +29,7 @@ add_executable(psvrecore_tests
     formats_tests.cpp
     cpk_tests.cpp
     arm_tests.cpp
+    analysis_tests.cpp
     generator_tests.cpp
     interp_tests.cpp
     float_tests.cpp
@@ -39,7 +40,7 @@ add_executable(psvrecore_tests
     gxm_translate_tests.cpp
 )
 target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")
-target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code
+target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::analysis psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code
                                               nx::foundation zlib-ng::zlibstatic)
 psvrecore_target_defaults(psvrecore_tests)
 

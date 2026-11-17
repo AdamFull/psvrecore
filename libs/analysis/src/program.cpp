@@ -142,9 +142,25 @@ Instruction Analyzer::decode_at(u32 address, Mode mode, arm::ItState& it, bool& 
     return arm::decode_thumb(hw1, hw2, address, it);
 }
 
+// A register copied into another, unconditionally: mov rd, rm, or add/sub rd, rm, #0 (which SNC uses as its move).
+static bool register_copy(const Instruction& in, u8& dst, u8& src) {
+    if (in.cond != arm::Cond::Al || in.operands[0].kind != OperandKind::Reg) return false;
+    if (in.op == Op::Mov && in.operand_count == 2 && in.operands[1].kind == OperandKind::Reg) {
+        dst = in.operands[0].reg, src = in.operands[1].reg;
+        return dst != arm::kPc && src != arm::kPc;
+    }
+    if ((in.op == Op::Add || in.op == Op::Sub) && in.operand_count == 3 && in.operands[1].kind == OperandKind::Reg &&
+        in.operands[2].kind == OperandKind::Imm && in.operands[2].imm == 0) {
+        dst = in.operands[0].reg, src = in.operands[1].reg;
+        return dst != arm::kPc && src != arm::kPc;
+    }
+    return false;
+}
+
 // The number of entries a table branch indexed by `index_reg` has, from the bounds check before it:
 // cmp rX, #N followed by a branch away when rX > N (bhi) or rX >= N (bhs), or a table branch executed only when
-// rX <= N (ldrls pc, ...).
+// rX <= N (ldrls pc, ...). The index may be a copy of the register compared (mov, or SNC's adds rd, rm, #0), made
+// after the compare.
 u32 Analyzer::bound_for(const Traversal& t, const Instruction& site, u8 index_reg, bool& found) const {
     found = false;
     bool guard_seen = false;
@@ -159,6 +175,11 @@ u32 Analyzer::bound_for(const Traversal& t, const Instruction& site, u8 index_re
         if (in.op == Op::B && is_conditional(in) && !guard_seen) {
             if (in.cond == arm::Cond::Hi) guard_seen = true, count = 1;
             else if (in.cond == arm::Cond::Cs) guard_seen = true, count = 0;
+            continue;
+        }
+        if (u8 dst, src; register_copy(in, dst, src) && dst == index_reg) {
+            if (guard_seen && (in.flags & arm::kSetsFlags)) return 0;  // (between the compare and its branch)
+            index_reg = src;
             continue;
         }
         if (in.op == Op::Cmp && in.operands[0].kind == OperandKind::Reg && in.operands[0].reg == index_reg &&
