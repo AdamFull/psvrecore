@@ -91,3 +91,104 @@ TEST_CASE("analysis: a fixed-address executable loads at the bases it was linked
     CHECK(static_cast<bool>(analysis::Image::from_bytes(bytes, linked)));
     CHECK(!analysis::Image::from_bytes(bytes, moved));
 }
+
+// Table branches bounded by the check before them, a constant compared through a register, a subtraction
+// after the check, or the branches that reach them.
+namespace bounds {
+
+// An image of one executable segment holding these halfwords from its start (the rest `bx lr`).
+analysis::Image thumb_image(std::initializer_list<u16> halfwords) {
+    analysis::Segment seg;
+    seg.base = seg.linked = kBase;
+    seg.flags = elf::kSegmentRead | elf::kSegmentExecute;
+    seg.bytes.assign(0x100, 0);
+    for (u32 i = 0; i < seg.bytes.size(); i += 2) seg.bytes[i] = 0x70, seg.bytes[i + 1] = 0x47;  // bx lr
+    u32 at = 0;
+    for (u16 h : halfwords) {
+        seg.bytes[at] = static_cast<u8>(h);
+        seg.bytes[at + 1] = static_cast<u8>(h >> 8);
+        at += 2;
+    }
+    return analysis::Image::from_segments({seg});
+}
+
+const analysis::JumpTable* table_at(const analysis::Program& p, u32 site) {
+    auto fn = p.functions.find(kBase | 1u);
+    if (fn == p.functions.end()) return nullptr;
+    auto t = fn->second.tables.find(site);
+    return t == fn->second.tables.end() ? nullptr : &t->second;
+}
+
+usize errors(const analysis::Program& p) {
+    usize n = 0;
+    for (const auto& d : p.diagnostics) n += d.severity == analysis::Severity::Error;
+    return n;
+}
+
+}  // namespace bounds
+
+using namespace bounds;
+
+TEST_CASE("analysis: a table branch bounded before a subtraction, against a constant in a register") {
+    // movw r3, #0x84; cmp r1, r3; bhi out; subs r1, #0x80; tbb [pc, r1]; 5 entries (0x84 - 0x80 + 1), a pad byte,
+    // then the cases (`bx lr` each) at +0x14..+0x1C. Read up to its first target instead, the table would take the
+    // pad byte as a sixth entry (a branch into the table).
+    const auto image = thumb_image({0xF240, 0x0384, 0x4299, 0xD80B, 0x3980, 0xE8DF, 0xF001,
+                                    0x0403, 0x0605, 0x0007});
+    analysis::Options options;
+    options.extra_entries = {kBase | 1u};
+    options.use_exidx = false;
+    const auto p = analysis::analyze(image, options);
+    const auto* t = table_at(p, kBase + 0x0A);
+    REQUIRE(t != nullptr);
+    CHECK(t->bounded);
+    REQUIRE(t->targets.size() == 5u);
+    for (u32 i = 0; i < 5; ++i) CHECK(t->targets[i] == ((kBase + 0x14 + 2 * i) | 1u));
+    CHECK(errors(p) == 0u);
+}
+
+TEST_CASE("analysis: a table branch on a value less a constant, checked before (subw)") {
+    // cmp r1, #0x87; bhi out; subw r0, r1, #0x84; tbb [pc, r0]: 4 entries, the cases after them.
+    const auto image = thumb_image({0x2987, 0xD80B, 0xF2A1, 0x0084, 0xE8DF, 0xF000, 0x0302, 0x0504});
+    analysis::Options options;
+    options.extra_entries = {kBase | 1u};
+    options.use_exidx = false;
+    const auto p = analysis::analyze(image, options);
+    const auto* t = table_at(p, kBase + 0x08);
+    REQUIRE(t != nullptr);
+    CHECK(t->bounded);
+    REQUIRE(t->targets.size() == 4u);
+    for (u32 i = 0; i < 4; ++i) CHECK(t->targets[i] == ((kBase + 0x10 + 2 * i) | 1u));
+    CHECK(errors(p) == 0u);
+}
+
+TEST_CASE("analysis: a table branch bounded on its own index is unchanged") {
+    // cmp r0, #3; bhi out; tbb [pc, r0]: 4 entries.
+    const auto image = thumb_image({0x2803, 0xD808, 0xE8DF, 0xF000, 0x0302, 0x0504});
+    analysis::Options options;
+    options.extra_entries = {kBase | 1u};
+    options.use_exidx = false;
+    const auto p = analysis::analyze(image, options);
+    const auto* t = table_at(p, kBase + 0x04);
+    REQUIRE(t != nullptr);
+    CHECK(t->bounded);
+    REQUIRE(t->targets.size() == 4u);
+    for (u32 i = 0; i < 4; ++i) CHECK(t->targets[i] == ((kBase + 0x0C + 2 * i) | 1u));
+    CHECK(errors(p) == 0u);
+}
+
+TEST_CASE("analysis: a table branch reached only by a branch that checks its index") {
+    // cmp r2, #3; bls tbb; bx lr; (bx lr); tbb [pc, r2]: 4 entries, two zero bytes, then the cases. Read up to its
+    // first target instead, the zero bytes would be two more entries (branches into the table).
+    const auto image = thumb_image({0x2A03, 0xD901, 0x4770, 0x4770, 0xE8DF, 0xF002, 0x0403, 0x0605, 0x0000});
+    analysis::Options options;
+    options.extra_entries = {kBase | 1u};
+    options.use_exidx = false;
+    const auto p = analysis::analyze(image, options);
+    const auto* t = table_at(p, kBase + 0x08);
+    REQUIRE(t != nullptr);
+    CHECK(t->bounded);
+    REQUIRE(t->targets.size() == 4u);
+    for (u32 i = 0; i < 4; ++i) CHECK(t->targets[i] == ((kBase + 0x12 + 2 * i) | 1u));
+    CHECK(errors(p) == 0u);
+}

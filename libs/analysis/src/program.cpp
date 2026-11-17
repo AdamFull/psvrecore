@@ -77,6 +77,8 @@ private:
     // the function is known); without it, such a table is not read.
     bool jump_table(Traversal& t, const Instruction& in, JumpTable& out, bool unbounded);
     u32 bound_for(const Traversal& t, const Instruction& site, u8 index_reg, bool& found) const;
+    u32 bound_before(const Traversal& t, nx::map<u32, Instruction>::const_iterator at, u8 index_reg, bool guard_seen,
+                     u32 count, bool& found) const;
     void diag(Severity s, u32 address, u32 function, nx::string message) {
         p_.diagnostics.push_back(Diagnostic{s, address, function, std::move(message)});
     }
@@ -157,17 +159,75 @@ static bool register_copy(const Instruction& in, u8& dst, u8& src) {
     return false;
 }
 
+// The value a register holds at an instruction, when the code just before it (straight-line) moves a constant into
+// it: mov rX, #N or movw rX, #N (no movt after it).
+template <class Code, class Iterator>
+bool constant_before(const Code& code, Iterator it, u8 reg, u32& value) {
+    for (int steps = 0; steps < 8 && it != code.begin(); ++steps) {
+        --it;
+        const Instruction& in = it->second;
+        const Flow f = flow_of(in);
+        if (in.operand_count >= 1 && in.operands[0].kind == OperandKind::Reg && in.operands[0].reg == reg) {
+            if ((in.op == Op::Mov || in.op == Op::Movw) && in.operand_count == 2 && in.cond == arm::Cond::Al &&
+                in.operands[1].kind == OperandKind::Imm) {
+                value = in.operands[1].imm;
+                return true;
+            }
+            return false;  // (written otherwise, or only read: not followed)
+        }
+        if (f.kind != FlowKind::Next) return false;
+    }
+    return false;
+}
+
 // The number of entries a table branch indexed by `index_reg` has, from the bounds check before it:
 // cmp rX, #N followed by a branch away when rX > N (bhi) or rX >= N (bhs), or a table branch executed only when
-// rX <= N (ldrls pc, ...). The index may be a copy of the register compared (mov, or SNC's adds rd, rm, #0), made
-// after the compare.
+// rX <= N (ldrls pc, ...). N may be a constant moved into a register just before (cmp rX, rY). The index may be a
+// copy of the register compared (mov, or SNC's adds rd, rm, #0), made after the compare, or the checked value less a
+// constant, subtracted after the check (cmp rX, #N; bhi; sub rI, rX, #K; tbb [pc, rI]): N - K + 1 entries then
+// (values below K were sent elsewhere before).
+// A table branch that only branches reach (the code before it does not run into it) may be guarded by those
+// branches instead: cmp rX, #N; ...; bls <the table branch> (or blo). Each must be such a guard; the largest bound
+// is taken.
 u32 Analyzer::bound_for(const Traversal& t, const Instruction& site, u8 index_reg, bool& found) const {
-    found = false;
     bool guard_seen = false;
     u32 count = 0;
     if (site.cond == arm::Cond::Ls) guard_seen = true, count = 1;  // (ARM: the table branch is itself conditional)
     else if (site.cond == arm::Cond::Cc) guard_seen = true, count = 0;
-    auto it = t.code.find(site.address);
+    auto at = t.code.find(site.address);
+    const u32 bound = bound_before(t, at, index_reg, guard_seen, count, found);
+    if (found || at == t.code.end() || at == t.code.begin() || site.cond != arm::Cond::Al) return bound;
+    auto before = std::prev(at);
+    if (before->first + before->second.size == site.address) {
+        const Flow f = flow_of(before->second);
+        if (f.kind == FlowKind::Next || f.kind == FlowKind::Call || f.conditional) return bound;  // (runs into it)
+    }
+    u32 largest = 0;
+    bool any = false;
+    for (auto it = t.code.begin(); it != t.code.end(); ++it) {
+        const Instruction& in = it->second;
+        if (in.op != Op::B) continue;
+        const Flow f = flow_of(in);
+        if (f.kind != FlowKind::Branch || (f.target & ~1u) != site.address) continue;
+        const bool ls = in.cond == arm::Cond::Ls, cc = in.cond == arm::Cond::Cc;
+        if (!ls && !cc) return found = false, 0;  // (reached without a check)
+        bool ok;
+        const u32 n = bound_before(t, it, index_reg, true, ls ? 1 : 0, ok);
+        if (!ok) return found = false, 0;
+        largest = std::max(largest, n);
+        any = true;
+    }
+    found = any;
+    return any ? largest : 0;
+}
+
+// The bound found walking back from `at` (exclusive) for the compare a guard tests: see bound_for.
+u32 Analyzer::bound_before(const Traversal& t, nx::map<u32, Instruction>::const_iterator it, u8 index_reg,
+                           bool guard_seen, u32 count, bool& found) const {
+    found = false;
+    u8 reg = index_reg;
+    u32 bias = 0;           // (the index is `reg` less this)
+    bool biased = false;
     for (int steps = 0; steps < 24 && it != t.code.begin(); ++steps) {
         --it;
         const Instruction& in = it->second;
@@ -177,16 +237,36 @@ u32 Analyzer::bound_for(const Traversal& t, const Instruction& site, u8 index_re
             else if (in.cond == arm::Cond::Cs) guard_seen = true, count = 0;
             continue;
         }
-        if (u8 dst, src; register_copy(in, dst, src) && dst == index_reg) {
+        if (u8 dst, src; register_copy(in, dst, src) && dst == reg) {
             if (guard_seen && (in.flags & arm::kSetsFlags)) return 0;  // (between the compare and its branch)
-            index_reg = src;
+            reg = src;
             continue;
         }
-        if (in.op == Op::Cmp && in.operands[0].kind == OperandKind::Reg && in.operands[0].reg == index_reg &&
-            in.operands[1].kind == OperandKind::Imm) {
-            if (!guard_seen) return 0;
-            found = true;
-            return in.operands[1].imm + count;
+        // sub rI, rX, #K (or subs rI, #K) between the check and the table branch: the check is on rX. Not once the
+        // guard is seen when it sets the flags (the guard would test this subtraction, not a compare).
+        if (in.op == Op::Sub && !biased && in.cond == arm::Cond::Al && in.operands[0].kind == OperandKind::Reg &&
+            in.operands[0].reg == reg && !(guard_seen && (in.flags & arm::kSetsFlags))) {
+            const arm::Operand& src = in.operand_count == 2 ? in.operands[0] : in.operands[1];
+            const arm::Operand& k = in.operand_count == 2 ? in.operands[1] : in.operands[2];
+            if ((in.operand_count == 2 || in.operand_count == 3) && src.kind == OperandKind::Reg && src.reg != arm::kPc &&
+                src.reg != arm::kSp && k.kind == OperandKind::Imm) {
+                reg = src.reg;
+                bias = k.imm;
+                biased = true;
+                continue;
+            }
+        }
+        if (in.op == Op::Cmp && in.operands[0].kind == OperandKind::Reg && in.operands[0].reg == reg) {
+            u32 n = 0;
+            bool known = false;
+            if (in.operands[1].kind == OperandKind::Imm) n = in.operands[1].imm, known = true;
+            else if (in.operands[1].kind == OperandKind::Reg) known = constant_before(t.code, it, in.operands[1].reg, n);
+            if (known) {
+                if (!guard_seen) return 0;
+                if (n < bias || n - bias + count > 0x10000) return 0;
+                found = true;
+                return n - bias + count;
+            }
         }
         if (f.kind != FlowKind::Next && !(f.kind == FlowKind::Branch && f.conditional)) break;
     }
