@@ -77,6 +77,18 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
     std::fprintf(stderr, "  host pc %s+0x%llx\n", name,
                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(r->ExceptionAddress) -
                                                  reinterpret_cast<uintptr_t>(module)));
+    // (and the calls that led there, those in the same module: the generated functions, for the guest's call chain)
+    void* frames[32];
+    const USHORT n = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+    std::fprintf(stderr, "  host calls");
+    for (USHORT i = 0; i < n; ++i) {
+        HMODULE m = nullptr;
+        if (module && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                         static_cast<LPCSTR>(frames[i]), &m) && m == module)
+            std::fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(frames[i]) -
+                                                                             reinterpret_cast<uintptr_t>(module)));
+    }
+    std::fputc('\n', stderr);
     std::fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;  // (the handler reports; the process then ends as for any access violation)
 }
