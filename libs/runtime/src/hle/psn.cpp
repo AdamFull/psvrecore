@@ -96,6 +96,41 @@ i32 sceNpWebApiUtilityParseNpId(Ptr<const char> text, Ptr<NpId> out) {
 }
 i32 sceNpTrophyAbortHandle(i32 handle) { return handle > 0 ? 0 : kTrophyInvalidArgument; }
 
+// The online IDs alone compared.
+i32 sceNpCmpOnlineId(Ptr<const NpId> a, Ptr<const NpId> b) { return compare_ids(a, b, nullptr); }
+// The platform type, kept in the ID's option bytes as a tag ("ps3", "psp2", "ps4"; none: zeros), and read back.
+i32 sceNpSetPlatformType(Ptr<NpId> id, i32 type) {
+    static constexpr char kTags[4][4] = {{0, 0, 0, 0}, {'p', 's', '3', 0}, {'p', 's', 'p', '2'}, {'p', 's', '4', 0}};
+    if (!id || !writable(id.address, sizeof(NpId)) || type < 0 || type > 3) return kUtilInvalidArgument;
+    std::memcpy(id->opt, kTags[type], 4);
+    return 0;
+}
+i32 sceNpGetPlatformType(Ptr<const NpId> id) {
+    if (!id || !readable(id.address, sizeof(NpId))) return kUtilInvalidArgument;
+    if (std::memcmp(id->opt, "ps3", 4) == 0) return 1;
+    if (std::memcmp(id->opt, "psp2", 4) == 0) return 2;
+    if (std::memcmp(id->opt, "ps4", 4) == 0) return 3;
+    return 0;
+}
+// Commerce's pools fall short by nothing (nothing is ever fetched).
+i32 zero_shortfall(u32 /*context*/, Ptr<i32> shortfall) {
+    if (!shortfall || !writable(shortfall.address, 4)) return kUtilInvalidArgument;
+    *shortfall = 0;
+    return 0;
+}
+// SceNpMatching2MemoryInfo (total, current, most; reserved): none used.
+i32 matching2_memory_info(u32 info) {
+    if (!info || !writable(info, 24)) return kUtilInvalidArgument;
+    std::memset(memory().host(info), 0, 24);
+    return 0;
+}
+// SceNpWebApiMemoryPoolStats (pool size, most in use, in use; reserved): none used.
+i32 webapi_pool_stats(u32 stats) {
+    if (!stats || !writable(stats, 16)) return kWebApiInvalidArgument;
+    std::memset(memory().host(stats), 0, 16);
+    return 0;
+}
+
 const Function kNpManagerMore[] = {
     FAIL(0x29C9B8A5, "(SceNpManager 0x29C9B8A5)", kManagerSignedOut),
     FAIL(0x7CE94530, "(SceNpManager 0x7CE94530)", kManagerSignedOut),
@@ -109,6 +144,7 @@ const Function kNpManagerMore[] = {
     FAIL(0xFE835967, "sceNpManagerGetAccountRegion", kManagerSignedOut),
     FAIL(0x43DC48A1, "sceNpManagerGetCachedParam", kManagerSignedOut),
     DONE(0xD9E6E56C, "sceNpUnregisterServiceStateCallback"),
+    DONE(0xECBC7614, "sceNpAuthAbortOAuthRequest"),
 };
 const Function kNpCommonMore[] = {
     FAIL(0x40724BEA, "(SceNpCommon 0x40724BEA)", kAuthSignedOut),
@@ -123,7 +159,11 @@ const Function kNpCommonMore[] = {
     FAIL(0x3377CD37, "sceNpAuthGetEntitlementIdList", kAuthSignedOut),
     FAIL(0x59608D1C, "sceNpAuthGetTicket", kAuthSignedOut),
     FAIL(0xC1E23E01, "sceNpAuthGetTicketParam", kAuthSignedOut),
-    DONE(0xE807D0BC, "sceNpSetPlatformType"),
+    HLE_FUNCTION(0xE807D0BC, sceNpSetPlatformType),
+    DONE(0xE2582575, "sceNpAuthAbortRequest"),
+    FAIL(0xC8E51CCA, "sceNpAuthGetEntitlementByIdPrefix", kAuthSignedOut),
+    Function{0x8327C26F, "sceNpCmpOnlineId", &entry<&sceNpCmpOnlineId>},
+    Function{0xE9A003DE, "sceNpGetPlatformType", &entry<&sceNpGetPlatformType>},
 };
 const Function kNpBasicMore[] = {
     FAIL(0x1211AE8E, "sceNpBasicGetBlockListEntries", kBasicSignedOut),
@@ -139,6 +179,13 @@ const Function kNpBasicMore[] = {
     FAIL(0x7A5020A5, "sceNpBasicSendInGameDataMessage", kBasicSignedOut),
     DONE(0x363FF161, "sceNpBasicUnregisterInGameDataMessageHandler"),
     DONE(0x2A764628, "sceNpBasicUnregisterJoinGameAckHandler"),
+    FAIL(0xF51545D8, "sceNpBasicCheckIfPlayerIsBlocked", kBasicSignedOut),
+    FAIL(0x9A9E2021, "sceNpBasicGetFriendContextState", kBasicSignedOut),
+    FAIL(0x91BF63CB, "sceNpBasicGetFriendRequestEntries", kBasicSignedOut),
+    FAIL(0xFE98E45A, "sceNpBasicGetFriendRequestEntryCount", kBasicSignedOut),
+    FAIL(0x3700E00C, "sceNpBasicGetRequestedFriendRequestEntries", kBasicSignedOut),
+    FAIL(0xB9041420, "sceNpBasicGetRequestedFriendRequestEntryCount", kBasicSignedOut),
+    FAIL(0xD20C2370, "sceNpBasicUnsetInGamePresence", kBasicSignedOut),
 };
 const Function kNpScoreMore[] = {
     FAIL(0x00F90E7B, "sceNpScoreGetBoardInfo", kManagerSignedOut),
@@ -153,6 +200,14 @@ const Function kNpScoreMore[] = {
     FAIL(0x40573917, "sceNpScoreRecordGameDataAsync", kManagerSignedOut),
     FAIL(0x320C0277, "sceNpScoreRecordScore", kManagerSignedOut),
     DONE(0x5EF44841, "sceNpScoreSetTimeout"),
+    FAIL(0xA0C94D46, "sceNpScoreCensorComment", kManagerSignedOut),
+    FAIL(0xAA0BBF8E, "sceNpScoreCensorCommentAsync", kManagerSignedOut),
+    FAIL(0x3CD9974E, "sceNpScoreGetBoardInfoAsync", kManagerSignedOut),
+    FAIL(0xCE3A9544, "sceNpScoreGetRankingByNpIdPcIdAsync", kManagerSignedOut),
+    FAIL(0x6FD2041A, "sceNpScoreSanitizeComment", kManagerSignedOut),
+    FAIL(0x15981858, "sceNpScoreSanitizeCommentAsync", kManagerSignedOut),
+    FAIL(0x31733BF3, "sceNpScoreWaitAsync", kManagerSignedOut),
+    DONE(0x7C68D91B, "sceNpScoreChangeModeForOtherSaveDataOwners"),
 };
 const Function kNpTusMore[] = {
     FAIL(0x8CA469F4, "sceNpTssGetSmallStorage", kManagerSignedOut),
@@ -170,6 +225,31 @@ const Function kNpTusMore[] = {
     DONE(0xC4BB64A7, "sceNpTusSetTimeout"),
     FAIL(0x44947D07, "sceNpTusTryAndSetVariableAsync", kManagerSignedOut),
     FAIL(0x518A64B9, "sceNpTusTryAndSetVariableVUserAsync", kManagerSignedOut),
+    FAIL(0x1C8D73A8, "sceNpTssGetDataAsync", kManagerSignedOut),
+    FAIL(0x987D1018, "sceNpTssGetDataNoLimit", kManagerSignedOut),
+    FAIL(0x7A101394, "sceNpTssGetDataNoLimitAsync", kManagerSignedOut),
+    FAIL(0xFC300E7E, "sceNpTssGetStorage", kManagerSignedOut),
+    FAIL(0x8972DF8F, "sceNpTssGetStorageAsync", kManagerSignedOut),
+    FAIL(0x0A5D05F1, "sceNpTusAddAndGetVariableAsync", kManagerSignedOut),
+    FAIL(0x9BA9148C, "sceNpTusDeleteMultiSlotDataVUserAsync", kManagerSignedOut),
+    FAIL(0xFC0C5159, "sceNpTusDeleteMultiSlotVariableAsync", kManagerSignedOut),
+    FAIL(0x3B44D0E4, "sceNpTusDeleteMultiSlotVariableVUserAsync", kManagerSignedOut),
+    FAIL(0x9E8E1CF8, "sceNpTusGetDataVUserAsync", kManagerSignedOut),
+    FAIL(0x27FB4EFD, "sceNpTusGetFriendsDataStatus", kManagerSignedOut),
+    FAIL(0x32064D64, "sceNpTusGetFriendsDataStatusAsync", kManagerSignedOut),
+    FAIL(0x47E1716A, "sceNpTusGetFriendsVariable", kManagerSignedOut),
+    FAIL(0xDFC8F03D, "sceNpTusGetFriendsVariableAsync", kManagerSignedOut),
+    FAIL(0xD62D2A0B, "sceNpTusGetMultiSlotDataStatusVUserAsync", kManagerSignedOut),
+    FAIL(0xF4D40B19, "sceNpTusGetMultiUserDataStatus", kManagerSignedOut),
+    FAIL(0xC08A1E5E, "sceNpTusGetMultiUserDataStatusAsync", kManagerSignedOut),
+    FAIL(0xAF7148A6, "sceNpTusGetMultiUserDataStatusVUser", kManagerSignedOut),
+    FAIL(0x7593D595, "sceNpTusGetMultiUserDataStatusVUserAsync", kManagerSignedOut),
+    FAIL(0xC5656132, "sceNpTusGetMultiUserVariable", kManagerSignedOut),
+    FAIL(0xBBEFCD26, "sceNpTusGetMultiUserVariableAsync", kManagerSignedOut),
+    FAIL(0x0374C127, "sceNpTusGetMultiUserVariableVUser", kManagerSignedOut),
+    FAIL(0xD51B39ED, "sceNpTusGetMultiUserVariableVUserAsync", kManagerSignedOut),
+    FAIL(0x1989CC51, "sceNpTusSetDataVUserAsync", kManagerSignedOut),
+    FAIL(0x3907A8BC, "sceNpTusWaitAsync", kManagerSignedOut),
 };
 const Function kNpUtilityMore[] = {
     DONE(0x32B068C4, "sceNpBandwidthTestAbort"),
@@ -193,6 +273,10 @@ const Function kNpUtilityMore[] = {
     FAIL(0x40EC7271, "sceNpWordFilterSanitizeCommentAsync", kManagerSignedOut),
     DONE(0x9F44CE45, "sceNpWordFilterSetTimeout"),
     DONE(0x7D140F70, "sceNpWordFilterTerm"),
+    FAIL(0xFDB0AE47, "sceNpLookupAvatarImage", kManagerSignedOut),
+    FAIL(0x282BD43C, "sceNpLookupAvatarImageAsync", kManagerSignedOut),
+    DONE(0xB0C9DC45, "sceNpLookupSetTimeout"),
+    FAIL(0x31B308AA, "sceNpWordFilterWaitAsync", kManagerSignedOut),
 };
 const Function kNpMessageMore[] = {
     FAIL(0x7E697F98, "sceNpMessageGetAttachedData", kMessageNotSignedIn),
@@ -202,6 +286,10 @@ const Function kNpMessageMore[] = {
     DONE(0xF533A73A, "sceNpMessageSetAttachedDataUsedFlag"),
     FAIL(0x35BE21C5, "sceNpMessageSyncMessage", kMessageNotSignedIn),
     DONE(0x380230A1, "sceNpMessageTerm"),
+    DONE(0x707B26C2, "sceNpMessageAbort"),
+    FAIL(0x514A4320, "sceNpMessageGetMessage", kMessageNotSignedIn),
+    FAIL(0x70116381, "sceNpMessageGetMessageEntry", kMessageNotSignedIn),
+    DONE(0x26AF5306, "sceNpMessageInitWithParam"),
 };
 const Function kNpSnsFacebookMore[] = {
     FAIL(0x9CF1BC76, "sceNpSnsFacebookCreateRequest", kFacebookNotSignedIn),
@@ -209,6 +297,8 @@ const Function kNpSnsFacebookMore[] = {
     FAIL(0xA3C9041D, "sceNpSnsFacebookGetLongAccessToken", kFacebookNotSignedIn),
     DONE(0x80557AA0, "sceNpSnsFacebookInit"),
     DONE(0xA71E6847, "sceNpSnsFacebookTerm"),
+    DONE(0x32FB2721, "sceNpSnsFacebookAbortRequest"),
+    FAIL(0x9A87EEE9, "sceNpSnsFacebookGetAccessToken", kFacebookNotSignedIn),
 };
 const Function kNpSignalingMore[] = {
     FAIL(0x92FFBDE3, "sceNpSignalingActivateConnection", kSignalingCtxNotFound),
@@ -228,6 +318,9 @@ const Function kNpPartyGameUtilMore[] = {
     DONE(0xB304962C, "sceNpPartyInit"),
     DONE(0x324C76F0, "sceNpPartyRegisterHandler"),
     DONE(0xF524AD2B, "sceNpPartyTerm"),
+    FAIL(0xE9173FE6, "sceNpPartyGetGameSessionReadyState", kPartyNotInParty),
+    FAIL(0x27AFCE24, "sceNpPartyGetId", kPartyNotInParty),
+    FAIL(0xF01585A3, "sceNpPartyGetMemberSessionInfo", kPartyNotInParty),
 };
 const Function kNpCommerce2More[] = {
     DONE(0xE7486A60, "sceNpCommerce2AbortReq"),
@@ -268,6 +361,10 @@ const Function kNpCommerce2More[] = {
     DONE(0x84E56A6D, "sceNpCommerce2ShowPsStoreIcon"),
     FAIL(0x7132EAA5, "sceNpCommerce2StartEmptyStoreCheck", kCommerce2NotSignedIn),
     DONE(0xB99958AE, "sceNpCommerce2Term"),
+    FAIL(0xD6A5B200, "sceNpCommerce2GetContentRatingInfoFromCategoryInfo", kCommerce2NotSignedIn),
+    Function{0x586B0599, "sceNpCommerce2GetShortfallOfLibhttpPool", &entry<&zero_shortfall>},
+    Function{0xBA5A5784, "sceNpCommerce2GetShortfallOfLibsslPool", &entry<&zero_shortfall>},
+    DONE(0x84C336C6, "sceNpCommerce2StopEmptyStoreCheck"),
 };
 const Function kNpMatching2More[] = {
     FAIL(0xBB2E7559, "sceNpMatching2ContextStart", kMatching2SignedOut),
@@ -301,6 +398,25 @@ const Function kNpMatching2More[] = {
     FAIL(0x4E4C55BD, "sceNpMatching2SignalingGetConnectionStatus", kMatching2SignedOut),
     FAIL(0x79310806, "sceNpMatching2SignalingGetLocalNetInfo", kMatching2SignedOut),
     DONE(0x0124641C, "sceNpMatching2Term"),
+    DONE(0xF2847E3B, "sceNpMatching2AbortContextStart"),
+    DONE(0x74EB6CE9, "sceNpMatching2AbortRequest"),
+    Function{0x7BD39E50, "sceNpMatching2GetMemoryInfo", &entry<&matching2_memory_info>},
+    DONE(0x3C507D4A, "sceNpMatching2RegisterLobbyEventCallback"),
+    DONE(0x4E3193D2, "sceNpMatching2RegisterLobbyMessageCallback"),
+    DONE(0x6E48307F, "sceNpMatching2SetSignalingOptParam"),
+    DONE(0xADCD102C, "sceNpMatching2SignalingCancelPeerNetInfo"),
+    FAIL(0x86E7C97D, "sceNpMatching2GetLobbyInfoList", kMatching2SignedOut),
+    FAIL(0x11BEFFA8, "sceNpMatching2GetRoomMemberDataExternalList", kMatching2SignedOut),
+    FAIL(0xB6E8C059, "sceNpMatching2GetRoomMemberIdListLocal", kMatching2SignedOut),
+    FAIL(0xD22C4989, "sceNpMatching2GetRoomPasswordLocal", kMatching2SignedOut),
+    FAIL(0x495D2B46, "sceNpMatching2GetSignalingOptParamLocal", kMatching2SignedOut),
+    FAIL(0x86458025, "sceNpMatching2GrantRoomOwner", kMatching2SignedOut),
+    FAIL(0x86CED8AF, "sceNpMatching2JoinLobby", kMatching2SignedOut),
+    FAIL(0x1E70D5B5, "sceNpMatching2LeaveLobby", kMatching2SignedOut),
+    FAIL(0x9388A007, "sceNpMatching2SendLobbyChatMessage", kMatching2SignedOut),
+    FAIL(0xF0CB1DD3, "sceNpMatching2SignalingGetPeerNetInfo", kMatching2SignedOut),
+    FAIL(0xFDC7B2C9, "sceNpMatching2SignalingGetPeerNetInfoResult", kMatching2SignedOut),
+    FAIL(0x881F7428, "sceNpMatching2SignalingGetPingInfo", kMatching2SignedOut),
 };
 const Function kNpWebApiMore[] = {
     DONE(0xEB3D14CE, "sceNpWebApiAbortRequest"),
@@ -321,6 +437,25 @@ const Function kNpWebApiMore[] = {
     DONE(0x001254C2, "sceNpWebApiTerminate"),
     DONE(0xC9056736, "sceNpWebApiUnregisterPushEventCallback"),
     DONE(0x06D28ADA, "sceNpWebApiUnregisterServicePushEventCallback"),
+    DONE(0xD462D519, "sceNpWebApiAbortHandle"),
+    DONE(0xB575A09C, "sceNpWebApiDeleteHandle"),
+    NEW_ID(0x6AB53577, "sceNpWebApiCreateExtdPushEventFilter"),
+    DONE(0x4980D88D, "sceNpWebApiDeleteExtdPushEventFilter"),
+    DONE(0x828F657B, "sceNpWebApiDeleteServicePushEventFilter"),
+    NEW_ID(0xE75796DD, "sceNpWebApiRegisterExtdPushEventCallback"),
+    DONE(0x2D272ACA, "sceNpWebApiUnregisterExtdPushEventCallback"),
+    Function{0x9DF7EE1E, "sceNpWebApiGetMemoryPoolStats", &entry<&webapi_pool_stats>},
+    DONE(0x9AE6BC46, "sceNpWebApiSetNpTitleId"),
+    FAIL(0x8DCD6D19, "sceNpWebApiAddHttpRequestHeader", kWebApiNotSignedIn),
+    FAIL(0xC4B24435, "sceNpWebApiAddMultipartPart", kWebApiNotSignedIn),
+    FAIL(0x55435037, "sceNpWebApiCreateMultipartRequest", kWebApiNotSignedIn),
+    FAIL(0x00234C88, "sceNpWebApiGetErrorCode", kWebApiNotSignedIn),
+    FAIL(0x67A3BC79, "sceNpWebApiGetHttpStatusCode", kWebApiNotSignedIn),
+    FAIL(0xB65DF857, "sceNpWebApiGetNpTitleId", kWebApiNotSignedIn),
+    FAIL(0xBDEC2650, "sceNpWebApiSendMultipartRequest", kWebApiNotSignedIn),
+    FAIL(0xC8E042B8, "sceNpWebApiSendMultipartRequest2", kWebApiNotSignedIn),
+    FAIL(0x51EA899B, "sceNpWebApiSendRequest", kWebApiNotSignedIn),
+    FAIL(0x8E870BE4, "sceNpWebApiSetMultipartContentType", kWebApiNotSignedIn),
 };
 const Function kNearUtilMore[] = {
     FAIL(0x1AA394BA, "(SceNearUtil 0x1AA394BA)", kNearNotRetrieved),
@@ -362,6 +497,9 @@ const Function kNearUtilMore[] = {
     FAIL(0xB14145DD, "sceNearReadReceivedGiftData", kNearNotRetrieved),
     DONE(0x2ED36EE2, "sceNearRefresh"),
     DONE(0x146BE236, "sceNearSetGift"),
+    FAIL(0x8F3CC01C, "sceNearGetGiftStatus", kNearNotRetrieved),
+    FAIL(0x360D4A19, "sceNearIgnoreDiscoveredGift", kNearNotRetrieved),
+    DONE(0x4CCE6A14, "sceNearSetGift2"),
 };
 
 const Function kNpCommonManual[] = {

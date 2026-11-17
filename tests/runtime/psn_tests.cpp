@@ -44,7 +44,7 @@ const Answer kAnswers[] = {
     {0xECB62224, 0x3377CD37, 0x80550310u},
     {0xECB62224, 0x59608D1C, 0x80550310u},
     {0xECB62224, 0xC1E23E01, 0x80550310u},
-    {0xECB62224, 0xE807D0BC, 0},
+    {0xECB62224, 0xE807D0BC, 0x80550601},  // (sceNpSetPlatformType: the "type" here is a pointer, not a type)
     {0x605BA760, 0x1211AE8E, 0x80551D06u},
     {0x605BA760, 0x407E1E6F, 0x80551D06u},
     {0x605BA760, 0x5183A4B5, 0x80551D06u},
@@ -371,4 +371,24 @@ TEST_CASE("dialogs: the PSN, store and photo dialogs open and the player backs o
         CHECK(u(call32(ctx, kSceCommonDialog, abort, {})) == kNotRunning);
     for (u32 nid : {0x33626E2Cu, 0xB55CF0E3u, 0xB7D4C911u, 0xBEBAEF25u, 0xD1858A78u})
         CHECK(u(call32(ctx, kSceCommonDialog, nid, {})) == kNotInUse);
+}
+
+TEST_CASE("psn: online IDs compared, the platform type kept in an NP ID, statistics of memory never used") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceNpCommon = 0xECB62224, kSceNpMatching2 = 0x7106F303;
+    const u32 a = scratch(36), b = scratch(36), info = scratch(24);
+    std::memset(t.rt.memory().host(a), 0, 36);
+    std::memset(t.rt.memory().host(b), 0, 36);
+    std::memcpy(t.rt.memory().host(a), "player", 6);
+    std::memcpy(t.rt.memory().host(b), "player", 6);
+    CHECK(call32(ctx, kSceNpCommon, 0x8327C26F /*sceNpCmpOnlineId*/, {a, b}) == 0);
+    t.rt.memory().host(b)[0] = 'q';
+    CHECK(u(call32(ctx, kSceNpCommon, 0x8327C26F, {a, b})) == 0x80550609u);
+    CHECK(call32(ctx, kSceNpCommon, 0xE807D0BC /*sceNpSetPlatformType*/, {a, 2}) == 0);
+    CHECK(call32(ctx, kSceNpCommon, 0xE9A003DE /*sceNpGetPlatformType*/, {a}) == 2);
+    CHECK(call32(ctx, kSceNpCommon, 0xE9A003DE, {b}) == 0);
+    std::memset(t.rt.memory().host(info), 0xAA, 24);
+    CHECK(call32(ctx, kSceNpMatching2, 0x7BD39E50 /*sceNpMatching2GetMemoryInfo*/, {info}) == 0);
+    CHECK(psv_ld32(info + 8) == 0);
 }

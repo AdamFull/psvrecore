@@ -2,6 +2,7 @@
 // its offline answers, SSL, RUDP and ad hoc matching.
 
 #include <cstring>
+#include <string_view>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
@@ -331,4 +332,27 @@ TEST_CASE("ad hoc: matching runs without ever finding anyone; the PSP-style libr
     REQUIRE(call32(ctx, kSceNetAdhocMatching, kMTerm, {}) == 0);
     CHECK(u(call32(ctx, kSceNetAdhocMatching, kMTerm, {})) == 0x80413113u);
     for (u32 nid : {0x87805E13u, 0x6C0B4971u, 0xE2FE9DD6u, 0x97A80065u}) CHECK(call32(ctx, kScePspnetAdhoc, nid, {0}) == 0);
+}
+
+TEST_CASE("net: MAC addresses to text and back, the socket IDs in use, RUDP's segment size, matching's hello option") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceLibRudp = 0x32910D11;
+    const u32 mac = scratch(6), text = scratch(18), back = scratch(6), fds = scratch(128), mss = scratch(2);
+    const u8 m[6] = {0x02, 0xAB, 0x00, 0x10, 0xFF, 0x01};
+    std::memcpy(t.rt.memory().host(mac), m, 6);
+    REQUIRE(call32(ctx, kSceNet, 0x84334EB2 /*sceNetEtherNtostr*/, {mac, text, 18}) == 0);
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(text))) == "02:ab:00:10:ff:01");
+    REQUIRE(call32(ctx, kSceNet, 0xEEC6D75F /*sceNetEtherStrton*/, {text, back}) == 0);
+    CHECK(std::memcmp(t.rt.memory().host(back), m, 6) == 0);
+    const u32 param = scratch(12);
+    psv_st32(param + 4, 0x20000);
+    REQUIRE(call32(ctx, kSceNet, kInit, {param}) == 0);
+    const i32 s = call32(ctx, kSceNet, kSocket, {0, 2, 2, 0});
+    REQUIRE(s > 0);
+    REQUIRE(call32(ctx, kSceNet, 0x138CF1D6 /*sceNetGetSockIdInfo*/, {fds, 0, 0}) == 0);
+    CHECK((t.rt.memory().host(fds)[s / 8] >> (s % 8) & 1) == 1);
+    CHECK(call32(ctx, kSceLibRudp, 0xE1DD9645 /*sceRudpSetMaxSegmentSize*/, {1200}) == 0);
+    CHECK(call32(ctx, kSceLibRudp, 0x68A52861 /*sceRudpGetMaxSegmentSize*/, {mss}) == 0);
+    CHECK(psv_ld16(mss) == 1200);
 }

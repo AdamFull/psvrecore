@@ -10,6 +10,7 @@
 // port, padding (16 bytes). Byte order and address text (InetPton/Ntop) need no network and work.
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 
 #include "hle_common.hpp"
@@ -537,6 +538,69 @@ i32 sceNetGetStatisticsInfo(Ptr<i32> out, i32 /*flags*/) {
 }
 
 // Byte order (the guest's is little-endian, the network's big-endian) and addresses as text.
+// The rest of SceNet:
+// - sceNetRecvmsg: a receive into the message's vectors (none ever arrives offline: as sceNetRecv).
+// - sceNetEpollWaitCB: sceNetEpollWait (callbacks are not run while it waits).
+// - DNS: the cache cleared and servers set, to no effect (nothing is resolved but numbers and the loopback name).
+// - Packet dumps (a debugging capture): made and destroyed; reading one gives nothing, aborting ends a read.
+// - sceNetGetSockIdInfo: the socket IDs in use, as bits of an fd set (1024 bits).
+// - sceNetEtherNtostr/Strton: a MAC address to "xx:xx:xx:xx:xx:xx" and back.
+i32 sceNetRecvmsg(i32 s, Ptr<const u32> message, i32 flags) {
+    if (!message || !readable(message.address, 28)) return result(kEfault);
+    return sceNetRecv(s, Ptr<u8>(0), 0, flags);
+}
+i32 sceNetEpollWaitCB(i32 e, Ptr<EpollEvent> events, i32 max, i32 timeout) { return epoll_wait(e, events, max, timeout); }
+i32 sceNetClearDnsCache(i32) { return 0; }
+i32 sceNetSetDnsInfo(Ptr<const u8> info, i32) { return info ? 0 : result(kEinval); }
+i32 sceNetDumpCreate(Ptr<const char> /*name*/, i32 length, i32) {
+    if (length < 0) return result(kEinval);
+    Net& n = net();
+    Held held(n.lock);
+    return new_id(n);
+}
+i32 sceNetDumpRead(i32 id, Ptr<u8>, i32 length, Ptr<i32> flags) {
+    if (id <= 0 || length < 0) return result(kEinval);
+    if (flags && writable(flags.address, 4)) *flags = 0;
+    return 0;
+}
+i32 sceNetDumpAbort(i32 id, i32) { return id > 0 ? 0 : result(kEinval); }
+i32 sceNetDumpDestroy(i32 id) { return id > 0 ? 0 : result(kEinval); }
+i32 sceNetGetSockIdInfo(Ptr<u8> fds, i32, i32) {
+    if (!fds || !writable(fds.address, 128)) return result(kEinval);
+    std::memset(fds.get(), 0, 128);
+    Net& n = net();
+    Held held(n.lock);
+    for (const auto& [id, socket] : n.sockets)
+        if (id >= 0 && id < 1024) fds.get()[id / 8] |= static_cast<u8>(1u << (id % 8));
+    return 0;
+}
+i32 sceNetEtherNtostr(Ptr<const u8> mac, Ptr<char> out, u32 length) {
+    if (!mac || !out || length < 18 || !readable(mac.address, 6) || !writable(out.address, 18)) return result(kEinval);
+    const u8* m = mac.get();
+    std::snprintf(out.get(), 18, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+    return 0;
+}
+i32 sceNetEtherStrton(Ptr<const char> text, Ptr<u8> mac) {
+    if (!text || !mac || !readable(text.address, 17) || !writable(mac.address, 6)) return result(kEinval);
+    u8 out[6];
+    const char* t = text.get();
+    for (u32 i = 0; i < 6; ++i) {
+        u32 v = 0;
+        for (u32 k = 0; k < 2; ++k) {
+            const char c = t[3 * i + k];
+            const u32 d = c >= '0' && c <= '9' ? static_cast<u32>(c - '0')
+                          : c >= 'a' && c <= 'f' ? static_cast<u32>(c - 'a' + 10)
+                          : c >= 'A' && c <= 'F' ? static_cast<u32>(c - 'A' + 10) : 99;
+            if (d > 15) return result(kEinval);
+            v = v * 16 + d;
+        }
+        if (i < 5 && t[3 * i + 2] != ':' && t[3 * i + 2] != '-') return result(kEinval);
+        out[i] = static_cast<u8>(v);
+    }
+    std::memcpy(mac.get(), out, 6);
+    return 0;
+}
+
 u32 sceNetHtonl(u32 v) { return __builtin_bswap32(v); }
 u32 sceNetNtohl(u32 v) { return __builtin_bswap32(v); }
 u32 sceNetHtons(u32 v) { return __builtin_bswap16(static_cast<u16>(v)); }
@@ -618,6 +682,17 @@ const Function kNet[] = {
     HLE_FUNCTION(0xFB3336A6, sceNetNtohll),
     HLE_FUNCTION(0xD5EEB048, sceNetInetPton),
     HLE_FUNCTION(0x98839B74, sceNetInetNtop),
+    HLE_FUNCTION(0xDE94C6FE, sceNetRecvmsg),
+    HLE_FUNCTION(0x92D3E767, sceNetEpollWaitCB),
+    HLE_FUNCTION(0xFEC1166D, sceNetClearDnsCache),
+    HLE_FUNCTION(0xD62EF218, sceNetSetDnsInfo),
+    HLE_FUNCTION(0xAFF9FA4D, sceNetDumpCreate),
+    HLE_FUNCTION(0x04042925, sceNetDumpRead),
+    HLE_FUNCTION(0x3B24E75F, sceNetDumpAbort),
+    HLE_FUNCTION(0x82DDCF63, sceNetDumpDestroy),
+    HLE_FUNCTION(0x138CF1D6, sceNetGetSockIdInfo),
+    HLE_FUNCTION(0x84334EB2, sceNetEtherNtostr),
+    HLE_FUNCTION(0xEEC6D75F, sceNetEtherStrton),
 };
 
 // ---- RUDP (SceLibRudp): reliable sessions over the game's own UDP sockets. Contexts and polls are made, bound and
@@ -781,6 +856,41 @@ i32 sceRudpPollWait(i32 poll, Ptr<void>, u32, u64 timeout) {
     return r == kEbadf ? kRudpInvalidPoll : r == kEintr ? kRudpCancelled : 0;
 }
 
+// The rest of RUDP: the segment size kept (a library-wide setting); a context's ends are unknown until it connects (none
+// does offline: INVALID_CONTEXT unless it exists, then nothing to read); polls cancelled; the I/O thread's second form.
+u16 g_rudp_mss = 1400;
+i32 sceRudpGetMaxSegmentSize(Ptr<u16> mss) {
+    if (!mss || !writable(mss.address, 2)) return kRudpInvalidArgument;
+    *mss = g_rudp_mss;
+    return 0;
+}
+i32 sceRudpSetMaxSegmentSize(u32 mss) {
+    if ((mss & 0xFFFF) == 0) return kRudpInvalidArgument;
+    g_rudp_mss = static_cast<u16>(mss);
+    return 0;
+}
+i32 sceRudpEnableInternalIOThread2(u32 stack, u32 priority, u64) { return sceRudpEnableInternalIOThread(stack, priority); }
+i32 sceRudpGetNumberOfPacketsToRead(i32 ctx) {
+    Held held(net().lock);
+    if (const i32 r = rudp_context(ctx); r < 0) return r;
+    return 0;
+}
+i32 rudp_not_connected(i32 ctx) {
+    Held held(net().lock);
+    if (const i32 r = rudp_context(ctx); r < 0) return r;
+    return kRudpNotAcceptable;
+}
+i32 sceRudpGetLocalInfo(i32 ctx, u32, u32, u32, u32, u32) { return rudp_not_connected(ctx); }
+i32 sceRudpGetRemoteInfo(i32 ctx, u32, u32, u32) { return rudp_not_connected(ctx); }
+i32 sceRudpPollCancel(i32 poll) {
+    Held held(net().lock);
+    if (!rudp().initialized) return kRudpNotInitialized;
+    auto it = rudp().polls.find(poll);
+    if (it == rudp().polls.end()) return kRudpInvalidPoll;
+    it->second = true;
+    return 0;
+}
+
 const Function kRudp[] = {
     HLE_FUNCTION(0x22C9AA29, sceRudpInit),
     HLE_FUNCTION(0x3EA0961E, sceRudpEnd),
@@ -806,6 +916,13 @@ const Function kRudp[] = {
     HLE_FUNCTION(0xC9ACBDF0, sceRudpPollDestroy),
     HLE_FUNCTION(0x18668BD8, sceRudpPollControl),
     HLE_FUNCTION(0x55918C7C, sceRudpPollWait),
+    HLE_FUNCTION(0x68A52861, sceRudpGetMaxSegmentSize),
+    HLE_FUNCTION(0xE1DD9645, sceRudpSetMaxSegmentSize),
+    HLE_FUNCTION(0x87EC465E, sceRudpEnableInternalIOThread2),
+    HLE_FUNCTION(0x5D0460CD, sceRudpGetNumberOfPacketsToRead),
+    HLE_FUNCTION(0x4DC43692, sceRudpGetLocalInfo),
+    HLE_FUNCTION(0x104E4D3B, sceRudpGetRemoteInfo),
+    HLE_FUNCTION(0xA9B92EFE, sceRudpPollCancel),
 };
 
 // ---- Ad hoc matching (SceNetAdhocMatching) and the PSP-style ad hoc control (ScePspnetAdhoc): no other console is
@@ -893,6 +1010,15 @@ i32 sceNetAdhocMatchingSetHelloOpt(i32 id, i32 length, Ptr<const void> hello) {
     if (const i32 r = running_context(id); r < 0) return r;
     return length < 0 || (length && !hello) ? kMatchingInvalidArg : 0;
 }
+// (sending to an unknown peer was never started; the hello option is none)
+i32 sceNetAdhocMatchingAbortSendData(i32 id, Ptr<const u32> target) { return unknown_target(id, target); }
+i32 sceNetAdhocMatchingGetHelloOpt(i32 id, Ptr<i32> length, Ptr<void>) {
+    Held held(net().lock);
+    if (const i32 r = running_context(id); r < 0) return r;
+    if (!length || !writable(length.address, 4)) return kMatchingInvalidArg;
+    *length = 0;
+    return 0;
+}
 // (no members: nobody was found)
 i32 sceNetAdhocMatchingGetMembers(i32 id, Ptr<u32> count, Ptr<void> /*members*/) {
     Held held(net().lock);
@@ -917,6 +1043,8 @@ const Function kAdhocMatching[] = {
     HLE_FUNCTION(0x83C0E435, sceNetAdhocMatchingSendData),
     HLE_FUNCTION(0x659D4B04, sceNetAdhocMatchingSetHelloOpt),
     HLE_FUNCTION(0x85B23CEB, sceNetAdhocMatchingGetMembers),
+    HLE_FUNCTION(0xFE77831E, sceNetAdhocMatchingAbortSendData),
+    HLE_FUNCTION(0x90AFFEDD, sceNetAdhocMatchingGetHelloOpt),
 };
 // (the PSP-style ad hoc library and its control start and end; nothing more is asked of them)
 const Function kPspnetAdhoc[] = {

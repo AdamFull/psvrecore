@@ -341,6 +341,7 @@ const Function kSslMore[] = {HLE_FUNCTION(0xBD203262, sceSslGetMemoryPoolStats)}
 const Function kSslInternal[] = {
     HLE_FUNCTION(0x4B4A2307, sceSslInternalIsInitalized),
     Function{0xF39A49C6, "sceSslInternalWrite", &entry<&ssl_internal_failed>},
+    Function{0x064DFC99, "sceSslInternalGetCertificateAuthority", &entry<&ssl_internal_failed>},
     Function{0x0DB6C206, "(SceSslInternal 0x0DB6C206)", &entry<&ssl_internal_failed>},
     Function{0x19B2BB58, "(SceSslInternal 0x19B2BB58)", &entry<&ssl_internal_failed>},
     Function{0x2185BB05, "(SceSslInternal 0x2185BB05)", &entry<&ssl_internal_failed>},

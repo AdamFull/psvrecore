@@ -564,10 +564,12 @@ const Function kNpWebApiCommonDialog[] = {
     Function{0x114F831A, "sceGameCustomDataDialogGetStatus", &entry<&other_status<Other::GameCustomData>>},
     Function{0xC2B39806, "sceGameCustomDataDialogGetResult", &entry<&other_result<Other::GameCustomData>>},
     Function{0xE183B9F3, "sceGameCustomDataDialogTerm", &entry<&other_term<Other::GameCustomData>>},
+    Function{0xF5A1FA42, "sceGameCustomDataDialogAbort", &entry<&other_abort<Other::GameCustomData>>},
     Function{0x8723A5F2, "sceInvitationDialogInit", &entry<&other_init<Other::Invitation>>},
     Function{0x5B735F60, "sceInvitationDialogGetStatus", &entry<&other_status<Other::Invitation>>},
     Function{0xEA14FB1E, "sceInvitationDialogGetResult", &entry<&other_result<Other::Invitation>>},
     Function{0x4136382C, "sceInvitationDialogTerm", &entry<&other_term<Other::Invitation>>},
+    Function{0x853E5D3B, "sceInvitationDialogAbort", &entry<&other_abort<Other::Invitation>>},
 };
 
 const Function kCommonDialog[] = {
