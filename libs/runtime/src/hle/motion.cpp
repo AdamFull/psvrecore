@@ -34,6 +34,7 @@ struct Motion {
     bool sampling = false;
     i32 deadband = 1, tilt_correction = 1;
     f32 angle_threshold = 0;
+    bool gyro_bias_correction = true, magnetometer = false;
 };
 Motion& motion() {
     static Motion m;
@@ -98,7 +99,12 @@ i32 sceMotionGetSensorState(Ptr<u8> out, i32 count) {
     return 0;
 }
 // (no magnetometer: turning it on changes nothing, the field's stability stays unknown)
-i32 sceMotionMagnetometerOn() { return 0; }
+i32 sceMotionMagnetometerOn() {
+    Motion& m = motion();
+    nx::scoped_lock<nx::mutex> held(m.lock);
+    m.magnetometer = true;
+    return 0;
+}
 
 i32 sceMotionSetDeadband(i32 value) {
     Motion& m = motion();
@@ -124,6 +130,55 @@ i32 sceMotionGetTiltCorrection() {
 }
 i32 sceMotionReset() { return 0; }  // (nothing has moved)
 
+// The rest: the angle threshold and gyro bias correction kept and read back; the magnetometer's state (on or off, as
+// set: there is none); the basic orientation (lying face up: 0, 0, 1); the sensors' physical places (not known: the
+// origin); a yaw rotation accepted (the orientation stays the identity: nothing is turned).
+i32 sceMotionSetAngleThreshold(f32 angle) {
+    Motion& m = motion();
+    nx::scoped_lock<nx::mutex> held(m.lock);
+    m.angle_threshold = angle;
+    return 0;
+}
+f32 sceMotionGetAngleThreshold() {
+    Motion& m = motion();
+    nx::scoped_lock<nx::mutex> held(m.lock);
+    return m.angle_threshold;
+}
+i32 sceMotionSetGyroBiasCorrection(u32 on) {
+    Motion& m = motion();
+    nx::scoped_lock<nx::mutex> held(m.lock);
+    m.gyro_bias_correction = on != 0;
+    return 0;
+}
+u32 sceMotionGetGyroBiasCorrection() {
+    Motion& m = motion();
+    nx::scoped_lock<nx::mutex> held(m.lock);
+    return m.gyro_bias_correction ? 1 : 0;
+}
+i32 sceMotionMagnetometerOff() {
+    Motion& m = motion();
+    nx::scoped_lock<nx::mutex> held(m.lock);
+    m.magnetometer = false;
+    return 0;
+}
+u32 sceMotionGetMagnetometerState() {
+    Motion& m = motion();
+    nx::scoped_lock<nx::mutex> held(m.lock);
+    return m.magnetometer ? 1 : 0;
+}
+i32 sceMotionGetBasicOrientation(Ptr<f32> out) {
+    if (!out || !writable(out.address, 12)) return err::code(0x80360200);  // (SCE_MOTION_ERROR_DATA_INVALID)
+    out.get()[0] = 0.0f, out.get()[1] = 0.0f, out.get()[2] = 1.0f;
+    return 0;
+}
+// SceMotionDeviceLocation: the accelerometer's and the gyro's positions (3 floats each), reserved.
+i32 sceMotionGetDeviceLocation(Ptr<u8> out) {
+    if (!out || !writable(out.address, 48)) return err::code(0x80360200);
+    std::memset(out.get(), 0, 48);
+    return 0;
+}
+i32 sceMotionRotateYaw(f32) { return 0; }
+
 const Function kFunctions[] = {
     HLE_FUNCTION(0x28034AC9, sceMotionStartSampling),
     HLE_FUNCTION(0xAF32CB1D, sceMotionStopSampling),
@@ -135,6 +190,15 @@ const Function kFunctions[] = {
     HLE_FUNCTION(0x0FD2CDA2, sceMotionReset),
     HLE_FUNCTION(0x47D679EA, sceMotionGetSensorState),
     HLE_FUNCTION(0x122A79F8, sceMotionMagnetometerOn),
+    HLE_FUNCTION(0xDACB2A41, sceMotionSetAngleThreshold),
+    HLE_FUNCTION(0x499B6C87, sceMotionGetAngleThreshold),
+    HLE_FUNCTION(0xA4A7E6E2, sceMotionSetGyroBiasCorrection),
+    HLE_FUNCTION(0xE8A28DA5, sceMotionGetGyroBiasCorrection),
+    HLE_FUNCTION(0xC1A7395A, sceMotionMagnetometerOff),
+    HLE_FUNCTION(0x3D4813AE, sceMotionGetMagnetometerState),
+    HLE_FUNCTION(0x4F28BFE0, sceMotionGetBasicOrientation),
+    HLE_FUNCTION(0x047F060A, sceMotionGetDeviceLocation),
+    HLE_FUNCTION(0x20F00078, sceMotionRotateYaw),
 };
 
 }  // namespace

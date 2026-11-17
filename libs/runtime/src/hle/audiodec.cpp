@@ -317,7 +317,12 @@ i32 sceAudiodecGetInternalError(Ptr<Ctrl> ctrl, Ptr<i32> error) {
     return 0;
 }
 
+// sceAudiodecDecodeNStreams (several decoders' frames in one call) is not in the SDK's header: its arguments are
+// unknown, and it answers UNSUPPORTED (games decode stream by stream).
+i32 decode_n_streams() { return kUnsupported; }
+
 const Function kFunctions[] = {
+    Function{0x68F4A9CB, "sceAudiodecDecodeNStreams", &entry<&decode_n_streams>},
     HLE_FUNCTION(0x445C2CEF, sceAudiodecInitLibrary),
     HLE_FUNCTION(0x45719B9D, sceAudiodecTermLibrary),
     HLE_FUNCTION(0x4DFD3AAA, sceAudiodecCreateDecoder),

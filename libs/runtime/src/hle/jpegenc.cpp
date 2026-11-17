@@ -210,9 +210,12 @@ i32 sceJpegEncoderEncode(u32 context, u32 in) {
 }
 
 std::atomic<bool> g_mjpeg{false};
+std::atomic<i32> g_max_split{0};
+// (0 split decoders is allowed: the SDK's samples start it so)
 i32 sceJpegInitMJpeg(i32 split_decoders) {
-    if (split_decoders < 1) return kJpegInvalidInitParam;
+    if (split_decoders < 0) return kJpegInvalidInitParam;
     if (g_mjpeg.exchange(true)) return kJpegInitDone;
+    g_max_split = split_decoders;
     return 0;
 }
 // SceJpegMJpegInitParam: size, the most split decoders, option.
@@ -241,12 +244,16 @@ u32 planes_size(const media::JpegImage& img) {
 
 // SceJpegOutputInfo: colour space | sampling, width, height (16 bits each), the output, temporary and coefficient
 // buffers' sizes, and four pitches (x, y): the planes' (no colour conversion), or the RGBA picture's.
+void write_output_info(u8* p, const media::JpegImage& img, i32 format);
 i32 sceJpegGetOutputInfo(u32 jpeg, u32 size, i32 format, i32 mode, Ptr<u8> info) {
     if (!info || !writable(info.address, 52)) return kJpegInvalidPointer;
     if (format != -1 && format != 0 && format != 4) return kJpegInvalidColorFormat;
     media::JpegImage img;
     if (const i32 r = read_image(jpeg, size, static_cast<u32>(mode), &img, false); r < 0) return r;
-    u8* p = info.get();
+    write_output_info(info.get(), img, format);
+    return 0;
+}
+void write_output_info(u8* p, const media::JpegImage& img, i32 format) {
     std::memset(p, 0, 52);
     const u32 space = img.components == 1 ? (1u << 16) | 0x101 : (2u << 16) | img.sampling();
     const u16 w = static_cast<u16>(img.width), h = static_cast<u16>(img.height);
@@ -259,7 +266,94 @@ i32 sceJpegGetOutputInfo(u32 jpeg, u32 size, i32 format, i32 mode, Ptr<u8> info)
         std::memcpy(p + 20 + 8 * c, &img.pitch[c], 4);
         std::memcpy(p + 24 + 8 * c, &img.rows[c], 4);
     }
+}
+
+// The split decoder (one frame's data fed in parts): SceJpegSplitDecodeCtrl: the stream buffer (pointer, size), the
+// write buffer (pointer, size), end of stream, decode mode, the output information (52 bytes), the output and
+// coefficient buffers, internal words. The first call takes the stream buffer's bytes; once the header is in, the
+// output information is filled and INIT_DONE answered (the game then gives its output buffer); while the end
+// marker has not come, INPUT_SUSPENDED asks for more in the write buffer (the stream buffer again, its whole size;
+// the game sets the size it loaded and the end flag at the end). Then the whole frame is decoded, as
+// sceJpegDecodeMJpegYCbCr writes it, and its size returned. Data is kept here, by the control block's address.
+constexpr i32 kJpegExceedMaxSplit = err::code(0x80650062), kJpegInputSuspended = err::code(0x80650064);
+struct Split {
+    nx::vector<u8> data;
+    bool started = false, header = false, asked = false;
+};
+struct Splits {
+    nx::mutex lock;
+    nx::flat_hash_map<u32, Split> by_ctrl;
+};
+Splits& splits() {
+    static Splits s;
+    return s;
+}
+i32 sceJpegCreateSplitDecoder(u32 ctrl) {
+    if (!g_mjpeg) return kJpegInvalidState;
+    if (!ctrl || !writable(ctrl, 0x60)) return kJpegInvalidPointer;
+    Splits& all = splits();
+    nx::scoped_lock<nx::mutex> held(all.lock);
+    if (static_cast<i32>(all.by_ctrl.size()) >= g_max_split) return kJpegExceedMaxSplit;
+    all.by_ctrl[ctrl] = Split{};
     return 0;
+}
+i32 sceJpegDeleteSplitDecoder(u32 ctrl) {
+    Splits& all = splits();
+    nx::scoped_lock<nx::mutex> held(all.lock);
+    return all.by_ctrl.erase(ctrl) ? 0 : kJpegInvalidPointer;
+}
+bool has_end(const nx::vector<u8>& d) {
+    for (usize i = d.size(); i >= 2; --i)
+        if (d[i - 2] == 0xFF && d[i - 1] == 0xD9) return true;
+    return false;
+}
+i32 sceJpegSplitDecodeMJpeg(u32 ctrl) {
+    if (!ctrl || !writable(ctrl, 0x60)) return kJpegInvalidPointer;
+    Splits& all = splits();
+    nx::scoped_lock<nx::mutex> held(all.lock);
+    auto it = all.by_ctrl.find(ctrl);
+    if (it == all.by_ctrl.end()) return kJpegInvalidPointer;
+    Split& sp = it->second;
+    const u32 stream = psv_ld32(ctrl), stream_size = psv_ld32(ctrl + 4), mode = psv_ld32(ctrl + 20);
+    const auto take = [&](u32 at, u32 n) {
+        if (!n) return true;
+        if (!at || !readable(at, n)) return false;
+        const u8* b = memory().host(at);
+        sp.data.insert(sp.data.end(), b, b + n);
+        return true;
+    };
+    if (!sp.started) {
+        sp.started = true;
+        if (!take(stream, stream_size)) return kJpegInvalidPointer;
+    } else if (sp.asked) {
+        sp.asked = false;
+        if (!take(psv_ld32(ctrl + 8), psv_ld32(ctrl + 12))) return kJpegInvalidPointer;
+    }
+    if ((mode & 0xF) > 3 || (mode & 0x70)) return kJpegInvalidDecodeMode;
+    const bool end = psv_ld32(ctrl + 16) != 0 || has_end(sp.data);
+    media::JpegImage img;
+    if (!sp.header) {
+        if (media::jpeg_info(sp.data, &img) == 0) {
+            sp.header = true;
+            write_output_info(memory().host(ctrl + 24), img, -1);
+            return kJpegInitDone;
+        }
+        if (end) return media::jpeg_info(sp.data, &img);
+    }
+    if (!end) {
+        psv_st32(ctrl + 8, stream), psv_st32(ctrl + 12, stream_size), psv_st32(ctrl + 16, 0);
+        sp.asked = true;
+        return kJpegInputSuspended;
+    }
+    if (const i32 r = media::jpeg_decode(sp.data, &img); r < 0) return r;
+    const u32 need = planes_size(img), out = psv_ld32(ctrl + 76);
+    if (!out || !writable(out, need)) return kJpegInvalidPointer;
+    u8* p = memory().host(out);
+    for (u32 c = 0; c < img.components; ++c) {
+        std::memcpy(p, img.plane[c].data(), img.plane[c].size());
+        p += img.plane[c].size();
+    }
+    return static_cast<i32>((img.width << 16) | img.height);
 }
 
 i32 sceJpegDecodeMJpegYCbCr(u32 jpeg, u32 size, u32 out, u32 out_size, i32 mode, u32 /*coef*/, u32 /*coef_size*/) {
@@ -326,6 +420,9 @@ const Function kDecoder[] = {
     HLE_FUNCTION(0x6215B095, sceJpegDecodeMJpeg),
     HLE_FUNCTION(0x6263AEC2, sceJpegCsc),
     HLE_FUNCTION(0xC2380E3A, sceJpegMJpegCsc),
+    HLE_FUNCTION(0x123B4734, sceJpegCreateSplitDecoder),
+    HLE_FUNCTION(0xDE8D5FA1, sceJpegDeleteSplitDecoder),
+    HLE_FUNCTION(0x4598EC9C, sceJpegSplitDecodeMJpeg),
 };
 
 const Function kFunctions[] = {
@@ -350,6 +447,11 @@ void register_jpegenc() {
         all.by_context.clear();
     }
     g_mjpeg = false;
+    {
+        Splits& all = splits();
+        nx::scoped_lock<nx::mutex> held(all.lock);
+        all.by_ctrl.clear();
+    }
     register_library({"SceJpegEncUser", kSceJpegEncUser, kFunctions});
     register_library({"SceJpegUser", kSceJpegUser, kDecoder});
 }

@@ -287,7 +287,23 @@ i32 sceAvcdecDecodeFlush(Ptr<const Ctrl> ctrl) {
     return 0;
 }
 
+// MPEG-4 part 2 (sceM4vdec*) and the AVC decoder's separate colour conversion (sceAvcdecCsc) are not in the SDK's
+// header (their records are unknown) and there is no MPEG-4 part 2 decoder here: they answer that the type is not
+// supported. The interlaced stream mode is accepted for AVC (progressive and interlaced streams decode alike here).
+i32 m4v_unsupported() { return kVideodecInvalidType; }
+i32 sceAvcdecSetInterlacedStreamMode(u32 type, u32 /*flag*/) { return type == kTypeHwAvcdec ? 0 : kVideodecInvalidType; }
+
 const Function kVideodec[] = {
+    HLE_FUNCTION(0x2DD70FC8, sceAvcdecSetInterlacedStreamMode),
+    Function{0xC67C1A80, "sceM4vdecQueryDecoderMemSize", &entry<&m4v_unsupported>},
+    Function{0x17C6AC9E, "sceM4vdecCreateDecoder", &entry<&m4v_unsupported>},
+    Function{0x0EB2E4E7, "sceM4vdecDeleteDecoder", &entry<&m4v_unsupported>},
+    Function{0x624664DB, "sceM4vdecDecode", &entry<&m4v_unsupported>},
+    Function{0xA8CF1942, "sceM4vdecDecodeAvailableSize", &entry<&m4v_unsupported>},
+    Function{0x7C460D75, "sceM4vdecDecodeFlush", &entry<&m4v_unsupported>},
+    Function{0x87CFD23B, "sceM4vdecDecodeStop", &entry<&m4v_unsupported>},
+    Function{0xB4BC325B, "sceM4vdecCsc", &entry<&m4v_unsupported>},
+    Function{0xB2A428DB, "sceAvcdecCsc", &entry<&m4v_unsupported>},
     HLE_FUNCTION(0xF1AF65A3, sceVideodecInitLibrary),
     HLE_FUNCTION(0x3A5F4924, sceVideodecTermLibrary),
     HLE_FUNCTION(0x6731BB2D, sceVideodecQueryMemSize),

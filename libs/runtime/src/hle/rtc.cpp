@@ -2,6 +2,7 @@
 // assertion handler (SceDbg).
 
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 
@@ -337,6 +338,145 @@ i32 sceRtcParseRFC3339(Ptr<u64> utc, Ptr<const char> text) {
     return 0;
 }
 
+// ---- the rest of the clock: validity, day counts, DOS and Win32 times, more additions, RFC 2822 in a zone, parsing
+
+bool leap(i32 y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+i32 days_in(i32 y, i32 m) {
+    static constexpr i32 kDays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    return m == 2 && leap(y) ? 29 : kDays[m - 1];
+}
+i32 sceRtcIsLeapYear(i32 year) { return year < 1 ? kRtcInvalidValue : leap(year) ? 1 : 0; }
+i32 sceRtcGetDaysInMonth(i32 year, i32 month) {
+    if (year < 1) return err::code(0x80251081);
+    if (month < 1 || month > 12) return err::code(0x80251082);
+    return days_in(year, month);
+}
+// (not in the SDK's header: taken as year, month, day, as sceRtcGetDayOfWeek; 1 for the first of January)
+i32 sceRtcGetDayOfYear(i32 year, i32 month, i32 day) {
+    if (year < 1 || month < 1 || month > 12 || day < 1 || day > days_in(year, month)) return kRtcInvalidValue;
+    i32 n = day;
+    for (i32 m = 1; m < month; ++m) n += days_in(year, m);
+    return n;
+}
+// 0, or the first field out of range.
+i32 sceRtcCheckValid(Ptr<const io::DateTime> in) {
+    if (!in || !readable(in.address, sizeof(io::DateTime))) return kRtcInvalidPointer;
+    const io::DateTime d = *in;
+    if (d.year < 1 || d.year > 9999) return err::code(0x80251081);
+    if (d.month < 1 || d.month > 12) return err::code(0x80251082);
+    if (d.day < 1 || d.day > days_in(d.year, d.month)) return err::code(0x80251083);
+    if (d.hour > 23) return err::code(0x80251084);
+    if (d.minute > 59) return err::code(0x80251085);
+    if (d.second > 59) return err::code(0x80251086);
+    if (d.microsecond > 999'999) return err::code(0x80251087);
+    return 0;
+}
+// DOS (FAT) time: years from 1980 (7 bits), month, day, hour, minute, seconds / 2.
+i32 sceRtcGetDosTime(Ptr<const io::DateTime> in, Ptr<u32> out) {
+    if (!in || !readable(in.address, sizeof(io::DateTime)) || !out || !writable(out.address, 4)) return kRtcInvalidPointer;
+    const io::DateTime d = *in;
+    if (d.year < 1980 || d.year > 2107) return kRtcInvalidValue;
+    *out = (u32{d.year} - 1980u) << 25 | u32{d.month} << 21 | u32{d.day} << 16 | u32{d.hour} << 11 | u32{d.minute} << 5 |
+           u32{d.second} / 2u;
+    return 0;
+}
+i32 sceRtcSetDosTime(Ptr<io::DateTime> out, u32 dos) {
+    if (!out || !writable(out.address, sizeof(io::DateTime))) return kRtcInvalidPointer;
+    io::DateTime d{};
+    d.year = static_cast<u16>(1980 + (dos >> 25)), d.month = static_cast<u16>((dos >> 21) & 15), d.day = static_cast<u16>((dos >> 16) & 31);
+    d.hour = static_cast<u16>((dos >> 11) & 31), d.minute = static_cast<u16>((dos >> 5) & 63), d.second = static_cast<u16>((dos & 31) * 2);
+    *out = d;
+    return 0;
+}
+i32 sceRtcSetWin32FileTime(Ptr<io::DateTime> out, u64 filetime) {
+    if (!out || !writable(out.address, sizeof(io::DateTime))) return kRtcInvalidPointer;
+    constexpr u64 k1601 = 584388ull * kMicrosPerDay;
+    *out = date_of(k1601 + filetime / 10);
+    return 0;
+}
+i32 sceRtcTickAddTicks(Ptr<u64> out, Ptr<const u64> in, i64 add) { return tick_add(out, in, add, 1); }
+i32 sceRtcTickAddWeeks(Ptr<u64> out, Ptr<const u64> in, i32 add) { return tick_add(out, in, add, 7 * 86'400'000'000ll); }
+// The clock was never set or rolled over here: both answer when the process started.
+u64 process_start_tick() {
+    static const u64 start = now_tick() - kernel().clock_ns() / 1000;
+    return start;
+}
+i32 sceRtcGetLastAdjustedTick(Ptr<u64> out) { return write_tick(out, process_start_tick()) ? 0 : kRtcInvalidPointer; }
+i32 sceRtcGetLastReincarnatedTick(Ptr<u64> out) { return write_tick(out, process_start_tick()) ? 0 : kRtcInvalidPointer; }
+// RFC 2822 in a given zone: "Wed, 01 Jan 2014 09:00:00 +0900".
+i32 sceRtcFormatRFC2822(Ptr<char> text, Ptr<const u64> utc, i32 zone_minutes) {
+    static const char* const kDays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char* const kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    u64 t;
+    if (!read_tick(utc, &t) || !writable(text.address, 32)) return kRtcInvalidPointer;
+    const io::DateTime d = date_of(static_cast<u64>(static_cast<i64>(t) + i64{zone_minutes} * 60'000'000));
+    const i32 a = zone_minutes < 0 ? -zone_minutes : zone_minutes;
+    const nx::string s = nx::format("{}, {:02} {} {:04} {:02}:{:02}:{:02} {}{:02}{:02}",
+                                    kDays[sceRtcGetDayOfWeek(d.year, d.month, d.day)], d.day, kMonths[d.month - 1], d.year,
+                                    d.hour, d.minute, d.second, zone_minutes < 0 ? '-' : '+', a / 60, a % 60);
+    std::memcpy(text.get(), s.c_str(), s.size() + 1);
+    return 0;
+}
+// A date and time in RFC 3339, or RFC 2822 ("[Wed, ]01 Jan 2014 09:00[:00] +0900", or GMT/UT/Z), to a UTC tick.
+i32 sceRtcParseDateTime(Ptr<u64> utc, Ptr<const char> text) {
+    if (!utc || !text || !writable(utc.address, 8)) return kRtcInvalidPointer;
+    if (sceRtcParseRFC3339(utc, text) == 0) return 0;
+    static const char* const kMonths[] = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"};
+    nx::string s = str(text, 64);
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    usize i = 0;
+    const auto at = [&](usize from, const char* word) {
+        const usize n = std::strlen(word);
+        return from + n <= s.size() && std::memcmp(s.data() + from, word, n) == 0;
+    };
+    const auto spaces = [&] {
+        while (i < s.size() && s[i] == ' ') ++i;
+    };
+    const auto number = [&](u32 most, u32* out) {
+        u32 v = 0, n = 0;
+        while (i < s.size() && n < most && s[i] >= '0' && s[i] <= '9') v = v * 10 + static_cast<u32>(s[i++] - '0'), ++n;
+        *out = v;
+        return n > 0;
+    };
+    spaces();
+    if (s.size() > i + 4 && s[i + 3] == ',') i += 4;  // (the day of the week)
+    spaces();
+    u32 day, year, hour, minute, second = 0;
+    if (!number(2, &day)) return kRtcBadParse;
+    spaces();
+    u32 month = 0;
+    for (u32 m = 0; m < 12; ++m)
+        if (at(i, kMonths[m])) month = m + 1;
+    if (!month) return kRtcBadParse;
+    i += 3;
+    spaces();
+    if (!number(4, &year)) return kRtcBadParse;
+    spaces();
+    if (!number(2, &hour) || i >= s.size() || s[i++] != ':' || !number(2, &minute)) return kRtcBadParse;
+    if (i < s.size() && s[i] == ':') {
+        ++i;
+        if (!number(2, &second)) return kRtcBadParse;
+    }
+    spaces();
+    i32 zone = 0;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+        const bool minus = s[i++] == '-';
+        u32 hhmm;
+        if (!number(4, &hhmm)) return kRtcBadParse;
+        zone = static_cast<i32>(hhmm / 100 * 60 + hhmm % 100) * (minus ? -1 : 1);
+    } else if (i < s.size() && !at(i, "gmt") && !at(i, "ut") && s[i] != 'z') {
+        return kRtcBadParse;
+    }
+    if (year < 1 || day < 1 || day > static_cast<u32>(days_in(static_cast<i32>(year), static_cast<i32>(month))) || hour > 23 ||
+        minute > 59 || second > 60)
+        return kRtcBadParse;
+    io::DateTime dt{};
+    dt.year = static_cast<u16>(year), dt.month = static_cast<u16>(month), dt.day = static_cast<u16>(day);
+    dt.hour = static_cast<u16>(hour), dt.minute = static_cast<u16>(minute), dt.second = static_cast<u16>(second);
+    write_tick(utc, static_cast<u64>(static_cast<i64>(tick_of(dt)) - i64{zone} * 60'000'000));
+    return 0;
+}
+
 // (SceRtc) The time the console has run, in microseconds: the process's here.
 u64 sceRtcGetAccumulativeTime() { return kernel().clock_ns() / 1000; }
 
@@ -353,6 +493,19 @@ const Function kRtcMore[] = {
     HLE_FUNCTION(0xCCEA2B54, sceRtcFormatRFC3339),
     HLE_FUNCTION(0x42CA8EB5, sceRtcFormatRFC2822LocalTime),
     HLE_FUNCTION(0x2D18AEEC, sceRtcParseRFC3339),
+    HLE_FUNCTION(0xF17FD8B5, sceRtcIsLeapYear),
+    HLE_FUNCTION(0x49EB4556, sceRtcGetDaysInMonth),
+    HLE_FUNCTION(0xB5C4E95F, sceRtcGetDayOfYear),
+    HLE_FUNCTION(0xD7622935, sceRtcCheckValid),
+    HLE_FUNCTION(0x92ABEBAF, sceRtcGetDosTime),
+    HLE_FUNCTION(0xF8B22B07, sceRtcSetDosTime),
+    HLE_FUNCTION(0xA79A8846, sceRtcSetWin32FileTime),
+    HLE_FUNCTION(0x4559E2DB, sceRtcTickAddTicks),
+    HLE_FUNCTION(0xE713C640, sceRtcTickAddWeeks),
+    HLE_FUNCTION(0x8148E95C, sceRtcGetLastAdjustedTick),
+    HLE_FUNCTION(0xA8C16615, sceRtcGetLastReincarnatedTick),
+    HLE_FUNCTION(0x147F2138, sceRtcFormatRFC2822),
+    HLE_FUNCTION(0x2347CE12, sceRtcParseDateTime),
 };
 const Function kRtcKernel[] = {HLE_FUNCTION(0x258BE8EC, sceRtcGetAccumulativeTime)};
 

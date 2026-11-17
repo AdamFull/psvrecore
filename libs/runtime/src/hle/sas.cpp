@@ -19,7 +19,7 @@
 //   decay per type, not the console's presets); echo is a short reverb with the delay line; delay is the delay line
 //   alone (its time and feedback from sceSasSetEffectParam, 0-127 each).
 // - Noise: a 15-bit linear feedback shift register, clocked faster for higher noise clocks (our rate mapping).
-// The peak meters and distortion are not implemented (no game calls them).
+// The peak meters and distortion are not in the SDK's header (their arguments unknown): they fail.
 
 #include "hle_common.hpp"
 
@@ -614,7 +614,14 @@ i32 sceSasSetEffect(i32 dry, i32 wet) {
     });
 }
 
+// The peak meters and distortion are not in the SDK's header (their arguments are unknown): they fail.
+i32 sas_not_supported() { return kFail; }
+
 const Function kFunctions[] = {
+    Function{0xB6642276, "sceSasGetDryPeak", &entry<&sas_not_supported>},
+    Function{0x4314F0E9, "sceSasGetWetPeak", &entry<&sas_not_supported>},
+    Function{0x1568017A, "sceSasGetPreMasterPeak", &entry<&sas_not_supported>},
+    Function{0x011788BE, "sceSasSetDistortion", &entry<&sas_not_supported>},
     HLE_FUNCTION(0x180C6824, sceSasGetNeededMemorySize),
     HLE_FUNCTION(0x449B5974, sceSasInit),
     HLE_FUNCTION(0x820D5F82, sceSasInitWithGrain),

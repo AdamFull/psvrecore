@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <ctime>
 
 #include "nxtest.h"
@@ -775,4 +776,111 @@ TEST_CASE("NID-only imports: SceMp4 answers as no MP4 reader, the kernel's debug
     REQUIRE(hle::find_variable(0x5AD9C136, "SceLibcParam", 0xDF084DFA, &at) != nullptr);
     REQUIRE(at != 0);
     CHECK(psv_ld32(at) == 0);  // (an empty block: the libc's defaults)
+}
+
+TEST_CASE("rtc: leap years, month lengths, days of the year, valid dates, DOS times, RFC 2822 out and in") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceRtcUser = 0x6704D3C6;
+    CHECK(call32(ctx, kSceRtcUser, 0xF17FD8B5 /*IsLeapYear*/, {2000}) == 1);
+    CHECK(call32(ctx, kSceRtcUser, 0xF17FD8B5, {1900}) == 0);
+    CHECK(call32(ctx, kSceRtcUser, 0x49EB4556 /*GetDaysInMonth*/, {2024, 2}) == 29);
+    CHECK(call32(ctx, kSceRtcUser, 0xB5C4E95F /*GetDayOfYear*/, {2023, 3, 1}) == 60);
+    const u32 date = scratch(16), dos = scratch(4), back = scratch(16), tick = scratch(8), text = scratch(64);
+    const auto set_date = [&](u32 at, u16 y, u16 mo, u16 d, u16 h, u16 mi, u16 s) {
+        const u16 v[6] = {y, mo, d, h, mi, s};
+        std::memcpy(t.rt.memory().host(at), v, 12);
+        psv_st32(at + 12, 0);
+    };
+    set_date(date, 2014, 2, 29, 10, 0, 0);
+    CHECK(u(call32(ctx, kSceRtcUser, 0xD7622935 /*CheckValid*/, {date})) == 0x80251083u);  // (no 29 February in 2014)
+    set_date(date, 2014, 1, 1, 9, 30, 58);
+    CHECK(call32(ctx, kSceRtcUser, 0xD7622935, {date}) == 0);
+    REQUIRE(call32(ctx, kSceRtcUser, 0x92ABEBAF /*GetDosTime*/, {date, dos}) == 0);
+    REQUIRE(call32(ctx, kSceRtcUser, 0xF8B22B07 /*SetDosTime*/, {back, psv_ld32(dos)}) == 0);
+    CHECK(std::memcmp(t.rt.memory().host(date), t.rt.memory().host(back), 12) == 0);
+    REQUIRE(call32(ctx, kSceRtcUser, 0x2347CE12 /*ParseDateTime*/, {tick, guest_string("Wed, 01 Jan 2014 09:00:00 +0900")}) == 0);
+    REQUIRE(call32(ctx, kSceRtcUser, 0x147F2138 /*FormatRFC2822*/, {text, tick, 0}) == 0);
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(text))) == "Wed, 01 Jan 2014 00:00:00 +0000");
+    CHECK(u(call32(ctx, kSceRtcUser, 0x2347CE12, {tick, guest_string("not a date")})) == 0x80251080u);
+}
+
+TEST_CASE("motion: the angle threshold and the magnetometer's state are kept") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceMotion = 0xDC571B3F;
+    ctx->vfp.s[0] = std::bit_cast<u32>(0.25f);
+    CHECK(call32(ctx, kSceMotion, 0xDACB2A41 /*SetAngleThreshold*/, {}) == 0);
+    ctx->vfp.s[0] = 0;
+    call32(ctx, kSceMotion, 0x499B6C87 /*GetAngleThreshold*/, {});
+    CHECK(std::bit_cast<f32>(ctx->vfp.s[0]) == 0.25f);
+    CHECK(call32(ctx, kSceMotion, 0x122A79F8 /*MagnetometerOn*/, {}) == 0);
+    CHECK(call32(ctx, kSceMotion, 0x3D4813AE /*GetMagnetometerState*/, {}) == 1);
+    CHECK(call32(ctx, kSceMotion, 0xC1A7395A /*MagnetometerOff*/, {}) == 0);
+    CHECK(call32(ctx, kSceMotion, 0x3D4813AE, {}) == 0);
+}
+
+TEST_CASE("jpeg: a picture decoded by the split decoder, its data given in two parts") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceJpegEncUser = 0x3748BFD3, kSceJpegUser = 0x880BF710;
+    // A picture to decode: the encoder's (64 x 32, grey).
+    const u32 enc = scratch(0x100), planes = scratch(64 * 32 * 2), file = scratch(0x8000);
+    std::memset(t.rt.memory().host(planes), 128, 64 * 32 * 2);
+    REQUIRE(call32(ctx, kSceJpegEncUser, 0x88DA92B4 /*Init*/, {enc, 64, 32, 8, file, 0x8000}) == 0);
+    const i32 size = call32(ctx, kSceJpegEncUser, 0xC60DE94C /*Encode*/, {enc, planes});
+    REQUIRE(size > 200);
+    CHECK(u(call32(ctx, kSceJpegUser, 0xB030773B /*InitMJpeg*/, {0})) == 0);  // (no split decoders: allowed)
+    CHECK(u(call32(ctx, kSceJpegUser, 0x123B4734 /*CreateSplitDecoder*/, {scratch(0x60)})) == 0x80650062u);
+    CHECK(call32(ctx, kSceJpegUser, 0x62842598 /*FinishMJpeg*/, {}) == 0);
+    REQUIRE(call32(ctx, kSceJpegUser, 0xB030773B, {1}) == 0);
+
+    const u32 ctrl = scratch(0x60), stream = scratch(128), out = scratch(64 * 32 * 2);
+    std::memset(t.rt.memory().host(ctrl), 0, 0x60);
+    REQUIRE(call32(ctx, kSceJpegUser, 0x123B4734, {ctrl}) == 0);
+    psv_st32(ctrl, stream), psv_st32(ctrl + 4, 128), psv_st32(ctrl + 20, 0);
+    const u8* jpeg = t.rt.memory().host(file);
+    u32 fed = 128;
+    std::memcpy(t.rt.memory().host(stream), jpeg, 128);
+    i32 r = 0;
+    bool init_done = false;
+    for (u32 guard = 0; guard < 64; ++guard) {
+        r = call32(ctx, kSceJpegUser, 0x4598EC9C /*SplitDecodeMJpeg*/, {ctrl});
+        if (u(r) == 0x80650063u) {  // (INIT_DONE: the header read)
+            init_done = true;
+            CHECK(psv_ld32(ctrl + 24 + 4) == (32u << 16 | 64u));
+            psv_st32(ctrl + 76, out);
+        } else if (u(r) == 0x80650064u) {  // (INPUT_SUSPENDED: the next part)
+            const u32 n = nx::min<u32>(psv_ld32(ctrl + 12), static_cast<u32>(size) - fed);
+            std::memcpy(t.rt.memory().host(psv_ld32(ctrl + 8)), jpeg + fed, n);
+            fed += n;
+            psv_st32(ctrl + 12, n);
+            psv_st32(ctrl + 16, fed == static_cast<u32>(size) ? 1 : 0);
+        } else {
+            break;
+        }
+    }
+    CHECK(init_done);
+    CHECK(u(r) == (64u << 16 | 32u));
+    CHECK(std::abs(static_cast<i32>(t.rt.memory().host(out)[100]) - 128) <= 2);
+    CHECK(call32(ctx, kSceJpegUser, 0xDE8D5FA1 /*DeleteSplitDecoder*/, {ctrl}) == 0);
+}
+
+TEST_CASE("system gesture: the primitive touch events themselves, by count and as an array") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceSystemGesture = 0xAF3FE2D3;
+    REQUIRE(call32(ctx, kSceSystemGesture, 0x6078A08B /*InitializePrimitiveTouchRecognizer*/, {0}) == 0);
+    const u32 front = scratch(144), events = scratch(96 * 4), count = scratch(4);
+    std::memset(t.rt.memory().host(front), 0, 144);
+    psv_st32(front, 1000), psv_st32(front + 12, 1);  // (one touch: id 7 at 100, 200)
+    t.rt.memory().host(front + 16)[0] = 7;
+    psv_st16(front + 18, 100), psv_st16(front + 20, 200);
+    REQUIRE(call32(ctx, kSceSystemGesture, 0xDF4C665A /*UpdatePrimitiveTouchRecognizer*/, {front, 0}) == 0);
+    CHECK(call32(ctx, kSceSystemGesture, 0xBAB8ECCB /*GetPrimitiveTouchEventsCount*/, {}) == 1);
+    REQUIRE(call32(ctx, kSceSystemGesture, 0xC750D3DA /*GetPrimitiveTouchEvents*/, {events, 4, count}) == 0);
+    CHECK(psv_ld32(count) == 1);
+    CHECK(psv_ld16(events + 4) == 7);
+    CHECK(psv_ld16(events + 12) == 100);
+    CHECK(psv_ld16(events + 14) == 200);
 }

@@ -539,12 +539,94 @@ i32 sceSystemGestureFinalizePrimitiveTouchRecognizer() {
     return 0;
 }
 
+// The primitive touch events themselves (SceSystemGesturePrimitiveTouchEvent, 96 bytes: state, ID (panel << 8 | touch),
+// pressed position and force, current position and force, the move since the last update and its force change, the
+// time since the last update and since pressed (microseconds), reserved). Forces are not reported: 0.
+constexpr u32 kPrimitiveSize = 96;
+void write_primitive(u8* out, const Primitive& p) {
+    std::memset(out, 0, kPrimitiveSize);
+    std::memcpy(out, &p.state, 4);
+    put16(out + 4, p.id);
+    put_vec(out + 6, p.pressed);
+    put_vec(out + 12, p.current);
+    put_vec(out + 18, p.delta);
+    std::memcpy(out + 24, &p.delta_time, 8);
+    std::memcpy(out + 32, &p.elapsed, 8);
+}
+i32 sceSystemGestureGetPrimitiveTouchEventsCount() {
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    if (!g.initialized) return kNotInitialized;
+    return static_cast<i32>(g.primitives.size());
+}
+i32 sceSystemGestureGetPrimitiveTouchEvents(Ptr<u8> out, u32 capacity, Ptr<u32> count) {
+    if (!out || !count || !writable(count.address, 4) || !writable(out.address, capacity * kPrimitiveSize)) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    if (!g.initialized) return kNotInitialized;
+    const u32 n = nx::min<u32>(capacity, static_cast<u32>(g.primitives.size()));
+    for (u32 i = 0; i < n; ++i) write_primitive(out.get() + i * kPrimitiveSize, g.primitives[i]);
+    *count = n;
+    return 0;
+}
+i32 sceSystemGestureGetPrimitiveTouchEventByIndex(u32 index, Ptr<u8> out) {
+    if (!out || !writable(out.address, kPrimitiveSize)) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    if (!g.initialized) return kNotInitialized;
+    if (index >= g.primitives.size()) return kOutOfArray;
+    write_primitive(out.get(), g.primitives[index]);
+    return 0;
+}
+i32 sceSystemGestureGetPrimitiveTouchEventByPrimitiveID(u32 id, Ptr<u8> out) {
+    if (!out || !writable(out.address, kPrimitiveSize)) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    if (!g.initialized) return kNotInitialized;
+    const Primitive* p = primitive(g, static_cast<u16>(id));
+    if (!p) return err::code(0x80890005);  // (SCE_SYSTEM_GESTURE_ERROR_EVENT_DATA_NOT_FOUND)
+    write_primitive(out.get(), *p);
+    return 0;
+}
+i32 sceSystemGestureResetPrimitiveTouchRecognizer() {
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    if (!g.initialized) return kNotInitialized;
+    g.primitives.clear();
+    g.last_update = 0;
+    return 0;
+}
+// SceSystemGestureTouchRecognizerInformation: type, panel, rectangle (4 x i16), last update (u64), reserved (256).
+i32 sceSystemGestureGetTouchRecognizerInformation(Ptr<const u8> object, Ptr<u8> info) {
+    if (!object || !info || !writable(info.address, 280)) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    const Recognizer* r = recognizer(g, object.address);
+    if (!r) return kInvalidArgument;
+    u8* p = info.get();
+    std::memset(p, 0, 280);
+    std::memcpy(p, &r->type, 4);
+    const u32 port = r->port;
+    std::memcpy(p + 4, &port, 4);
+    const i16 rect[4] = {static_cast<i16>(r->rect.x), static_cast<i16>(r->rect.y), static_cast<i16>(r->rect.w),
+                         static_cast<i16>(r->rect.h)};
+    std::memcpy(p + 8, rect, 8);
+    std::memcpy(p + 16, &g.last_update, 8);
+    return 0;
+}
+
 const Function kFunctions[] = {
     HLE_FUNCTION(0x789D867C, sceSystemGestureGetTouchEvents),
     HLE_FUNCTION(0x5570B83E, sceSystemGestureGetTouchEventByEventID),
     HLE_FUNCTION(0x0D941B90, sceSystemGestureResetTouchRecognizer),
     HLE_FUNCTION(0xA9DB29F6, sceSystemGestureUpdateTouchRecognizerRectangle),
     HLE_FUNCTION(0xB3875104, sceSystemGestureFinalizePrimitiveTouchRecognizer),
+    HLE_FUNCTION(0xBAB8ECCB, sceSystemGestureGetPrimitiveTouchEventsCount),
+    HLE_FUNCTION(0xC750D3DA, sceSystemGestureGetPrimitiveTouchEvents),
+    HLE_FUNCTION(0xE0577765, sceSystemGestureGetPrimitiveTouchEventByIndex),
+    HLE_FUNCTION(0x480564C9, sceSystemGestureGetPrimitiveTouchEventByPrimitiveID),
+    HLE_FUNCTION(0xFD5A6504, sceSystemGestureResetPrimitiveTouchRecognizer),
+    HLE_FUNCTION(0xF0DB1AE5, sceSystemGestureGetTouchRecognizerInformation),
     HLE_FUNCTION(0x6078A08B, sceSystemGestureInitializePrimitiveTouchRecognizer),
     HLE_FUNCTION(0xDF4C665A, sceSystemGestureUpdatePrimitiveTouchRecognizer),
     HLE_FUNCTION(0xC3367370, sceSystemGestureCreateTouchRecognizer),

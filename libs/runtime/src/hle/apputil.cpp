@@ -552,6 +552,34 @@ i32 sceAppUtilAppEventParseNpBasicJoinablePresence(Ptr<const AppEventParam> e, P
 i32 sceAppUtilAppEventParseNearGift(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
 i32 sceAppUtilAppEventParseLiveArea(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
 i32 sceAppUtilAppEventParseSessionInvitation(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseGameCustomData(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseIncomingDialog(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseNpActivity(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseScreenShotNotification(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseTeleport(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseTriggerUtil(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+i32 sceAppUtilAppEventParseWebBrowser(Ptr<const AppEventParam> e, Ptr<void> out) { return parse_event(e, out); }
+// The web browser's cookies: added and reset, to no effect (there is no browser).
+i32 sceAppUtilAddCookieWebBrowser(Ptr<const void> param) {
+    if (!apputil().initialized) return kNotInitialized;
+    return param ? 0 : kParameter;
+}
+i32 sceAppUtilResetCookieWebBrowser(Ptr<const void> param) {
+    if (!apputil().initialized) return kNotInitialized;
+    return param ? 0 : kParameter;
+}
+// PSP save data on the memory card: there is none (no names found; a load finds no slot).
+i32 sceAppUtilPspSaveDataGetDirNameList(Ptr<const void> /*prefix*/, Ptr<void> list, u32 count, Ptr<u32> hits) {
+    if (!apputil().initialized) return kNotInitialized;
+    if ((count && !list) || !hits || !writable(hits.address, 4)) return kParameter;
+    *hits = 0;
+    return 0;
+}
+i32 sceAppUtilPspSaveDataLoad(Ptr<const void> param) {
+    if (!apputil().initialized) return kNotInitialized;
+    if (!param) return kParameter;
+    return err::code(0x80100641);  // (SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND)
+}
 // SceAppUtilBgdlStatus: no background download (its fields all 0).
 i32 sceAppUtilBgdlGetStatus(Ptr<u8> status) {
     if (!apputil().initialized) return kNotInitialized;
@@ -586,6 +614,17 @@ const Function kFunctionsMore[] = {
     HLE_FUNCTION(0x77380601, sceAppUtilAppEventParseNearGift),
     HLE_FUNCTION(0x0F4EE55F, sceAppUtilAppEventParseLiveArea),
     HLE_FUNCTION(0xA58E6FCE, sceAppUtilAppEventParseSessionInvitation),
+    HLE_FUNCTION(0x0B04C067, sceAppUtilAppEventParseGameCustomData),
+    HLE_FUNCTION(0x22297D59, sceAppUtilAppEventParseIncomingDialog),
+    HLE_FUNCTION(0xF6B75651, sceAppUtilAppEventParseNpActivity),
+    HLE_FUNCTION(0x2AF42D6A, sceAppUtilAppEventParseScreenShotNotification),
+    HLE_FUNCTION(0x665A8B7E, sceAppUtilAppEventParseTeleport),
+    HLE_FUNCTION(0x8DEE696B, sceAppUtilAppEventParseTriggerUtil),
+    HLE_FUNCTION(0x8ED716F5, sceAppUtilAppEventParseWebBrowser),
+    HLE_FUNCTION(0xC97D5D9E, sceAppUtilAddCookieWebBrowser),
+    HLE_FUNCTION(0x4FAAD133, sceAppUtilResetCookieWebBrowser),
+    HLE_FUNCTION(0x9942071D, sceAppUtilPspSaveDataGetDirNameList),
+    HLE_FUNCTION(0x7402C6EA, sceAppUtilPspSaveDataLoad),
     HLE_FUNCTION(0x96F478D6, sceAppUtilBgdlGetStatus),
     HLE_FUNCTION(0x53B2C020, sceAppUtilAddcontMount),
     HLE_FUNCTION(0x1B36AF8C, sceAppUtilAddcontUmount),
