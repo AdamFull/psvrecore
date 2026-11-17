@@ -106,19 +106,26 @@ void fiber_main(nx::fiber::Transfer t) {
     const u32 arg_on_run = hand->value;
     ThreadFibers& tf = *t_fibers;
     PsvContext* ctx = tf.ctx;
-    // (its registers start as the thread's were, its stack at the top of its context memory)
-    ctx->r[13] = (f->context + f->context_size) & ~7u;
+    // (its registers start as the resumer's were, its stack at the top of its context memory; a fiber made without
+    // context memory runs on the stack of the side that resumed it, below where that side waits: libult's workers
+    // run their first fiber so)
+    ctx->r[13] = f->context ? (f->context + f->context_size) & ~7u : (ctx->r[13] - 64) & ~7u;
+    nx::logd(logs::hle, "fiber '{}' (0x{:08x}) starts at 0x{:08x}, sp 0x{:08x}", f->name, f->guest, f->entry, ctx->r[13]);
     call_guest(ctx, f->entry, std::array<u32, 2>{f->arg_on_initialize, arg_on_run});
     nx::loge(logs::hle, "fiber '{}' returned from its entry 0x{:08x} (a fiber must switch away instead)", f->name, f->entry);
     psv_trap(ctx, f->entry, PSV_TRAP_RETURNED);
 }
 
-i32 _sceFiberInitializeImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context,
-                            u32 context_size, Ptr<const void> /*opt*/, u32 /*build_version*/) {
-    if (!fiber || !entry || !context) return kNull;
+// `detached`: a fiber made without its context memory (0 and 0), given one when it is first switched to
+// (_sceFiberAttachContextAndSwitch): libult makes its threads' fibers so.
+i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context, u32 context_size,
+               bool detached) {
+    if (!fiber || !entry) return kNull;
+    const bool none = detached && !context && !context_size;
+    if (!context && !none) return kNull;
     if ((fiber.address & 7) || (context & 7) || (context_size & 7)) return kAlignment;
-    if (context_size < kContextMinimum) return kRange;
-    if (!writable(fiber.address, 128) || !writable(context, context_size)) return kInvalid;
+    if (!none && context_size < kContextMinimum) return kRange;
+    if (!writable(fiber.address, 128) || (!none && !writable(context, context_size))) return kInvalid;
     Fibers& fs = fibers();
     auto stack = fs.stacks.acquire();
     if (!stack) return kAgain;
@@ -139,6 +146,19 @@ i32 _sceFiberInitializeImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 
     }
     fs.fibers[fiber.address] = std::move(f);
     return 0;
+}
+
+i32 _sceFiberInitializeImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context,
+                            u32 context_size, Ptr<const void> /*opt*/, u32 /*build_version*/) {
+    return initialize(fiber, name, entry, arg_on_initialize, context, context_size, false);
+}
+
+// The same with an internal option word before the build version (libult passes 2 for a fiber without context
+// memory, 3 with): only a missing context is told apart here.
+i32 _sceFiberInitializeWithInternalOptionImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize,
+                                              u32 context, u32 context_size, Ptr<const void> /*opt*/,
+                                              u32 /*internal_option*/, u32 /*build_version*/) {
+    return initialize(fiber, name, entry, arg_on_initialize, context, context_size, true);
 }
 
 i32 sceFiberFinalize(Ptr<u8> fiber) {
@@ -186,6 +206,41 @@ i32 sceFiberReturnToThread(PsvContext* ctx, u32 arg_on_return, Ptr<u32> arg_on_r
     return 0;
 }
 
+// Gives a fiber made without context memory its memory, then resumes it as sceFiberRun (from a thread) or
+// sceFiberSwitch (from a fiber) would.
+i32 _sceFiberAttachContextAndSwitch(PsvContext* ctx, Ptr<u8> fiber, u32 context, u32 context_size, u32 arg_on_run_to,
+                                    Ptr<u32> arg_on_run) {
+    if (!fiber || !context) return kNull;
+    if ((context & 7) || (context_size & 7)) return kAlignment;
+    if (context_size < kContextMinimum) return kRange;
+    if (!writable(context, context_size)) return kInvalid;
+    ThreadFibers& t = this_thread(ctx);
+    Fiber* f = find(fiber.address);
+    if (!f) return kInvalid;
+    if (f->running || f->started) return kState;
+    f->context = context, f->context_size = context_size;
+    nx::logd(logs::hle, "fiber '{}' (0x{:08x}): context 0x{:08x}, 0x{:x} bytes attached", f->name, f->guest, context, context_size);
+    const u32 back = resume(t, f, arg_on_run_to);
+    if (arg_on_run && writable(arg_on_run.address, 4)) *arg_on_run = back;
+    return 0;
+}
+
+// SceFiberInfo (128 bytes): the entry, its argument, the context memory and its size, the name (32 bytes), and the
+// context's unused margin (not measured: 0).
+i32 sceFiberGetInfo(Ptr<u8> fiber, Ptr<u8> info) {
+    if (!fiber || !info) return kNull;
+    if ((fiber.address & 7) || (info.address & 7)) return kAlignment;
+    if (!writable(info.address, 128)) return kInvalid;
+    Fiber* f = find(fiber.address);
+    if (!f) return kInvalid;
+    u8* out = info.get();
+    std::memset(out, 0, 128);
+    const u32 words[4] = {f->entry, f->arg_on_initialize, f->context, f->context_size};
+    std::memcpy(out, words, sizeof words);
+    std::memcpy(out + 16, f->name.data(), std::min<usize>(f->name.size(), 31));
+    return 0;
+}
+
 i32 sceFiberGetSelf(PsvContext* ctx, Ptr<u32> out) {
     if (!out) return kNull;
     ThreadFibers& t = this_thread(ctx);
@@ -202,6 +257,34 @@ const Function kFiber[] = {
     HLE_FUNCTION(0xE4283144, sceFiberSwitch),
     HLE_FUNCTION(0x3B42921F, sceFiberReturnToThread),
     HLE_FUNCTION(0x414D8CA5, sceFiberGetSelf),
+    HLE_FUNCTION(0xC6A3F9BB, _sceFiberInitializeWithInternalOptionImpl),
+    HLE_FUNCTION(0xE00B9AFE, _sceFiberAttachContextAndSwitch),
+    HLE_FUNCTION(0x189599B4, sceFiberGetInfo),
+};
+
+// libult's hooks into the system's user-level object manager, its debugger support and the Razor profiler: nothing
+// registers or captures here. The profiler's capture flag pointer is null (libult then writes no packets).
+i32 _sceUlobjMgrRegisterLibultProtocolRevision(u32 /*revision*/) { return 0; }
+i32 ulobj_dbg_ignored() { return 0; }
+i32 _sceRazorCpuWriteFiberUltPkt() { return 0; }
+
+constexpr u32 kSceUlobjMgr = 0xDB18BB68, kSceUlobjDbg = 0x49F67FCF, kScePerf = 0x447F047D;
+const Function kUlobjMgr[] = {
+    HLE_FUNCTION(0x50F2F2AA, _sceUlobjMgrRegisterLibultProtocolRevision),
+};
+const Function kUlobjDbg[] = {
+    Function{0xD7F0F610, "(SceUlobjDbg 0xD7F0F610)", &entry<&ulobj_dbg_ignored>},
+    Function{0xF9C0F5DA, "(SceUlobjDbg 0xF9C0F5DA)", &entry<&ulobj_dbg_ignored>},
+};
+const Function kPerf[] = {
+    HLE_FUNCTION(0x409D966A, _sceRazorCpuWriteFiberUltPkt),
+};
+const Variable kPerfVariables[] = {
+    // (the pointer, then the flag it points to: libult reads the flag through it unconditionally)
+    {0x936A5F31, "_pLibPerfCaptureFlagPtr", 8, [](u8* host, u32 guest) {
+         const u32 words[2] = {guest + 4, 0};
+         std::memcpy(host, words, sizeof words);
+     }},
 };
 
 }  // namespace
@@ -215,6 +298,9 @@ void register_fiber() {
         fs.fibers.clear();
     }
     register_library({"SceFiber", kSceFiber, kFiber});
+    register_library({"SceUlobjMgr", kSceUlobjMgr, kUlobjMgr});
+    register_library({"SceUlobjDbg", kSceUlobjDbg, kUlobjDbg});
+    register_library({"ScePerf", kScePerf, kPerf, kPerfVariables});
 }
 
 }  // namespace psvrecore::runtime::hle
