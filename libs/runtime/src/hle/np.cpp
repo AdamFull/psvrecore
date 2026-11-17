@@ -2,7 +2,8 @@
 // SceNpScore, SceNpActivity, SceNpTrophy); asking for the user's NP ID or posting an activity answers "signed out";
 // the service state callback is never called (the state does not change). Trophies are local, as on the console:
 // contexts and handles are made, and an unlocked trophy is logged and remembered for the run (unlocking it again
-// answers "already unlocked").
+// answers "already unlocked". Authentication (SceNpCommon's NpAuth), friends and presence (SceNpBasic) and user
+// lookups (SceNpUtility) start, and what would reach PSN answers "signed out".
 
 #include "hle_common.hpp"
 #include "core/foundation/containers/hash_map.h"
@@ -12,7 +13,9 @@ namespace psvrecore::runtime::hle {
 namespace {
 
 constexpr u32 kSceNpManager = 0xD8835093, kSceNpScore = 0x75F052DB, kSceNpActivity = 0xFEF492ED,
-              kSceNpTrophy = 0x4332C10D;
+              kSceNpTrophy = 0x4332C10D, kSceNpCommon = 0xECB62224, kSceNpBasic = 0x605BA760, kSceNpUtility = 0x7B47D9CF;
+constexpr i32 kAuthSignedOut = err::code(0x80550310), kBasicSignedOut = err::code(0x80551D06);
+constexpr i32 kServiceStateSignedOut = 1;
 constexpr i32 kManagerSignedOut = err::code(0x8055050A), kActivitySignedOut = err::code(0x80552306),
               kNpInvalidArgument = err::code(0x80550003);
 // (trophy errors, assumed from the library's numbering: invalid argument, already unlocked)
@@ -35,6 +38,39 @@ i32 sceNpInit(Ptr<const void>, Ptr<const void>) {
 i32 sceNpCheckCallback() { return 0; }
 i32 sceNpRegisterServiceStateCallback(u32 /*callback*/, u32 /*userdata*/) { return 0; }
 i32 sceNpManagerGetNpId(Ptr<void> out) { return out ? kManagerSignedOut : kNpInvalidArgument; }
+i32 sceNpTerm() { return 0; }
+i32 sceNpGetServiceState(Ptr<i32> state) {
+    if (!state || !writable(state.address, 4)) return kNpInvalidArgument;
+    *state = kServiceStateSignedOut;
+    return 0;
+}
+i32 sceNpManagerGetChatRestrictionFlag(Ptr<i32> flag) { return flag ? kManagerSignedOut : kNpInvalidArgument; }
+i32 sceNpManagerGetContentRatingFlag(Ptr<i32> restricted, Ptr<i32> age) {
+    return restricted && age ? kManagerSignedOut : kNpInvalidArgument;
+}
+
+// (NpAuth: a ticket request needs PSN)
+i32 sceNpAuthInit() { return 0; }
+i32 sceNpAuthTerm() { return 0; }
+i32 sceNpAuthCreateStartRequest(Ptr<const void> param) { return param ? kAuthSignedOut : kNpInvalidArgument; }
+
+// (NpBasic: friends and presence need PSN; handlers are kept and never called)
+i32 sceNpBasicInit(Ptr<const void>) { return 0; }
+i32 sceNpBasicTerm() { return 0; }
+i32 sceNpBasicRegisterHandler(Ptr<const void>, Ptr<const void>, Ptr<void>) { return 0; }
+i32 sceNpBasicUnregisterHandler() { return 0; }
+i32 sceNpBasicCheckCallback() { return 0; }
+i32 sceNpBasicSetInGamePresence(Ptr<const void>) { return kBasicSignedOut; }
+i32 sceNpBasicGetGameJoiningPresence(Ptr<const void>, Ptr<void>) { return kBasicSignedOut; }
+i32 sceNpBasicGetFriendListEntryCount(Ptr<u32>) { return kBasicSignedOut; }
+i32 sceNpBasicGetFriendListEntries(u32, Ptr<void>, u32, Ptr<u32>) { return kBasicSignedOut; }
+
+// (NpLookup: a title context needs PSN; the error assumed as the manager's "signed out")
+i32 sceNpLookupInit(i32 /*async*/, i32 /*priority*/, i32 /*affinity*/, Ptr<const void>) { return 0; }
+i32 sceNpLookupTerm() { return 0; }
+i32 sceNpLookupCreateTitleCtx(Ptr<const void> comm_id, Ptr<const void> self) {
+    return comm_id && self ? kManagerSignedOut : kNpInvalidArgument;
+}
 
 i32 sceNpScoreInit(i32, i32, Ptr<const void>) { return 0; }
 i32 sceNpScoreTerm() { return 0; }
@@ -71,6 +107,31 @@ const Function kNpManager[] = {
     HLE_FUNCTION(0x3B0AE9A9, sceNpCheckCallback),
     HLE_FUNCTION(0x3C94B4B4, sceNpManagerGetNpId),
     HLE_FUNCTION(0x44239C35, sceNpRegisterServiceStateCallback),
+    HLE_FUNCTION(0x19E40AE1, sceNpTerm),
+    HLE_FUNCTION(0x54060DF6, sceNpGetServiceState),
+    HLE_FUNCTION(0x60C575B1, sceNpManagerGetChatRestrictionFlag),
+    HLE_FUNCTION(0xAF0073B2, sceNpManagerGetContentRatingFlag),
+};
+const Function kNpCommon[] = {
+    HLE_FUNCTION(0x441D8B4E, sceNpAuthInit),
+    HLE_FUNCTION(0x6093B689, sceNpAuthTerm),
+    HLE_FUNCTION(0xED42079F, sceNpAuthCreateStartRequest),
+};
+const Function kNpBasic[] = {
+    HLE_FUNCTION(0xEFB91A99, sceNpBasicInit),
+    HLE_FUNCTION(0x389BCB3B, sceNpBasicTerm),
+    HLE_FUNCTION(0x26E6E048, sceNpBasicRegisterHandler),
+    HLE_FUNCTION(0x050AE072, sceNpBasicUnregisterHandler),
+    HLE_FUNCTION(0x20146AEC, sceNpBasicCheckCallback),
+    HLE_FUNCTION(0x51D75562, sceNpBasicSetInGamePresence),
+    HLE_FUNCTION(0x863249CB, sceNpBasicGetGameJoiningPresence),
+    HLE_FUNCTION(0xDF41F308, sceNpBasicGetFriendListEntryCount),
+    HLE_FUNCTION(0xFF07E787, sceNpBasicGetFriendListEntries),
+};
+const Function kNpUtility[] = {
+    HLE_FUNCTION(0x9246A673, sceNpLookupInit),
+    HLE_FUNCTION(0x0158B61B, sceNpLookupTerm),
+    HLE_FUNCTION(0x5110E17E, sceNpLookupCreateTitleCtx),
 };
 const Function kNpScore[] = {
     HLE_FUNCTION(0x0433069F, sceNpScoreInit),
@@ -101,6 +162,9 @@ void register_np() {
     register_library({"SceNpScore", kSceNpScore, kNpScore});
     register_library({"SceNpActivity", kSceNpActivity, kNpActivity});
     register_library({"SceNpTrophy", kSceNpTrophy, kNpTrophy});
+    register_library({"SceNpCommon", kSceNpCommon, kNpCommon});
+    register_library({"SceNpBasic", kSceNpBasic, kNpBasic});
+    register_library({"SceNpUtility", kSceNpUtility, kNpUtility});
 }
 
 }  // namespace psvrecore::runtime::hle

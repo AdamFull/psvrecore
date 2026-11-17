@@ -10,6 +10,7 @@
 #include "hle_common.hpp"
 
 #include <cstring>
+#include "core/foundation/strings/format.h"
 
 namespace psvrecore::runtime::hle {
 
@@ -82,7 +83,134 @@ i32 started(const char* what) {
     return 0;
 }
 i32 sceNetInit(Ptr<const void>) { return started("SceNet"); }
-i32 sceNetCtlInit() { return started("SceNetCtl"); }
+i32 sceNetTerm() { return 0; }
+
+// Byte order (the guest's is little-endian, the network's big-endian) and addresses as text.
+u32 sceNetHtonl(u32 v) { return __builtin_bswap32(v); }
+u32 sceNetNtohl(u32 v) { return __builtin_bswap32(v); }
+u32 sceNetHtons(u32 v) { return __builtin_bswap16(static_cast<u16>(v)); }
+u32 sceNetNtohs(u32 v) { return __builtin_bswap16(static_cast<u16>(v)); }
+constexpr i32 kNetAfInet = 2;
+constexpr i32 kNetEafnosupport = err::code(0x8041012F);  // (SCE_NET_ERROR_EAFNOSUPPORT)
+// IPv4 only: "a.b.c.d" into 4 bytes in network order; 1 if parsed, 0 if not.
+i32 sceNetInetPton(i32 af, Ptr<const char> text, Ptr<u8> out) {
+    if (af != kNetAfInet) return kNetEafnosupport;
+    if (!text || !out || !writable(out.address, 4)) return err::kFault;
+    const nx::string t = str(text, 16);
+    u32 part[4] = {}, n = 0, digits = 0;
+    for (const char c : t) {
+        if (c >= '0' && c <= '9') {
+            part[n] = part[n] * 10 + static_cast<u32>(c - '0');
+            if (++digits > 3 || part[n] > 255) return 0;
+        } else if (c == '.' && digits && n < 3) {
+            ++n, digits = 0;
+        } else {
+            return 0;
+        }
+    }
+    if (n != 3 || !digits) return 0;
+    for (u32 k = 0; k < 4; ++k) out.get()[k] = static_cast<u8>(part[k]);
+    return 1;
+}
+u32 sceNetInetNtop(i32 af, Ptr<const u8> address, Ptr<char> out, u32 size) {
+    if (af != kNetAfInet || !address || !out) return 0;
+    const u8* a = address.get();
+    const nx::string t = nx::format("{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+    if (size < t.size() + 1 || !writable(out.address, size)) return 0;
+    std::memcpy(out.get(), t.c_str(), t.size() + 1);
+    return out.address;
+}
+
+// ---- SceNetCtl: offline, the connection and ad hoc both disconnected; nothing ever changes, so callbacks never run
+constexpr i32 kNetCtlNotInitialized = err::code(0x80412101), kNetCtlCallbackMax = err::code(0x80412103),
+              kNetCtlIdNotFound = err::code(0x80412104), kNetCtlInvalidId = err::code(0x80412105),
+              kNetCtlInvalidAddr = err::code(0x80412107), kNetCtlNotConnected = err::code(0x80412108);
+constexpr u32 kNetCtlCallbacks = 8;
+struct NetCtl {
+    nx::mutex lock;
+    bool initialized = false;
+    bool inet[kNetCtlCallbacks] = {}, adhoc[kNetCtlCallbacks] = {};
+};
+NetCtl& netctl() {
+    static NetCtl n;
+    return n;
+}
+i32 sceNetCtlInit() {
+    {
+        NetCtl& n = netctl();
+        nx::scoped_lock<nx::mutex> held(n.lock);
+        n.initialized = true;
+    }
+    return started("SceNetCtl");
+}
+i32 sceNetCtlTerm() {
+    NetCtl& n = netctl();
+    nx::scoped_lock<nx::mutex> held(n.lock);
+    n.initialized = false;
+    for (u32 i = 0; i < kNetCtlCallbacks; ++i) n.inet[i] = n.adhoc[i] = false;
+    return 0;
+}
+i32 netctl_ready() {
+    NetCtl& n = netctl();
+    nx::scoped_lock<nx::mutex> held(n.lock);
+    return n.initialized ? 0 : kNetCtlNotInitialized;
+}
+i32 sceNetCtlCheckCallback() { return netctl_ready(); }
+i32 register_callback(bool* slots, Ptr<i32> cid) {
+    NetCtl& n = netctl();
+    nx::scoped_lock<nx::mutex> held(n.lock);
+    if (!n.initialized) return kNetCtlNotInitialized;
+    if (!cid || !writable(cid.address, 4)) return kNetCtlInvalidAddr;
+    for (u32 i = 0; i < kNetCtlCallbacks; ++i)
+        if (!slots[i]) {
+            slots[i] = true;
+            *cid = static_cast<i32>(i);
+            return 0;
+        }
+    return kNetCtlCallbackMax;
+}
+i32 unregister_callback(bool* slots, i32 cid) {
+    NetCtl& n = netctl();
+    nx::scoped_lock<nx::mutex> held(n.lock);
+    if (!n.initialized) return kNetCtlNotInitialized;
+    if (cid < 0 || cid >= static_cast<i32>(kNetCtlCallbacks)) return kNetCtlInvalidId;
+    if (!slots[cid]) return kNetCtlIdNotFound;
+    slots[cid] = false;
+    return 0;
+}
+i32 sceNetCtlInetRegisterCallback(Ptr<const void>, Ptr<void>, Ptr<i32> cid) { return register_callback(netctl().inet, cid); }
+i32 sceNetCtlInetUnregisterCallback(i32 cid) { return unregister_callback(netctl().inet, cid); }
+i32 sceNetCtlAdhocRegisterCallback(Ptr<const void>, Ptr<void>, Ptr<i32> cid) { return register_callback(netctl().adhoc, cid); }
+i32 sceNetCtlAdhocUnregisterCallback(i32 cid) { return unregister_callback(netctl().adhoc, cid); }
+i32 get_state(Ptr<i32> state) {
+    if (const i32 r = netctl_ready(); r < 0) return r;
+    if (!state || !writable(state.address, 4)) return kNetCtlInvalidAddr;
+    *state = 0;  // (SCE_NET_CTL_STATE_DISCONNECTED)
+    return 0;
+}
+i32 sceNetCtlInetGetState(Ptr<i32> state) { return get_state(state); }
+i32 sceNetCtlAdhocGetState(Ptr<i32> state) { return get_state(state); }
+// (the result of the last event: there was none)
+i32 get_result(i32 /*event*/, Ptr<i32> error) {
+    if (const i32 r = netctl_ready(); r < 0) return r;
+    if (!error || !writable(error.address, 4)) return kNetCtlInvalidAddr;
+    *error = 0;
+    return 0;
+}
+i32 sceNetCtlInetGetResult(i32 event, Ptr<i32> error) { return get_result(event, error); }
+i32 sceNetCtlAdhocGetResult(i32 event, Ptr<i32> error) { return get_result(event, error); }
+i32 sceNetCtlInetGetInfo(i32 code, Ptr<void> info) {
+    if (const i32 r = netctl_ready(); r < 0) return r;
+    if (!info) return kNetCtlInvalidAddr;
+    nx::logd(logs::hle, "network information {}: not connected", code);
+    return kNetCtlNotConnected;
+}
+i32 sceNetCtlAdhocGetInAddr(Ptr<void> address) {
+    if (const i32 r = netctl_ready(); r < 0) return r;
+    if (!address) return kNetCtlInvalidAddr;
+    return kNetCtlNotConnected;
+}
+i32 sceNetCtlAdhocDisconnect() { return netctl_ready(); }
 i32 sceHttpInit(u32) { return started("SceHttp"); }
 i32 sceSslInit(u32) { return started("SceSsl"); }
 
@@ -91,8 +219,32 @@ const Function kAppMgrUser[] = {
     HLE_FUNCTION(0x10B5765F, sceAppMgrReceiveSystemEvent),
 };
 const Function kPower[] = {HLE_FUNCTION(0x3CE187B6, scePowerSetConfigurationMode)};
-const Function kNet[] = {HLE_FUNCTION(0xEB03E265, sceNetInit)};
-const Function kNetCtl[] = {HLE_FUNCTION(0x495CA1DB, sceNetCtlInit)};
+const Function kNet[] = {
+    HLE_FUNCTION(0xEB03E265, sceNetInit),
+    HLE_FUNCTION(0xEA3CC286, sceNetTerm),
+    HLE_FUNCTION(0x4C30B03C, sceNetHtonl),
+    HLE_FUNCTION(0xD2EAA645, sceNetNtohl),
+    HLE_FUNCTION(0x9FA3207B, sceNetHtons),
+    HLE_FUNCTION(0x07845128, sceNetNtohs),
+    HLE_FUNCTION(0xD5EEB048, sceNetInetPton),
+    HLE_FUNCTION(0x98839B74, sceNetInetNtop),
+};
+const Function kNetCtl[] = {
+    HLE_FUNCTION(0x495CA1DB, sceNetCtlInit),
+    HLE_FUNCTION(0xCD188648, sceNetCtlTerm),
+    HLE_FUNCTION(0xDFFC3ED4, sceNetCtlCheckCallback),
+    HLE_FUNCTION(0xEAEE6185, sceNetCtlInetRegisterCallback),
+    HLE_FUNCTION(0xD0C3BF3F, sceNetCtlInetUnregisterCallback),
+    HLE_FUNCTION(0xFFA9D594, sceNetCtlAdhocRegisterCallback),
+    HLE_FUNCTION(0xA4471E10, sceNetCtlAdhocUnregisterCallback),
+    HLE_FUNCTION(0x6D26AC68, sceNetCtlInetGetState),
+    HLE_FUNCTION(0x0961A561, sceNetCtlAdhocGetState),
+    HLE_FUNCTION(0x6B20EC02, sceNetCtlInetGetResult),
+    HLE_FUNCTION(0x7AE0ED19, sceNetCtlAdhocGetResult),
+    HLE_FUNCTION(0xB26D07F3, sceNetCtlInetGetInfo),
+    HLE_FUNCTION(0x7118C99D, sceNetCtlAdhocGetInAddr),
+    HLE_FUNCTION(0xED43B79A, sceNetCtlAdhocDisconnect),
+};
 const Function kHttp[] = {HLE_FUNCTION(0x214926D9, sceHttpInit)};
 const Function kSsl[] = {HLE_FUNCTION(0x3C733316, sceSslInit)};
 const Function kDebugLed[] = {HLE_FUNCTION(0x78E702D3, sceKernelSetGPO)};

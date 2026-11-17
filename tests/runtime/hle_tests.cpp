@@ -494,3 +494,28 @@ TEST_CASE("recomp: a function stood in for a registered one is what lookups find
     CHECK(calls == 1);
     recomp::override_function(kAt, nullptr);
 }
+
+TEST_CASE("clib: a heap in the caller's memory (sceClibMspace*): blocks in it, aligned, reused once freed") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kCreate = 0x3B9E301A, kDestroy = 0xAE1A21EC, kMalloc = 0x86EF7680, kMemalign = 0x3C847D57,
+                  kFree = 0x9C56B4D1;
+    const u32 region = scratch(0x10000);
+    const u32 heap = call32(ctx, kSceLibKernel, kCreate, {region, 0x10000});
+    REQUIRE(heap != 0);
+    const u32 a = call32(ctx, kSceLibKernel, kMalloc, {heap, 100});
+    const u32 b = call32(ctx, kSceLibKernel, kMemalign, {heap, 256, 64});
+    CHECK(a > region);
+    CHECK(a % 8 == 0);
+    CHECK(b % 256 == 0);
+    CHECK(b >= a + 100);
+    CHECK(b + 64 <= region + 0x10000);
+    // (everything freed: one block again, so the whole rest of the region can be had)
+    call32(ctx, kSceLibKernel, kFree, {heap, a});
+    call32(ctx, kSceLibKernel, kFree, {heap, b});
+    const u32 big = call32(ctx, kSceLibKernel, kMalloc, {heap, 0xF000});
+    CHECK(big != 0);
+    CHECK(call32(ctx, kSceLibKernel, kMalloc, {heap, 0x2000}) == 0);  // (full)
+    CHECK(call32(ctx, kSceLibKernel, kDestroy, {heap}) == 0x10000);
+    CHECK(call32(ctx, kSceLibKernel, kMalloc, {heap, 16}) == 0);  // (no such heap)
+}

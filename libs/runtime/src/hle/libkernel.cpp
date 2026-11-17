@@ -163,6 +163,13 @@ i32 sceClibPrintf(Ptr<const char> fmt, Variadic va) {
     return static_cast<i32>(text.size());
 }
 
+i32 sceClibVprintf(Ptr<const char> fmt, u32 va_list) {
+    FormatArgs args{nullptr, va_list};
+    const nx::string text = format(str(fmt, 1 << 16), args);
+    runtime().files().write(runtime().files().stdout_fd(), text.data(), static_cast<u32>(text.size()));
+    return static_cast<i32>(text.size());
+}
+
 i32 sceClibSnprintf(u32 buffer, u32 size, Ptr<const char> fmt, Variadic va) {
     FormatArgs args{&va, 0};
     return put_formatted(buffer, size, format(str(fmt, 1 << 16), args));
@@ -203,6 +210,15 @@ u32 sceClibStrncpy(u32 dst, u32 src, u32 n) {
 }
 i32 sceClibStrcmp(u32 a, u32 b) { return std::strcmp(cstr(a), cstr(b)); }
 i32 sceClibStrncmp(u32 a, u32 b, u32 n) { return std::strncmp(cstr(a), cstr(b), n); }
+i32 sceClibStrncasecmp(u32 a, u32 b, u32 n) {
+    const char *x = cstr(a), *y = cstr(b);
+    for (u32 i = 0; i < n; ++i) {
+        const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : static_cast<u8>(c); };
+        const i32 cx = lower(x[i]), cy = lower(y[i]);
+        if (cx != cy || !cx) return cx - cy;
+    }
+    return 0;
+}
 u32 sceClibStrnlen(u32 s, u32 max) {
     u32 n = 0;
     while (n < max && cstr(s)[n]) ++n;
@@ -276,6 +292,8 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0xC458D60A, sceClibStrncpy),
     HLE_FUNCTION(0xA2FB4D9D, sceClibStrcmp),
     HLE_FUNCTION(0x660D1F6D, sceClibStrncmp),
+    HLE_FUNCTION(0xB54C0BE4, sceClibStrncasecmp),
+    HLE_FUNCTION(0x5EA3B6CE, sceClibVprintf),
     HLE_FUNCTION(0xAC595E68, sceClibStrnlen),
     HLE_FUNCTION(0x614076B7, sceClibStrchr),
     HLE_FUNCTION(0x6E728AAE, sceClibStrrchr),
@@ -309,6 +327,7 @@ void register_system_libraries() {
     register_audioout();
     register_touch();
     register_systemgesture();
+    register_mspace();
     register_motion();
     register_apputil();
     register_ngs();

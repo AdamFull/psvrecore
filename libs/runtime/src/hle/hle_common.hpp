@@ -48,6 +48,7 @@ void register_avplayer();
 void register_system();
 void register_systemgesture();
 void register_motion();
+void register_mspace();
 void register_fiber();
 void register_np();
 void register_videodec();
