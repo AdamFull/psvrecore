@@ -229,8 +229,9 @@ namespace {
 
 enum Part : u32 { kVertexInput, kPreRasterization, kFragmentShader, kFragmentOutput };
 
-// (a part's description: what its library reads of the pipeline's, the rest left as defaults() has it)
-GraphicsPipelineDesc part_of(u32 part, const GraphicsPipelineDesc& d) {
+// (a part's description: what its library reads of the pipeline's, the rest left as defaults() has it; the state
+// made dynamic left out)
+GraphicsPipelineDesc part_of(u32 part, const GraphicsPipelineDesc& d, bool dynamic) {
     GraphicsPipelineDesc p = GraphicsPipelineDesc::defaults();
     switch (part) {
         case kVertexInput:
@@ -239,16 +240,18 @@ GraphicsPipelineDesc part_of(u32 part, const GraphicsPipelineDesc& d) {
             p.binding_count = d.binding_count, p.attribute_count = d.attribute_count, p.topology = d.topology;
             break;
         case kPreRasterization:
-            p.vertex = d.vertex, p.layout = d.layout, p.polygon = d.polygon, p.cull = d.cull, p.front = d.front;
-            p.depth_clamp = d.depth_clamp, p.depth_bias = d.depth_bias;
+            p.vertex = d.vertex, p.layout = d.layout, p.polygon = d.polygon, p.depth_clamp = d.depth_clamp;
+            if (!dynamic) p.cull = d.cull, p.front = d.front, p.depth_bias = d.depth_bias;
             std::memcpy(p.specialization, d.specialization, sizeof p.specialization);
             p.specialization_count = d.specialization_count;
             p.formats = d.formats;
             break;
         case kFragmentShader:
             p.fragment = d.fragment, p.layout = d.layout;
-            p.depth_test = d.depth_test, p.depth_write = d.depth_write, p.depth_compare = d.depth_compare;
-            p.stencil_test = d.stencil_test, p.stencil_front = d.stencil_front, p.stencil_back = d.stencil_back;
+            if (!dynamic) {
+                p.depth_test = d.depth_test, p.depth_write = d.depth_write, p.depth_compare = d.depth_compare;
+                p.stencil_test = d.stencil_test, p.stencil_front = d.stencil_front, p.stencil_back = d.stencil_back;
+            }
             std::memcpy(p.specialization, d.specialization, sizeof p.specialization);
             p.specialization_count = d.specialization_count;
             p.formats = d.formats;
@@ -260,10 +263,31 @@ GraphicsPipelineDesc part_of(u32 part, const GraphicsPipelineDesc& d) {
     return p;
 }
 
+// (a part's dynamic states: the first three, and the rest with dynamic_state)
+template <usize N>
+u32 dynamic_state_count(const VkDynamicState (&states)[N], bool dynamic) {
+    return dynamic ? static_cast<u32>(N) : 3u;
+}
+
 }  // namespace
 
+void set_dynamic_state(VkCommandBuffer cmd, const GraphicsPipelineDesc& d) {
+    vkCmdSetCullMode(cmd, d.cull);
+    vkCmdSetFrontFace(cmd, d.front);
+    vkCmdSetDepthBiasEnable(cmd, d.depth_bias ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthTestEnable(cmd, d.depth_test ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthWriteEnable(cmd, d.depth_write ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthCompareOp(cmd, d.depth_compare);
+    vkCmdSetStencilTestEnable(cmd, d.stencil_test ? VK_TRUE : VK_FALSE);
+    const VkStencilOpState& f = d.stencil_front;
+    const VkStencilOpState& b = d.stencil_back;
+    vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_BIT, f.failOp, f.passOp, f.depthFailOp, f.compareOp);
+    vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_BACK_BIT, b.failOp, b.passOp, b.depthFailOp, b.compareOp);
+}
+
 Result<VkPipeline> Pipelines::library(u32 part, const GraphicsPipelineDesc& full) {
-    const GraphicsPipelineDesc d = part_of(part, full);
+    const bool dynamic_states = device_.caps().dynamic_state;
+    const GraphicsPipelineDesc d = part_of(part, full, dynamic_states);
     const u64 hash = d.hash();
     {
         nx::scoped_lock<nx::mutex> held(lock_);
@@ -318,9 +342,14 @@ Result<VkPipeline> Pipelines::library(u32 part, const GraphicsPipelineDesc& full
     if (d.formats.color_input && device_.caps().raster_order_attachment)
         blend.flags |= VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     // (each part's dynamic state, as graphics() makes them dynamic)
-    const VkDynamicState pre_raster[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS};
+    // (with dynamic_state, the rasterization, depth and stencil state too: the draws set them, set_dynamic_state)
+    const VkDynamicState pre_raster[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                         VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
+                                         VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE};
     const VkDynamicState fragment[] = {VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-                                       VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
+                                       VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                       VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+                                       VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP};
     const VkDynamicState output[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     const VkFormat color_format = d.formats.color;
@@ -342,14 +371,14 @@ Result<VkPipeline> Pipelines::library(u32 part, const GraphicsPipelineDesc& full
             lib.flags = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
             info.stageCount = 1, info.pStages = &stage, info.layout = d.layout;
             info.pViewportState = &viewport, info.pRasterizationState = &raster;
-            dynamic.dynamicStateCount = static_cast<u32>(std::size(pre_raster)), dynamic.pDynamicStates = pre_raster;
+            dynamic.dynamicStateCount = dynamic_state_count(pre_raster, dynamic_states), dynamic.pDynamicStates = pre_raster;
             info.pDynamicState = &dynamic;
             break;
         case kFragmentShader:
             lib.flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
             info.stageCount = 1, info.pStages = &stage, info.layout = d.layout;
             info.pDepthStencilState = &ds, info.pMultisampleState = &ms;
-            dynamic.dynamicStateCount = static_cast<u32>(std::size(fragment)), dynamic.pDynamicStates = fragment;
+            dynamic.dynamicStateCount = dynamic_state_count(fragment, dynamic_states), dynamic.pDynamicStates = fragment;
             info.pDynamicState = &dynamic;
             break;
         default:
@@ -374,6 +403,7 @@ Result<VkPipeline> Pipelines::library(u32 part, const GraphicsPipelineDesc& full
 }
 
 Result<void> Pipelines::prepare(const GraphicsPipelineDesc& d) {
+    // (a pass reading its colour as an input attachment uses a render pass: made whole, as graphics() makes it)
     if (!device_.caps().pipeline_library || passes_.uses_render_pass(d.formats)) return {};
     if (d.vertex)
         if (auto l = library(kPreRasterization, d); !l) return nx::err(l.error());

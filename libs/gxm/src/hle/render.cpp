@@ -2286,6 +2286,9 @@ nx::vector<u8> scale_down_samples(const u8* in, u32 w, u32 h, u32 s) {
 struct DrawPlan {
     const Draw* draw = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    // (its rasterization, depth and stencil state, for a linked pipeline's dynamic state: set_dynamic_state reads
+    // only those fields)
+    vk::GraphicsPipelineDesc state;
     u32 missing = 0;  // (a pipeline not made yet: 1 + its index in the scene's list of them)
     VkPipeline vertex_secondary = VK_NULL_HANDLE, fragment_secondary = VK_NULL_HANDLE;
     nx::vector<std::pair<u32, VkDeviceSize>> streams;  // (binding, offset in the vertex buffer)
@@ -3480,6 +3483,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         pass_formats.color_input = reads_color;
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
+        if (d.caps().dynamic_state) plan.state = desc;
         // (one not made yet: made with the scene's others after its draws are planned, on several threads)
         plan.pipeline = r.pipelines->find(desc);
         if (!plan.pipeline) {
@@ -3986,6 +3990,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                                      VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0, nullptr, 0, nullptr);
             }
             if (last.pipeline != p.pipeline) vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline), last.pipeline = p.pipeline;
+            if (d.caps().dynamic_state) vk::set_dynamic_state(*cmd, p.state);
             if (std::memcmp(&last.scissor, &p.scissor, sizeof p.scissor) != 0)
                 vkCmdSetScissor(*cmd, 0, 1, &p.scissor), last.scissor = p.scissor;
             const StencilState& front = st.stencil[0];

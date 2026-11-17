@@ -121,6 +121,10 @@ private:
     std::atomic<usize> count_{0};
 };
 
+// A draw's rasterization, depth and stencil state, for a pipeline linked with them dynamic (Capabilities::
+// dynamic_state): set for each draw (a whole pipeline bound before sets its own over them).
+void set_dynamic_state(VkCommandBuffer cmd, const GraphicsPipelineDesc& desc);
+
 // A shader module from SPIR-V words.
 Result<VkShaderModule> create_shader(Device& device, std::span<const u32> spirv);
 

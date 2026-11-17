@@ -45,6 +45,9 @@ struct Capabilities {
     // with rasterization-order access (VK_EXT_ or VK_ARM_rasterization_order_attachment_access).
     bool raster_order_attachment = false;
     bool pipeline_library = false;  // VK_EXT_graphics_pipeline_library
+    // The libraries' rasterization, depth and stencil state dynamic (Vulkan 1.3's extended dynamic state): a shader's
+    // library is the same for all of them, found in the driver's cache in later runs.
+    bool dynamic_state = false;
     VkFormat depth_stencil_format = VK_FORMAT_UNDEFINED;  // D32_SFLOAT_S8_UINT or D24_UNORM_S8_UINT
     u32 vendor_id = 0;
     f32 timestamp_period = 0.0f;  // nanoseconds per timestamp tick (0: the queue has no timestamps)

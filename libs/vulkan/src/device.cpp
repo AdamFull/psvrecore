@@ -297,6 +297,7 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
             extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
             extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
             caps.pipeline_library = true;
+            caps.dynamic_state = core13;
         }
     }
 
