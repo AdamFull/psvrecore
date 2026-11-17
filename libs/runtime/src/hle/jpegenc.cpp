@@ -1,8 +1,13 @@
 // The JPEG encoder (SceJpegEncUser): an encoder's set-up, kept here by its context's address (the size, the pixel
 // format, the output buffer, the compression ratio). Encoding and the colour conversion are not implemented: a call to
 // either stops the program until they are.
+//
+// The motion JPEG decoder (SceJpegUser): started and finished (finishing one never started does nothing); decoding is
+// not implemented.
 
 #include "hle_common.hpp"
+
+#include <atomic>
 
 #include "core/foundation/containers/hash_map.h"
 
@@ -10,7 +15,8 @@ namespace psvrecore::runtime::hle {
 
 namespace {
 
-constexpr u32 kSceJpegEncUser = 0x3748BFD3;
+constexpr u32 kSceJpegEncUser = 0x3748BFD3, kSceJpegUser = 0x880BF710;
+constexpr i32 kJpegInitDone = err::code(0x80650063), kJpegInvalidInitParam = err::code(0x80650067);
 constexpr u32 kContextSize = 0x100;
 constexpr i32 kImageSize = err::code(0x80650200), kInvalidRatio = err::code(0x80650202),
               kInvalidPixelFormat = err::code(0x80650203), kInvalidPointer = err::code(0x80650205);
@@ -68,6 +74,22 @@ i32 sceJpegEncoderSetCompressionRatio(u32 context, i32 ratio) {
     return 0;
 }
 
+std::atomic<bool> g_mjpeg{false};
+i32 sceJpegInitMJpeg(i32 split_decoders) {
+    if (split_decoders < 1) return kJpegInvalidInitParam;
+    if (g_mjpeg.exchange(true)) return kJpegInitDone;
+    return 0;
+}
+i32 sceJpegFinishMJpeg() {
+    g_mjpeg = false;
+    return 0;
+}
+
+const Function kDecoder[] = {
+    HLE_FUNCTION(0xB030773B, sceJpegInitMJpeg),
+    HLE_FUNCTION(0x62842598, sceJpegFinishMJpeg),
+};
+
 const Function kFunctions[] = {
     HLE_FUNCTION(0x2B55844D, sceJpegEncoderGetContextSize),
     HLE_FUNCTION(0x88DA92B4, sceJpegEncoderInit),
@@ -84,7 +106,9 @@ void register_jpegenc() {
         nx::scoped_lock<nx::mutex> held(all.lock);
         all.by_context.clear();
     }
+    g_mjpeg = false;
     register_library({"SceJpegEncUser", kSceJpegEncUser, kFunctions});
+    register_library({"SceJpegUser", kSceJpegUser, kDecoder});
 }
 
 }  // namespace psvrecore::runtime::hle
