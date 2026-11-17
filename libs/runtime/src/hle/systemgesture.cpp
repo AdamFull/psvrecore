@@ -469,7 +469,82 @@ i32 sceSystemGestureGetTouchEventByIndex(Ptr<const u8> object, u32 index, Ptr<u8
     return 0;
 }
 
+void put_event(const Event& e, u8* p) {
+    std::memset(p, 0, kEventSize);
+    std::memcpy(p, &e.id, 4);
+    std::memcpy(p + 4, &e.state, 4);
+    std::memcpy(p + 8, &e.type, 4);
+    std::memcpy(p + 16, &e.time, 8);
+    std::memcpy(p + 24, e.property, 64);
+}
+
+// The events as an array: as many as there are and the buffer holds, their count.
+i32 sceSystemGestureGetTouchEvents(Ptr<const u8> object, Ptr<u8> out, u32 capacity, Ptr<u32> count) {
+    if (!object || !count || !writable(count.address, 4)) return kInvalidArgument;
+    if (capacity && (!out || !writable(out.address, kEventSize * capacity))) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    Recognizer* r = recognizer(g, object.address);
+    if (!r) return kInvalidArgument;
+    const u32 n = nx::min<u32>(capacity, static_cast<u32>(r->events.size()));
+    for (u32 i = 0; i < n; ++i) put_event(r->events[i], out.get() + kEventSize * i);
+    *count = n;
+    return 0;
+}
+i32 sceSystemGestureGetTouchEventByEventID(Ptr<const u8> object, u32 id, Ptr<u8> out) {
+    if (!object || !out || !writable(out.address, kEventSize)) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    Recognizer* r = recognizer(g, object.address);
+    if (!r) return kInvalidArgument;
+    for (const Event& e : r->events)
+        if (e.id == id) {
+            put_event(e, out.get());
+            return 0;
+        }
+    return kOutOfArray;
+}
+// A recognizer starts over: no events, nothing in progress.
+i32 sceSystemGestureResetTouchRecognizer(Ptr<u8> object) {
+    if (!object) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    Recognizer* r = recognizer(g, object.address);
+    if (!r) return kInvalidArgument;
+    Recognizer fresh;
+    fresh.type = r->type, fresh.port = r->port, fresh.rect = r->rect, fresh.max_taps = r->max_taps,
+    fresh.hold_time = r->hold_time;
+    *r = std::move(fresh);
+    return 0;
+}
+// The area it recognizes in (SceSystemGestureRectangle: x, y, width, height; 0 width: the whole panel).
+i32 sceSystemGestureUpdateTouchRecognizerRectangle(Ptr<u8> object, Ptr<const i16> rect) {
+    if (!object || !rect || !readable(rect.address, 8)) return kInvalidArgument;
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    Recognizer* r = recognizer(g, object.address);
+    if (!r) return kInvalidArgument;
+    i16 v[4];
+    std::memcpy(v, rect.get(), 8);
+    r->rect = {v[0], v[1], v[2], v[3]};
+    return 0;
+}
+// The primitive recognizer ends: touches forgotten (it must be initialized again before an update).
+i32 sceSystemGestureFinalizePrimitiveTouchRecognizer() {
+    Gestures& g = gestures();
+    nx::scoped_lock<nx::mutex> held(g.lock);
+    if (!g.initialized) return kNotInitialized;
+    g.initialized = false;
+    g.primitives.clear();
+    return 0;
+}
+
 const Function kFunctions[] = {
+    HLE_FUNCTION(0x789D867C, sceSystemGestureGetTouchEvents),
+    HLE_FUNCTION(0x5570B83E, sceSystemGestureGetTouchEventByEventID),
+    HLE_FUNCTION(0x0D941B90, sceSystemGestureResetTouchRecognizer),
+    HLE_FUNCTION(0xA9DB29F6, sceSystemGestureUpdateTouchRecognizerRectangle),
+    HLE_FUNCTION(0xB3875104, sceSystemGestureFinalizePrimitiveTouchRecognizer),
     HLE_FUNCTION(0x6078A08B, sceSystemGestureInitializePrimitiveTouchRecognizer),
     HLE_FUNCTION(0xDF4C665A, sceSystemGestureUpdatePrimitiveTouchRecognizer),
     HLE_FUNCTION(0xC3367370, sceSystemGestureCreateTouchRecognizer),

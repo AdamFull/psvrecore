@@ -349,3 +349,49 @@ TEST_CASE("apputil, power, LiveArea, game update, photo export: the host's answe
     CHECK(u(call32(ctx, kScePhotoExport, 0x70512321 /*FromData*/, {out, 16, out, out, 0, 0, out, 64})) == 0x80101A0Cu);
     CHECK(u(call32(ctx, kScePhotoExport, 0x70512321, {0, 16, out, out, 0, 0, out, 64})) == 0x80101A01u);
 }
+
+TEST_CASE("audio in, motion sensors, cameras, video decoder memory: silence at the grain's pace, a still console") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceAudioIn = 0xF8DC61A3, kOpen = 0x39B50DC1, kRelease = 0x3A61B8C4, kInput = 0x638ADD2D,
+                  kAdopt = 0x566AC433, kStatus = 0x2F940377;
+    CHECK(u(call32(ctx, kSceAudioIn, kOpen, {1, 256, 16000, 0})) == 0x80260104u);  // (no such port type)
+    CHECK(u(call32(ctx, kSceAudioIn, kOpen, {0, 300, 16000, 0})) == 0x80260102u);
+    CHECK(u(call32(ctx, kSceAudioIn, kOpen, {0, 256, 44100, 0})) == 0x80260103u);
+    const i32 port = call32(ctx, kSceAudioIn, kOpen, {0, 256, 16000, 0});
+    REQUIRE(port >= 0);
+    CHECK(u(call32(ctx, kSceAudioIn, kOpen, {0, 512, 16000, 0})) == 0x80260107u);  // (one voice port)
+    const u32 buf = scratch(512);
+    std::memset(t.rt.memory().host(buf), 0x55, 512);
+    const u64 before = t.rt.kernel().clock_ns();
+    for (u32 i = 0; i < 5; ++i) REQUIRE(call32(ctx, kSceAudioIn, kInput, {u(port), buf}) == 0);
+    CHECK(t.rt.kernel().clock_ns() - before >= 4 * 16'000'000ull);  // (256 samples at 16 kHz: 16 ms each)
+    CHECK(t.rt.memory().host(buf)[511] == 0);
+    CHECK(call32(ctx, kSceAudioIn, kAdopt, {0}) == 1);
+    CHECK(call32(ctx, kSceAudioIn, kStatus, {1}) == 0);
+    CHECK(call32(ctx, kSceAudioIn, kRelease, {u(port)}) == 0);
+    CHECK(u(call32(ctx, kSceAudioIn, kInput, {u(port), buf})) == 0x80260109u);
+
+    constexpr u32 kSceMotion = 0xDC571B3F, kStart = 0x28034AC9, kSensor = 0x47D679EA, kMag = 0x122A79F8;
+    const u32 states = scratch(64 * 3);
+    CHECK(u(call32(ctx, kSceMotion, kSensor, {states, 3})) == 0x80360202u);  // (not sampling)
+    REQUIRE(call32(ctx, kSceMotion, kStart, {}) == 0);
+    REQUIRE(call32(ctx, kSceMotion, kSensor, {states, 3}) == 0);
+    f32 z;
+    std::memcpy(&z, t.rt.memory().host(states + 64 * 2 + 8), 4);
+    CHECK(z == -1.0f);  // (gravity down the back)
+    CHECK(psv_ld32(states + 64 * 2 + 40) == 2);
+    CHECK(call32(ctx, kSceMotion, kMag, {}) == 0);
+
+    constexpr u32 kSceCamera = 0xDA91B3ED;
+    CHECK(u(call32(ctx, kSceCamera, 0x62AFF0B8 /*SetEV*/, {0, 1})) == 0x802E0004u);  // (not open)
+    CHECK(u(call32(ctx, kSceCamera, 0xE9D2CFB1 /*SetEffect*/, {0, 1})) == 0x802E0004u);
+
+    constexpr u32 kSceVideodecUser = 0x163C3727;
+    const u32 info = scratch(64), mem = scratch(8), ctrl = scratch(32);
+    psv_st32(mem, 0x1234);
+    REQUIRE(call32(ctx, kSceVideodecUser, 0x6731BB2D /*QueryMemSize*/, {0x1001, info, mem}) == 0);
+    CHECK(psv_ld32(mem) == 0);
+    CHECK(call32(ctx, kSceVideodecUser, 0x230A78FF /*InitLibraryWithUnmapMem*/, {0x1001, ctrl, info}) == 0);
+    CHECK(call32(ctx, kSceVideodecUser, 0x3A5F4924 /*TermLibrary*/, {0x1001}) == 0);
+}

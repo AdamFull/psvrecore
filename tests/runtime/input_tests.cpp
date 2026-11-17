@@ -281,4 +281,30 @@ TEST_CASE("system gestures: a tap, a drag, and touches cancelled when updates st
     frame(3'000'000, true, 100, 100);
     frame(3'500'000, true, 100, 100);
     CHECK(first(drag).state == 4);
+
+    // The events as an array, by ID; a reset forgets them; a rectangle away from the touch sees nothing.
+    constexpr u32 kEvents = 0x789D867C, kById = 0x5570B83E, kReset = 0x0D941B90, kRectangle = 0xA9DB29F6,
+                  kFinalize = 0xB3875104;
+    frame(4'000'000, true, 100, 100);
+    const u32 events = scratch(144 * 4), count = scratch(4);
+    REQUIRE(call32(ctx, kGesture, kEvents, {drag, events, 4, count}) == 0);
+    REQUIRE(psv_ld32(count) == 1);
+    const u32 id = psv_ld32(events);
+    CHECK(call32(ctx, kGesture, kById, {drag, id, event}) == 0);
+    CHECK(psv_ld32(event) == id);
+    CHECK(call32(ctx, kGesture, kById, {drag, id + 100, event}) == err::code(0x80890004));
+    CHECK(call32(ctx, kGesture, kReset, {drag}) == 0);
+    CHECK(call32(ctx, kGesture, kCount, {drag}) == 0);
+    const u32 rect = scratch(8);
+    const i16 r[4] = {800, 400, 100, 100};
+    std::memcpy(t.rt.memory().host(rect), r, 8);
+    CHECK(call32(ctx, kGesture, kRectangle, {drag, rect}) == 0);
+    frame(4'016'000, false, 0, 0);
+    frame(4'033'000, true, 100, 100);
+    CHECK(call32(ctx, kGesture, kCount, {drag}) == 0);
+    frame(4'050'000, false, 0, 0);
+    frame(4'066'000, true, 850, 450);  // (pressed inside it)
+    CHECK(call32(ctx, kGesture, kCount, {drag}) == 1);
+    CHECK(call32(ctx, kGesture, kFinalize, {}) == 0);
+    CHECK(call32(ctx, kGesture, kUpdatePrimitive, {touch, 0}) == err::code(0x80890003));  // (not initialized)
 }

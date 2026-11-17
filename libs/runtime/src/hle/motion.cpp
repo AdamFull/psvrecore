@@ -74,6 +74,32 @@ i32 sceMotionGetState(Ptr<MotionState> out) {
     return 0;
 }
 
+// SceMotionSensorState (64 bytes): the sensors' own readings, the newest last: as still and level (gravity 1 g down
+// the back, no rotation), one record per call's count, a microsecond apart.
+i32 sceMotionGetSensorState(Ptr<u8> out, i32 count) {
+    if (count < 1 || count > 64 || !out || !writable(out.address, 64u * static_cast<u32>(count))) return err::kFault;
+    Motion& m = motion();
+    {
+        nx::scoped_lock<nx::mutex> held(m.lock);
+        if (!m.sampling) return kNotStarted;
+    }
+    const u64 now = kernel().process_time();
+    for (i32 i = 0; i < count; ++i) {
+        u8* r = out.get() + 64 * i;
+        std::memset(r, 0, 64);
+        const f32 z = -1.0f;
+        std::memcpy(r + 8, &z, 4);
+        const u64 at = now - static_cast<u64>(count - 1 - i);
+        const u32 stamp = static_cast<u32>(at), counter = static_cast<u32>(i);
+        std::memcpy(r + 36, &stamp, 4);
+        std::memcpy(r + 40, &counter, 4);
+        std::memcpy(r + 48, &at, 8);
+    }
+    return 0;
+}
+// (no magnetometer: turning it on changes nothing, the field's stability stays unknown)
+i32 sceMotionMagnetometerOn() { return 0; }
+
 i32 sceMotionSetDeadband(i32 value) {
     Motion& m = motion();
     nx::scoped_lock<nx::mutex> held(m.lock);
@@ -107,6 +133,8 @@ const Function kFunctions[] = {
     HLE_FUNCTION(0xAF09FCDB, sceMotionSetTiltCorrection),
     HLE_FUNCTION(0xC1652201, sceMotionGetTiltCorrection),
     HLE_FUNCTION(0x0FD2CDA2, sceMotionReset),
+    HLE_FUNCTION(0x47D679EA, sceMotionGetSensorState),
+    HLE_FUNCTION(0x122A79F8, sceMotionMagnetometerOn),
 };
 
 }  // namespace

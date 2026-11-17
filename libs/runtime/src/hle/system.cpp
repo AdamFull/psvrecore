@@ -141,6 +141,8 @@ i32 sceCameraSetAutoControlHold(i32 device, i32) { return not_open(device); }
 i32 sceCameraSetISO(i32 device, i32) { return not_open(device); }
 i32 sceCameraSetNightmode(i32 device, i32) { return not_open(device); }
 i32 sceCameraSetAntiFlicker(i32 device, i32) { return not_open(device); }
+i32 sceCameraSetEV(i32 device, i32) { return not_open(device); }
+i32 sceCameraSetEffect(i32 device, i32) { return not_open(device); }
 
 i32 started(const char* what) {
     nx::logi(logs::hle, "{}: started (offline: nothing connects)", what);
@@ -382,6 +384,8 @@ const Function kCamera[] = {
     HLE_FUNCTION(0x3CF630A1, sceCameraSetISO),
     HLE_FUNCTION(0x3F26233E, sceCameraSetNightmode),
     HLE_FUNCTION(0xE312958A, sceCameraSetAntiFlicker),
+    HLE_FUNCTION(0x62AFF0B8, sceCameraSetEV),
+    HLE_FUNCTION(0xE9D2CFB1, sceCameraSetEffect),
 };
 const Function kScreenShot[] = {
     HLE_FUNCTION(0x05DB59C7, sceScreenShotSetParam),

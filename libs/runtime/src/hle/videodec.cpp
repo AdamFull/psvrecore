@@ -186,6 +186,17 @@ i32 sceVideodecInitLibrary(u32 type, Ptr<const void> /*info*/) {
     return 0;
 }
 
+// (the library's memory is the runtime's own: none of the game's is needed, or used when given)
+i32 sceVideodecQueryMemSize(u32 type, Ptr<const void> info, Ptr<u32> mem_info) {
+    if (type != kTypeHwAvcdec) return kVideodecInvalidType;
+    if (!info || !mem_info || !writable(mem_info.address, 4)) return err::kInvalidArgument;
+    *mem_info = 0;
+    return 0;
+}
+i32 sceVideodecInitLibraryWithUnmapMem(u32 type, Ptr<const void> /*ctrl*/, Ptr<const void> info) {
+    return sceVideodecInitLibrary(type, info);
+}
+
 i32 sceVideodecTermLibrary(u32 type) {
     if (type != kTypeHwAvcdec) return kVideodecInvalidType;
     nx::scoped_lock<nx::mutex> held(videodec().lock);
@@ -279,6 +290,8 @@ i32 sceAvcdecDecodeFlush(Ptr<const Ctrl> ctrl) {
 const Function kVideodec[] = {
     HLE_FUNCTION(0xF1AF65A3, sceVideodecInitLibrary),
     HLE_FUNCTION(0x3A5F4924, sceVideodecTermLibrary),
+    HLE_FUNCTION(0x6731BB2D, sceVideodecQueryMemSize),
+    HLE_FUNCTION(0x230A78FF, sceVideodecInitLibraryWithUnmapMem),
     HLE_FUNCTION(0x97E95EDB, sceAvcdecQueryDecoderMemSize),
     HLE_FUNCTION(0xE82BB69B, sceAvcdecCreateDecoder),
     HLE_FUNCTION(0x8A0E359E, sceAvcdecDeleteDecoder),
