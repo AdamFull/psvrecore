@@ -462,8 +462,16 @@ nx::string Kernel::describe_threads() {
                           t->name, state, t->priority, static_cast<u32>(t->affinity), t->cpu, t->ctx.r[14], t->ctx.r[13]);
         if (t->state == ThreadState::Waiting) {
             const auto it = impl_->objects.find(t->wait.object);
-            out += nx::format(" (wait type 0x{:x} on 0x{:08x} '{}')", static_cast<u32>(t->wait.type),
+            out += nx::format(" (wait type 0x{:x} on 0x{:08x} '{}'", static_cast<u32>(t->wait.type),
                               static_cast<u32>(t->wait.object), it != impl_->objects.end() ? it->second->name.c_str() : "");
+            // (a mutex's owner and count: who the thread waits for)
+            if (it != impl_->objects.end() &&
+                (it->second->cls == ObjectClass::Mutex || it->second->cls == ObjectClass::LwMutex)) {
+                const auto* m = static_cast<const Mutex*>(it->second.get());
+                out += m->owner ? nx::format(", held by 0x{:08x} '{}' count {}", static_cast<u32>(m->owner->uid), m->owner->name, m->count)
+                                : nx::format(", not held, count {}", m->count);
+            }
+            out += ")";
         }
         out += "\n";
     }
