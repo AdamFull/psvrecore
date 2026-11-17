@@ -2855,7 +2855,10 @@ void ahead_make(Renderer& r, const AheadPair& pair, const ColorFormat& cf) {
     }
     // (a shader compiled ahead in a run before: in the driver's cache, its library made quickly when a draw needs it)
     const ShaderKey vkey = vertex_key(w.vp, vs), fkey = fragment_key(w.fp, fs, inline_secondary);
-    const bool need_v = !r.cache.prepared(vkey), need_f = !r.cache.prepared(fkey);
+    // (a colour-reading shader's mark its own: before local read, those were marked with no library made)
+    ShaderKey fmark = fkey;
+    if (reads_color) fmark[0] ^= 0x5A;
+    const bool need_v = !r.cache.prepared(vkey), need_f = !r.cache.prepared(fmark);
     if (!need_v && !need_f) return;
     const u64 from = nx::os::ticks_ns();
     const VkShaderModule vm = need_v ? ahead_module(r, vkey, vq, [&] { return translate_vertex(w.vp.gxp, w.vp.primary, vs); })
@@ -2871,9 +2874,10 @@ void ahead_make(Renderer& r, const AheadPair& pair, const ColorFormat& cf) {
     desc.vertex = vm, desc.fragment = fm, desc.layout = r.layout;
     desc.depth_test = 1, desc.depth_write = 1, desc.depth_compare = VK_COMPARE_OP_LESS_OR_EQUAL;
     desc.formats = formats;
-    if (!r.pipelines->prepare(desc)) return;
+    const auto made = r.pipelines->prepare(desc);
+    if (!made || !*made) return;  // (a render pass's: made whole when a draw needs it)
     if (vm) r.cache.add_prepared(vkey);
-    if (fm) r.cache.add_prepared(fkey);
+    if (fm) r.cache.add_prepared(fmark);
     r.pipelines_changed.store(true);  // (the driver's cache has them now: saved with the rest)
     Ahead& a = ahead();
     const nx::scoped_lock<nx::mutex> held(a.lock);

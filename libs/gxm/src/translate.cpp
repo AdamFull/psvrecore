@@ -1753,7 +1753,8 @@ void Translator::fragment_prologue() {
             store(chain(tp_fu_, sa_.var, {u(k)}), load(tu_, buffer_word(sa_buf_, iadd(sa_base_, u(k)))));
     }
     if (fragment_shader->blend_read) blend_read_ = find_blend_read(gxp_, program_);
-    if (gxp_.native_color && gxp_.frag_color && !blend_read_) {
+    // (with no colour attachment, a depth-only pass's, nothing to read: the register left as it starts)
+    if (gxp_.native_color && gxp_.frag_color && !blend_read_ && fragment_shader->color_output) {
         // The colour attachment's value, back in the output register's lanes and format.
         b_.capability(SpvCapabilityInputAttachment);
         const Id image = b_.t_image(tf_, SpvDimSubpassData, 0, 0, 0, 2, SpvImageFormatUnknown);

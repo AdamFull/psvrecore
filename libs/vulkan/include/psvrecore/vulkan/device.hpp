@@ -45,6 +45,9 @@ struct Capabilities {
     // with rasterization-order access (VK_EXT_ or VK_ARM_rasterization_order_attachment_access).
     bool raster_order_attachment = false;
     bool pipeline_library = false;  // VK_EXT_graphics_pipeline_library
+    // VK_KHR_dynamic_rendering_local_read: a pass reading its colour as an input attachment rendered dynamically too
+    // (no render pass: its pipelines made of libraries as the others are). PSVRECORE_LOCAL_READ=0 turns it off.
+    bool local_read = false;
     // The libraries' rasterization, depth and stencil state dynamic (Vulkan 1.3's extended dynamic state): a shader's
     // library is the same for all of them, found in the driver's cache in later runs.
     bool dynamic_state = false;

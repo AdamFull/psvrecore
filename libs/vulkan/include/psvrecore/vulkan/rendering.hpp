@@ -54,7 +54,9 @@ public:
     RenderPasses& operator=(const RenderPasses&) = delete;
 
     // Whether passes with these formats use a render pass (and pipelines need one).
-    bool uses_render_pass(const PassFormats& f) const { return f.color_input || !device_.caps().dynamic_rendering; }
+    bool uses_render_pass(const PassFormats& f) const {
+        return (f.color_input && !device_.caps().local_read) || !device_.caps().dynamic_rendering;
+    }
     // A render pass pipelines with these formats can be made for (any load and store operations).
     Result<VkRenderPass> compatible(const PassFormats& formats);
 

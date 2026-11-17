@@ -89,8 +89,9 @@ public:
     // two, where a whole pipeline's shaders are compiled together for each pair (25-630 ms).
     Result<VkPipeline> linked(const GraphicsPipelineDesc& desc);
     // The libraries of its shaders made, without a pipeline (the vertex shader's if it has one, the fragment shader's
-    // if it has one): the driver compiles them into its cache. Nothing without pipeline libraries.
-    Result<void> prepare(const GraphicsPipelineDesc& desc);
+    // if it has one): the driver compiles them into its cache. False when it makes none (no pipeline libraries, or a
+    // render pass).
+    Result<bool> prepare(const GraphicsPipelineDesc& desc);
     // Made before (VK_NULL_HANDLE: not yet); `linked`, whether it is one linked() made.
     VkPipeline find(const GraphicsPipelineDesc& desc, bool* linked = nullptr) const;
     usize count() const { return count_.load(std::memory_order_relaxed); }
@@ -122,7 +123,7 @@ private:
 };
 
 // A draw's rasterization, depth and stencil state, for a pipeline linked with them dynamic (Capabilities::
-// dynamic_state): set for each draw (a whole pipeline bound before sets its own over them).
+// dynamic_state): set for each draw (whole pipelines have them dynamic too, then).
 void set_dynamic_state(VkCommandBuffer cmd, const GraphicsPipelineDesc& desc);
 
 // A shader module from SPIR-V words.

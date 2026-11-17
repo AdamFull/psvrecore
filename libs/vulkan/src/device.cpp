@@ -1,5 +1,6 @@
 #include "psvrecore/vulkan/device.hpp"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "psvrecore/log.hpp"
@@ -301,6 +302,25 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         }
     }
 
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR local_read{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    const char* local_read_env = std::getenv("PSVRECORE_LOCAL_READ");
+    if (caps.dynamic_rendering && has_ext(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) &&
+        !(local_read_env && std::atoi(local_read_env) == 0)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &local_read;
+        vkGetPhysicalDeviceFeatures2(gpu, &query);
+        if (local_read.dynamicRenderingLocalRead) {
+            local_read = VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+            local_read.dynamicRenderingLocalRead = VK_TRUE;
+            local_read.pNext = chain;
+            chain = &local_read;
+            extensions.push_back(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+            caps.local_read = true;
+        }
+    }
+
     const f32 priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue.queueFamilyIndex = d->queue_family_;
@@ -393,7 +413,7 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
              VK_API_VERSION_PATCH(props.apiVersion), VK_API_VERSION_MAJOR(caps.api_version),
              VK_API_VERSION_MINOR(caps.api_version), caps.dynamic_rendering ? "dynamic rendering" : "render passes",
              caps.raster_order_attachment ? ", rasterization-order attachments" : "", caps.int64 ? ", int64" : "",
-             caps.pipeline_library ? ", pipeline libraries" : "",
+             caps.pipeline_library ? ", pipeline libraries" : "", caps.local_read ? ", local read" : "",
              d->messenger_ ? "; validation layer on" : "");
     // (what the device offers that faster paths could use: not enabled)
     nx::string offered;

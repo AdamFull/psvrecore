@@ -94,6 +94,19 @@ VkPipeline Pipelines::find(const GraphicsPipelineDesc& d, bool* linked) const {
     return e ? e->pipeline : VK_NULL_HANDLE;
 }
 
+namespace {
+
+// A colour-reading pipeline rendered dynamically (local read): its input attachment 0 the colour attachment, said
+// (the default mapping, which the validation layer does not take for a fragment shader's library).
+bool reads_color(const GraphicsPipelineDesc& d, VkRenderingInputAttachmentIndexInfoKHR& info) {
+    static constexpr u32 kFirst = 0;
+    if (!d.formats.color_input || d.formats.color == VK_FORMAT_UNDEFINED) return false;
+    info.colorAttachmentCount = 1, info.pColorAttachmentInputIndices = &kFirst;
+    return true;
+}
+
+}  // namespace
+
 Result<VkPipeline> Pipelines::graphics(const GraphicsPipelineDesc& d) {
     VkRenderPass render_pass = VK_NULL_HANDLE;
     {
@@ -173,12 +186,18 @@ Result<VkPipeline> Pipelines::graphics(const GraphicsPipelineDesc& d) {
     blend.pAttachments = &attachment;
     if (d.formats.color_input && device_.caps().raster_order_attachment)
         blend.flags |= VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+    // (with dynamic_state, the rasterization, depth and stencil state too, as the libraries have them: the draws set
+    // them for whichever is bound, set_dynamic_state)
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
                                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                                              VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS,
-                                             VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+                                             VK_DYNAMIC_STATE_BLEND_CONSTANTS,   VK_DYNAMIC_STATE_CULL_MODE,
+                                             VK_DYNAMIC_STATE_FRONT_FACE,        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+                                             VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+                                             VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,  VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                             VK_DYNAMIC_STATE_STENCIL_OP};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = static_cast<u32>(std::size(dynamic_states));
+    dynamic.dynamicStateCount = device_.caps().dynamic_state ? static_cast<u32>(std::size(dynamic_states)) : 7u;
     dynamic.pDynamicStates = dynamic_states;
 
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -193,6 +212,8 @@ Result<VkPipeline> Pipelines::graphics(const GraphicsPipelineDesc& d) {
         if (aspect_of(d.formats.depth) & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.stencilAttachmentFormat = d.formats.depth;
         info.pNext = &rendering;
     }
+    VkRenderingInputAttachmentIndexInfoKHR input_index{VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR};
+    if (!render_pass && reads_color(d, input_index)) rendering.pNext = &input_index;
     info.stageCount = stage_count;
     info.pStages = stages;
     info.pVertexInputState = &vertex;
@@ -359,6 +380,8 @@ Result<VkPipeline> Pipelines::library(u32 part, const GraphicsPipelineDesc& full
     if (aspect_of(d.formats.depth) & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.stencilAttachmentFormat = d.formats.depth;
     VkGraphicsPipelineLibraryCreateInfoEXT lib{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
     rendering.pNext = &lib;
+    VkRenderingInputAttachmentIndexInfoKHR input_index{VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR};
+    if (part == kFragmentShader && reads_color(d, input_index)) input_index.pNext = &lib, rendering.pNext = &input_index;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.pNext = &rendering;
     info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
@@ -402,14 +425,14 @@ Result<VkPipeline> Pipelines::library(u32 part, const GraphicsPipelineDesc& full
     return p;
 }
 
-Result<void> Pipelines::prepare(const GraphicsPipelineDesc& d) {
-    // (a pass reading its colour as an input attachment uses a render pass: made whole, as graphics() makes it)
-    if (!device_.caps().pipeline_library || passes_.uses_render_pass(d.formats)) return {};
+Result<bool> Pipelines::prepare(const GraphicsPipelineDesc& d) {
+    // (a pass with a render pass, one reading its colour without local read: made whole, as graphics() makes it)
+    if (!device_.caps().pipeline_library || passes_.uses_render_pass(d.formats)) return false;
     if (d.vertex)
         if (auto l = library(kPreRasterization, d); !l) return nx::err(l.error());
     if (d.fragment)
         if (auto l = library(kFragmentShader, d); !l) return nx::err(l.error());
-    return {};
+    return true;
 }
 
 Result<VkPipeline> Pipelines::linked(const GraphicsPipelineDesc& d) {
