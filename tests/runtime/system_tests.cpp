@@ -2,6 +2,7 @@
 // attachment, renaming and options.
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -478,4 +479,162 @@ TEST_CASE("jpeg: an encoded picture decodes back to close to the colours given, 
     CHECK(worst <= 12);
     CHECK(a[3] == 255);
     CHECK(call32(ctx, kSceJpegUser, kFinish, {}) == 0);
+}
+
+TEST_CASE("codec engine: allocations from a block are aligned, within it, apart, and the block closes when empty") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceCodecEngineUser = 0x469AB062, kOpen = 0xF0B4C892, kClose = 0x95EA3B3E, kAlloc = 0x1A3A53E5,
+                  kFree = 0x6A31831D;
+    const u32 block = scratch(0x10000);
+    CHECK(u(call32(ctx, kSceCodecEngineUser, kOpen, {0, 0x10000})) == 0x80600000u);
+    const i32 uid = call32(ctx, kSceCodecEngineUser, kOpen, {block, 0x10000});
+    REQUIRE(uid > 0);
+    const u32 a = u(call32(ctx, kSceCodecEngineUser, kAlloc, {u(uid), 0x100, 0x1000}));
+    const u32 b = u(call32(ctx, kSceCodecEngineUser, kAlloc, {u(uid), 0x3000, 0x100}));
+    CHECK(a % 0x1000 == 0);
+    CHECK(b % 0x100 == 0);
+    CHECK(a >= block);
+    CHECK(a + 0x100 <= block + 0x10000);
+    CHECK(b >= block);
+    CHECK(b + 0x3000 <= block + 0x10000);
+    CHECK((a + 0x100 <= b || b + 0x3000 <= a));
+    CHECK(u(call32(ctx, kSceCodecEngineUser, kAlloc, {u(uid), 0x20000, 0})) == 0x80600001u);  // (too big)
+    CHECK(u(call32(ctx, kSceCodecEngineUser, kAlloc, {u(uid), 0x100, 3})) == 0x80600002u);
+    CHECK(u(call32(ctx, kSceCodecEngineUser, kClose, {u(uid)})) == 0x8060000Bu);  // (in use)
+    CHECK(call32(ctx, kSceCodecEngineUser, kFree, {u(uid), a}) == 0);
+    CHECK(u(call32(ctx, kSceCodecEngineUser, kFree, {u(uid), a})) == 0x8060000Au);
+    // (the room freed is used again)
+    CHECK(u(call32(ctx, kSceCodecEngineUser, kAlloc, {u(uid), 0x100, 0x1000})) == a);
+    CHECK(call32(ctx, kSceCodecEngineUser, kFree, {u(uid), a}) == 0);
+    CHECK(call32(ctx, kSceCodecEngineUser, kFree, {u(uid), b}) == 0);
+    CHECK(call32(ctx, kSceCodecEngineUser, kClose, {u(uid)}) == 0);
+    CHECK(u(call32(ctx, kSceCodecEngineUser, kClose, {u(uid)})) == 0x80600005u);
+}
+
+namespace {
+nx::vector<u32> g_ime_events;
+u32 g_ime_arg = 0;
+void ime_handler(PsvContext* ctx, u32) {
+    g_ime_arg = ctx->r[0];
+    g_ime_events.push_back(psv_ld32(ctx->r[1]));
+}
+}  // namespace
+
+TEST_CASE("ime: the keyboard opens, then Enter is pressed with the game's text") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceIme = 0xD2553017, kOpen = 0x0E050613, kUpdate = 0x71D6898A, kSetText = 0xF3BD9A76,
+                  kSetCaret = 0xD8342D2A, kClose = 0x889A8421;
+    GuestCode code;
+    const u32 handler = code.add(&ime_handler);
+    code.install();
+    g_ime_events.clear();
+    const u32 param = scratch(64), work = scratch(20 * 1024), buffer = scratch(2 * 17), initial = scratch(8), caret = scratch(16);
+    std::memset(t.rt.memory().host(param), 0, 64);
+    const u16 hi[] = {0x48, 0x69, 0};  // ("Hi")
+    std::memcpy(t.rt.memory().host(initial), hi, sizeof hi);
+    psv_st32(param + 28, work);
+    psv_st32(param + 32, 0x1234);
+    psv_st32(param + 36, handler);
+    psv_st32(param + 44, initial);
+    psv_st32(param + 48, 16);
+    psv_st32(param + 52, buffer);
+    CHECK(u(call32(ctx, kSceIme, kUpdate, {})) == 0x80100701u);  // (not open)
+    psv_st32(param + 48, 0);
+    CHECK(u(call32(ctx, kSceIme, kOpen, {param})) == 0x80100719u);
+    psv_st32(param + 48, 16);
+    REQUIRE(call32(ctx, kSceIme, kOpen, {param}) == 0);
+    CHECK(u(call32(ctx, kSceIme, kOpen, {param})) == 0x80100700u);
+    CHECK(psv_ld16(buffer) == 0x48);
+    CHECK(psv_ld16(buffer + 4) == 0);
+    const u16 longer[] = {0x48, 0x65, 0x6C, 0x6C, 0x6F, 0};  // ("Hello")
+    const u32 text = scratch(sizeof longer);
+    std::memcpy(t.rt.memory().host(text), longer, sizeof longer);
+    CHECK(call32(ctx, kSceIme, kSetText, {text, 5}) == 0);
+    CHECK(call32(ctx, kSceIme, kSetCaret, {caret}) == 0);
+    for (int i = 0; i < 4; ++i) CHECK(call32(ctx, kSceIme, kUpdate, {}) == 0);
+    REQUIRE(g_ime_events.size() == 2);
+    CHECK(g_ime_events[0] == 0);  // (open)
+    CHECK(g_ime_events[1] == 5);  // (Enter)
+    CHECK(g_ime_arg == 0x1234);
+    CHECK(psv_ld16(buffer + 8) == 0x6F);
+    CHECK(psv_ld16(buffer + 10) == 0);
+    CHECK(call32(ctx, kSceIme, kClose, {}) == 0);
+    CHECK(u(call32(ctx, kSceIme, kClose, {})) == 0x80100701u);
+}
+
+TEST_CASE("voice: PCM written to an input port reaches the PCM output ports connected to it; the microphone is silent") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceVoice = 0xCE56E214, kInit = 0x805CC20F, kEnd = 0xAC98853E, kStart = 0xB2ED725B, kStop = 0xC3868DF6,
+                  kCreate = 0xFA4E57B1, kConnect = 0x698BDAAE, kDisconnect = 0x5F0260F4, kDelete = 0xAE46564D,
+                  kWrite = 0x0A22EC0E, kRead = 0x09E4D18C, kInfo = 0x5933CCFB, kGetAttr = 0x73F72940,
+                  kSetVolume = 0xD93769E6, kGetVolume = 0x875CC80D, kGetBitRate = 0xD02C00B4;
+    const u32 init = scratch(32), start = scratch(32), id = scratch(4), param = scratch(32);
+    std::memset(t.rt.memory().host(init), 0, 32);
+    std::memset(t.rt.memory().host(start), 0, 32);
+    CHECK(u(call32(ctx, kSceVoice, kInit, {init, 99})) == 0x804E0805u);
+    REQUIRE(call32(ctx, kSceVoice, kInit, {init, 100}) == 0);
+    CHECK(u(call32(ctx, kSceVoice, kInit, {init, 100})) == 0x804E0802u);
+    const auto create = [&](u32 type, u32 extra0, u32 extra1, u32 extra2) {
+        std::memset(t.rt.memory().host(param), 0, 32);
+        psv_st32(param, type);
+        psv_st32(param + 8, std::bit_cast<u32>(1.0f));
+        psv_st32(param + 12, extra0);
+        psv_st32(param + 16, extra1);
+        psv_st32(param + 20, extra2);
+        CHECK(call32(ctx, kSceVoice, kCreate, {id, param}) == 0);
+        return psv_ld32(id);
+    };
+    const u32 mic = create(0, 0, 0, 0), pcm_in = create(1, 4096, 0, 16000), pcm_out = create(3, 4096, 0, 16000),
+              voice_out = create(4, 3850, 0, 0);
+    CHECK(call32(ctx, kSceVoice, kConnect, {pcm_in, pcm_out}) == 0);
+    CHECK(call32(ctx, kSceVoice, kConnect, {pcm_in, voice_out}) == 0);
+    CHECK(call32(ctx, kSceVoice, kConnect, {mic, voice_out}) == 0);
+    CHECK(u(call32(ctx, kSceVoice, kConnect, {pcm_out, pcm_in})) == 0x804E0807u);
+    REQUIRE(call32(ctx, kSceVoice, kStart, {start}) == 0);
+
+    const u32 data = scratch(2048), size = scratch(4), out = scratch(2048);
+    for (u32 i = 0; i < 2048; ++i) t.rt.memory().host(data)[i] = static_cast<u8>(i * 7);
+    psv_st32(size, 1100);  // (two whole frames taken)
+    REQUIRE(call32(ctx, kSceVoice, kWrite, {pcm_in, data, size, 0}) == 0);
+    CHECK(psv_ld32(size) == 1024);
+    const u32 info = scratch(32), edges = scratch(16);
+    psv_st32(info + 8, edges);
+    psv_st16(info + 20, 4);
+    REQUIRE(call32(ctx, kSceVoice, kInfo, {pcm_out, info}) == 0);
+    CHECK(psv_ld32(info) == 3);
+    CHECK(psv_ld32(info + 4) == 3);  // (running)
+    CHECK(psv_ld32(info + 12) == 1024);
+    CHECK(psv_ld32(info + 16) == 512);
+    CHECK(psv_ld16(info + 20) == 1);
+    CHECK(psv_ld32(edges) == pcm_in);
+    psv_st32(size, 2048);
+    REQUIRE(call32(ctx, kSceVoice, kRead, {pcm_out, out, size}) == 0);
+    CHECK(psv_ld32(size) == 1024);
+    CHECK(std::memcmp(t.rt.memory().host(out), t.rt.memory().host(data), 1024) == 0);
+    // (nothing reaches the voice data port: no codec, and the microphone is silent)
+    psv_st32(size, 2048);
+    REQUIRE(call32(ctx, kSceVoice, kRead, {voice_out, out, size}) == 0);
+    CHECK(psv_ld32(size) == 0);
+    const u32 active = scratch(4);
+    t.rt.memory().host(active)[0] = 1;
+    CHECK(call32(ctx, kSceVoice, kGetAttr, {mic, 1000, active}) == 0);
+    CHECK(t.rt.memory().host(active)[0] == 0);
+
+    ctx->vfp.s[0] = std::bit_cast<u32>(0.5f);
+    CHECK(call32(ctx, kSceVoice, kSetVolume, {pcm_out}) == 0);
+    const u32 volume = scratch(4), bitrate = scratch(4);
+    CHECK(call32(ctx, kSceVoice, kGetVolume, {pcm_out, volume}) == 0);
+    CHECK(std::bit_cast<f32>(psv_ld32(volume)) == 0.5f);
+    CHECK(call32(ctx, kSceVoice, kGetBitRate, {voice_out, bitrate}) == 0);
+    CHECK(psv_ld32(bitrate) == 3850);
+    CHECK(call32(ctx, kSceVoice, kDisconnect, {pcm_in, pcm_out}) == 0);
+    CHECK(u(call32(ctx, kSceVoice, kDisconnect, {pcm_in, pcm_out})) == 0x804E0807u);
+    CHECK(call32(ctx, kSceVoice, kDelete, {pcm_in}) == 0);
+    CHECK(u(call32(ctx, kSceVoice, kDelete, {pcm_in})) == 0x804E0804u);
+    CHECK(call32(ctx, kSceVoice, kStop, {}) == 0);
+    CHECK(call32(ctx, kSceVoice, kEnd, {}) == 0);
+    CHECK(u(call32(ctx, kSceVoice, kEnd, {})) == 0x804E0801u);
 }

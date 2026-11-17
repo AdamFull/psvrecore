@@ -420,6 +420,9 @@ void register_system_libraries() {
     register_services();
     register_audiodec();
     register_videodec();
+    register_codecengine();
+    register_ime();
+    register_voice();
     register_commondialog();
 }
 

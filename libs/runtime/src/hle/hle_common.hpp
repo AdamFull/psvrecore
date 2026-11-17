@@ -58,6 +58,9 @@ void register_psn();
 void register_services();
 void register_audiodec();
 void register_videodec();
+void register_codecengine();
+void register_ime();
+void register_voice();
 void register_commondialog();
 
 }  // namespace psvrecore::runtime::hle
