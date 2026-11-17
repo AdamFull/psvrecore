@@ -178,7 +178,15 @@ GraphicsPipelineDesc desc_for(Gpu& g, Fragment kind, const Pass& pass) {
     return d;
 }
 
-void draw(Gpu& g, VkCommandBuffer cmd, VkPipeline pipeline, std::span<const Vertex> vertices, u32 width, u32 height) {
+// (the pipelines leave their rasterization, depth and stencil state dynamic where the device can: set from the
+// description they were made from)
+void bind(Gpu& g, VkCommandBuffer cmd, VkPipeline pipeline, const GraphicsPipelineDesc& desc) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    if (g.device->caps().dynamic_state) set_dynamic_state(cmd, desc);
+}
+
+void draw(Gpu& g, VkCommandBuffer cmd, VkPipeline pipeline, const GraphicsPipelineDesc& desc,
+          std::span<const Vertex> vertices, u32 width, u32 height) {
     Buffer vb = value_or_throw(create_host_buffer(*g.device, vertices.size_bytes(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
     std::memcpy(vb.mapped, vertices.data(), vertices.size_bytes());
     flush(*g.device, vb);
@@ -187,7 +195,7 @@ void draw(Gpu& g, VkCommandBuffer cmd, VkPipeline pipeline, std::span<const Vert
     const VkRect2D scissor{{0, 0}, {width, height}};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    bind(g, cmd, pipeline, desc);
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb.buffer, &offset);
     vkCmdDraw(cmd, static_cast<u32>(vertices.size()), 1, 0, 0);
@@ -238,11 +246,12 @@ TEST_CASE("vulkan gpu: a triangle over a cleared target") {
         Image color = value_or_throw(create_image(*g->device, target()));
         Pass pass;
         pass.color = {&color, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, {{0.0f, 0.0f, 1.0f, 1.0f}}};
-        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc_for(*g, Fragment::Color, pass)));
+        const auto desc = desc_for(*g, Fragment::Color, pass);
+        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
         OneShot shot(*g->device);
         VkCommandBuffer cmd = value_or_throw(shot.begin());
         REQUIRE(g->passes->begin(cmd, pass));
-        draw(*g, cmd, p, half(0.5f, 1, 0, 0, 1), kSize, kSize);
+        draw(*g, cmd, p, desc, half(0.5f, 1, 0, 0, 1), kSize, kSize);
         g->passes->end(cmd);
         REQUIRE(shot.submit_and_wait());
         const auto image = value_or_throw(read_image(*g->device, color));
@@ -282,8 +291,8 @@ TEST_CASE("vulkan gpu: depth test and blending") {
         OneShot shot(d);
         VkCommandBuffer cmd = value_or_throw(shot.begin());
         REQUIRE(g->passes->begin(cmd, pass));
-        draw(*g, cmd, pn, half(0.25f, 1, 0, 0, 1), kSize, kSize);  // near: red
-        draw(*g, cmd, pf, full(0.75f, 0, 1, 0, 0.5f), kSize, kSize);  // far: green at half, blended where it passes
+        draw(*g, cmd, pn, near_desc, half(0.25f, 1, 0, 0, 1), kSize, kSize);  // near: red
+        draw(*g, cmd, pf, far_desc, full(0.75f, 0, 1, 0, 0.5f), kSize, kSize);  // far: green at half, blended where it passes
         g->passes->end(cmd);
         REQUIRE(shot.submit_and_wait());
         const auto image = value_or_throw(read_image(d, color));
@@ -338,14 +347,15 @@ TEST_CASE("vulkan gpu: texture sampling") {
         Image color = value_or_throw(create_image(d, target()));
         Pass pass;
         pass.color = {&color, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, {}};
-        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc_for(*g, Fragment::Texture, pass)));
+        const auto desc = desc_for(*g, Fragment::Texture, pass);
+        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
         // (the value is the texture coordinate: 0-1 across the target)
         const Vertex quad[] = {{-1, -1, 0, {0, 0, 0, 0}}, {3, -1, 0, {2, 0, 0, 0}}, {-1, 3, 0, {0, 2, 0, 0}}};
         OneShot shot(d);
         VkCommandBuffer cmd = value_or_throw(shot.begin());
         REQUIRE(g->passes->begin(cmd, pass));
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g->layout[1], 0, 1, &set, 0, nullptr);
-        draw(*g, cmd, p, quad, kSize, kSize);
+        draw(*g, cmd, p, desc, quad, kSize, kSize);
         g->passes->end(cmd);
         REQUIRE(shot.submit_and_wait());
         const auto image = value_or_throw(read_image(d, color));
@@ -371,11 +381,12 @@ TEST_CASE("vulkan gpu: multisampling with a resolve") {
         Image color = value_or_throw(create_image(d, target()));
         Pass pass;
         pass.color = {&ms, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_DONT_CARE, {{0, 0, 0, 1}}, &color};
-        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc_for(*g, Fragment::Color, pass)));
+        const auto desc = desc_for(*g, Fragment::Color, pass);
+        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
         OneShot shot(d);
         VkCommandBuffer cmd = value_or_throw(shot.begin());
         REQUIRE(g->passes->begin(cmd, pass));
-        draw(*g, cmd, p, half(0, 1, 1, 1, 1), kSize, kSize);
+        draw(*g, cmd, p, desc, half(0, 1, 1, 1, 1), kSize, kSize);
         g->passes->end(cmd);
         REQUIRE(shot.submit_and_wait());
         const auto image = value_or_throw(read_image(d, color));
@@ -424,12 +435,13 @@ TEST_CASE("vulkan gpu: reading the colour attachment (programmable blending)") {
     Pass pass;
     pass.color = {&color, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, {{0.25f, 0.5f, 0.75f, 1.0f}}};
     pass.color_input = true;
-    const VkPipeline p = value_or_throw(g->pipelines->graphics(desc_for(*g, Fragment::InvertInput, pass)));
+    const auto desc = desc_for(*g, Fragment::InvertInput, pass);
+    const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
     OneShot shot(d);
     VkCommandBuffer cmd = value_or_throw(shot.begin());
     REQUIRE(g->passes->begin(cmd, pass));
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g->layout[2], 0, 1, &set, 0, nullptr);
-    draw(*g, cmd, p, half(0, 0, 0, 0, 0), kSize, kSize);
+    draw(*g, cmd, p, desc, half(0, 0, 0, 0, 0), kSize, kSize);
     if (!d.caps().raster_order_attachment) {
         // (without rasterization-order access, a barrier between draws that read what the one before wrote)
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -438,7 +450,7 @@ TEST_CASE("vulkan gpu: reading the colour attachment (programmable blending)") {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0, nullptr, 0, nullptr);
     }
-    draw(*g, cmd, p, full(0, 0, 0, 0, 0), kSize, kSize);  // (inverts again where the first one drew)
+    draw(*g, cmd, p, desc, full(0, 0, 0, 0, 0), kSize, kSize);  // (inverts again where the first one drew)
     g->passes->end(cmd);
     REQUIRE(shot.submit_and_wait());
     const auto image = value_or_throw(read_image(d, color));
@@ -458,7 +470,8 @@ TEST_CASE("vulkan gpu: frames in flight, streamed data and deferred releases") {
     Image color = value_or_throw(create_image(d, target()));
     Pass pass;
     pass.color = {&color, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, {}};
-    const VkPipeline p = value_or_throw(g->pipelines->graphics(desc_for(*g, Fragment::Color, pass)));
+    const auto desc = desc_for(*g, Fragment::Color, pass);
+    const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
     for (u32 i = 0; i < 5; ++i) {
         VkCommandBuffer cmd = value_or_throw(frames.begin());
         const auto vertices = full(0, static_cast<f32>(i) / 4.0f, 0, 0, 1);
@@ -470,7 +483,7 @@ TEST_CASE("vulkan gpu: frames in flight, streamed data and deferred releases") {
         const VkRect2D scissor{{0, 0}, {kSize, kSize}};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        bind(*g, cmd, p, desc);
         vkCmdBindVertexBuffers(cmd, 0, 1, &slice.buffer, &slice.offset);
         vkCmdDraw(cmd, 3, 1, 0, 0);
         g->passes->end(cmd);

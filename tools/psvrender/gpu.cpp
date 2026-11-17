@@ -215,6 +215,7 @@ Result<void> render_on_gpu(const GpuOptions& options, std::span<const Draw> draw
 
         struct Prepared {
             VkPipeline pipeline = VK_NULL_HANDLE;
+            vk::GraphicsPipelineDesc state;  // (its rasterization, depth and stencil state: dynamic where it can be)
             VkDescriptorSet set = VK_NULL_HANDLE;
             nx::vector<vk::Buffer*> streams;
             vk::Buffer* indices = nullptr;
@@ -277,6 +278,7 @@ Result<void> render_on_gpu(const GpuOptions& options, std::span<const Draw> draw
             auto pipeline = G.pipelines->graphics(desc);
             if (!pipeline) return nx::err(pipeline.error());
             p.pipeline = *pipeline;
+            p.state = desc;
             auto ib = buffer(dr.indices.data(), dr.indices.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
             if (!ib) return nx::err(ib.error());
             p.indices = *ib;
@@ -343,6 +345,7 @@ Result<void> render_on_gpu(const GpuOptions& options, std::span<const Draw> draw
         const f32 blend[4] = {0, 0, 0, 0};
         for (const Prepared& p : prepared) {
             vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+            if (d.caps().dynamic_state) vk::set_dynamic_state(*cmd, p.state);
             vkCmdSetStencilReference(*cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
             vkCmdSetStencilCompareMask(*cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
             vkCmdSetStencilWriteMask(*cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
