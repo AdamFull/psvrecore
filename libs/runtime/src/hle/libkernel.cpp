@@ -256,6 +256,13 @@ u32 sceClibStrlcat(u32 dst, u32 src, u32 size) {
 
 // ---- failures
 
+// The console's OpenPSID (16 bytes identifying it): one fixed value here, the same on every run.
+i32 sceKernelGetOpenPsId(u32 id) {
+    if (!id || !memory().valid(id, 16)) return err::kIllegalAddress;
+    static constexpr u8 kId[16] = {'p', 's', 'v', 'r', 'e', 'c', 'o', 'r', 'e', 0, 0, 0, 0, 0, 0, 1};
+    std::memcpy(memory().host(id), kId, sizeof kId);
+    return 0;
+}
 i32 sceClibAbort() {
     nx::loge(logs::kernel, "the guest called sceClibAbort()");
     runtime().exit_process(134);
@@ -301,6 +308,7 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0xA37E6383, sceClibStrncat),
     HLE_FUNCTION(0x70CBC2D5, sceClibStrlcat),
     HLE_FUNCTION(0x2F2C6046, sceClibAbort),
+    HLE_FUNCTION(0x261E2C34, sceKernelGetOpenPsId),
     Function{0x37691BF8, "__stack_chk_fail", &entry<&stack_chk_fail>},
     Function{0x4373B548, "__sce_aeabi_idiv0", &entry<&sce_aeabi_idiv0>},
     Function{0xFB235848, "__sce_aeabi_ldiv0", &entry<&sce_aeabi_ldiv0>},
@@ -336,6 +344,7 @@ void register_system_libraries() {
     register_system();
     register_fiber();
     register_np();
+    register_online();
     register_videodec();
     register_commondialog();
 }

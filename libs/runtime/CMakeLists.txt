@@ -19,6 +19,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/mspace.cpp
     src/hle/ngs.cpp
     src/hle/np.cpp
+    src/hle/online.cpp
     src/hle/processmgr.cpp
     src/hle/rtc.cpp
     src/hle/sysmem.cpp
