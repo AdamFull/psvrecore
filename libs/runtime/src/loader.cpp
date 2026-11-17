@@ -175,6 +175,7 @@ void Loader::link_module(LoadedModule& m) {
             if (u.type == 2 && u.variable < m.code->variable_count) {  // (ABS32; code uses read the generated table)
                 const u32 value = m.code->variables[u.variable].address + u.addend;
                 std::memcpy(memory.host(u.at), &value, 4);
+                nx::logd(logs::loader, "{}: variable {} at 0x{:08x} = 0x{:08x}", m.name, u.variable, u.at, value);
             }
     }
     for (const auto& s : m.image.segments())
