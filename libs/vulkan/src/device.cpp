@@ -42,17 +42,19 @@ Error vk_error(const char* what, VkResult r) { return Error{nx::format("{}: {}",
 
 namespace {
 
-bool has_layer(const char* name) {
+// The Vulkan version an installed layer was written for (its specVersion), or 0 when it is not installed.
+u32 layer_version(const char* name) {
     u32 n = 0;
     vkEnumerateInstanceLayerProperties(&n, nullptr);
     nx::vector<VkLayerProperties> layers(n);
     vkEnumerateInstanceLayerProperties(&n, layers.data());
     for (const auto& l : layers)
-        if (std::strcmp(l.layerName, name) == 0) return true;
-    return false;
+        if (std::strcmp(l.layerName, name) == 0) return l.specVersion ? l.specVersion : 1u;
+    return 0;
 }
 
-Result<VkInstance> make_instance(const DeviceOptions& options, bool& validation) {
+// The validation layer's version, when it is on (0: off).
+Result<VkInstance> make_instance(const DeviceOptions& options, bool& validation, u32* validation_version = nullptr) {
     if (const VkResult r = volkInitialize(); r != VK_SUCCESS) return nx::err(vk_error("no Vulkan loader", r));
     const u32 loader = volkGetInstanceVersion();
     if (loader < VK_API_VERSION_1_1) return failure("the Vulkan loader is older than 1.1");
@@ -61,7 +63,9 @@ Result<VkInstance> make_instance(const DeviceOptions& options, bool& validation)
     app.pEngineName = "psvrecore";
     app.apiVersion = loader >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     nx::vector<const char*> layers, extensions = options.instance_extensions;
-    validation = options.validation && has_layer("VK_LAYER_KHRONOS_validation");
+    const u32 layer = options.validation ? layer_version("VK_LAYER_KHRONOS_validation") : 0;
+    validation = layer != 0;
+    if (validation_version) *validation_version = layer;
     if (options.validation && !validation) nx::logw(logs::gpu, "the Vulkan validation layer is not installed");
     if (validation) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
@@ -139,7 +143,8 @@ Result<nx::vector<nx::string>> Device::list() {
 Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     auto d = nx::make_unique<Device>();
     bool validation = false;
-    auto instance = make_instance(options, validation);
+    u32 validation_version = 0;
+    auto instance = make_instance(options, validation, &validation_version);
     if (!instance) return nx::err(instance.error());
     d->instance_ = *instance;
     if (validation) {
@@ -305,8 +310,15 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR local_read{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
     const char* local_read_env = std::getenv("PSVRECORE_LOCAL_READ");
+    // (a validation layer older than the extension (Vulkan 1.3.276) reports its structures and what it allows as
+    // errors: with one, the device goes without it, as on a device that lacks it, and validation stays meaningful)
+    const bool layer_knows_local_read = !validation || validation_version >= VK_MAKE_API_VERSION(0, 1, 3, 276);
+    if (caps.dynamic_rendering && has_ext(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) && !layer_knows_local_read)
+        nx::logi(logs::gpu, "Vulkan device: local read left off: the validation layer ({}.{}.{}) predates it",
+                 VK_API_VERSION_MAJOR(validation_version), VK_API_VERSION_MINOR(validation_version),
+                 VK_API_VERSION_PATCH(validation_version));
     if (caps.dynamic_rendering && has_ext(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) &&
-        !(local_read_env && std::atoi(local_read_env) == 0)) {
+        layer_knows_local_read && !(local_read_env && std::atoi(local_read_env) == 0)) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         query.pNext = &local_read;
         vkGetPhysicalDeviceFeatures2(gpu, &query);
