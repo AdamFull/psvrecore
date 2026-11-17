@@ -925,6 +925,114 @@ void make_graphics(Renderer& r, std::span<GraphicsJob> jobs) {
             if (j.pipeline) pipeline_whole(j.desc);
 }
 
+// ---- Pipelines made asynchronously -----------------------------------------------------------------------------
+// Without pipeline libraries (an Adreno 830's driver: 43-390 ms for a pair of shaders not made before, whatever its
+// state 0.2-0.6 ms once it was; a song's first play there stalled up to 0.6 s for its dancers' pipelines), a scene's
+// new pipelines are made on threads of their own: the scene waits for them a few milliseconds (kAsyncWaitNs: those
+// in the driver's cache), and is drawn without the draws of the others, which the scenes after draw once they are
+// made. PSVRECORE_ASYNC_PIPELINES=0 waits for them all.
+struct AsyncPipelines {
+    nx::mutex lock;
+    nx::semaphore work, made;
+    nx::vector<GraphicsJob> queue, done;                   // (to make; made, for a scene to record)
+    nx::vector<vk::GraphicsPipelineDesc> pending, failed;  // (queued or being made; failed: not tried again)
+    bool started = false;
+};
+AsyncPipelines& async_pipelines() {
+    static AsyncPipelines* a = new AsyncPipelines;  // (its threads run to the process's end)
+    return *a;
+}
+constexpr u64 kAsyncWaitNs = 6'000'000;
+
+bool async_on(const Renderer& r) {
+    static const bool off = [] {
+        const char* v = std::getenv("PSVRECORE_ASYNC_PIPELINES");
+        return v && std::atoi(v) == 0;
+    }();
+    return !off && !r.device->caps().pipeline_library && !r.warming;
+}
+
+bool listed(const nx::vector<vk::GraphicsPipelineDesc>& list, const vk::GraphicsPipelineDesc& d) {
+    for (const vk::GraphicsPipelineDesc& e : list)
+        if (e.same(d)) return true;
+    return false;
+}
+
+void async_run(Renderer& r) {
+    AsyncPipelines& a = async_pipelines();
+    for (;;) {
+        a.work.acquire();
+        GraphicsJob j;
+        {
+            const nx::scoped_lock<nx::mutex> held(a.lock);
+            if (a.queue.empty()) continue;
+            j = std::move(a.queue.front());
+            a.queue.erase(a.queue.begin());
+        }
+        const u64 t0 = nx::os::ticks_ns();
+        if (auto p = r.pipelines->graphics(j.desc)) j.pipeline = *p;
+        else j.error = p.error().message;
+        j.ns = nx::os::ticks_ns() - t0;
+        {
+            const nx::scoped_lock<nx::mutex> held(a.lock);
+            for (usize i = 0; i < a.pending.size(); ++i)
+                if (a.pending[i].same(j.desc)) {
+                    a.pending.erase(a.pending.begin() + static_cast<isize>(i));
+                    break;
+                }
+            if (!j.pipeline) a.failed.push_back(j.desc);
+            a.done.push_back(std::move(j));
+        }
+        a.made.release();
+    }
+}
+
+// The jobs queued (those neither queued nor failed before), then waited for until made or kAsyncWaitNs has passed:
+// those made have their pipelines.
+void make_async(Renderer& r, std::span<GraphicsJob> jobs) {
+    AsyncPipelines& a = async_pipelines();
+    {
+        const nx::scoped_lock<nx::mutex> held(a.lock);
+        if (!a.started) {
+            a.started = true;
+            for (u32 t = 0; t < pipeline_threads(); ++t) {
+                nx::thread_options options;
+                options.name = "pipelines";
+                nx::thread worker([&r] { async_run(r); }, options);
+                worker.detach();
+            }
+        }
+        u32 queued = 0;
+        for (const GraphicsJob& j : jobs) {
+            if (listed(a.pending, j.desc) || listed(a.failed, j.desc)) continue;
+            a.pending.push_back(j.desc);
+            a.queue.push_back({j.desc});
+            ++queued;
+        }
+        if (queued) a.work.release(queued);
+    }
+    const u64 until = nx::os::ticks_ns() + kAsyncWaitNs;
+    for (;;) {
+        bool all = true;
+        for (GraphicsJob& j : jobs) {
+            if (!j.pipeline) j.pipeline = r.pipelines->find(j.desc);
+            all &= j.pipeline != VK_NULL_HANDLE;
+        }
+        const u64 now = nx::os::ticks_ns();
+        if (all || now >= until) break;
+        (void)a.made.try_acquire_for(std::chrono::nanoseconds(until - now));
+    }
+}
+
+// The pipelines made asynchronously since the last call.
+nx::vector<GraphicsJob> async_made() {
+    AsyncPipelines& a = async_pipelines();
+    const nx::scoped_lock<nx::mutex> held(a.lock);
+    nx::vector<GraphicsJob> out = std::move(a.done);
+    a.done.clear();
+    return out;
+}
+
 // The variants' keys: the program's bytes, and what else its translation reads.
 ShaderKey secondary_key(const Program& p) {
     const u8 kind = 's';
@@ -1621,6 +1729,7 @@ struct SceneProfile {
     u64 colour_uploads = 0;
     u64 began = 0, ns_before[kParts] = {}, misses_before = 0, miss_ns_before = 0;  // (this scene's start)
     u64 pipelines_made = 0, pipeline_ns = 0, pipelines_before = 0, pipeline_ns_before = 0;  // (made while drawing)
+    u64 skipped = 0, skipped_before = 0;  // (draws left out: their pipelines being made asynchronously)
     // (shader modules and secondary programs' compute pipelines made while drawing: translated or from the cache)
     u64 shaders_made = 0, shader_ns = 0, shaders_before = 0, shader_ns_before = 0;
     u64 finish_wait_before = 0, finish_work_before = 0, finished_before = 0;
@@ -1663,6 +1772,7 @@ struct SceneProfile {
             began = at;
             std::memcpy(ns_before, ns, sizeof ns);
             misses_before = misses, miss_ns_before = miss_ns, pipelines_before = pipelines_made, pipeline_ns_before = pipeline_ns;
+            skipped_before = skipped;
             shaders_before = shaders_made, shader_ns_before = shader_ns;
             finish_wait_before = finish_wait_ns, finish_work_before = finish_work_ns, finished_before = finished;
             std::memcpy(back_before, back_ns, sizeof back_ns);
@@ -1686,12 +1796,12 @@ struct SceneProfile {
                     parts += nx::format(" {} {:.1f};", kNames[i], static_cast<f64>(ns[i] - ns_before[i]) / 1e6);
             nx::logi(logs::gpu, "gxm profile: a slow scene, {:.1f} ms:{} {} new textures ({:.1f} ms), {} shaders and secondary "
                      "pipelines made ({:.1f} ms), {} pipelines made ({:.1f} ms), {} earlier scenes finished ({:.1f} ms waiting "
-                     "for the GPU, {:.1f} writing back)",
+                     "for the GPU, {:.1f} writing back), {} draws left out",
                      static_cast<f64>(took) / 1e6, parts, misses - misses_before, static_cast<f64>(miss_ns - miss_ns_before) / 1e6,
                      shaders_made - shaders_before, static_cast<f64>(shader_ns - shader_ns_before) / 1e6,
                      pipelines_made - pipelines_before, static_cast<f64>(pipeline_ns - pipeline_ns_before) / 1e6,
                      finished - finished_before, static_cast<f64>(finish_wait_ns - finish_wait_before) / 1e6,
-                     static_cast<f64>(finish_work_ns - finish_work_before) / 1e6);
+                     static_cast<f64>(finish_work_ns - finish_work_before) / 1e6, skipped - skipped_before);
             if (ns[3] - ns_before[3] >= 4'000'000)
                 nx::logi(logs::gpu, "gxm profile: its textures: hashed {:.1f} ms, decoded {:.1f} ({} decoded ahead), images "
                          "made {:.1f}, uploads queued {:.1f}", static_cast<f64>(hash_ns - tex_before[0]) / 1e6,
@@ -2933,7 +3043,8 @@ void ahead_run(Renderer& r) {
 
 // The threads start (once warm_up is done with the renderer's maps). PSVRECORE_PIPELINES_AHEAD=0 turns it off;
 // without pipeline libraries it is off (a pair compiled ahead helps only that pair, and the game pairs a fragment
-// program with vertex programs other than the one it was made for).
+// program with vertex programs other than the one it was made for: an Adreno 830's new pipelines are made
+// asynchronously instead, make_async).
 void ahead_start(Renderer& r) {
     Ahead& a = ahead();
     if (a.started.exchange(true)) return;
@@ -3524,37 +3635,47 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         plan.scissor = {{x0 * si, y0 * si}, {static_cast<u32>(x1 - x0 + 1) * scale, static_cast<u32>(y1 - y0 + 1) * scale}};
         plans.push_back(std::move(plan));
     }
+    // (a phone's driver: up to a tenth of a second for each pipeline whose shaders are new; a scene of a song's start
+    // had 9 of them; made asynchronously without pipeline libraries, async_on)
+    const bool async = async_on(r);
     if (!missing.empty()) {
-        // (a phone's driver: up to a tenth of a second for each pipeline whose shaders are new; a scene of a song's
-        // start had 9 of them)
         const u64 pipeline_from = nx::os::ticks_ns();
-        make_graphics(r, missing);
+        if (async) make_async(r, missing);
+        else make_graphics(r, missing);
         if (g_profile.on)
             g_profile.pipelines_made += static_cast<u32>(missing.size()), g_profile.pipeline_ns += nx::os::ticks_ns() - pipeline_from;
-        for (const GraphicsJob& m : missing) {
-            if (!m.pipeline) {
-                nx::logw(logs::gpu, "{}", m.error);
-                continue;
-            }
-            // (a new one: recorded, to be made before the game starts next time)
-            ShaderCache::Graphics g;
-            g.desc = m.desc;
-            g.desc.vertex = VK_NULL_HANDLE, g.desc.fragment = VK_NULL_HANDLE, g.desc.layout = VK_NULL_HANDLE;
-            g.vertex = r.module_keys[reinterpret_cast<u64>(m.desc.vertex)];
-            g.fragment = r.module_keys[reinterpret_cast<u64>(m.desc.fragment)];
-            // (shaders compiled ahead: their SPIR-V saved now, for warm_up to make this one next time)
-            for (const ShaderKey* k : {&g.vertex, &g.fragment})
-                if (auto it = r.unsaved.find(short_key(*k)); it != r.unsaved.end()) {
-                    r.cache.add_spirv(*k, unpack_words(it->second.second));
-                    r.unsaved.erase(it);
-                }
-            r.cache.add_graphics(g);
-            r.made_pipelines.fetch_add(1);
-            r.pipelines_changed.store(true);
+    }
+    // (the new ones recorded: those made now, or asynchronously by now)
+    nx::vector<GraphicsJob> made;
+    if (async) made = async_made();
+    for (const GraphicsJob& m : async ? std::span<const GraphicsJob>(made) : std::span<const GraphicsJob>(missing)) {
+        if (!m.pipeline) {
+            nx::logw(logs::gpu, "{}", m.error);
+            continue;
         }
+        // (a new one: recorded, to be made before the game starts next time)
+        ShaderCache::Graphics g;
+        g.desc = m.desc;
+        g.desc.vertex = VK_NULL_HANDLE, g.desc.fragment = VK_NULL_HANDLE, g.desc.layout = VK_NULL_HANDLE;
+        g.vertex = r.module_keys[reinterpret_cast<u64>(m.desc.vertex)];
+        g.fragment = r.module_keys[reinterpret_cast<u64>(m.desc.fragment)];
+        // (shaders compiled ahead: their SPIR-V saved now, for warm_up to make this one next time)
+        for (const ShaderKey* k : {&g.vertex, &g.fragment})
+            if (auto it = r.unsaved.find(short_key(*k)); it != r.unsaved.end()) {
+                r.cache.add_spirv(*k, unpack_words(it->second.second));
+                r.unsaved.erase(it);
+            }
+        r.cache.add_graphics(g);
+        r.made_pipelines.fetch_add(1);
+        r.pipelines_changed.store(true);
+    }
+    if (!missing.empty()) {
         for (DrawPlan& plan : plans)
             if (plan.missing) plan.pipeline = missing[plan.missing - 1].pipeline;
+        // (those not made: a failure, or still being made asynchronously, drawn by the scenes after)
+        const usize planned = plans.size();
         std::erase_if(plans, [](const DrawPlan& plan) { return !plan.pipeline; });
+        if (g_profile.on) g_profile.skipped += planned - plans.size();
     }
 
     g_profile.mark(1);
