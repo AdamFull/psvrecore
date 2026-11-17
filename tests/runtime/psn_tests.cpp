@@ -323,3 +323,52 @@ TEST_CASE("psn: a trophy unlocked twice answers already unlocked") {
     REQUIRE(call32(ctx, kSceNpTrophy, kUnlock, {1, 1, 7, platinum}) == 0);
     CHECK(u(call32(ctx, kSceNpTrophy, kUnlock, {1, 1, 7, platinum})) == 0x8055160Fu);
 }
+
+TEST_CASE("dialogs: the PSN, store and photo dialogs open and the player backs out; aborts end a running dialog") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceCommonDialog = 0xE537816C, kSceNpWebApiCommonDialog = 0x883CFD5C, kUpdate = 0x90530F2F;
+    constexpr u32 kNotRunning = 0x80020404u, kNotInUse = 0x80020411u;
+    struct Set {
+        u32 library, init, status, result, term;
+    };
+    const Set sets[] = {
+        {kSceCommonDialog, 0x4535A358, 0x2A0D060F, 0x7EC95C61, 0x7AB50F63},  // NP message
+        {kSceCommonDialog, 0x5E0AFDF8, 0xFDFE6042, 0x749CAFFC, 0x04B63D6F},  // NP profile
+        {kSceCommonDialog, 0x52ECD8A5, 0x7004BB2E, 0x07ED1E26, 0xB787F4B0},  // store checkout
+        {kSceCommonDialog, 0x93FCFEC6, 0x1FD5D373, 0xD29FE607, 0x4A880C6A},  // friend list
+        {kSceCommonDialog, 0x6821F09B, 0x147650E8, 0xA8682304, 0xDE1F3928},  // Facebook
+        {kSceCommonDialog, 0x73EE7C9C, 0x032206D8, 0xD855414C, 0x7FE5BD77},  // photo import
+        {kSceNpWebApiCommonDialog, 0x23C9840E, 0x114F831A, 0xC2B39806, 0xE183B9F3},  // game custom data
+        {kSceNpWebApiCommonDialog, 0x8723A5F2, 0x5B735F60, 0xEA14FB1E, 0x4136382C},  // invitation
+    };
+    const u32 param = scratch(256), result = scratch(64), update = scratch(64);
+    for (const Set& s : sets) {
+        CHECK(call32(ctx, s.library, s.status, {}) == 0);  // (none)
+        REQUIRE(call32(ctx, s.library, s.init, {param}) == 0);
+        CHECK(call32(ctx, s.library, s.status, {}) == 1);  // (running)
+        CHECK(u(call32(ctx, s.library, s.term, {})) == 0x80020410u);  // (not finished)
+        REQUIRE(call32(ctx, kSceCommonDialog, kUpdate, {update}) == 0);
+        CHECK(call32(ctx, s.library, s.status, {}) == 2);  // (finished)
+        REQUIRE(call32(ctx, s.library, s.result, {result}) == 0);
+        CHECK(psv_ld32(result) == 1);  // (user canceled)
+        CHECK(call32(ctx, s.library, s.term, {}) == 0);
+        CHECK(u(call32(ctx, s.library, s.term, {})) == kNotInUse);
+    }
+    // Aborts: a running dialog ends, aborted; one that does not run cannot be.
+    for (u32 abort : {0x47AB6D04u, 0x2B02BE3Fu, 0x58FA2062u}) CHECK(u(call32(ctx, kSceCommonDialog, abort, {})) == kNotRunning);
+    REQUIRE(call32(ctx, kSceCommonDialog, 0x4535A358, {param}) == 0);
+    REQUIRE(call32(ctx, kSceCommonDialog, 0x47AB6D04 /*sceNpMessageDialogAbort*/, {}) == 0);
+    REQUIRE(call32(ctx, kSceCommonDialog, 0x7EC95C61, {result}) == 0);
+    CHECK(psv_ld32(result) == 2);  // (aborted)
+    CHECK(call32(ctx, kSceCommonDialog, 0x7AB50F63, {}) == 0);
+    std::memset(t.rt.memory().host(param), 0, 256);
+    REQUIRE(call32(ctx, kSceCommonDialog, 0xA38A4A0D /*sceNetCheckDialogInit*/, {param}) == 0);
+    REQUIRE(call32(ctx, kSceCommonDialog, 0x2D8EDF09 /*sceNetCheckDialogAbort*/, {}) == 0);
+    CHECK(call32(ctx, kSceCommonDialog, 0x8027292A /*GetStatus*/, {}) == 2);
+    CHECK(call32(ctx, kSceCommonDialog, 0x8BE51C15 /*Term*/, {}) == 0);
+    for (u32 abort : {0x2D8EDF09u, 0xDC346979u, 0x013E7F74u, 0xC296D396u})
+        CHECK(u(call32(ctx, kSceCommonDialog, abort, {})) == kNotRunning);
+    for (u32 nid : {0x33626E2Cu, 0xB55CF0E3u, 0xB7D4C911u, 0xBEBAEF25u, 0xD1858A78u})
+        CHECK(u(call32(ctx, kSceCommonDialog, nid, {})) == kNotInUse);
+}

@@ -8,7 +8,9 @@
 //   does: savedata0:'s slots), the list's focused slot is chosen;
 // - network check: offline, the player declines to connect (user canceled, PSN not reached);
 // - trophy setup: done (trophies are local);
-// - text input (IME): the text confirmed as the game gave it (its initial text, in the input buffer).
+// - text input (IME): the text confirmed as the game gave it (its initial text, in the input buffer);
+// - PSN, store and photo dialogs (messages, profiles, friends, Facebook, checkout, photo import, a game's custom data,
+//   invitations): signed out (and no photos), the player backs out (user canceled).
 // Every message's text is logged, to see what the game asks.
 
 #include "hle_common.hpp"
@@ -20,7 +22,7 @@ namespace psvrecore::runtime::hle {
 
 namespace {
 
-constexpr u32 kSceCommonDialog = 0xE537816C;
+constexpr u32 kSceCommonDialog = 0xE537816C, kSceNpWebApiCommonDialog = 0x883CFD5C;
 constexpr i32 kBusy = err::code(0x80020401), kNull = err::code(0x80020402), kNotRunning = err::code(0x80020404),
               kNotFinished = err::code(0x80020410), kNotInUse = err::code(0x80020411);
 constexpr i32 kStatusNone = 0, kStatusRunning = 1, kStatusFinished = 2;
@@ -28,7 +30,7 @@ constexpr i32 kResultOk = 0, kResultUserCanceled = 1, kResultAborted = 2;
 constexpr u32 kCommonParam = 4;  // (every dialog's parameters: the SDK version, then SceCommonDialogParam (76 bytes))
 constexpr u32 kParamBody = kCommonParam + 76;
 
-enum class Kind : u8 { None, Message, SaveData, NetCheck, TrophySetup, Ime };
+enum class Kind : u8 { None, Message, SaveData, NetCheck, TrophySetup, Ime, Other };
 
 struct Dialog {
     nx::mutex lock;
@@ -37,6 +39,7 @@ struct Dialog {
     bool waits = false;    // (until the game closes it)
     bool updated = false;  // (shown: an update came since it started)
     i32 mode = 0, result = kResultOk, button = 0;
+    u8 other = 0;  // (which of the dialogs answered alike: Kind::Other)
     u32 slot = 0, userdata = 0;
     bool slot_exists = false;
     SaveData::SlotParam slot_param{};
@@ -420,6 +423,153 @@ i32 sceNpTrophySetupDialogGetResult(Ptr<u8> result) {
 }
 i32 sceNpTrophySetupDialogTerm() { return term(Kind::TrophySetup); }
 
+// ---- aborts, and the message dialog closed by the game
+
+i32 abort_dialog(Kind kind) {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (d.kind != kind || d.status != kStatusRunning) return kNotRunning;
+    d.status = kStatusFinished;
+    d.result = kResultAborted;
+    return 0;
+}
+i32 sceNetCheckDialogAbort() { return abort_dialog(Kind::NetCheck); }
+i32 sceNpTrophySetupDialogAbort() { return abort_dialog(Kind::TrophySetup); }
+i32 sceSaveDataDialogAbort() { return abort_dialog(Kind::SaveData); }
+// (a message that waits, closed: finished, no button chosen)
+i32 sceMsgDialogClose() {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (d.kind != Kind::Message || d.status != kStatusRunning) return kNotRunning;
+    d.status = kStatusFinished;
+    d.result = kResultOk;
+    d.button = 0;
+    return 0;
+}
+
+// ---- the PSN, store and photo dialogs: the console is signed out (and has no photos), so each is shown and the
+// player backs out of it: finished, "user canceled". Their results begin with that result word.
+
+enum class Other : u8 { NpMessage = 1, NpProfile, StoreCheckout, NpFriendList, NpSnsFacebook, PhotoImport, GameCustomData,
+                        Invitation };
+const char* other_name(Other o) {
+    switch (o) {
+        case Other::NpMessage: return "NP message";
+        case Other::NpProfile: return "NP profile";
+        case Other::StoreCheckout: return "store checkout";
+        case Other::NpFriendList: return "NP friend list";
+        case Other::NpSnsFacebook: return "Facebook";
+        case Other::PhotoImport: return "photo import";
+        case Other::GameCustomData: return "game custom data";
+        case Other::Invitation: return "invitation";
+    }
+    return "?";
+}
+template <Other O>
+i32 other_init(Ptr<const u8> param) {
+    if (!param) return kNull;
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (const i32 r = start(Kind::Other, false); r < 0) return r;
+    d.other = static_cast<u8>(O);
+    d.result = kResultUserCanceled;
+    nx::logi(logs::hle, "{} dialog: signed out, the player backs out of it", other_name(O));
+    return 0;
+}
+template <Other O>
+bool is_other(const Dialog& d) {
+    return d.kind == Kind::Other && d.other == static_cast<u8>(O);
+}
+template <Other O>
+i32 other_status() {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    return is_other<O>(d) ? d.status : kStatusNone;
+}
+template <Other O>
+i32 other_result(Ptr<u8> result) {
+    if (!result) return kNull;
+    if (!writable(result.address, 4)) return err::code(0x80020403);
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (!is_other<O>(d) || d.status == kStatusNone) return kNotInUse;
+    if (d.status != kStatusFinished) return kNotFinished;
+    psv_st32(result.address, static_cast<u32>(d.result));
+    return 0;
+}
+template <Other O>
+i32 other_term() {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (!is_other<O>(d) || d.status == kStatusNone) return kNotInUse;
+    if (d.status == kStatusRunning) return kNotFinished;
+    d.kind = Kind::None;
+    d.status = kStatusNone;
+    return 0;
+}
+template <Other O>
+i32 other_abort() {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (!is_other<O>(d) || d.status != kStatusRunning) return kNotRunning;
+    d.status = kStatusFinished;
+    d.result = kResultAborted;
+    return 0;
+}
+// (functions known only by NID, imported by a game's own module: no dialog of theirs is in use)
+i32 dialog_unnamed() { return kNotInUse; }
+
+
+const Function kCommonDialogMore[] = {
+    HLE_FUNCTION(0x2D8EDF09, sceNetCheckDialogAbort),
+    HLE_FUNCTION(0xDC346979, sceNpTrophySetupDialogAbort),
+    HLE_FUNCTION(0x013E7F74, sceSaveDataDialogAbort),
+    HLE_FUNCTION(0xC296D396, sceMsgDialogClose),
+    Function{0x4535A358, "sceNpMessageDialogInit", &entry<&other_init<Other::NpMessage>>},
+    Function{0x2A0D060F, "sceNpMessageDialogGetStatus", &entry<&other_status<Other::NpMessage>>},
+    Function{0x7EC95C61, "sceNpMessageDialogGetResult", &entry<&other_result<Other::NpMessage>>},
+    Function{0x7AB50F63, "sceNpMessageDialogTerm", &entry<&other_term<Other::NpMessage>>},
+    Function{0x47AB6D04, "sceNpMessageDialogAbort", &entry<&other_abort<Other::NpMessage>>},
+    Function{0x5E0AFDF8, "sceNpProfileDialogInit", &entry<&other_init<Other::NpProfile>>},
+    Function{0xFDFE6042, "sceNpProfileDialogGetStatus", &entry<&other_status<Other::NpProfile>>},
+    Function{0x749CAFFC, "sceNpProfileDialogGetResult", &entry<&other_result<Other::NpProfile>>},
+    Function{0x04B63D6F, "sceNpProfileDialogTerm", &entry<&other_term<Other::NpProfile>>},
+    Function{0x2B02BE3F, "sceNpProfileDialogAbort", &entry<&other_abort<Other::NpProfile>>},
+    Function{0x52ECD8A5, "sceStoreCheckoutDialogInit", &entry<&other_init<Other::StoreCheckout>>},
+    Function{0x7004BB2E, "sceStoreCheckoutDialogGetStatus", &entry<&other_status<Other::StoreCheckout>>},
+    Function{0x07ED1E26, "sceStoreCheckoutDialogGetResult", &entry<&other_result<Other::StoreCheckout>>},
+    Function{0xB787F4B0, "sceStoreCheckoutDialogTerm", &entry<&other_term<Other::StoreCheckout>>},
+    Function{0x93FCFEC6, "sceNpFriendListDialogInit", &entry<&other_init<Other::NpFriendList>>},
+    Function{0x1FD5D373, "sceNpFriendListDialogGetStatus", &entry<&other_status<Other::NpFriendList>>},
+    Function{0xD29FE607, "sceNpFriendListDialogGetResult", &entry<&other_result<Other::NpFriendList>>},
+    Function{0x4A880C6A, "sceNpFriendListDialogTerm", &entry<&other_term<Other::NpFriendList>>},
+    Function{0x58FA2062, "sceNpFriendListDialogAbort", &entry<&other_abort<Other::NpFriendList>>},
+    Function{0x6821F09B, "sceNpSnsFacebookDialogInit", &entry<&other_init<Other::NpSnsFacebook>>},
+    Function{0x147650E8, "sceNpSnsFacebookDialogGetStatus", &entry<&other_status<Other::NpSnsFacebook>>},
+    Function{0xA8682304, "sceNpSnsFacebookDialogGetResultLongToken", &entry<&other_result<Other::NpSnsFacebook>>},
+    Function{0xDE1F3928, "sceNpSnsFacebookDialogTerm", &entry<&other_term<Other::NpSnsFacebook>>},
+    Function{0x73EE7C9C, "scePhotoImportDialogInit", &entry<&other_init<Other::PhotoImport>>},
+    Function{0x032206D8, "scePhotoImportDialogGetStatus", &entry<&other_status<Other::PhotoImport>>},
+    Function{0xD855414C, "scePhotoImportDialogGetResult", &entry<&other_result<Other::PhotoImport>>},
+    Function{0x7FE5BD77, "scePhotoImportDialogTerm", &entry<&other_term<Other::PhotoImport>>},
+    Function{0x33626E2C, "(SceCommonDialog 0x33626E2C)", &entry<&dialog_unnamed>},
+    Function{0xB55CF0E3, "(SceCommonDialog 0xB55CF0E3)", &entry<&dialog_unnamed>},
+    Function{0xB7D4C911, "(SceCommonDialog 0xB7D4C911)", &entry<&dialog_unnamed>},
+    Function{0xBEBAEF25, "(SceCommonDialog 0xBEBAEF25)", &entry<&dialog_unnamed>},
+    Function{0xD1858A78, "(SceCommonDialog 0xD1858A78)", &entry<&dialog_unnamed>},
+};
+// (the web API's dialogs: their own library)
+const Function kNpWebApiCommonDialog[] = {
+    Function{0x23C9840E, "sceGameCustomDataDialogInit", &entry<&other_init<Other::GameCustomData>>},
+    Function{0x114F831A, "sceGameCustomDataDialogGetStatus", &entry<&other_status<Other::GameCustomData>>},
+    Function{0xC2B39806, "sceGameCustomDataDialogGetResult", &entry<&other_result<Other::GameCustomData>>},
+    Function{0xE183B9F3, "sceGameCustomDataDialogTerm", &entry<&other_term<Other::GameCustomData>>},
+    Function{0x8723A5F2, "sceInvitationDialogInit", &entry<&other_init<Other::Invitation>>},
+    Function{0x5B735F60, "sceInvitationDialogGetStatus", &entry<&other_status<Other::Invitation>>},
+    Function{0xEA14FB1E, "sceInvitationDialogGetResult", &entry<&other_result<Other::Invitation>>},
+    Function{0x4136382C, "sceInvitationDialogTerm", &entry<&other_term<Other::Invitation>>},
+};
+
 const Function kCommonDialog[] = {
     HLE_FUNCTION(0x90530F2F, sceCommonDialogUpdate),
     HLE_FUNCTION(0x755FF270, sceMsgDialogInit),
@@ -461,6 +611,8 @@ void register_commondialog() {
         d.status = kStatusNone;
     }
     register_library({"SceCommonDialog", kSceCommonDialog, kCommonDialog});
+    register_library({"SceCommonDialog", kSceCommonDialog, kCommonDialogMore});
+    register_library({"SceNpWebApiCommonDialog", kSceNpWebApiCommonDialog, kNpWebApiCommonDialog});
 }
 
 }  // namespace psvrecore::runtime::hle
