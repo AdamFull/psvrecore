@@ -440,6 +440,132 @@ i32 Kernel::wait_event(Uid uid, u32 bits, u32* result, u64* user_data, Timeout t
     }
 }
 
+i32 Kernel::poll_event(Uid uid, u32 bits, u32* result, u64* user_data) {
+    Lock guard(impl_->lock);
+    SimpleEvent* e = impl_->get<SimpleEvent>(uid, ObjectClass::SimpleEvent);
+    if (!e) return err::kUnknownEventId;
+    const u32 got = e->pattern & bits;
+    if (!bits || !got) return err::kEventCond;
+    if (e->auto_reset()) e->pattern &= ~got;
+    if (result) *result = got;
+    if (user_data) *user_data = e->user_data;
+    return err::kOk;
+}
+
+i32 Kernel::pulse_event(Uid uid, u32 bits, u64 user_data) {
+    Lock guard(impl_->lock);
+    SimpleEvent* e = impl_->get<SimpleEvent>(uid, ObjectClass::SimpleEvent);
+    if (!e) return err::kUnknownEventId;
+    e->user_data = user_data;
+    for (usize i = 0; i < e->waiters.threads.size();) {
+        Thread* w = e->waiters.threads[i];
+        const u32 got = bits & w->wait.count;
+        if (!got) {
+            ++i;
+            continue;
+        }
+        w->wait.pattern = got;
+        impl_->end_wait(w, err::kOk);
+    }
+    return err::kOk;
+}
+
+i32 Kernel::cancel_event(Uid uid, bool set, u32 pattern, u64 user_data, u32* waiting) {
+    Lock guard(impl_->lock);
+    SimpleEvent* e = impl_->get<SimpleEvent>(uid, ObjectClass::SimpleEvent);
+    if (!e) return err::kUnknownEventId;
+    if (waiting) *waiting = static_cast<u32>(e->waiters.threads.size());
+    while (!e->waiters.empty()) impl_->end_wait(e->waiters.front(), err::kWaitCancel);
+    if (set) e->pattern = pattern, e->user_data = user_data;
+    return err::kOk;
+}
+
+i32 Kernel::register_event_callback(Uid event, Uid callback, bool add) {
+    Lock guard(impl_->lock);
+    SimpleEvent* e = impl_->get<SimpleEvent>(event, ObjectClass::SimpleEvent);
+    if (!e) return err::kUnknownEventId;
+    if (!impl_->get<Callback>(callback, ObjectClass::Callback)) return err::kUnknownCallbackId;
+    auto it = std::find(e->callbacks.begin(), e->callbacks.end(), callback);
+    if (add) {
+        if (it == e->callbacks.end()) e->callbacks.push_back(callback);
+    } else {
+        if (it == e->callbacks.end()) return err::kUnknownCallbackId;
+        e->callbacks.erase(it);
+    }
+    return err::kOk;
+}
+
+i32 Kernel::unregister_event_callbacks(Uid event) {
+    Lock guard(impl_->lock);
+    SimpleEvent* e = impl_->get<SimpleEvent>(event, ObjectClass::SimpleEvent);
+    if (!e) return err::kUnknownEventId;
+    e->callbacks.clear();
+    return err::kOk;
+}
+
+i32 Kernel::notify_event_callbacks(Uid event, i32 arg) {
+    nx::vector<Uid> callbacks;
+    {
+        Lock guard(impl_->lock);
+        SimpleEvent* e = impl_->get<SimpleEvent>(event, ObjectClass::SimpleEvent);
+        if (!e) return err::kUnknownEventId;
+        callbacks = e->callbacks;
+    }
+    for (Uid cb : callbacks) notify_callback(cb, arg);
+    return err::kOk;
+}
+
+i32 Kernel::object_summary(Uid uid, ObjectClass cls, ObjectSummary* out) {
+    Lock guard(impl_->lock);
+    auto it = impl_->objects.find(uid);
+    if (it == impl_->objects.end() || it->second->cls != cls) return -1;
+    Object* o = it->second.get();
+    *out = ObjectSummary{};
+    out->name = o->name, out->attr = o->attr;
+    const auto uid_of = [](const Thread* t) { return t ? static_cast<u32>(t->uid) : 0u; };
+    switch (cls) {
+    case ObjectClass::SimpleEvent: {
+        auto* e = static_cast<SimpleEvent*>(o);
+        out->a = e->pattern, out->b = static_cast<u32>(e->waiters.threads.size()), out->e = e->user_data;
+        break;
+    }
+    case ObjectClass::Cond:
+    case ObjectClass::LwCond: {
+        auto* c = static_cast<Cond*>(o);
+        out->a = static_cast<u32>(c->mutex), out->b = static_cast<u32>(c->waiters.threads.size()), out->c = c->work;
+        break;
+    }
+    case ObjectClass::RWLock: {
+        auto* l = static_cast<RWLock*>(o);
+        i32 count = l->write_count;
+        for (const auto& [t, n] : l->readers) count += n;
+        out->a = static_cast<u32>(count), out->b = uid_of(l->writer);
+        for (const Thread* t : l->waiters.threads) (t->wait.mode ? out->d : out->c) += 1;
+        break;
+    }
+    case ObjectClass::MsgPipe: {
+        auto* p = static_cast<MsgPipe*>(o);
+        out->a = p->size, out->b = p->size - static_cast<u32>(p->data.size());
+        out->c = static_cast<u32>(p->senders.threads.size()), out->d = static_cast<u32>(p->receivers.threads.size());
+        break;
+    }
+    case ObjectClass::Callback: {
+        auto* cb = static_cast<Callback*>(o);
+        out->a = uid_of(cb->thread), out->b = cb->function, out->c = cb->common;
+        out->d = static_cast<u32>(cb->notify_count), out->e = static_cast<u32>(cb->notify_arg);
+        break;
+    }
+    default: break;
+    }
+    return err::kOk;
+}
+
+u32 Kernel::class_of(Uid uid) {
+    Lock guard(impl_->lock);
+    auto it = impl_->objects.find(uid);
+    return it == impl_->objects.end() ? 0u : static_cast<u32>(it->second->cls);
+}
+
 // ---- opening by name
 
 Uid Kernel::open_object(nx::string_view name, ObjectClass cls, i32 unknown) {

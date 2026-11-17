@@ -17,6 +17,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/iofilemgr.cpp
     src/hle/jpegenc.cpp
     src/hle/json.cpp
+    src/hle/kernel_more.cpp
     src/hle/libkernel.cpp
     src/hle/modulemgr.cpp
     src/hle/mp4lib.cpp

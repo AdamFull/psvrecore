@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <string_view>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
@@ -871,4 +872,99 @@ TEST_CASE("kernel: firmware 1.x's NIDs for the current priority and the system t
     const u32 low = u(call32(ctx, kSceThreadmgr, 0x47F6DE49, {}));
     CHECK(low <= static_cast<u32>(t.rt.kernel().process_time()));
     CHECK(low > 0);
+}
+
+namespace {
+u32 g_stack_seen = 0;
+void on_other_stack(PsvContext* ctx, u32) {
+    g_stack_seen = ctx->r[13];
+    ctx->r[0] = ctx->r[0] + 1;  // (its common argument, plus one)
+}
+}  // namespace
+
+TEST_CASE("kernel more: atomics, C helpers, events polled, pulsed and cancelled, several waited on, infos, timers") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    // atomics
+    const u32 cell = scratch(8);
+    psv_st32(cell, 10);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x2E84A93B, {cell, 5}) == 15);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x115C516F, {cell, 3}) == 15);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x1124A1D4, {cell, 12, 40}) == 12);
+    CHECK(psv_ld32(cell) == 40);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x4B33FD3C, {cell, 1, 40}) == 0);
+    CHECK(psv_ld32(cell) == 40);
+    psv_st32(cell, 0);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0xCA3294F1, {cell}) == -1);
+    CHECK(psv_ld32(cell) == 0);
+    psv_st32(cell, 0xFF), psv_st32(cell + 4, 0);
+    call32(ctx, 0xCAE9ACE6, 0xD7D49E36, {cell, 0x0F});
+    CHECK(psv_ld32(cell) == 0xF0);
+    CHECK(call(ctx, 0xCAE9ACE6, 0x63DAF37D, {cell, 0, 0, 1}) == 0xF0);  // (adds 1 << 32)
+    CHECK(psv_ld32(cell + 4) == 1);
+    // C helpers
+    const u32 hay = guest_string("hello world"), needle = guest_string("world"), dst = scratch(8);
+    CHECK(u(call32(ctx, 0xCAE9ACE6, 0xE265498B, {hay, needle})) == hay + 6);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0xB0335388, {'q'}) == 'Q');
+    CHECK(call32(ctx, 0xCAE9ACE6, 0xB9B6B05A, {dst, hay, 8}) == 0);  // (too long: nothing written)
+    CHECK(u(call32(ctx, 0xCAE9ACE6, 0xB9B6B05A, {dst, needle, 8})) == dst);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x100091AF, {hay + 6, needle, 5}) == 0);
+    // events
+    const i32 ev = call32(ctx, 0xCAE9ACE6, 0xE6DB2494, {guest_string("ev"), 0, 0, 0});
+    REQUIRE(ev > 0);
+    const u32 got = scratch(4), data = scratch(8), info = scratch(64), waiting = scratch(4);
+    CHECK(u(call32(ctx, 0xCAE9ACE6, 0x241F3634, {u(ev), 1, got, data})) == 0x80028202u);
+    CHECK(call32(ctx, 0x859A24B1, 0x324218CD, {u(ev), 0x6, 0x1234, 0}) == 0);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x241F3634, {u(ev), 2, got, data}) == 0);
+    CHECK(psv_ld32(got) == 2);
+    CHECK(psv_ld32(data) == 0x1234);
+    REQUIRE(call32(ctx, 0xCAE9ACE6, 0xE35F19D6, {u(ev), info}) == 0);
+    CHECK(psv_ld32(info + 44) == 0x6);
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(info + 8))) == "ev");
+    CHECK(call32(ctx, 0x859A24B1, 0x8D27BAD6, {u(ev), 0x1, 0, 0}) == 0);
+    const u32 pattern = scratch(4);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0xE5A2AC66, {u(ev), pattern}) == 0);
+    CHECK(psv_ld32(pattern) == 0x6);  // (a pulse leaves the pattern as it was)
+    const u32 list = scratch(16), results = scratch(48), tmo = scratch(4);
+    psv_st32(list, u(ev)), psv_st32(list + 4, 0x4), psv_st32(list + 8, u(ev)), psv_st32(list + 12, 0x8);
+    psv_st32(tmo, 2000);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x10586418, {list, 2, 1, results, tmo}) == 0);  // (OR: the first)
+    CHECK(psv_ld32(results + 8) == 0x4);
+    psv_st32(tmo, 2000);
+    CHECK(u(call32(ctx, 0xCAE9ACE6, 0x10586418, {list, 2, 2, results, tmo})) == 0x80028005u);  // (AND: timeout)
+    CHECK(call32(ctx, 0xCAE9ACE6, 0xB01387D5, {u(ev), 0x10, 0, 0, waiting}) == 0);
+    CHECK(psv_ld32(waiting) == 0);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0xE5A2AC66, {u(ev), pattern}) == 0);
+    CHECK(psv_ld32(pattern) == 0x10);
+    CHECK(call32(ctx, 0x859A24B1, 0xC9678F7F, {u(ev)}) == 14);  // (the kernel's class number of a simple event)
+    // a message pipe through two buffers
+    const i32 pipe = call32(ctx, 0xCAE9ACE6, 0x0A10C1C8, {guest_string("pipe"), 0x40, 0, 64, 0});
+    REQUIRE(pipe > 0);
+    const u32 a = guest_string("abc"), b = guest_string("defg"), v = scratch(16), moved = scratch(4), out = scratch(16);
+    psv_st32(v, a), psv_st32(v + 4, 3), psv_st32(v + 8, b), psv_st32(v + 12, 4);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x60DB346F, {u(pipe), v, 2, 0, moved}) == 0);
+    CHECK(psv_ld32(moved) == 7);
+    const u32 pinfo = scratch(60);
+    REQUIRE(call32(ctx, 0xCAE9ACE6, 0x4046D16B, {u(pipe), pinfo}) == 0);
+    CHECK(psv_ld32(pinfo + 48) == 64 - 7);
+    psv_st32(v, out), psv_st32(v + 4, 7);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0x86ECC0FF, {u(pipe), v, 1, 0, moved}) == 0);
+    CHECK(std::memcmp(t.rt.memory().host(out), "abcdefg", 7) == 0);
+    // timers
+    const i32 timer = call32(ctx, 0xCAE9ACE6, 0x2255B2A5, {guest_string("tm"), 0, 0});
+    REQUIRE(timer > 0);
+    CHECK(call(ctx, 0x859A24B1, 0x273B4A4D, {u(timer), 0, 5000, 0}) == 0);
+    CHECK(call(ctx, 0x859A24B1, 0x3EFD3165, {u(timer)}) == 5000);
+    const u32 tinfo = scratch(0x60);
+    REQUIRE(call32(ctx, 0xCAE9ACE6, 0x7E35E10A, {u(timer), tinfo}) == 0);
+    CHECK(psv_ld32(tinfo + 56) == 5000);
+    CHECK(u(call32(ctx, 0xCAE9ACE6, 0x621D293B, {u(timer), 0, 0, 0})) == 0x80020004u);
+    // another stack
+    GuestCode code;
+    const u32 fn = code.add(&on_other_stack);
+    code.install();
+    const u32 stack = scratch(0x1000);
+    CHECK(call32(ctx, 0xCAE9ACE6, 0xAFE2B300, {stack, 0x1000, fn, 41}) == 42);
+    CHECK(g_stack_seen <= stack + 0x1000);
+    CHECK(g_stack_seen > stack);
 }

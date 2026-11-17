@@ -65,6 +65,7 @@ void register_sas();
 void register_json();
 void register_pvf();
 void register_mp4lib();
+void register_kernel_more();
 void register_commondialog();
 
 }  // namespace psvrecore::runtime::hle

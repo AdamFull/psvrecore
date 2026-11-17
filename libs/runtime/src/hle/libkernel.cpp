@@ -171,6 +171,20 @@ i32 sceClibVprintf(Ptr<const char> fmt, u32 va_list) {
     return static_cast<i32>(text.size());
 }
 
+// To a file descriptor (the program's files, or its standard output and error).
+i32 sceClibDprintf(i32 fd, Ptr<const char> fmt, Variadic va) {
+    FormatArgs args{&va, 0};
+    const nx::string text = format(str(fmt, 1 << 16), args);
+    runtime().files().write(fd, text.data(), static_cast<u32>(text.size()));
+    return static_cast<i32>(text.size());
+}
+i32 sceClibVdprintf(i32 fd, Ptr<const char> fmt, u32 va_list) {
+    FormatArgs args{nullptr, va_list};
+    const nx::string text = format(str(fmt, 1 << 16), args);
+    runtime().files().write(fd, text.data(), static_cast<u32>(text.size()));
+    return static_cast<i32>(text.size());
+}
+
 i32 sceClibSnprintf(u32 buffer, u32 size, Ptr<const char> fmt, Variadic va) {
     FormatArgs args{&va, 0};
     return put_formatted(buffer, size, format(str(fmt, 1 << 16), args));
@@ -373,6 +387,8 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0xFA26BC62, sceClibPrintf),
     HLE_FUNCTION(0x8CBA03D5, sceClibSnprintf),
     HLE_FUNCTION(0xFA6BE467, sceClibVsnprintf),
+    HLE_FUNCTION(0x4340EF77, sceClibDprintf),
+    HLE_FUNCTION(0xABC6893C, sceClibVdprintf),
     HLE_FUNCTION(0x632980D7, sceClibMemset),
     HLE_FUNCTION(0x14E9DBD7, sceClibMemcpy),
     HLE_FUNCTION(0x2E3B02A1, sceClibMemcpy),  // (sceClibMemcpy_safe)
@@ -459,6 +475,7 @@ void register_system_libraries() {
     register_json();
     register_pvf();
     register_mp4lib();
+    register_kernel_more();
     register_commondialog();
 }
 

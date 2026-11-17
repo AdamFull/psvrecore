@@ -452,6 +452,111 @@ u64 sceKernelGetTimerTimeWide(i32 uid) {
     return it == t.timers.end() ? ~u64{0} : it->second.now(kernel().process_time());
 }
 
+// The rest of the timers: their base and current times (SceKernelSysClock: a 64-bit count of microseconds), the time
+// set, opened by name, information. Timer events (a timer that sets its event at intervals, to be waited on as an
+// event) are not implemented: setting one answers SCE_KERNEL_ERROR_UNSUP, and no thread waits on a timer.
+Timer* timer(Timers& t, i32 uid) {
+    auto it = t.timers.find(uid);
+    return it == t.timers.end() ? nullptr : &it->second;
+}
+constexpr i32 kUnknownTimerId = err::code(0x80028241);
+u64 sceKernelGetTimerBaseWide(i32 uid) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    const Timer* tm = timer(t, uid);
+    return tm ? tm->base_us : ~u64{0};
+}
+i32 sceKernelGetTimerBase(i32 uid, Ptr<u64> base) {
+    if (!base || !writable(base.address, 8)) return err::kIllegalAddress;
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    const Timer* tm = timer(t, uid);
+    if (!tm) return kUnknownTimerId;
+    *base = tm->base_us;
+    return 0;
+}
+i32 sceKernelGetTimerTime(i32 uid, Ptr<u64> clock) {
+    if (!clock || !writable(clock.address, 8)) return err::kIllegalAddress;
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    const Timer* tm = timer(t, uid);
+    if (!tm) return kUnknownTimerId;
+    *clock = tm->now(kernel().process_time());
+    return 0;
+}
+// (the count set: a running timer counts on from it)
+u64 set_timer_time(Timer& tm, u64 value) {
+    const u64 now = kernel().process_time(), old = tm.now(now);
+    tm.counted_us = value;
+    if (tm.active) tm.base_us = now;
+    return old;
+}
+u64 sceKernelSetTimerTimeWide(i32 uid, u64 value) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    Timer* tm = timer(t, uid);
+    return tm ? set_timer_time(*tm, value) : ~u64{0};
+}
+i32 sceKernelSetTimerTime(i32 uid, Ptr<u64> clock) {
+    if (!clock || !writable(clock.address, 8)) return err::kIllegalAddress;
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    Timer* tm = timer(t, uid);
+    if (!tm) return kUnknownTimerId;
+    *clock = set_timer_time(*tm, *clock);
+    return 0;
+}
+i32 sceKernelSetTimerEvent(i32 uid, i32, Ptr<u64>, i32) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    return timer(t, uid) ? err::kUnsupported : kUnknownTimerId;
+}
+i32 sceKernelGetTimerEventRemainingTime(i32 uid, Ptr<u64>) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    return timer(t, uid) ? err::kUnsupported : kUnknownTimerId;
+}
+i32 sceKernelCancelTimer(i32 uid, Ptr<u32> waiting) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    if (!timer(t, uid)) return kUnknownTimerId;
+    if (waiting && writable(waiting.address, 4)) *waiting = 0;
+    return 0;
+}
+i32 sceKernelOpenTimer(Ptr<const char> name) {
+    const nx::string n = str(name, 31);
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    for (const auto& [uid, tm] : t.timers)
+        if (tm.name == n) return uid;
+    return kUnknownTimerId;
+}
+i32 sceKernelCloseTimer(i32 uid) {
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    return timer(t, uid) ? 0 : kUnknownTimerId;
+}
+// SceKernelTimerInfo (0x60): size, ID, name (32), attributes, active, base and current time, schedule and interval
+// (no events: 0), type, repeat, waiting threads, reserved.
+i32 sceKernelGetTimerInfo(i32 uid, Ptr<u8> info) {
+    if (!info || !writable(info.address, 0x60)) return err::kIllegalAddress;
+    Timers& t = timers();
+    nx::scoped_lock<nx::mutex> held(t.lock);
+    const Timer* tm = timer(t, uid);
+    if (!tm) return kUnknownTimerId;
+    u8* p = info.get();
+    std::memset(p, 0, 0x60);
+    const u32 size = 0x60, active = tm->active ? 1 : 0;
+    const u64 now = tm->now(kernel().process_time());
+    std::memcpy(p, &size, 4);
+    std::memcpy(p + 4, &uid, 4);
+    std::memcpy(p + 8, tm->name.c_str(), nx::min<usize>(tm->name.size(), 31));
+    std::memcpy(p + 44, &active, 4);
+    std::memcpy(p + 48, &tm->base_us, 8);
+    std::memcpy(p + 56, &now, 8);
+    return 0;
+}
+
 // ---- reader-writer locks, message pipes, simple events (the kernel's objects.cpp); objects opened by name
 
 i32 sceKernelCreateRWLock(Ptr<const char> name, u32 attr, Ptr<const void>) { return kernel().create_rwlock(str(name, 31), attr); }
@@ -547,6 +652,13 @@ i32 sceKernelCloseSimpleEvent(i32 uid) {
 }
 
 const Function kLibKernelObjects[] = {
+    HLE_FUNCTION(0x1F59E04D, sceKernelGetTimerBase),
+    HLE_FUNCTION(0x381DC300, sceKernelGetTimerTime),
+    HLE_FUNCTION(0xFFAD717F, sceKernelSetTimerTime),
+    HLE_FUNCTION(0x621D293B, sceKernelSetTimerEvent),
+    HLE_FUNCTION(0x75B1EB3E, sceKernelGetTimerEventRemainingTime),
+    HLE_FUNCTION(0x9CCF768C, sceKernelCancelTimer),
+    HLE_FUNCTION(0x7E35E10A, sceKernelGetTimerInfo),
     HLE_FUNCTION(0x8667951D, sceKernelCreateRWLock),
     HLE_FUNCTION(0xFA670F0F, sceKernelLockReadRWLock),
     HLE_FUNCTION(0x2D4A62B7, sceKernelLockReadRWLockCB),
@@ -568,6 +680,10 @@ const Function kLibKernelObjects[] = {
 // (two NIDs firmware 1.x's libraries import from SceThreadmgr, which vita-headers knows only as the kernel's
 // ksceKernelGetThreadCurrentPriority and ksceKernelGetSystemTimeLow: the same functions on the user side)
 const Function kThreadmgrObjects[] = {
+    HLE_FUNCTION(0x5DBC1960, sceKernelGetTimerBaseWide),
+    HLE_FUNCTION(0x273B4A4D, sceKernelSetTimerTimeWide),
+    HLE_FUNCTION(0xB6E286E7, sceKernelOpenTimer),
+    HLE_FUNCTION(0xACE60E4A, sceKernelCloseTimer),
     Function{0x01414F0B, "sceKernelGetThreadCurrentPriority", &entry<&sceKernelGetThreadCurrentPriority>},
     Function{0x47F6DE49, "sceKernelGetSystemTimeLow", &entry<&sceKernelGetSystemTimeLow>},
     HLE_FUNCTION(0xE73649CA, sceKernelDeleteRWLock),
@@ -627,6 +743,7 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0xC88D44AD, sceKernelWaitCond),
     HLE_FUNCTION(0x4CE42CE2, sceKernelWaitCondCB),
     HLE_FUNCTION(0xDA6EC8EF, sceKernelCreateLwMutex),
+    Function{0xB84EF718, "_sceKernelCreateLwMutex", &entry<&sceKernelCreateLwMutex>},
     HLE_FUNCTION(0x244E76D2, sceKernelDeleteLwMutex),
     HLE_FUNCTION(0x46E7BE7B, sceKernelLockLwMutex),
     HLE_FUNCTION(0x3148C6B6, sceKernelLockLwMutexCB),

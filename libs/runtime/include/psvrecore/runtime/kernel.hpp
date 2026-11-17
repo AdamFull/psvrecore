@@ -215,6 +215,7 @@ struct SimpleEvent : Object {
     u32 pattern = 0;
     u64 user_data = 0;
     WaitQueue waiters;
+    nx::vector<Uid> callbacks;  // (notified by sceKernelSetEventWithNotifyCallback)
     bool auto_reset() const { return attr & 0x100; }
 };
 
@@ -373,6 +374,30 @@ public:
     i32 set_event(Uid uid, u32 bits, u64 user_data);
     i32 clear_event(Uid uid, u32 bits);
     i32 wait_event(Uid uid, u32 bits, u32* result, u64* user_data, kernel::Timeout timeout, bool callbacks);
+    // Without waiting: the bits it has (EVENT_COND when none of `bits`).
+    i32 poll_event(Uid uid, u32 bits, u32* result, u64* user_data);
+    // The bits set for the threads waiting now, then the pattern as it was.
+    i32 pulse_event(Uid uid, u32 bits, u64 user_data);
+    // The waiting threads released with WAIT_CANCEL; with `set`, the pattern and user data given.
+    i32 cancel_event(Uid uid, bool set, u32 pattern, u64 user_data, u32* waiting);
+    // Callbacks notified when the event's pattern is set with notification (sceKernelSetEventWithNotifyCallback).
+    i32 register_event_callback(Uid event, Uid callback, bool add);
+    i32 unregister_event_callbacks(Uid event);
+    i32 notify_event_callbacks(Uid event, i32 arg);
+    // What an object holds, for the Info calls: its name and attributes, and by class:
+    // - SimpleEvent: a pattern, b waiting, e user data;
+    // - Cond / LwCond: a the mutex, b waiting, c the work area;
+    // - RWLock: a lock count (readers, or the writer's count), b the writer's UID, c readers waiting, d writers waiting;
+    // - MsgPipe: a size, b free, c senders waiting, d receivers waiting;
+    // - Callback: a its thread, b function, c common, d notify count, e notify argument.
+    struct ObjectSummary {
+        nx::string name;
+        u32 attr = 0, a = 0, b = 0, c = 0, d = 0;
+        u64 e = 0;
+    };
+    i32 object_summary(Uid uid, kernel::ObjectClass cls, ObjectSummary* out);
+    // An object's class (0: no such object).
+    u32 class_of(Uid uid);
     // An openable object (SCE_KERNEL_ATTR_OPENABLE) of this class by its name: its UID, or the class's unknown-ID
     // error; closing checks the UID is one of the class.
     Uid open_object(nx::string_view name, kernel::ObjectClass cls, i32 unknown);
