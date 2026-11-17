@@ -20,8 +20,8 @@ constexpr i32 kAuthSignedOut = err::code(0x80550310), kBasicSignedOut = err::cod
 constexpr i32 kServiceStateSignedOut = 1;
 constexpr i32 kManagerSignedOut = err::code(0x8055050A), kActivitySignedOut = err::code(0x80552306),
               kNpInvalidArgument = err::code(0x80550003);
-// (trophy errors, assumed from the library's numbering: invalid argument, already unlocked)
-constexpr i32 kTrophyInvalidArgument = err::code(0x80551604), kTrophyAlreadyUnlocked = err::code(0x80551619);
+// (trophy errors: invalid argument, already unlocked)
+constexpr i32 kTrophyInvalidArgument = err::code(0x80551604), kTrophyAlreadyUnlocked = err::code(0x8055160F);
 
 struct Np {
     nx::mutex lock;
