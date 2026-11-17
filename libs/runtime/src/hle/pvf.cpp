@@ -3,10 +3,11 @@
 // glyphs drawn into the game's buffer (8-bit, or 4-bit with the left pixel in the low nibble) at a 26.6 position,
 // each pixel the brighter of what is there and the glyph's coverage. The em value is kept but changes nothing
 // here. The system's own fonts are not available: the system fonts here (SIL OFL 1.1, built in) are Roboto Regular
-// and Bold (third_party/roboto, Latin sans-serif) and Noto Sans JP Regular (third_party/noto-sans-jp, Japanese
-// sans-serif: kana, the JIS kanji, Latin). The font list holds the three; a search for Japanese (or Japanese and Korean)
-// finds Noto Sans JP, any other Roboto, bold for the bold styles; the default Japanese font is Noto Sans JP. No Korean
-// or Chinese font. Fonts open from the game's memory or a file. A character the font lacks is drawn as the alternative character when one is set, else NOGLYPH. Vertical
+// and Bold (third_party/roboto, Latin sans-serif) and Noto Sans JP, KR, SC and TC Regular (third_party/noto-cjk:
+// Japanese, Korean, Simplified and Traditional Chinese sans-serif, each with Latin). The font list holds the six; a
+// search finds the font of the language asked: Japanese Noto Sans JP, Korean or Japanese-and-Korean Noto Sans KR (it
+// has kana and hanja too), Chinese Noto Sans SC (the exact search also TC), any other Roboto, bold for the bold styles;
+// the default Japanese font is Noto Sans JP. Fonts open from the game's memory or a file. A character the font lacks is drawn as the alternative character when one is set, else NOGLYPH. Vertical
 // layout: no vertical forms are used (IsVertElement false; Noto's vertical punctuation is not substituted); the vertical calls place the same glyph centred
 // on the vertical line, a line's height apart. Kerning is 0; emboldening and skew are kept, not applied. The glyph
 // outline calls (absent from the SDK's header: their records are unknown) answer NOSUPPORT; the FreeType hooks are
@@ -23,13 +24,19 @@
 
 namespace psvrecore::runtime::hle {
 
-// The system fonts' files (generated/fonts/*.cpp, from third_party/roboto and third_party/noto-sans-jp).
+// The system fonts' files (generated/fonts/*.cpp, from third_party/roboto and third_party/noto-cjk).
 extern const u8 kRoboto_Regular[];
 extern const usize kRoboto_RegularSize;
 extern const u8 kRoboto_Bold[];
 extern const usize kRoboto_BoldSize;
 extern const u8 kNotoSansJP_Regular[];
 extern const usize kNotoSansJP_RegularSize;
+extern const u8 kNotoSansKR_Regular[];
+extern const usize kNotoSansKR_RegularSize;
+extern const u8 kNotoSansSC_Regular[];
+extern const usize kNotoSansSC_RegularSize;
+extern const u8 kNotoSansTC_Regular[];
+extern const usize kNotoSansTC_RegularSize;
 
 namespace {
 
@@ -71,15 +78,18 @@ struct SystemFont {
     const char* file_name;
     f32 weight;
     u16 style;     // (SCE_PVF_STYLE_REGULAR, _BOLD)
-    u16 language;  // (SCE_PVF_LANGUAGE_J, _LATIN)
+    u16 language;  // (SCE_PVF_LANGUAGE_J, _LATIN, _K, _C)
 };
-constexpr u16 kJapanese = 1, kLatin = 2, kJapaneseKorean = 5;
+constexpr u16 kJapanese = 1, kLatin = 2, kKorean = 3, kChinese = 4, kJapaneseKorean = 5;
 const SystemFont kSystemFonts[] = {
     {kRoboto_Regular, &kRoboto_RegularSize, "Roboto", "Regular", "Roboto-Regular.ttf", 400.0f, 1, kLatin},
     {kRoboto_Bold, &kRoboto_BoldSize, "Roboto", "Bold", "Roboto-Bold.ttf", 700.0f, 5, kLatin},
     {kNotoSansJP_Regular, &kNotoSansJP_RegularSize, "Noto Sans JP", "Regular", "NotoSansJP-Regular.otf", 400.0f, 1, kJapanese},
+    {kNotoSansKR_Regular, &kNotoSansKR_RegularSize, "Noto Sans KR", "Regular", "NotoSansKR-Regular.otf", 400.0f, 1, kKorean},
+    {kNotoSansSC_Regular, &kNotoSansSC_RegularSize, "Noto Sans SC", "Regular", "NotoSansSC-Regular.otf", 400.0f, 1, kChinese},
+    {kNotoSansTC_Regular, &kNotoSansTC_RegularSize, "Noto Sans TC", "Regular", "NotoSansTC-Regular.otf", 400.0f, 1, kChinese},
 };
-constexpr i32 kSystemFontCount = 3, kJapaneseFont = 2;
+constexpr i32 kSystemFontCount = 6, kJapaneseFont = 2, kKoreanFont = 3, kChineseFont = 4;
 
 // ScePvf_t_fontStyleInfo (216 bytes): weight, family, style, sub-style, language, region, country (u16 each), the font,
 // style and file names (64 bytes each), extra attributes, expiry date.
@@ -200,14 +210,17 @@ i32 scePvfGetFontInfoByIndexNumber(u32 lib, u32 style, i32 index) {
     if (!style || !writable(style, 216) || index < 0 || index >= kSystemFontCount) return kArg;
     return with_lib(lib, [&](Lib&) { return write_style(style, kSystemFonts[index]), 0; });
 }
-// The closest font: Noto Sans JP for Japanese (or Japanese and Korean), else Roboto, bold for the bold styles.
+// The closest font: the one of the language asked (Japanese and Korean: KR, which has both), else Roboto, bold for
+// the bold styles.
 i32 scePvfFindOptimumFont(u32 lib, u32 style, u32 error) {
     if (!style || !memory().valid(style, 216)) return set_error(error, kArg), -1;
     const i32 r = with_lib(lib, [](Lib&) { return 0; });
     set_error(error, r);
     if (r < 0) return -1;
     const u32 language = psv_ld16(style + 10);
-    if (language == kJapanese || language == kJapaneseKorean) return kJapaneseFont;
+    if (language == kJapanese) return kJapaneseFont;
+    if (language == kKorean || language == kJapaneseKorean) return kKoreanFont;
+    if (language == kChinese) return kChineseFont;
     return bold_style(psv_ld16(style + 6)) ? 1 : 0;
 }
 // A font exactly as asked (the family, style and language given, or 0 for any): the first that is, or -1 and NOFILE.

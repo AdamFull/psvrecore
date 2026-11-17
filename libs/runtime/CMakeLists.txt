@@ -81,10 +81,12 @@ target_link_libraries(psvrecore_runtime PRIVATE psvrecore_libatrac9)
 target_include_directories(psvrecore_runtime SYSTEM PRIVATE "${PSVRECORE_DIR}/third_party/minimp3")
 
 # ScePvf's system fonts, built in as byte arrays (SIL OFL 1.1): Roboto Regular and Bold (third_party/roboto) and Noto
-# Sans JP Regular (third_party/noto-sans-jp). Each becomes generated/fonts/<name>.cpp, written again only when its
-# font is newer (turning Noto's 4.5 MB into text takes a few seconds).
+# Sans JP, KR, SC and TC Regular (third_party/noto-cjk). Each becomes generated/fonts/<name>.cpp, written again only
+# when its font is newer (turning a Noto font of several MB into text takes a few seconds).
 set(_psvrecore_fonts
-    "roboto/Roboto-Regular.ttf" "roboto/Roboto-Bold.ttf" "noto-sans-jp/NotoSansJP-Regular.otf")
+    "roboto/Roboto-Regular.ttf" "roboto/Roboto-Bold.ttf"
+    "noto-cjk/NotoSansJP-Regular.otf" "noto-cjk/NotoSansKR-Regular.otf"
+    "noto-cjk/NotoSansSC-Regular.otf" "noto-cjk/NotoSansTC-Regular.otf")
 foreach(_font IN LISTS _psvrecore_fonts)
     set(_path "${PSVRECORE_DIR}/third_party/${_font}")
     get_filename_component(_name "${_font}" NAME_WE)

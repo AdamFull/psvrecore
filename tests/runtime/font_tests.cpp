@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <utility>
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
@@ -265,14 +266,19 @@ TEST_CASE("pvf: the system fonts: listed, found, opened and drawn, across and do
     const u32 lib = u(call32(ctx, kScePvf, kNewLib, {init, error}));
     REQUIRE(lib != 0);
 
-    CHECK(call32(ctx, kScePvf, kNumList, {lib, error}) == 3);
-    const u32 list = scratch(216 * 3), style = scratch(216);
-    REQUIRE(call32(ctx, kScePvf, kList, {lib, list, 3}) == 0);
+    CHECK(call32(ctx, kScePvf, kNumList, {lib, error}) == 6);
+    const u32 list = scratch(216 * 6), style = scratch(216);
+    REQUIRE(call32(ctx, kScePvf, kList, {lib, list, 6}) == 0);
     CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 16))) == "Roboto");
     CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 216 + 80))) == "Bold");
     CHECK(psv_ld16(list + 216 + 6) == 5);
     CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 432 + 16))) == "Noto Sans JP");
     CHECK(psv_ld16(list + 432 + 10) == 1);  // (Japanese)
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 648 + 16))) == "Noto Sans KR");
+    CHECK(psv_ld16(list + 648 + 10) == 3);  // (Korean)
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 864 + 16))) == "Noto Sans SC");
+    CHECK(std::string_view(reinterpret_cast<const char*>(t.rt.memory().host(list + 1080 + 16))) == "Noto Sans TC");
+    CHECK(psv_ld16(list + 1080 + 10) == 4);  // (Chinese)
     std::memset(t.rt.memory().host(style), 0, 216);
     psv_st16(style + 6, 5);  // (bold)
     CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 1);
@@ -283,8 +289,17 @@ TEST_CASE("pvf: the system fonts: listed, found, opened and drawn, across and do
     CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 2);
     psv_st16(style + 6, 1);  // (Japanese regular)
     CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == 2);
-    psv_st16(style + 10, 3);  // (Korean: none)
+    psv_st16(style + 10, 3);  // (Korean)
+    CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == 3);
+    psv_st16(style + 10, 4);  // (Chinese: Simplified first)
+    CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == 4);
+    psv_st16(style + 10, 5);  // (Japanese and Korean: none exactly, KR the closest: it has kana)
     CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == -1);
+    CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 3);
+    psv_st16(style + 4, 2);  // (Chinese serif: none exactly, SC the closest)
+    psv_st16(style + 10, 4);
+    CHECK(call32(ctx, kScePvf, kFind, {lib, style, error}) == -1);
+    CHECK(call32(ctx, kScePvf, kOptimum, {lib, style, error}) == 4);
 
     const u32 font = u(call32(ctx, kScePvf, kOpen, {lib, 0, 0, error}));
     REQUIRE(font != 0);
@@ -353,6 +368,23 @@ TEST_CASE("pvf: the system fonts: listed, found, opened and drawn, across and do
     for (u32 i = 0; i < 64 * 64; ++i) ink += t.rt.memory().host(pixels)[i] > 128;
     CHECK(ink > 60);
     CHECK(call32(ctx, kScePvf, kClose, {japanese}) == 0);
+    // Korean, Simplified and Traditional Chinese by their index: each draws its own script.
+    const std::pair<u32, u32> others[] = {{3, 0xD55C /*한*/}, {4, 0x6C49 /*汉*/}, {5, 0x9AD4 /*體*/}};
+    for (const auto& [index, code] : others) {
+        const u32 other = u(call32(ctx, kScePvf, kOpen, {lib, index, 0, error}));
+        REQUIRE(other != 0);
+        CHECK(call32(ctx, kScePvf, kIsElement, {other, code}) == 1);
+        ctx->vfp.s[0] = std::bit_cast<u32>(20.0f);
+        ctx->vfp.s[1] = std::bit_cast<u32>(20.0f);
+        REQUIRE(call32(ctx, kScePvf, kCharSize, {other}) == 0);
+        std::memset(t.rt.memory().host(pixels), 0, 64 * 64);
+        REQUIRE(call32(ctx, kScePvf, kGlyphImage, {other, code, image}) == 0);
+        u32 other_ink = 0;
+        for (u32 i = 0; i < 64 * 64; ++i) other_ink += t.rt.memory().host(pixels)[i] > 128;
+        CHECK(other_ink > 40);
+        CHECK(call32(ctx, kScePvf, kClose, {other}) == 0);
+    }
+    CHECK(call32(ctx, kScePvf, kIsElement, {font, 0xD55C}) == 0);  // (Roboto: no Hangul)
     CHECK(call32(ctx, kScePvf, kClose, {font}) == 0);
     CHECK(call32(ctx, kScePvf, kDoneLib, {lib}) == 0);
     CHECK(g_font_allocs == g_font_frees);
