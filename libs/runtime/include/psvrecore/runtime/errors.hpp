@@ -47,6 +47,12 @@ inline constexpr i32 kEventFlagMulti = code(0x800280E2);
 inline constexpr i32 kEventFlagCond = code(0x800280E3);
 inline constexpr i32 kAlreadySent = code(0x80028121);
 inline constexpr i32 kUnknownSemaphoreId = code(0x80028101);
+inline constexpr i32 kUnknownRWLockId = code(0x800281E1), kRWLockRecursive = code(0x800281E2),
+                     kRWLockNotOwned = code(0x800281E4), kRWLockUnlockUnderflow = code(0x800281E5),
+                     kRWLockFailedToLock = code(0x800281E6);
+inline constexpr i32 kUnknownEventId = code(0x80028201), kEventCond = code(0x80028202);
+inline constexpr i32 kUnknownMsgPipeId = code(0x80028221), kMsgPipeFull = code(0x80028222),
+                     kMsgPipeEmpty = code(0x80028223), kMsgPipeDeleted = code(0x80028224);
 inline constexpr i32 kSemaphoreZero = code(0x80028102);
 inline constexpr i32 kSemaphoreOverflow = code(0x80028103);
 inline constexpr i32 kUnknownMutexId = code(0x80028141);

@@ -451,6 +451,141 @@ u64 sceKernelGetTimerTimeWide(i32 uid) {
     return it == t.timers.end() ? ~u64{0} : it->second.now(kernel().process_time());
 }
 
+// ---- reader-writer locks, message pipes, simple events (the kernel's objects.cpp); objects opened by name
+
+i32 sceKernelCreateRWLock(Ptr<const char> name, u32 attr, Ptr<const void>) { return kernel().create_rwlock(str(name, 31), attr); }
+i32 sceKernelDeleteRWLock(i32 uid) { return kernel().delete_rwlock(uid); }
+i32 sceKernelLockReadRWLock(i32 uid, Ptr<u32> t) { return kernel().lock_rwlock(uid, false, timeout(t), false); }
+i32 sceKernelLockReadRWLockCB(i32 uid, Ptr<u32> t) { return kernel().lock_rwlock(uid, false, timeout(t), true); }
+i32 sceKernelLockWriteRWLock(i32 uid, Ptr<u32> t) { return kernel().lock_rwlock(uid, true, timeout(t), false); }
+i32 sceKernelLockWriteRWLockCB(i32 uid, Ptr<u32> t) { return kernel().lock_rwlock(uid, true, timeout(t), true); }
+i32 sceKernelTryLockReadRWLock(i32 uid) { return kernel().try_lock_rwlock(uid, false); }
+i32 sceKernelTryLockWriteRWLock(i32 uid) { return kernel().try_lock_rwlock(uid, true); }
+i32 sceKernelUnlockReadRWLock(i32 uid) { return kernel().unlock_rwlock(uid, false); }
+i32 sceKernelUnlockWriteRWLock(i32 uid) { return kernel().unlock_rwlock(uid, true); }
+i32 sceKernelCancelRWLock(i32 uid, Ptr<u32> readers, Ptr<u32> writers, i32 /*flag*/) {
+    return kernel().cancel_rwlock(uid, readers.get(), writers.get());
+}
+
+// (the type: where the buffer lives, user main memory or CDRAM; the buffer is the kernel's here either way)
+i32 sceKernelCreateMsgPipe(Ptr<const char> name, u32 /*type*/, u32 attr, u32 size, Ptr<const void>) {
+    return kernel().create_msg_pipe(str(name, 31), attr, size);
+}
+i32 sceKernelDeleteMsgPipe(i32 uid) { return kernel().delete_msg_pipe(uid); }
+i32 msg_pipe(bool send, i32 uid, u32 buffer, u32 size, u32 mode, Ptr<u32> result, Ptr<u32> t, bool callbacks) {
+    u32 moved = 0;
+    const i32 r = send ? kernel().send_msg_pipe(uid, buffer, size, mode, &moved, timeout(t), callbacks)
+                       : kernel().receive_msg_pipe(uid, buffer, size, mode, &moved, timeout(t), callbacks);
+    if (result && writable(result.address, 4)) *result = moved;
+    return r;
+}
+i32 sceKernelSendMsgPipe(i32 uid, u32 buffer, u32 size, u32 mode, Ptr<u32> result, Ptr<u32> t) {
+    return msg_pipe(true, uid, buffer, size, mode, result, t, false);
+}
+i32 sceKernelSendMsgPipeCB(i32 uid, u32 buffer, u32 size, u32 mode, Ptr<u32> result, Ptr<u32> t) {
+    return msg_pipe(true, uid, buffer, size, mode, result, t, true);
+}
+i32 sceKernelTrySendMsgPipe(i32 uid, u32 buffer, u32 size, u32 mode, Ptr<u32> result) {
+    return msg_pipe(true, uid, buffer, size, mode | 0x10, result, Ptr<u32>(), false);
+}
+i32 sceKernelReceiveMsgPipe(i32 uid, u32 buffer, u32 size, u32 mode, Ptr<u32> result, Ptr<u32> t) {
+    return msg_pipe(false, uid, buffer, size, mode, result, t, false);
+}
+i32 sceKernelReceiveMsgPipeCB(i32 uid, u32 buffer, u32 size, u32 mode, Ptr<u32> result, Ptr<u32> t) {
+    return msg_pipe(false, uid, buffer, size, mode, result, t, true);
+}
+i32 sceKernelTryReceiveMsgPipe(i32 uid, u32 buffer, u32 size, u32 mode, Ptr<u32> result) {
+    return msg_pipe(false, uid, buffer, size, mode | 0x10, result, Ptr<u32>(), false);
+}
+i32 sceKernelCancelMsgPipe(i32 uid, Ptr<u32> senders, Ptr<u32> receivers) {
+    return kernel().cancel_msg_pipe(uid, senders.get(), receivers.get());
+}
+
+i32 sceKernelCreateSimpleEvent(Ptr<const char> name, u32 attr, u32 pattern, Ptr<const void>) {
+    return kernel().create_simple_event(str(name, 31), attr, pattern);
+}
+i32 sceKernelDeleteSimpleEvent(i32 uid) { return kernel().delete_simple_event(uid); }
+i32 sceKernelSetEvent(i32 uid, u32 bits, u64 user_data) { return kernel().set_event(uid, bits, user_data); }
+i32 sceKernelClearEvent(i32 uid, u32 bits) { return kernel().clear_event(uid, bits); }
+i32 wait_simple_event(i32 uid, u32 bits, Ptr<u32> result, Ptr<u64> user_data, Ptr<u32> t, bool callbacks) {
+    u32 got = 0;
+    u64 data = 0;
+    const i32 r = kernel().wait_event(uid, bits, &got, &data, timeout(t), callbacks);
+    if (r == 0 && result && writable(result.address, 4)) *result = got;
+    if (r == 0 && user_data && writable(user_data.address, 8)) std::memcpy(user_data.get(), &data, 8);
+    return r;
+}
+i32 sceKernelWaitEvent(i32 uid, u32 bits, Ptr<u32> result, Ptr<u64> user_data, Ptr<u32> t) {
+    return wait_simple_event(uid, bits, result, user_data, t, false);
+}
+i32 sceKernelWaitEventCB(i32 uid, u32 bits, Ptr<u32> result, Ptr<u64> user_data, Ptr<u32> t) {
+    return wait_simple_event(uid, bits, result, user_data, t, true);
+}
+
+i32 sceKernelOpenSema(Ptr<const char> name) {
+    return kernel().open_object(str(name, 31), kernel::ObjectClass::Semaphore, err::kUnknownSemaphoreId);
+}
+i32 sceKernelCloseSema(i32 uid) { return kernel().close_object(uid, kernel::ObjectClass::Semaphore, err::kUnknownSemaphoreId); }
+i32 sceKernelOpenMutex(Ptr<const char> name) {
+    return kernel().open_object(str(name, 31), kernel::ObjectClass::Mutex, err::kUnknownMutexId);
+}
+i32 sceKernelCloseMutex(i32 uid) { return kernel().close_object(uid, kernel::ObjectClass::Mutex, err::kUnknownMutexId); }
+i32 sceKernelOpenRWLock(Ptr<const char> name) {
+    return kernel().open_object(str(name, 31), kernel::ObjectClass::RWLock, err::kUnknownRWLockId);
+}
+i32 sceKernelCloseRWLock(i32 uid) { return kernel().close_object(uid, kernel::ObjectClass::RWLock, err::kUnknownRWLockId); }
+i32 sceKernelOpenMsgPipe(Ptr<const char> name) {
+    return kernel().open_object(str(name, 31), kernel::ObjectClass::MsgPipe, err::kUnknownMsgPipeId);
+}
+i32 sceKernelCloseMsgPipe(i32 uid) { return kernel().close_object(uid, kernel::ObjectClass::MsgPipe, err::kUnknownMsgPipeId); }
+i32 sceKernelOpenSimpleEvent(Ptr<const char> name) {
+    return kernel().open_object(str(name, 31), kernel::ObjectClass::SimpleEvent, err::kUnknownEventId);
+}
+i32 sceKernelCloseSimpleEvent(i32 uid) {
+    return kernel().close_object(uid, kernel::ObjectClass::SimpleEvent, err::kUnknownEventId);
+}
+
+const Function kLibKernelObjects[] = {
+    HLE_FUNCTION(0x8667951D, sceKernelCreateRWLock),
+    HLE_FUNCTION(0xFA670F0F, sceKernelLockReadRWLock),
+    HLE_FUNCTION(0x2D4A62B7, sceKernelLockReadRWLockCB),
+    HLE_FUNCTION(0x67A187BB, sceKernelLockWriteRWLock),
+    HLE_FUNCTION(0xA4777082, sceKernelLockWriteRWLockCB),
+    HLE_FUNCTION(0x190CA94B, sceKernelCancelRWLock),
+    HLE_FUNCTION(0x0A10C1C8, sceKernelCreateMsgPipe),
+    HLE_FUNCTION(0x0CA71EA2, sceKernelSendMsgPipe),
+    HLE_FUNCTION(0xA5CA74AC, sceKernelSendMsgPipeCB),
+    HLE_FUNCTION(0xDFC670E0, sceKernelTrySendMsgPipe),
+    HLE_FUNCTION(0x4E81DD5C, sceKernelReceiveMsgPipe),
+    HLE_FUNCTION(0x33AF829B, sceKernelReceiveMsgPipeCB),
+    HLE_FUNCTION(0x5615B006, sceKernelTryReceiveMsgPipe),
+    HLE_FUNCTION(0xEF14BA37, sceKernelCancelMsgPipe),
+    HLE_FUNCTION(0xE6DB2494, sceKernelCreateSimpleEvent),
+    HLE_FUNCTION(0x120F03AF, sceKernelWaitEvent),
+    HLE_FUNCTION(0xA0490795, sceKernelWaitEventCB),
+};
+const Function kThreadmgrObjects[] = {
+    HLE_FUNCTION(0xE73649CA, sceKernelDeleteRWLock),
+    HLE_FUNCTION(0xEFDDA456, sceKernelTryLockReadRWLock),
+    HLE_FUNCTION(0x206CBB66, sceKernelTryLockWriteRWLock),
+    HLE_FUNCTION(0x3EF91145, sceKernelUnlockReadRWLock),
+    HLE_FUNCTION(0xB4151397, sceKernelUnlockWriteRWLock),
+    HLE_FUNCTION(0xE78BCCF7, sceKernelDeleteMsgPipe),
+    HLE_FUNCTION(0x208CFE28, sceKernelDeleteSimpleEvent),
+    HLE_FUNCTION(0x324218CD, sceKernelSetEvent),
+    HLE_FUNCTION(0x7B2A4B28, sceKernelClearEvent),
+    HLE_FUNCTION(0xCBE235C7, sceKernelOpenSema),
+    HLE_FUNCTION(0xA2D81F9E, sceKernelCloseSema),
+    HLE_FUNCTION(0x52E17182, sceKernelOpenMutex),
+    HLE_FUNCTION(0x03E23AF6, sceKernelCloseMutex),
+    HLE_FUNCTION(0xCE510196, sceKernelOpenRWLock),
+    HLE_FUNCTION(0xFD5BD5C1, sceKernelCloseRWLock),
+    HLE_FUNCTION(0x0E1CB9F6, sceKernelOpenMsgPipe),
+    HLE_FUNCTION(0x1305A065, sceKernelCloseMsgPipe),
+    HLE_FUNCTION(0x4E1E4DF8, sceKernelOpenSimpleEvent),
+    HLE_FUNCTION(0xFEF4CA53, sceKernelCloseSimpleEvent),
+};
+
 const Function kLibKernel[] = {
     HLE_FUNCTION(0xC5C11EE7, sceKernelCreateThread),
     HLE_FUNCTION(0xF08DE149, sceKernelStartThread),
@@ -562,6 +697,8 @@ void register_threadmgr() {
     }
     register_library({"SceLibKernel", kSceLibKernel, kLibKernel});
     register_library({"SceThreadmgr", kSceThreadmgr, kThreadmgr});
+    register_library({"SceLibKernel", kSceLibKernel, kLibKernelObjects});
+    register_library({"SceThreadmgr", kSceThreadmgr, kThreadmgrObjects});
     register_library({"SceThreadmgrCoredumpTime", kSceThreadmgrCoredumpTime, kThreadmgrCoredumpTime});
 }
 

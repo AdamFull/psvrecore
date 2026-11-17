@@ -115,6 +115,12 @@ struct Kernel::Impl {
     void unlock_owned_mutexes(kernel::Thread* t);
     // (sync.cpp) A mutex the thread owns is released as a whole: ownership passes to the next waiter.
     void hand_over_mutex(kernel::Mutex* m);
+    // (objects.cpp) The lock to the queue's head; what a message pipe can move now (`self`, the calling thread, is
+    // taken out of its queue when it is satisfied, not woken); a send or receive.
+    void hand_over_rwlock(kernel::RWLock* l);
+    void pump_msg_pipe(kernel::MsgPipe* p, kernel::Thread* self);
+    i32 transfer_msg_pipe(Uid uid, bool send, u32 buffer, u32 size, u32 mode, u32* moved, const kernel::Timeout& timeout,
+                          bool callbacks);
 };
 
 // The priority a create or change call asks for: SCE_KERNEL_DEFAULT_PRIORITY_USER (+/- offset) means the game

@@ -33,6 +33,7 @@ add_library(psvrecore_runtime STATIC
     src/kernel/scheduler.cpp
     src/kernel/sync.cpp
     src/kernel/threads.cpp
+    src/kernel/objects.cpp
     src/loader.cpp
     src/memory.cpp
     src/media/decoders.cpp

@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <memory>
+#include <utility>
 
 #include "psvrecore/recomp/guest.h"
 #include "psvrecore/runtime/errors.hpp"
@@ -55,6 +56,9 @@ enum class ObjectClass : u32 {
     Callback = 8,
     LwMutex = 10,
     LwCond = 11,
+    RWLock = 12,
+    MsgPipe = 13,
+    SimpleEvent = 14,
 };
 
 enum class ThreadState : u32 {
@@ -74,8 +78,11 @@ enum class WaitType : u32 {
     EventFlag = 0x10,
     Semaphore = 0x20,
     Mutex = 0x40,
+    RWLock = 0x80,
     CondSignal = 0x100,
     CondMutex = 0x200,
+    Event = 0x10000,
+    MsgPipe = 0x40000,
     LwMutex = 0x100000,
     LwCondSignal = 0x200000,
     LwCondMutex = 0x400000,
@@ -182,6 +189,33 @@ struct Cond : Object {
     Uid mutex = 0;
     WaitQueue waiters;
     u32 work = 0;
+};
+
+// A reader-writer lock: read locks held (and by whom), or one writer (recursively, with the attribute).
+struct RWLock : Object {
+    RWLock() : Object(ObjectClass::RWLock) {}
+    nx::vector<std::pair<Thread*, i32>> readers;
+    Thread* writer = nullptr;
+    i32 write_count = 0;
+    WaitQueue waiters;  // (each wait's mode: 0 read, 1 write)
+    bool recursive() const { return attr & 0x2; }
+};
+
+// A message pipe: a byte buffer between senders and receivers (none: senders hand bytes to receivers directly).
+struct MsgPipe : Object {
+    MsgPipe() : Object(ObjectClass::MsgPipe) {}
+    u32 size = 0;
+    nx::vector<u8> data;  // (what is in the buffer, oldest first)
+    WaitQueue senders, receivers;
+};
+
+// A simple event: a pattern of bits and the user data set with them; a waiter wants any of its bits.
+struct SimpleEvent : Object {
+    SimpleEvent() : Object(ObjectClass::SimpleEvent) {}
+    u32 pattern = 0;
+    u64 user_data = 0;
+    WaitQueue waiters;
+    bool auto_reset() const { return attr & 0x100; }
 };
 
 struct Callback : Object {
@@ -319,6 +353,30 @@ public:
     i32 delete_cond(Uid uid, kernel::ObjectClass cls = kernel::ObjectClass::Cond);
     i32 wait_cond(Uid uid, kernel::Timeout timeout, bool callbacks, kernel::ObjectClass cls = kernel::ObjectClass::Cond);
     i32 signal_cond(Uid uid, bool all, Uid to, kernel::ObjectClass cls = kernel::ObjectClass::Cond);
+
+    // ---- reader-writer locks, message pipes, simple events (objects.cpp)
+    Uid create_rwlock(nx::string_view name, u32 attr);
+    i32 delete_rwlock(Uid uid);
+    i32 lock_rwlock(Uid uid, bool write, kernel::Timeout timeout, bool callbacks);
+    i32 try_lock_rwlock(Uid uid, bool write);
+    i32 unlock_rwlock(Uid uid, bool write);
+    i32 cancel_rwlock(Uid uid, u32* waiting_readers, u32* waiting_writers);
+    // (send: guest buffer and size; `mode` MSG_PIPE_MODE_* bits: FULL, DONT_WAIT, DONT_REMOVE; the bytes moved in
+    // `*moved`)
+    Uid create_msg_pipe(nx::string_view name, u32 attr, u32 size);
+    i32 delete_msg_pipe(Uid uid);
+    i32 send_msg_pipe(Uid uid, u32 buffer, u32 size, u32 mode, u32* moved, kernel::Timeout timeout, bool callbacks);
+    i32 receive_msg_pipe(Uid uid, u32 buffer, u32 size, u32 mode, u32* moved, kernel::Timeout timeout, bool callbacks);
+    i32 cancel_msg_pipe(Uid uid, u32* waiting_senders, u32* waiting_receivers);
+    Uid create_simple_event(nx::string_view name, u32 attr, u32 pattern);
+    i32 delete_simple_event(Uid uid);
+    i32 set_event(Uid uid, u32 bits, u64 user_data);
+    i32 clear_event(Uid uid, u32 bits);
+    i32 wait_event(Uid uid, u32 bits, u32* result, u64* user_data, kernel::Timeout timeout, bool callbacks);
+    // An openable object (SCE_KERNEL_ATTR_OPENABLE) of this class by its name: its UID, or the class's unknown-ID
+    // error; closing checks the UID is one of the class.
+    Uid open_object(nx::string_view name, kernel::ObjectClass cls, i32 unknown);
+    i32 close_object(Uid uid, kernel::ObjectClass cls, i32 unknown);
 
     // ---- callbacks
     Uid create_callback(nx::string_view name, u32 attr, u32 function, u32 common);

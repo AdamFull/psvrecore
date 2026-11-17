@@ -695,3 +695,171 @@ TEST_CASE("kernel: suspended, no thread runs and the clock stands still; resumed
     CHECK(wait_end(ctx, counter) == 0);
     g_object = 0;
 }
+
+namespace {
+constexpr u32 kCreateRWLock = 0x8667951D, kLockReadRWLock = 0xFA670F0F, kLockWriteRWLock = 0x67A187BB,
+              kTryLockReadRWLock = 0xEFDDA456, kTryLockWriteRWLock = 0x206CBB66, kUnlockReadRWLock = 0x3EF91145,
+              kUnlockWriteRWLock = 0xB4151397, kDeleteRWLock = 0xE73649CA;
+constexpr u32 kCreateMsgPipe = 0x0A10C1C8, kSendMsgPipe = 0x0CA71EA2, kReceiveMsgPipe = 0x4E81DD5C,
+              kTrySendMsgPipe = 0xDFC670E0, kTryReceiveMsgPipe = 0x5615B006, kCancelMsgPipe = 0xEF14BA37,
+              kDeleteMsgPipe = 0xE78BCCF7;
+constexpr u32 kCreateSimpleEvent = 0xE6DB2494, kWaitEvent = 0x120F03AF, kSetEvent = 0x324218CD,
+              kClearEvent = 0x7B2A4B28, kDeleteSimpleEvent = 0x208CFE28, kOpenSema = 0xCBE235C7, kCloseSema = 0xA2D81F9E;
+u32 g_buffer = 0, g_result = 0;
+}  // namespace
+
+TEST_CASE("kernel: reader-writer locks share reading, give writing alone, and hand over in queue order") {
+    TestRuntime t(1);
+    g_log.events.clear();
+    GuestCode code;
+    const u32 writer = code.add([](PsvContext* ctx, uint32_t) {
+        g_log.add(call32(ctx, kSceLibKernel, kLockWriteRWLock, {u(g_object), 0}) == 0 ? "write" : "error");
+        call32(ctx, kSceThreadmgr, kUnlockWriteRWLock, {u(g_object)});
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    g_object = call32(ctx, kSceLibKernel, kCreateRWLock, {guest_string("rw"), 0, 0});
+    REQUIRE(g_object > 0);
+    REQUIRE(call32(ctx, kSceLibKernel, kLockReadRWLock, {u(g_object), 0}) == 0);
+    CHECK(call32(ctx, kSceLibKernel, kLockReadRWLock, {u(g_object), 0}) == err::kRWLockRecursive);  // (not recursive)
+    CHECK(call32(ctx, kSceThreadmgr, kTryLockWriteRWLock, {u(g_object)}) == err::kRWLockFailedToLock);
+    const i32 w = create_thread(ctx, "writer", writer, 100);
+    start_thread(ctx, w);  // (waits: a reader holds it)
+    g_log.add("reading");
+    // (a writer waits: a new read lock waits behind it, so a try fails)
+    CHECK(call32(ctx, kSceThreadmgr, kTryLockReadRWLock, {u(g_object)}) == err::kRWLockRecursive);
+    CHECK(call32(ctx, kSceThreadmgr, kUnlockReadRWLock, {u(g_object)}) == 0);  // (the writer has it, and runs)
+    g_log.add("unlocked");
+    wait_end(ctx, w);
+    CHECK(g_log.joined() == "reading write unlocked");
+    CHECK(call32(ctx, kSceThreadmgr, kUnlockReadRWLock, {u(g_object)}) == err::kRWLockNotOwned);
+    CHECK(call32(ctx, kSceThreadmgr, kTryLockReadRWLock, {u(g_object)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kUnlockReadRWLock, {u(g_object)}) == 0);
+    // Recursive: the writer may read and write again.
+    const i32 r = call32(ctx, kSceLibKernel, kCreateRWLock, {guest_string("rec"), 0x2, 0});
+    REQUIRE(call32(ctx, kSceLibKernel, kLockWriteRWLock, {u(r), 0}) == 0);
+    CHECK(call32(ctx, kSceLibKernel, kLockWriteRWLock, {u(r), 0}) == 0);
+    CHECK(call32(ctx, kSceLibKernel, kLockReadRWLock, {u(r), 0}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kUnlockReadRWLock, {u(r)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kUnlockWriteRWLock, {u(r)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kUnlockWriteRWLock, {u(r)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kUnlockWriteRWLock, {u(r)}) == err::kRWLockNotOwned);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteRWLock, {u(r)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteRWLock, {u(g_object)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteRWLock, {u(g_object)}) == err::kUnknownRWLockId);
+}
+
+TEST_CASE("kernel: message pipes carry bytes through their buffer, or straight from sender to receiver") {
+    TestRuntime t(1);
+    g_log.events.clear();
+    GuestCode code;
+    const u32 receiver = code.add([](PsvContext* ctx, uint32_t) {
+        const u32 moved = scratch(4);
+        // (FULL: six bytes or wait)
+        const i32 r = call32(ctx, kSceLibKernel, kReceiveMsgPipe, {u(g_object), g_buffer, 6, 0x1, moved, 0});
+        g_log.add(r == 0 && psv_ld32(moved) == 6 ? "received6" : "error");
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    Runtime& rt = t.rt;
+    g_object = call32(ctx, kSceLibKernel, kCreateMsgPipe, {guest_string("pipe"), 64, 0, 8, 0});
+    REQUIRE(g_object > 0);
+    g_buffer = scratch(16);
+    const u32 moved = scratch(4), out = scratch(16);
+    REQUIRE(call32(ctx, kSceLibKernel, kSendMsgPipe, {u(g_object), guest_string("abcd"), 4, 0x1, moved, 0}) == 0);
+    CHECK(psv_ld32(moved) == 4);
+    const i32 rt_thread = create_thread(ctx, "receiver", receiver, 100);
+    start_thread(ctx, rt_thread);  // (has four: waits for two more)
+    g_log.add("sent4");
+    REQUIRE(call32(ctx, kSceLibKernel, kSendMsgPipe, {u(g_object), guest_string("efgh"), 4, 0x1, moved, 0}) == 0);
+    wait_end(ctx, rt_thread);
+    CHECK(g_log.joined() == "sent4 received6");
+    CHECK(std::memcmp(rt.memory().host(g_buffer), "abcdef", 6) == 0);
+    // Two left: an ASAP receive of four gets them; then the pipe is empty.
+    REQUIRE(call32(ctx, kSceLibKernel, kTryReceiveMsgPipe, {u(g_object), out, 4, 0, moved}) == 0);
+    CHECK(psv_ld32(moved) == 2);
+    CHECK(std::memcmp(rt.memory().host(out), "gh", 2) == 0);
+    CHECK(call32(ctx, kSceLibKernel, kTryReceiveMsgPipe, {u(g_object), out, 4, 0, moved}) == err::kMsgPipeEmpty);
+    // Full: a FULL send that does not fit, without waiting, fails; DONT_REMOVE looks without taking.
+    REQUIRE(call32(ctx, kSceLibKernel, kTrySendMsgPipe, {u(g_object), guest_string("12345678"), 8, 0x1, moved}) == 0);
+    CHECK(call32(ctx, kSceLibKernel, kTrySendMsgPipe, {u(g_object), guest_string("9"), 1, 0x1, moved}) == err::kMsgPipeFull);
+    REQUIRE(call32(ctx, kSceLibKernel, kReceiveMsgPipe, {u(g_object), out, 3, 0x101, moved, 0}) == 0);
+    CHECK(std::memcmp(rt.memory().host(out), "123", 3) == 0);
+    REQUIRE(call32(ctx, kSceLibKernel, kReceiveMsgPipe, {u(g_object), out, 8, 0x1, moved, 0}) == 0);
+    CHECK(std::memcmp(rt.memory().host(out), "12345678", 8) == 0);
+    // A timeout, with nothing to receive.
+    const u32 timeout = scratch(4);
+    psv_st32(timeout, 10000);
+    CHECK(call32(ctx, kSceLibKernel, kReceiveMsgPipe, {u(g_object), out, 1, 0, moved, timeout}) == err::kWaitTimeout);
+    const u32 counts = scratch(8);
+    CHECK(call32(ctx, kSceLibKernel, kCancelMsgPipe, {u(g_object), counts, counts + 4}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteMsgPipe, {u(g_object)}) == 0);
+
+    // Without a buffer: the sender's bytes go straight to the waiting receiver.
+    g_log.events.clear();
+    g_object = call32(ctx, kSceLibKernel, kCreateMsgPipe, {guest_string("direct"), 64, 0, 0, 0});
+    REQUIRE(g_object > 0);
+    std::memset(rt.memory().host(g_buffer), 0, 16);
+    CHECK(call32(ctx, kSceLibKernel, kTrySendMsgPipe, {u(g_object), guest_string("zz"), 2, 0x1, moved}) == err::kMsgPipeFull);  // (nobody receives)
+    const i32 r2 = create_thread(ctx, "receiver", receiver, 100);
+    start_thread(ctx, r2);
+    REQUIRE(call32(ctx, kSceLibKernel, kSendMsgPipe, {u(g_object), guest_string("uvwxyz"), 6, 0x1, moved, 0}) == 0);
+    wait_end(ctx, r2);
+    CHECK(g_log.joined() == "received6");
+    CHECK(std::memcmp(rt.memory().host(g_buffer), "uvwxyz", 6) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteMsgPipe, {u(g_object)}) == 0);
+}
+
+TEST_CASE("kernel: simple events release a waiter on any of its bits, with the user data; auto reset clears them") {
+    TestRuntime t(1);
+    g_log.events.clear();
+    GuestCode code;
+    const u32 waiter = code.add([](PsvContext* ctx, uint32_t) {
+        const u32 result = scratch(4), data = scratch(8);
+        const i32 r = call32(ctx, kSceLibKernel, kWaitEvent, {u(g_object), 0x2, result, data, 0});
+        g_result = psv_ld32(result);
+        g_log.add(r == 0 && psv_ld32(data) == 0x55667788u && psv_ld32(data + 4) == 0x11223344u ? "released" : "error");
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    g_object = call32(ctx, kSceLibKernel, kCreateSimpleEvent, {guest_string("ev"), 0x100, 0, 0});  // (auto reset)
+    REQUIRE(g_object > 0);
+    const i32 w = create_thread(ctx, "waiter", waiter, 100);
+    start_thread(ctx, w);
+    g_log.add("set");
+    // (bits 1 and 2; the user data a 64-bit argument in r2:r3)
+    REQUIRE(call32(ctx, kSceThreadmgr, kSetEvent, {u(g_object), 0x6, 0x55667788u, 0x11223344u}) == 0);
+    wait_end(ctx, w);
+    CHECK(g_log.joined() == "set released");
+    CHECK(g_result == 0x2);
+    const u32 result = scratch(4), timeout = scratch(4);
+    REQUIRE(call32(ctx, kSceLibKernel, kWaitEvent, {u(g_object), 0x6, result, 0, 0}) == 0);
+    CHECK(psv_ld32(result) == 0x4);  // (bit 2 was cleared by the waiter's release)
+    psv_st32(timeout, 10000);
+    CHECK(call32(ctx, kSceLibKernel, kWaitEvent, {u(g_object), 0x6, result, 0, timeout}) == err::kWaitTimeout);
+    CHECK(call32(ctx, kSceLibKernel, kWaitEvent, {u(g_object), 0, result, 0, 0}) == err::kEventCond);
+    // Manual reset: the bits stay until cleared (a clear keeps the bits given).
+    const i32 manual = call32(ctx, kSceLibKernel, kCreateSimpleEvent, {guest_string("m"), 0, 0x3, 0});
+    REQUIRE(call32(ctx, kSceLibKernel, kWaitEvent, {u(manual), 0x1, result, 0, 0}) == 0);
+    REQUIRE(call32(ctx, kSceLibKernel, kWaitEvent, {u(manual), 0x1, result, 0, 0}) == 0);
+    REQUIRE(call32(ctx, kSceThreadmgr, kClearEvent, {u(manual), 0x2}) == 0);
+    psv_st32(timeout, 1000);
+    CHECK(call32(ctx, kSceLibKernel, kWaitEvent, {u(manual), 0x1, result, 0, timeout}) == err::kWaitTimeout);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteSimpleEvent, {u(manual)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteSimpleEvent, {u(g_object)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kDeleteSimpleEvent, {u(g_object)}) == err::kUnknownEventId);
+}
+
+TEST_CASE("kernel: an openable object is found by its name; others are not") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    const i32 shared = call32(ctx, kSceLibKernel, kCreateSema, {guest_string("shared"), 0x80, 0, 1, 0});
+    const i32 hidden = call32(ctx, kSceLibKernel, kCreateSema, {guest_string("hidden"), 0, 0, 1, 0});
+    REQUIRE(shared > 0);
+    REQUIRE(hidden > 0);
+    CHECK(call32(ctx, kSceThreadmgr, kOpenSema, {guest_string("shared")}) == shared);
+    CHECK(call32(ctx, kSceThreadmgr, kOpenSema, {guest_string("hidden")}) == err::kUnknownSemaphoreId);
+    CHECK(call32(ctx, kSceThreadmgr, kOpenSema, {guest_string("none")}) == err::kUnknownSemaphoreId);
+    CHECK(call32(ctx, kSceThreadmgr, kCloseSema, {u(shared)}) == 0);
+    CHECK(call32(ctx, kSceThreadmgr, kCloseSema, {0x1234}) == err::kUnknownSemaphoreId);
+}
