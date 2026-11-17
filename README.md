@@ -36,6 +36,7 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | `scripts/arm_check.py` | Checks psvdis against llvm-objdump over generated instruction corpora or a code file |
 | `scripts/probe_check.py` | Same-source differential tests: SDK-built C probes, recompiled, against the host build (needs the SDK) |
 | `scripts/program_check.py` | Whole SDK-built test programs, recompiled with the SDK's libc and libfios2 and booted on the runtime (needs the SDK) |
+| `scripts/hle_coverage.py` | Which system functions the runtime implements, per library, against the SDK's stubs and what given games import (needs the SDK) |
 | `tests` | Unit tests, the generator-versus-interpreter test and the runtime's tests (no game data or SDK files needed); `tests/probes` and `tests/programs` (sources for the SDK-built checks) |
 | `cmake`, `scripts` | Build helpers |
 | `docs` | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Status](docs/STATUS.md) · [Known issues](docs/KNOWN_ISSUES.md) · [Building](docs/BUILDING.md) |
@@ -68,6 +69,19 @@ psvinfo cpk --list data.cpk             # every file: path, ID, offset, stored a
 Names come from vita-headers' database (`third_party/vita-headers/db/360`) unless `--no-default-db` is given;
 `--db` adds more databases (`.yml`, `.tsv`, or folders of them). The `info` command also checks every relocation
 against the module's linked contents.
+
+`scripts/hle_coverage.py` measures the system libraries the runtime implements against the SDK's public API and,
+optionally, against what games import (game folders or modules as arguments; the reports are derived from them, so
+keep them outside the repository):
+
+```
+python scripts/hle_coverage.py --sdk C:/path/to/sdk --out coverage.md
+python scripts/hle_coverage.py --sdk C:/path/to/sdk --out coverage.md --imports-out imports.md "My Game=D:/games/PCSB00000"
+```
+
+For each library: the implemented functions of the reference, the percentage, what is missing and which of the given
+games import each missing function; with `--imports-out`, each game's imports against the runtime. See the script's
+help for how a game folder is read.
 
 `psvdis` disassembles raw code in the syntax llvm-objdump prints:
 
