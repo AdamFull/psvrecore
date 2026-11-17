@@ -1,6 +1,7 @@
 // The system's dialogs (SceCommonDialog): the message, save data, network check and trophy setup dialogs, without
 // drawing anything. One dialog at a time, as on the console: Init starts it (running), and the game's calls to
-// sceCommonDialogUpdate (each frame, to draw it) let it finish, with the answer a player gives most often:
+// sceCommonDialogUpdate (each frame, to draw it) let it finish, with the answer a player gives most often (a save
+// data dialog can then go on to another step, sceSaveDataDialogContinue, until the game finishes and ends it):
 // - messages with buttons: OK or Yes; messages that only wait (progress, "please wait") stay up until the game
 //   closes them (sceSaveDataDialogFinish), as on the console;
 // - save data: confirmations are confirmed, the fixed slot is the one the game named (it exists if its save data
@@ -81,7 +82,8 @@ bool find_slot(u32 id, SaveData::SlotParam* out) {
     nx::string host;
     if (runtime().files().resolve("savedata0:", &host, nullptr) < 0) return false;
     SaveData data(host);
-    return data.ok() && data.slot(id, out);
+    SaveData::SlotParam param{};
+    return data.ok() && data.slot(id, out ? out : &param);
 }
 
 i32 sceCommonDialogUpdate(Ptr<const void> param) {
@@ -225,7 +227,9 @@ i32 sceImeDialogTerm() { return term(Kind::Ime); }
 
 // ---- save data dialog
 
-i32 sceSaveDataDialogInit(Ptr<const u8> param) {
+// Init starts the dialog; Continue (`continuing`) gives the running one new contents (a progress message that then
+// says it is done, say), as if it had been started with them.
+i32 save_data_dialog(Ptr<const u8> param, bool continuing) {
     if (!param || !memory().valid(param.address, kParamBody + 76)) return kNull;
     const u32 p = param.address;
     const i32 mode = static_cast<i32>(word(p + kParamBody)), type = static_cast<i32>(word(p + kParamBody + 4));
@@ -236,10 +240,38 @@ i32 sceSaveDataDialogInit(Ptr<const u8> param) {
     u32 slot = 0;
     switch (mode) {
         case 1: slot = word(fixed), what = nx::format("slot {}", slot); break;  // (fixed: its target slot)
-        case 2: {  // (list: the slot it focuses on, else the first listed)
-            const u32 slots = word(list), count = word(list + 4), focus_id = word(list + 12);
-            slot = word(list + 8) == 8 ? focus_id : (count ? word(slots) : 0);
-            what = nx::format("list of {} \"{}\" (slot {} chosen)", count, text(word(list + 16), 128), slot);
+        case 2: {  // (list: the slot it focuses on is chosen)
+            // SceAppUtilSaveDataSlot (16 bytes) each: the slot's ID first. The focus: the list's head or tail (0,
+            // 1), its first or last empty slot (2, 3), its first or last with data (4, 5; the latest and oldest, 6
+            // and 7, taken as the first), or a slot by ID (8).
+            const u32 slots = word(list), count = std::min<u32>(word(list + 4), 1024), focus = word(list + 8);
+            nx::vector<u32> ids;
+            nx::vector<bool> exists;
+            nx::string listed;
+            for (u32 i = 0; i < count; ++i) {
+                const u32 id = word(slots + 16 * i);
+                ids.push_back(id);
+                exists.push_back(find_slot(id, nullptr));
+                listed += nx::format("{}{}{}", i ? " " : "", id, exists.back() ? "*" : "");
+            }
+            const auto first = [&](bool want, bool from_tail) -> u32 {
+                for (u32 k = 0; k < count; ++k) {
+                    const u32 i = from_tail ? count - 1 - k : k;
+                    if (exists[i] == want) return ids[i];
+                }
+                return count ? ids[from_tail ? count - 1 : 0] : 0;
+            };
+            switch (focus) {
+                case 1: slot = count ? ids[count - 1] : 0; break;
+                case 2: slot = first(false, false); break;
+                case 3: slot = first(false, true); break;
+                case 4: case 6: case 7: slot = first(true, false); break;
+                case 5: slot = first(true, true); break;
+                case 8: slot = word(list + 12); break;
+                default: slot = count ? ids[0] : 0; break;
+            }
+            what = nx::format("list \"{}\" of slots {} (* with data), focus {}: slot {} chosen", text(word(list + 16), 128),
+                              listed, focus, slot);
             break;
         }
         case 3: {
@@ -262,14 +294,32 @@ i32 sceSaveDataDialogInit(Ptr<const u8> param) {
     }
     Dialog& d = dialog();
     nx::scoped_lock<nx::mutex> held(d.lock);
+    if (continuing) {
+        // (on the console a step the player answered leaves the dialog running, its sub-status finished; here it
+        // finishes, so a finished dialog not yet ended continues too: the next step of the same dialog)
+        if (d.kind != Kind::SaveData || d.status == kStatusNone) return kNotRunning;
+        d.status = kStatusNone;  // (started again below with the new contents)
+    }
     if (const i32 r = start(Kind::SaveData, waits); r < 0) return r;
     d.mode = mode;
     d.button = 1;  // (OK, Yes)
     d.slot = slot;
     d.userdata = word(p + kParamBody + 40);
     d.slot_exists = find_slot(slot, &d.slot_param);
-    nx::logi(logs::hle, "save data dialog ({}): {}{}", type == 1 ? "save" : type == 2 ? "load" : type == 3 ? "delete" : "-", what,
+    nx::logi(logs::hle, "save data dialog{} ({}): {}{}", continuing ? " continued" : "",
+             type == 1 ? "save" : type == 2 ? "load" : type == 3 ? "delete" : "-", what,
              waits ? " (stays up until finished)" : " (answered OK/Yes)");
+    return 0;
+}
+i32 sceSaveDataDialogInit(Ptr<const u8> param) { return save_data_dialog(param, false); }
+i32 sceSaveDataDialogContinue(Ptr<const u8> param) { return save_data_dialog(param, true); }
+
+// Closes the part of the dialog shown over the game's own (its sub-status finished); the dialog stays running.
+i32 sceSaveDataDialogSubClose() {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (d.kind != Kind::SaveData || d.status == kStatusNone) return kNotRunning;
+    d.updated = true;
     return 0;
 }
 
@@ -287,8 +337,8 @@ i32 sceSaveDataDialogFinish(Ptr<const void> param) {
     if (!param) return kNull;
     Dialog& d = dialog();
     nx::scoped_lock<nx::mutex> held(d.lock);
-    if (d.kind != Kind::SaveData || d.status != kStatusRunning) return kNotRunning;
-    d.status = kStatusFinished;
+    if (d.kind != Kind::SaveData || d.status == kStatusNone) return kNotRunning;
+    d.status = kStatusFinished;  // (already, when its last step was answered)
     return 0;
 }
 
@@ -300,7 +350,8 @@ i32 sceSaveDataDialogGetResult(Ptr<u8> result) {
     Dialog& d = dialog();
     nx::scoped_lock<nx::mutex> held(d.lock);
     if (d.kind != Kind::SaveData || d.status == kStatusNone) return kNotInUse;
-    if (d.status != kStatusFinished) return kNotFinished;
+    // (a running dialog answers too once the part shown has finished: its sub-status, as on the console)
+    if (d.status != kStatusFinished && !(d.status == kStatusRunning && d.updated)) return kNotFinished;
     const u32 r = result.address;
     psv_st32(r, static_cast<u32>(d.mode));
     psv_st32(r + 4, static_cast<u32>(d.result));
@@ -312,6 +363,8 @@ i32 sceSaveDataDialogGetResult(Ptr<u8> result) {
             std::memcpy(memory().host(slot_param), &d.slot_param, sizeof(SaveData::SlotParam));
     }
     psv_st32(r + 20, d.userdata);
+    nx::logd(logs::hle, "save data dialog result: mode {}, result {}, button {}, slot {} ({})", d.mode, d.result, d.button,
+             d.slot, d.slot_exists ? "with data" : "empty");
     return 0;
 }
 
@@ -386,6 +439,8 @@ const Function kCommonDialog[] = {
     HLE_FUNCTION(0x6C49924B, sceSaveDataDialogFinish),
     HLE_FUNCTION(0xB2FF576E, sceSaveDataDialogGetResult),
     HLE_FUNCTION(0x2192A10A, sceSaveDataDialogTerm),
+    HLE_FUNCTION(0x19192C8B, sceSaveDataDialogContinue),
+    HLE_FUNCTION(0x415D6068, sceSaveDataDialogSubClose),
     HLE_FUNCTION(0xA38A4A0D, sceNetCheckDialogInit),
     HLE_FUNCTION(0x8027292A, sceNetCheckDialogGetStatus),
     HLE_FUNCTION(0xB05FCE9E, sceNetCheckDialogGetResult),
