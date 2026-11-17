@@ -3,8 +3,10 @@
 
 #include <initializer_list>
 
+#include "formats_builders.hpp"
 #include "nxtest.h"
 #include "psvrecore/analysis/program.hpp"
+#include "psvrecore/formats/elf.hpp"
 
 using namespace psvrecore;
 
@@ -78,4 +80,14 @@ TEST_CASE("analysis: a flag-setting copy between the compare and its branch give
     const auto* table = table_of(program);
     REQUIRE(table != nullptr);
     CHECK(!table->bounded);
+}
+
+// A fixed-address executable is loaded where it was linked: given those bases it loads, given others it is refused.
+TEST_CASE("analysis: a fixed-address executable loads at the bases it was linked at, and only there") {
+    auto bytes = test::module_elf();
+    bytes[0x10] = static_cast<u8>(elf::kTypeSceExec), bytes[0x11] = static_cast<u8>(elf::kTypeSceExec >> 8);
+    const u32 linked[] = {test::kBase0, test::kBase1}, moved[] = {0x82000000, 0x82010000};
+    CHECK(static_cast<bool>(analysis::Image::from_bytes(bytes)));
+    CHECK(static_cast<bool>(analysis::Image::from_bytes(bytes, linked)));
+    CHECK(!analysis::Image::from_bytes(bytes, moved));
 }

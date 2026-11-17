@@ -49,6 +49,7 @@ Result<Image> Image::from_bytes(std::span<const u8> data, std::span<const u32> b
     nx::vector<u32> all_bases;
     nx::vector<nx::vector<u8>> contents;
     usize loadable = 0;
+    bool moved = false;
     for (usize i = 0; i < file->segments().size(); ++i) {
         const auto& s = file->segments()[i];
         u32 base = s.vaddr;
@@ -56,6 +57,7 @@ Result<Image> Image::from_bytes(std::span<const u8> data, std::span<const u32> b
             if (!bases.empty()) {
                 if (loadable >= bases.size()) return failure(nx::format("no base given for loadable segment {}", i));
                 base = bases[loadable];
+                moved |= base != s.vaddr;
             }
             ++loadable;
         }
@@ -67,8 +69,9 @@ Result<Image> Image::from_bytes(std::span<const u8> data, std::span<const u32> b
     }
     if (!bases.empty() && bases.size() != loadable)
         return failure(nx::format("{} bases given for {} loadable segments", bases.size(), loadable));
-    if (!bases.empty() && file->type() == elf::kTypeSceExec)
-        return failure("a fixed-address executable cannot be moved");
+    // (a fixed-address executable may be given the bases it was linked at: the loader gives every module the bases
+    // its code was generated for)
+    if (moved && file->type() == elf::kTypeSceExec) return failure("a fixed-address executable cannot be moved");
 
     auto relocs = reloc::decode_all(*file);
     if (!relocs) return nx::err(relocs.error());
