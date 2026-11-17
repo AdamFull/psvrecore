@@ -16,6 +16,10 @@ namespace psvrecore::recomp {
 void register_module(const PsvModuleCode& module);
 void clear_modules();
 PsvFunction find_function(u32 code);
+// The import whose stub is at `code` (as the module's import_stubs give it), or nullptr. Calls and jumps through a
+// register to a stub (fixed-address code may build a stub's address with movw/movt) call the import, as the stub
+// would on the console.
+const PsvImport* find_import_stub(u32 code);
 // Puts `f` where the function at `code` was (its address as calls give it: bit 0 set for Thumb code), for the calls
 // that look it up (indirect calls and jumps: direct calls
 // are compiled to the function itself), and returns the one it replaces (nullptr: none was there). Before the

@@ -5,6 +5,11 @@
 // The functions' arguments are as libfios2's wrappers pass them (its own API, documented in the SDK, plus the process
 // in front): GetList02(process, min order, max order, ids, max ids, *actual count) and
 // ResolveWithRangeSync02(process, flags, in path, out path, max length, min order, max order).
+//
+// Older libfios2 builds (firmware 1.x: WipEout 2048's) import the same services from SceFios2Kernel, as
+// _sceFiosKernelOverlay*. Most take their arguments as the API does; GetList, ResolveSync and ResolveWithRangeSync
+// take the first three and a block of the rest on the caller's stack (laid out below, as libfios2's wrappers fill
+// it).
 
 #include "hle_common.hpp"
 
@@ -22,8 +27,7 @@ i32 sceFiosOverlayGetList02(i32 /*process*/, u32 /*min_order*/, u32 /*max_order*
     return err::kOk;
 }
 
-i32 sceFiosOverlayResolveWithRangeSync02(i32 /*process*/, i32 flags, Ptr<const char> in, Ptr<char> out, u32 max_length,
-                                         u32 /*min_order*/, u32 /*max_order*/) {
+i32 resolve_to_itself(i32 flags, Ptr<const char> in, Ptr<char> out, u32 max_length) {
     const nx::string path = str(in, 1024);
     nx::logd(logs::io, "fios overlay resolve '{}' (flags 0x{:x}): itself", path, static_cast<u32>(flags));
     if (!out || max_length == 0) return err::kOk;
@@ -34,8 +38,16 @@ i32 sceFiosOverlayResolveWithRangeSync02(i32 /*process*/, i32 flags, Ptr<const c
     return err::kOk;
 }
 
+i32 sceFiosOverlayResolveWithRangeSync02(i32 /*process*/, i32 flags, Ptr<const char> in, Ptr<char> out, u32 max_length,
+                                         u32 /*min_order*/, u32 /*max_order*/) {
+    return resolve_to_itself(flags, in, out, max_length);
+}
+
+thread_local bool g_overlays_disabled = false;  // (guest threads are host threads)
+
 i32 sceFiosOverlayThreadSetDisabled02(i32 disabled) {
     nx::logd(logs::io, "fios overlays for this thread {}", disabled ? "off" : "on");
+    g_overlays_disabled = disabled != 0;
     return err::kOk;
 }
 
@@ -47,6 +59,82 @@ i32 sceFiosOverlayAddForProcess02() { return unsupported("sceFiosOverlayAddForPr
 i32 sceFiosOverlayModifyForProcess02() { return unsupported("sceFiosOverlayModifyForProcess02"); }
 i32 sceFiosOverlayRemoveForProcess02() { return unsupported("sceFiosOverlayRemoveForProcess02"); }
 i32 sceFiosOverlayGetInfoForProcess02() { return unsupported("sceFiosOverlayGetInfoForProcess02"); }
+
+// ---- SceFios2Kernel (older libfios2)
+
+constexpr u32 kSceFios2Kernel = 0x8757B742;
+
+struct GetListArgs {  // GetList(process, min order, max order, this)
+    Ptr<i32> ids;
+    u32 max_ids;
+    Ptr<u32> actual;
+    u32 ids_size;  // (bytes: max_ids * 4, at most 0x200)
+};
+struct ResolveArgs {  // ResolveSync(process, flags, in path, this)
+    Ptr<char> out;
+    u32 max_length;
+    u32 in_length;  // (strlen(in) + 1)
+    u32 out_size;
+};
+struct ResolveWithRangeArgs {  // ResolveWithRangeSync(process, flags, in path, this)
+    Ptr<char> out;
+    u32 max_length;
+    u8 min_order, max_order, pad[2];
+    u32 in_length;
+    u32 out_size;
+};
+static_assert(sizeof(GetListArgs) == 16 && sizeof(ResolveArgs) == 16 && sizeof(ResolveWithRangeArgs) == 20);
+
+i32 _sceFiosKernelOverlayGetList(i32 process, u32 min_order, u32 max_order, Ptr<GetListArgs> args) {
+    if (!args || !readable(args.address, sizeof(GetListArgs))) return err::kFault;
+    const GetListArgs a = *args;
+    return sceFiosOverlayGetList02(process, min_order, max_order, a.ids, a.max_ids, a.actual);
+}
+i32 _sceFiosKernelOverlayResolveSync(i32 /*process*/, i32 flags, Ptr<const char> in, Ptr<ResolveArgs> args) {
+    if (!args || !readable(args.address, sizeof(ResolveArgs))) return err::kFault;
+    const ResolveArgs a = *args;
+    return resolve_to_itself(flags, in, a.out, a.max_length);
+}
+i32 _sceFiosKernelOverlayResolveWithRangeSync(i32 /*process*/, i32 flags, Ptr<const char> in,
+                                              Ptr<ResolveWithRangeArgs> args) {
+    if (!args || !readable(args.address, sizeof(ResolveWithRangeArgs))) return err::kFault;
+    const ResolveWithRangeArgs a = *args;
+    return resolve_to_itself(flags, in, a.out, a.max_length);
+}
+// Which of `available` I/O schedulers suits a path (its length in the block): libfios2 runs a path on its second
+// scheduler when the answer is 1. The host's files are all on one device: the first.
+i32 _sceFiosKernelOverlayGetRecommendedScheduler(i32 available, Ptr<const char> path, Ptr<const u32> /*length*/) {
+    nx::logd(logs::io, "fios scheduler for '{}' (of {}): the first", path ? str(path, 1024) : nx::string(), available);
+    return 0;
+}
+i32 _sceFiosKernelOverlayThreadSetDisabled(i32 disabled) { return sceFiosOverlayThreadSetDisabled02(disabled); }
+i32 _sceFiosKernelOverlayThreadIsDisabled() { return g_overlays_disabled ? 1 : 0; }
+i32 _sceFiosKernelOverlayAdd() { return unsupported("_sceFiosKernelOverlayAdd"); }
+i32 _sceFiosKernelOverlayAddForProcess() { return unsupported("_sceFiosKernelOverlayAddForProcess"); }
+i32 _sceFiosKernelOverlayModify() { return unsupported("_sceFiosKernelOverlayModify"); }
+i32 _sceFiosKernelOverlayModifyForProcess() { return unsupported("_sceFiosKernelOverlayModifyForProcess"); }
+i32 _sceFiosKernelOverlayRemove() { return unsupported("_sceFiosKernelOverlayRemove"); }
+i32 _sceFiosKernelOverlayRemoveForProcess() { return unsupported("_sceFiosKernelOverlayRemoveForProcess"); }
+i32 _sceFiosKernelOverlayGetInfo() { return unsupported("_sceFiosKernelOverlayGetInfo"); }
+i32 _sceFiosKernelOverlayGetInfoForProcess() { return unsupported("_sceFiosKernelOverlayGetInfoForProcess"); }
+
+// (the overlay directory functions, DH*, are not implemented: nothing has called them)
+const Function kFios2Kernel[] = {
+    HLE_FUNCTION(0x9379E2D5, _sceFiosKernelOverlayGetList),
+    HLE_FUNCTION(0xE9AE60FB, _sceFiosKernelOverlayResolveSync),
+    HLE_FUNCTION(0x8CCA471A, _sceFiosKernelOverlayResolveWithRangeSync),
+    HLE_FUNCTION(0xB02E0B26, _sceFiosKernelOverlayGetRecommendedScheduler),
+    HLE_FUNCTION(0x3E9172EA, _sceFiosKernelOverlayThreadSetDisabled),
+    HLE_FUNCTION(0x629F4FE4, _sceFiosKernelOverlayThreadIsDisabled),
+    HLE_FUNCTION(0x6DBCF0B2, _sceFiosKernelOverlayAdd),
+    HLE_FUNCTION(0x2A381357, _sceFiosKernelOverlayAddForProcess),
+    HLE_FUNCTION(0x6D6CDE05, _sceFiosKernelOverlayModify),
+    HLE_FUNCTION(0x6DF2FC05, _sceFiosKernelOverlayModifyForProcess),
+    HLE_FUNCTION(0xB4927173, _sceFiosKernelOverlayRemove),
+    HLE_FUNCTION(0xF8277E07, _sceFiosKernelOverlayRemoveForProcess),
+    HLE_FUNCTION(0xF44F3505, _sceFiosKernelOverlayGetInfo),
+    HLE_FUNCTION(0xBC6B3CC5, _sceFiosKernelOverlayGetInfoForProcess),
+};
 
 const Function kFios2User[] = {
     HLE_FUNCTION(0x1DD808D1, sceFiosOverlayGetList02),
@@ -60,6 +148,9 @@ const Function kFios2User[] = {
 
 }  // namespace
 
-void register_fios2() { register_library({"SceFios2User", kSceFios2User, kFios2User}); }
+void register_fios2() {
+    register_library({"SceFios2User", kSceFios2User, kFios2User});
+    register_library({"SceFios2Kernel", kSceFios2Kernel, kFios2Kernel});
+}
 
 }  // namespace psvrecore::runtime::hle

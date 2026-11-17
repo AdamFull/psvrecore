@@ -335,6 +335,23 @@ TEST_CASE("files: what the guest writes to stdout reaches the tty sink") {
     CHECK(captured == "line\n2+3");
 }
 
+TEST_CASE("files: a terminal opened by name (tty0:) reads nothing and writes to the tty sink") {
+    TestRuntime t;
+    static nx::string captured;
+    captured.clear();
+    t.rt.files().set_tty_sink(FileSystem::Sink([](i32, nx::string_view text) { captured += text; }));
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kOpen = 0x6C60AC61, kClose = 0xC70B8886, kRead = 0xFDB32293, kWrite = 0x34EFD876;
+    const i32 fd = call32(ctx, kSceLibKernel, kOpen, {guest_string("tty0:"), 0x3, 0});  // (libc's stdin: read-write)
+    CHECK(fd > 0);
+    CHECK(call32(ctx, kSceIofilemgr, kRead, {u(fd), guest_string("xxxx"), 4}) == 0);
+    CHECK(call32(ctx, kSceIofilemgr, kWrite, {u(fd), guest_string("hi"), 2}) == 2);
+    CHECK(captured == "hi");
+    CHECK(call32(ctx, kSceIofilemgr, kClose, {u(fd)}) == 0);
+    CHECK(call32(ctx, kSceIofilemgr, kClose, {u(fd)}) == err::kBadFile);
+    CHECK(call32(ctx, kSceLibKernel, kOpen, {guest_string("tty0x:"), 0x3, 0}) < 0);
+}
+
 TEST_CASE("files: a layered device shows the update's files over the base game's; folders list both") {
     TempDir dir;
     TestRuntime t;
@@ -434,6 +451,30 @@ TEST_CASE("timers: count microseconds of the process's time while started") {
     CHECK(call32(ctx, kSceThreadmgr, kDelete, {u(uid)}) == 0);
     CHECK(call32(ctx, kSceThreadmgr, kStart, {u(uid)}) == static_cast<i32>(0x80028241u));
     CHECK(call(ctx, kSceThreadmgr, kTime, {u(uid)}) == ~u64{0});
+}
+
+TEST_CASE("recomp: a call or jump through a register to an import's stub calls the import") {
+    static u32 calls = 0;
+    calls = 0;
+    static PsvImport imports[1] = {{0x11111111, 0x22222222, "SceTest", [](PsvContext* ctx, uint32_t) {
+                                        ++calls;
+                                        ctx->r[0] = 42;
+                                    }}};
+    static const u32 stubs[1] = {0x9F000010};  // (an ARM stub: even)
+    PsvModuleCode code{};
+    code.name = "stubs";
+    code.imports = imports;
+    code.import_count = 1;
+    code.import_stubs = stubs;
+    recomp::register_module(code);
+    CHECK(recomp::find_import_stub(0x9F000010) == &imports[0]);
+    CHECK(recomp::find_import_stub(0x9F000011) == nullptr);
+    PsvContext ctx{};
+    psv_call(&ctx, 0x9F000010, 0);
+    CHECK(calls == 1);
+    CHECK(ctx.r[0] == 42);
+    psv_jump(&ctx, 0x9F000010, 0, 0);
+    CHECK(calls == 2);
 }
 
 TEST_CASE("recomp: a function stood in for a registered one is what lookups find, and gives back the one it replaced") {

@@ -22,6 +22,14 @@ bool iequal(nx::string_view a, nx::string_view b) {
     return true;
 }
 
+// A terminal device: tty0:, tty1:, ... (libc opens tty0: for its standard streams).
+bool is_tty(nx::string_view path) {
+    if (path.size() < 5 || !iequal(path.substr(0, 3), "tty") || path.back() != ':') return false;
+    for (usize i = 3; i + 1 < path.size(); ++i)
+        if (path[i] < '0' || path[i] > '9') return false;
+    return true;
+}
+
 nx::string lowercase(nx::string_view s) {
     nx::string out;
     for (const char c : s) out.push_back(lower(c));
@@ -275,6 +283,12 @@ i32 FileSystem::add_handle(std::shared_ptr<Handle> h) {
 }
 
 i32 FileSystem::open(nx::string_view path, u32 flags, i32 /*mode*/) {
+    if (is_tty(path)) {  // (the console's terminal, as the standard streams: no input, output to the tty sink)
+        if (!(flags & (io::kRead | io::kWrite))) return err::kInvalid;
+        auto h = std::make_shared<Handle>();
+        h->tty = true;
+        return add_handle(std::move(h));
+    }
     Located at;
     if (const i32 r = locate(path, &at); r < 0) return r;
     if (at.empty_root()) return err::kIsDirectory;
@@ -308,7 +322,7 @@ i32 FileSystem::close(i32 fd) {
     nx::scoped_lock<nx::mutex> guard(lock_);
     auto it = handles_.find(fd);
     if (it == handles_.end() || it->second->directory) return err::kBadFile;
-    if (it->second->tty) return err::kOk;
+    if (it->second->tty && (fd == kStdin || fd == kStdout || fd == kStderr)) return err::kOk;
     handles_.erase(it);
     return err::kOk;
 }

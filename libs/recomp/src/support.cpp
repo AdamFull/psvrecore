@@ -22,6 +22,12 @@ nx::flat_hash_map<u32, PsvFunction>& functions() {
     return map;
 }
 
+// Each module's import stubs, by address. Registered with the functions.
+nx::flat_hash_map<u32, const PsvImport*>& import_stubs() {
+    static nx::flat_hash_map<u32, const PsvImport*> map;
+    return map;
+}
+
 [[noreturn]] void default_handler(PsvContext* ctx, const TrapInfo& trap) {
     nx::loge(logs::kernel, "recompiled code stopped: {}", describe(trap));
     if (ctx)
@@ -46,9 +52,20 @@ TrapHandler g_handler = nullptr;
 void register_module(const PsvModuleCode& module) {
     auto& map = functions();
     for (u32 i = 0; i < module.function_count; ++i) map[module.functions[i].address] = module.functions[i].function;
+    if (module.import_stubs)
+        for (u32 i = 0; i < module.import_count; ++i) import_stubs()[module.import_stubs[i]] = &module.imports[i];
 }
 
-void clear_modules() { functions().clear(); }
+void clear_modules() {
+    functions().clear();
+    import_stubs().clear();
+}
+
+const PsvImport* find_import_stub(u32 code) {
+    auto& map = import_stubs();
+    auto it = map.find(code);
+    return it == map.end() ? nullptr : it->second;
+}
 
 PsvFunction find_function(u32 code) {
     auto& map = functions();
@@ -115,6 +132,7 @@ void psv_trap(PsvContext* ctx, uint32_t pc, uint32_t kind) {
 
 void psv_call(PsvContext* ctx, uint32_t target, uint32_t ret) {
     if (PsvFunction f = find_function(target)) return f(ctx, ret);
+    if (const PsvImport* import = find_import_stub(target)) return psv_call_import(ctx, import, ret);
     TrapInfo t;
     t.pc = ret;
     t.kind = kTrapUnknownTarget;
@@ -124,6 +142,7 @@ void psv_call(PsvContext* ctx, uint32_t target, uint32_t ret) {
 
 void psv_jump(PsvContext* ctx, uint32_t target, uint32_t ret, uint32_t from) {
     if (PsvFunction f = find_function(target)) return f(ctx, ret);
+    if (const PsvImport* import = find_import_stub(target)) return psv_call_import(ctx, import, ret);
     TrapInfo t;
     t.pc = from;
     t.kind = kTrapUnknownTarget;

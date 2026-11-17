@@ -28,6 +28,8 @@ inline void put_name(char* out, nx::string_view name) {
 
 // True if [address, address + size) is guest memory the guest may write.
 inline bool writable(u32 address, u32 size) { return address && memory().valid(address, size, true); }
+// True if [address, address + size) is guest memory the guest may read.
+inline bool readable(u32 address, u32 size) { return address && memory().valid(address, size, false); }
 
 void register_threadmgr();
 void register_sysmem();
@@ -44,6 +46,8 @@ void register_apputil();
 void register_ngs();
 void register_avplayer();
 void register_system();
+void register_systemgesture();
+void register_motion();
 void register_fiber();
 void register_np();
 void register_videodec();

@@ -158,6 +158,10 @@ i32 sceKernelUnregisterThreadEventHandler(i32 /*uid*/) { return err::kOk; }
 i32 sceKernelCreateSema(Ptr<const char> name, u32 attr, i32 init, i32 max, Ptr<const void>) {
     return kernel().create_semaphore(str(name, 31), attr, init, max);
 }
+// The same, under the NID firmware 1.6x's libraries import it by (sceKernelCreateSema_16XX: WipEout 2048).
+i32 sceKernelCreateSema_16XX(Ptr<const char> name, u32 attr, i32 init, i32 max, Ptr<const void> option) {
+    return sceKernelCreateSema(name, attr, init, max, option);
+}
 i32 sceKernelDeleteSema(i32 uid) { return kernel().delete_semaphore(uid); }
 i32 sceKernelWaitSema(i32 uid, i32 count, Ptr<u32> t) { return kernel().wait_semaphore(uid, count, timeout(t), false); }
 i32 sceKernelWaitSemaCB(i32 uid, i32 count, Ptr<u32> t) { return kernel().wait_semaphore(uid, count, timeout(t), true); }
@@ -279,6 +283,8 @@ i32 sceKernelUnlockLwMutex(Ptr<u8> work, i32 count) {
     if (uid < 0) return uid;
     return kernel().unlock_mutex(uid, count, ObjectClass::LwMutex);
 }
+// The same, under the NID older SDKs' libraries import it by (WipEout 2048's libc and libfios2).
+i32 sceKernelUnlockLwMutex2(Ptr<u8> work, i32 count) { return sceKernelUnlockLwMutex(work, count); }
 i32 lw_mutex_info(i32 uid, Ptr<LwMutexInfo> out) {
     kernel::Mutex m;
     Uid owner = 0;
@@ -461,6 +467,7 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0xB295EB61, sceKernelGetTLSAddr),
     HLE_FUNCTION(0x6D8C0F13, sceKernelRegisterThreadEventHandler),
     HLE_FUNCTION(0x1BD67366, sceKernelCreateSema),
+    HLE_FUNCTION(0x297AA2AE, sceKernelCreateSema_16XX),
     HLE_FUNCTION(0x0C7B834B, sceKernelWaitSema),
     HLE_FUNCTION(0x174692B4, sceKernelWaitSemaCB),
     HLE_FUNCTION(0x66D6BF05, sceKernelCancelSema),
@@ -485,6 +492,7 @@ const Function kLibKernel[] = {
     HLE_FUNCTION(0x3148C6B6, sceKernelLockLwMutexCB),
     HLE_FUNCTION(0xA6A2C915, sceKernelTryLockLwMutex),
     HLE_FUNCTION(0x91FA6614, sceKernelUnlockLwMutex),
+    HLE_FUNCTION(0x120AFC8C, sceKernelUnlockLwMutex2),
     HLE_FUNCTION(0xF7D8F1FC, sceKernelGetLwMutexInfo),
     HLE_FUNCTION(0x4846613D, sceKernelGetLwMutexInfoById),
     HLE_FUNCTION(0x48C7EAE6, sceKernelCreateLwCond),
@@ -502,6 +510,7 @@ const Function kLibKernel[] = {
 
 const Function kThreadmgr[] = {
     HLE_FUNCTION(0x1D17DECF, sceKernelExitDeleteThread),
+    HLE_FUNCTION(0x0C8A38E1, sceKernelExitThread),  // (as older firmware exports it: SceThreadmgrCoredumpTime later)
     HLE_FUNCTION(0x1BBDE3D9, sceKernelDeleteThread),
     HLE_FUNCTION(0x4B675D05, sceKernelDelayThread),
     HLE_FUNCTION(0x9C0180E1, sceKernelDelayThreadCB),
