@@ -81,7 +81,8 @@ python scripts/hle_coverage.py --sdk C:/path/to/sdk --out coverage.md --imports-
 
 For each library: the implemented functions of the reference, the percentage, what is missing and which of the given
 games import each missing function; with `--imports-out`, each game's imports against the runtime. See the script's
-help for how a game folder is read.
+help for how a game folder is read. `--check` only checks the tables: an entry whose name the reference gives another
+NID (a mistyped NID) fails it.
 
 `psvdis` disassembles raw code in the syntax llvm-objdump prints:
 

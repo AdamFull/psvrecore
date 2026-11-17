@@ -261,6 +261,9 @@ def main():
     ap.add_argument('--out', help='the coverage report (default: standard output)')
     ap.add_argument('--imports-out', help='the per-game import survey (needs games)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--check', action='store_true',
+                    help='only check the tables: every entry whose name the reference gives another NID, or whose NID '
+                         'the reference names otherwise (exit status 1 if any)')
     ap.add_argument('games', nargs='*', help='[Name=]path: a game folder, executable or module')
     args = ap.parse_args()
 
@@ -271,6 +274,9 @@ def main():
     hle = read_hle(ROOT)
     sdk, _ = read_stubs(psvinfo, args.sdk)
     db, modules = read_db(args.db)
+
+    if args.check:
+        sys.exit(check_names(hle, sdk, db))
 
     games = []  # (name, {(lib, nid): (name, kind)}, own libs, files read, unreadable)
     if args.games:
@@ -386,6 +392,31 @@ def main():
             sys.exit('--imports-out needs games')
         with open(args.imports_out, 'w', encoding='utf-8', newline='\n') as f:
             f.write(imports_report(games, hle, name_of, imported_by, import_names))
+
+
+def check_names(hle, sdk, db):
+    """Entries whose name and NID disagree with the reference (the SDK's, else the database's): a NID mistyped, or a
+    function registered under another's name. Names are compared without a leading underscore; an entry whose
+    function is also registered at the reference's NID is an alias (an older NID of it) and is not reported."""
+    problems = 0
+    for lib in sorted(hle):
+        ref = sdk.get(lib) or db.get(lib) or {}
+        by_name = {}
+        for nid, (name, _) in ref.items():
+            by_name.setdefault(name.lstrip('_'), set()).add(nid)
+        for nid, (name, _) in sorted(hle[lib].items()):
+            key = name.lstrip('_')
+            if key in by_name and by_name[key] & set(hle[lib]):
+                continue  # (also registered at the reference's NID: this one is another NID for it, e.g. an older one)
+            if nid in ref and ref[nid][0].lstrip('_') != key and key in by_name:
+                print('%s: 0x%08X is %s in the reference, registered as %s' % (lib, nid, ref[nid][0], name))
+                problems += 1
+            elif nid not in ref and key in by_name:
+                print('%s: %s is 0x%s in the reference, registered as 0x%08X' % (
+                    lib, name, '/0x'.join('%08X' % n for n in sorted(by_name[key])), nid))
+                problems += 1
+    print('%d problems' % problems)
+    return 1 if problems else 0
 
 
 def imports_report(games, hle, name_of, imported_by, import_names):
