@@ -1077,3 +1077,122 @@ TEST_CASE("jpeg: pictures decode to the luma another decoder gives") {
     }
     CHECK(checked > 0);
 }
+
+TEST_CASE("sas: ADPCM and PCM voices play, loop, end and are shaped and mixed as set") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceSas = 0xEE47EC43, kSize = 0x180C6824, kInit = 0x449B5974, kExit = 0xBB7D6790, kGetGrain = 0x2BEA45BC,
+                  kCore = 0x7A4672B2, kCoreMix = 0xBD496983, kSetVoice = 0x2B75F9BC, kSetPcm = 0xB1756EFC,
+                  kVolume = 0x0BE8204D, kPitch = 0x2C48A08C, kSimple = 0xECCE0DB8, kKeyOn = 0xC838DB6F,
+                  kKeyOff = 0x5E42ADAB, kEnd = 0x007E63E6, kEnvelope = 0x296A9910, kOutputMode = 0x44DDB3C4,
+                  kFxType = 0xCDF2DDD5, kFxVolume = 0x55EDDBFA, kFx = 0xB0444E69, kPause = 0x59C7A9DF;
+    const u32 size = scratch(4), work = scratch(0x10000), out = scratch(256 * 4 * 2);
+    CHECK(u(call32(ctx, kSceSas, kCore, {out})) == 0x80420100u);  // (not started)
+    REQUIRE(call32(ctx, kSceSas, kSize, {0, size}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kInit, {0, work, psv_ld32(size)}) == 0);
+    CHECK(u(call32(ctx, kSceSas, kInit, {0, work, psv_ld32(size)})) == 0x80420101u);
+    CHECK(call32(ctx, kSceSas, kGetGrain, {}) == 256);
+    const auto sample = [&](u32 i, u32 c) { return static_cast<i16>(psv_ld16(out + (i * 2 + c) * 2)); };
+
+    // ADPCM blocks with filter 0 and shift 0: a nibble n decodes to n << 12. Each block's 28 samples here are one nibble.
+    const auto block = [&](u32 at, u32 flags, u32 nibble) {
+        u8* b = t.rt.memory().host(at);
+        b[0] = 0, b[1] = static_cast<u8>(flags);
+        std::memset(b + 2, static_cast<int>(nibble | (nibble << 4)), 14);
+    };
+    const u32 vag = scratch(64);
+    block(vag, 0, 2), block(vag + 16, 0, 2), block(vag + 32, 7, 5);  // (the third block ends the sound, unplayed)
+    REQUIRE(call32(ctx, kSceSas, kSetVoice, {0, vag, 48, 0}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kVolume, {0, 0x1000, 0x800, 0, 0}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kKeyOn, {0}) == 0);
+    CHECK(call32(ctx, kSceSas, kEnd, {0}) == 1);  // (until the next synthesis)
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    CHECK(sample(0, 0) == 8192);
+    CHECK(sample(0, 1) == 4096);
+    CHECK(sample(55, 0) == 8192);
+    CHECK(sample(56, 0) == 0);
+    CHECK(call32(ctx, kSceSas, kEnd, {0}) == 1);
+
+    // A loop: from block 0 (flags 6) to block 1 (flags 3), round and round until key off.
+    block(vag, 6, 1), block(vag + 16, 3, 3);
+    REQUIRE(call32(ctx, kSceSas, kSetVoice, {0, vag, 48, 1}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kKeyOn, {0}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    CHECK(sample(0, 0) == 4096);
+    CHECK(sample(28, 0) == 12288);
+    CHECK(sample(56, 0) == 4096);
+    CHECK(sample(255, 0) == 12288);  // (255 = 4 * 56 + 31)
+    CHECK(call32(ctx, kSceSas, kEnd, {0}) == 0);
+    CHECK(call32(ctx, kSceSas, kEnvelope, {0}) == 0x40000000);
+    REQUIRE(call32(ctx, kSceSas, kKeyOff, {0}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    CHECK(call32(ctx, kSceSas, kEnd, {0}) == 1);
+
+    // PCM, looping from sample 2; at half pitch, every other sample interpolated.
+    const u32 pcm = scratch(8);
+    const i16 ramp[4] = {0, 1000, 2000, 3000};
+    std::memcpy(t.rt.memory().host(pcm), ramp, 8);
+    REQUIRE(call32(ctx, kSceSas, kSetPcm, {1, pcm, 4, 2}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kVolume, {1, 0x1000, 0x1000, 0, 0}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kKeyOn, {1}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    const i16 looped[8] = {0, 1000, 2000, 3000, 2000, 3000, 2000, 3000};
+    for (u32 i = 0; i < 8; ++i) CHECK(sample(i, 0) == looped[i]);
+    CHECK(u(call32(ctx, kSceSas, kPitch, {1, 0})) == 0x80420012u);
+    REQUIRE(call32(ctx, kSceSas, kPitch, {1, 0x800}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kKeyOn, {1}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    for (u32 i = 0; i < 6; ++i) CHECK(sample(i, 0) == static_cast<i16>(500 * i));
+    // (paused: silent, its place kept)
+    REQUIRE(call32(ctx, kSceSas, kPause, {1, 1}) == 0);
+    CHECK(u(call32(ctx, kSceSas, kKeyOn, {1})) == 0x80420016u);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    CHECK(sample(10, 0) == 0);
+    REQUIRE(call32(ctx, kSceSas, kPause, {1, 0}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kKeyOff, {1}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+
+    // The simple envelope: attack rate 0 (the fastest: 7/16 of the height a sample), sustain level 15 (the top),
+    // sustain rate 0x7F (held).
+    block(vag, 0, 2), block(vag + 16, 0, 2), block(vag + 32, 7, 0);
+    REQUIRE(call32(ctx, kSceSas, kSetVoice, {0, vag, 48, 0}) == 0);
+    CHECK(u(call32(ctx, kSceSas, kSimple, {0, 0x000F, 1u << 13})) == 0x80420013u);  // (no such sustain shape)
+    REQUIRE(call32(ctx, kSceSas, kSimple, {0, 0x000F, 0x7Fu << 6}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kKeyOn, {0}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    CHECK(sample(0, 0) == 3584);
+    CHECK(sample(1, 0) == 7168);
+    CHECK(sample(2, 0) == 8192);
+
+    // Mixed with what is in the buffer.
+    REQUIRE(call32(ctx, kSceSas, kKeyOn, {0}) == 0);
+    for (u32 i = 0; i < 512; ++i) psv_st16(out + 2 * i, 1000);
+    REQUIRE(call32(ctx, kSceSas, kCoreMix, {out, 0x800, 0x1000}) == 0);
+    CHECK(sample(2, 0) == 8192 + 500);
+    CHECK(sample(2, 1) == 4096 + 1000);
+    CHECK(sample(100, 0) == 500);
+
+    // The delay effect: the wet mix, 256 samples later.
+    REQUIRE(call32(ctx, kSceSas, kKeyOff, {0}) == 0);
+    const u32 one = scratch(2);
+    psv_st16(one, 10000);
+    REQUIRE(call32(ctx, kSceSas, kSetPcm, {2, one, 1, u(-1)}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kVolume, {2, 0, 0, 0x1000, 0x1000}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kFxType, {7}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kFxVolume, {0x1000, 0x1000}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kFx, {1, 1}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kKeyOn, {2}) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    CHECK(sample(0, 0) == 0);
+    REQUIRE(call32(ctx, kSceSas, kCore, {out}) == 0);
+    CHECK(sample(0, 0) == 10000);
+    CHECK(sample(0, 1) == 10000);
+    CHECK(sample(1, 0) == 0);
+
+    REQUIRE(call32(ctx, kSceSas, kOutputMode, {1}) == 0);
+    CHECK(u(call32(ctx, kSceSas, kFxType, {0})) == 0x80420024u);
+    const u32 back = scratch(4), back_size = scratch(4);
+    REQUIRE(call32(ctx, kSceSas, kExit, {back, back_size}) == 0);
+    CHECK(psv_ld32(back) == work);
+    CHECK(u(call32(ctx, kSceSas, kExit, {back, back_size})) == 0x80420100u);
+}

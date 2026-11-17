@@ -423,6 +423,7 @@ void register_system_libraries() {
     register_codecengine();
     register_ime();
     register_voice();
+    register_sas();
     register_commondialog();
 }
 
