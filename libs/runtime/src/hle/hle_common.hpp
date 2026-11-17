@@ -56,6 +56,7 @@ void register_online();
 void register_net();
 void register_psn();
 void register_services();
+void register_audiodec();
 void register_videodec();
 void register_commondialog();
 

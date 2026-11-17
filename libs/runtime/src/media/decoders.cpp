@@ -231,6 +231,7 @@ bool AacDecoder::decode(std::span<const u8> frame, nx::vector<i16>& pcm) {
 }
 
 u32 AacDecoder::sample_rate() const { return static_cast<u32>(s_->ext.samplingRate); }
+u32 AacDecoder::bytes_used() const { return static_cast<u32>(s_->ext.inputBufferUsedLength); }
 
 void AacDecoder::reset() {
     if (s_->memory) PVMP4AudioDecoderResetBuffer(s_->memory);

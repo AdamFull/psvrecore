@@ -418,6 +418,7 @@ void register_system_libraries() {
     register_net();
     register_psn();
     register_services();
+    register_audiodec();
     register_videodec();
     register_commondialog();
 }

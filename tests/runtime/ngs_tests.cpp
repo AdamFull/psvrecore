@@ -928,3 +928,107 @@ TEST_CASE("ngs: stereo VAG made by vagconv2 plays back both channels of its sour
     }
     CHECK(checked > 0);
 }
+
+// The audio decoder library (SceAudiodecUser) on the same ATRAC9 data: frame by frame, then 8 at a time; what it
+// decodes is at9tool's decoding (after the encoder's delay, found as the offset where they agree).
+TEST_CASE("audiodec: ATRAC9 frames decode as at9tool decodes them; the library's handles and errors") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceAudiodecUser = 0x2AA62046, kInit = 0x445C2CEF, kTerm = 0x45719B9D, kCreate = 0x4DFD3AAA,
+                  kDelete = 0xE7A24E16, kDecode = 0xCCDABA04, kDecodeN = 0x8018AA9B, kClear = 0xF72F9B64;
+    constexpr u32 kAt9 = 0x1003, kAac = 0x1005, kMp3 = 0x1004;
+    const u32 init = scratch(8), ctrl = scratch(40), info = scratch(32);
+    psv_st32(init, 8), psv_st32(init + 4, 4);
+    const auto make_ctrl = [&] {
+        std::memset(t.rt.memory().host(ctrl), 0, 40);
+        psv_st32(ctrl, 40);
+        psv_st32(ctrl + 32, 16);
+        psv_st32(ctrl + 36, info);
+    };
+    make_ctrl();
+    CHECK(u(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kAt9})) == 0x807F0005u);  // (not initialized)
+    REQUIRE(call32(ctx, kSceAudiodecUser, kInit, {kAt9, init}) == 0);
+    CHECK(u(call32(ctx, kSceAudiodecUser, kInit, {kAt9, init})) == 0x807F0003u);
+    CHECK(u(call32(ctx, kSceAudiodecUser, kInit, {0x1234, init})) == 0x807F0001u);
+    std::memset(t.rt.memory().host(info), 0, 32);
+    psv_st32(info, 28);
+    CHECK(u(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kAt9})) == 0x807F2000u);  // (no configuration)
+    // AAC: channels checked; MP3: no decoder here.
+    REQUIRE(call32(ctx, kSceAudiodecUser, kInit, {kAac, init}) == 0);
+    make_ctrl();
+    psv_st32(info, 20), psv_st32(info + 4, 1), psv_st32(info + 8, 3), psv_st32(info + 12, 48000), psv_st32(info + 16, 0);
+    CHECK(u(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kAac})) == 0x807F3000u);
+    psv_st32(info + 8, 2);
+    REQUIRE(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kAac}) == 0);
+    CHECK(psv_ld32(ctrl + 28) == 2048 * 2 * 2);  // (the most PCM a call writes)
+    CHECK(call32(ctx, kSceAudiodecUser, kDelete, {ctrl}) == 0);
+    CHECK(u(call32(ctx, kSceAudiodecUser, kDelete, {ctrl})) == 0x807F0009u);
+    REQUIRE(call32(ctx, kSceAudiodecUser, kInit, {kMp3, init}) == 0);
+    CHECK(u(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kMp3})) == 0x807F000Eu);
+    CHECK(call32(ctx, kSceAudiodecUser, kTerm, {kMp3}) == 0);
+    CHECK(call32(ctx, kSceAudiodecUser, kTerm, {kAac}) == 0);
+
+    const auto dir = nx::os::environment_variable("PSVRECORE_AT9_DIR");
+    if (!dir) {
+        std::printf("(PSVRECORE_AT9_DIR not set: no ATRAC9 data to check)\n");
+        return;
+    }
+    auto entries = nx::fs::directory_entries(nx::fs::path_view(*dir));
+    REQUIRE(entries.has_value());
+    u32 checked = 0;
+    for (const auto& e : *entries) {
+        const nx::string path(e.path);
+        if (path.size() < 4 || path.substr(path.size() - 4) != ".at9") continue;
+        const nx::vector<u8> at9 = read_file(path);
+        const nx::vector<u8> wav = read_file(path.substr(0, path.size() - 4) + ".wav");
+        const auto fmt = riff_chunk(at9, "fmt "), data = riff_chunk(at9, "data"), ref = riff_chunk(wav, "data");
+        REQUIRE(fmt.size() >= 48);
+        u16 channels;
+        std::memcpy(&channels, fmt.data() + 2, 2);
+        make_ctrl();
+        std::memset(t.rt.memory().host(info), 0, 32);
+        psv_st32(info, 28);
+        std::memcpy(t.rt.memory().host(info + 4), fmt.data() + 44, 4);
+        REQUIRE(call32(ctx, kSceAudiodecUser, kCreate, {ctrl, kAt9}) == 0);
+        CHECK(psv_ld32(info + 8) == channels);
+        CHECK(psv_ld32(info + 16) == 48000);
+        const u32 es_max = psv_ld32(ctrl + 16), pcm_max = psv_ld32(ctrl + 28);
+        const u32 es = aligned(static_cast<u32>(data.size()) + 4096), pcm = aligned(pcm_max * 8);
+        std::memcpy(t.rt.memory().host(es), data.data(), data.size());
+        psv_st32(ctrl + 8, es), psv_st32(ctrl + 20, pcm);
+        nx::vector<i16> got;
+        u32 at = 0;
+        for (u32 call = 0; at + es_max * 8 <= data.size(); ++call) {
+            psv_st32(ctrl + 8, es + at);
+            const bool n8 = call % 2 == 1;  // (one frame, then eight)
+            REQUIRE(call32(ctx, kSceAudiodecUser, n8 ? kDecodeN : kDecode, n8 ? std::initializer_list<u32>{ctrl, 8}
+                                                                               : std::initializer_list<u32>{ctrl}) == 0);
+            CHECK(psv_ld32(ctrl + 12) > 0);
+            CHECK(psv_ld32(ctrl + 12) <= es_max * (n8 ? 8 : 1));
+            const u32 written = psv_ld32(ctrl + 24);
+            CHECK(written == pcm_max * (n8 ? 8 : 1));
+            const i16* p = reinterpret_cast<const i16*>(t.rt.memory().host(pcm));
+            got.insert(got.end(), p, p + written / 2);
+            at += psv_ld32(ctrl + 12);
+        }
+        // (at9tool's decoding starts after the encoder's delay: the offset where the two agree best)
+        const usize ref_samples = ref.size() / 2;
+        usize best = 0, best_differ = ~usize{0};
+        for (usize delay = 0; delay <= 4096 && delay < got.size(); delay += channels) {
+            usize differ = 0;
+            for (usize i = 0; i < 20000 && delay + i < got.size() && i < ref_samples; ++i) {
+                i16 want;
+                std::memcpy(&want, ref.data() + i * 2, 2);
+                differ += got[delay + i] != want;
+            }
+            if (differ < best_differ) best_differ = differ, best = delay;
+        }
+        CHECK(best_differ == 0);
+        std::printf("audiodec: %s: %zu samples, the encoder delay %zu, %zu differ\n", path.c_str(), got.size(), best / channels,
+                    best_differ);
+        CHECK(call32(ctx, kSceAudiodecUser, kClear, {ctrl}) == 0);
+        CHECK(call32(ctx, kSceAudiodecUser, kDelete, {ctrl}) == 0);
+        ++checked;
+    }
+    CHECK(checked > 0);
+}

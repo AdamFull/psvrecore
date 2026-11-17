@@ -8,6 +8,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/commondialog.cpp
     src/hle/avplayer.cpp
     src/hle/audioout.cpp
+    src/hle/audiodec.cpp
     src/hle/ctrl.cpp
     src/hle/fiber.cpp
     src/hle/fios2.cpp

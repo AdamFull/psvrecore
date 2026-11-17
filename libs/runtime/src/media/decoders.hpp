@@ -57,6 +57,8 @@ public:
     // Decodes one frame into interleaved stereo (1024 samples per channel, 2048 with SBR); false on an error.
     bool decode(std::span<const u8> frame, nx::vector<i16>& pcm);
     u32 sample_rate() const;
+    // The bytes of its input the last decode() used (a raw frame may be followed by the next).
+    u32 bytes_used() const;
     void reset();
 
 private:
