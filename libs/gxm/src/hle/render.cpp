@@ -523,6 +523,7 @@ struct Renderer {
     // the flusher thread as soon as the GPU is done with it.
     struct Pending {
         u64 number = 0;  // (in submission order, from 1)
+        u64 index = 0;   // (Renderer::scenes when it was rendered: what CachedTexture::used counts)
         DepthTarget* kept_depth = nullptr;  // (the kept depth image it drew with, and whether it stores it)
         bool stores_kept_depth = false;
         DepthTarget* depth_sources[2] = {};  // (the kept images it copies its depth and stencil from)
@@ -533,6 +534,9 @@ struct Renderer {
     };
     nx::vector<Pending> pending;
     std::atomic<u32> pending_count{0};
+    // Cached textures' images let go while a pending scene may still sample them (retire_image), with the scene
+    // count (`scenes`) then: destroyed once no scene rendered by then is pending.
+    nx::vector<std::pair<vk::Image, u64>> retired;
     // The scenes ended and not yet rendered, in order (end_scene; the renderer's thread renders them), numbered from
     // 1 as they end; `rendered` the last that thread is done with.
     struct Ended {
@@ -695,6 +699,32 @@ struct TargetsHeld {
 // The pending scenes finished, oldest first: all of them but the newest `keep`, or only those the GPU is done with
 // (`all` false). Under targets_lock.
 void finish_pending(Renderer& r, bool all, usize keep = 0);
+
+// A cached texture's image given up (evicted, or a reused one whose scene failed): destroyed now only if no pending
+// scene can sample it, else once the scenes rendered up to now are finished. A scene's descriptors name the image's
+// view until the GPU is done with it, and up to kScenesInFlight - 1 scenes are still on the GPU when the next
+// starts: destroyed earlier, the GPU read freed memory and descriptors (the validation layer's
+// VUID-vkDestroyImage-image-01000).
+void retire_image(Renderer& r, vk::Image& image) {
+    if (!image.image) return;
+    if (r.pending.empty()) {
+        vk::destroy_image(*r.device, image);
+        return;
+    }
+    r.retired.push_back({image, r.scenes});
+    image = {};
+}
+
+// The retired images no pending scene can sample any more, destroyed.
+void destroy_retired(Renderer& r) {
+    if (r.retired.empty()) return;
+    const u64 oldest = r.pending.empty() ? ~u64{0} : r.pending.front().index;
+    std::erase_if(r.retired, [&](std::pair<vk::Image, u64>& x) {
+        if (x.second >= oldest) return false;
+        vk::destroy_image(*r.device, x.first);
+        return true;
+    });
+}
 
 // How many scenes the GPU may have in flight (a frame's worth: the CPU prepares a frame's scenes while the GPU draws
 // them one after another; a scene is waited for only when the GPU is that far behind).
@@ -2035,7 +2065,7 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
             auto buffer = texels ? vk::create_host_buffer(*r.device, texels->data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
                                  : Result<vk::Buffer>(failure("texture: the columns past the surface"));
             if (!buffer) {
-                vk::destroy_image(*r.device, c.image);
+                retire_image(r, c.image);
                 r.texture_bytes -= c.bytes;
                 return nullptr;
             }
@@ -2127,7 +2157,7 @@ void finish_target_copies(Renderer& r, bool recorded) {
             give_upload(r, u);
             if (auto it = r.textures.find(u.key); it != r.textures.end()) {
                 r.texture_bytes -= it->second.bytes;
-                vk::destroy_image(*r.device, it->second.image);
+                retire_image(r, it->second.image);
                 r.textures.erase(it);
             }
         }
@@ -2138,7 +2168,7 @@ void finish_target_copies(Renderer& r, bool recorded) {
         if (recorded) continue;
         if (auto it = r.textures.find(c.key); it != r.textures.end()) {
             r.texture_bytes -= it->second.bytes;
-            vk::destroy_image(*r.device, it->second.image);
+            retire_image(r, it->second.image);
             r.textures.erase(it);
         }
     }
@@ -2313,7 +2343,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
                 r.textures.erase(old);
                 if (!queue()) {
                     r.texture_bytes -= c.bytes;
-                    vk::destroy_image(*r.device, c.image);
+                    retire_image(r, c.image);
                     r.by_words.erase(words_key);
                     return nullptr;
                 }
@@ -2345,8 +2375,8 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     return &it->second;
 }
 
-// The cached textures no scene has used for a while, and the least recently used past the budget, destroyed (at a
-// scene's start: the scenes before are done on the GPU).
+// The cached textures no scene has used for a while, and the least recently used past the budget, let go (at a
+// scene's start; the scenes before may still be on the GPU: retire_image keeps what they sample until they are done).
 void evict_textures(Renderer& r) {
     if (r.scenes % 32 != 0 && r.texture_bytes <= kTextureBudget) return;
     nx::vector<std::pair<u64, u64>> by_age;  // (last used, key)
@@ -2357,7 +2387,7 @@ void evict_textures(Renderer& r) {
         if (used + kept >= r.scenes && r.texture_bytes <= kTextureBudget) break;
         auto it = r.textures.find(key);
         r.texture_bytes -= it->second.bytes;
-        vk::destroy_image(*r.device, it->second.image);
+        retire_image(r, it->second.image);
         r.textures.erase(it);
     }
 }
@@ -3184,6 +3214,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             Renderer::Pending pending;
             pending.shot = std::move(shot);
             pending.number = number;
+            pending.index = r.scenes;
             r.submitted = number;
             pending.finish = [notes = std::move(notifications)](bool) {
                 for (const Notification& n : notes) notify(n);
@@ -4401,6 +4432,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     }
     pending.shot = std::move(shot);
     pending.number = number;
+    pending.index = r.scenes;
     r.submitted = number;
     g_profile.mark(6);
     // (the scenes the GPU is done with; and the oldest, waited for, when it has kScenesInFlight with this one)
@@ -4444,6 +4476,7 @@ void finish_pending(Renderer& r, bool all, usize keep) {
         }
         r.pending.erase(r.pending.begin());
     }
+    destroy_retired(r);
     r.pending_count.store(static_cast<u32>(r.pending.size()), std::memory_order_release);
 }
 
