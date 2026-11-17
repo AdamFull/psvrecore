@@ -156,6 +156,27 @@ i32 sceGxmNotificationWait(Ptr<const Notification> n) {
     return 0;
 }
 
+// Waits for the GPU to signal something (a scene done, a notification written) between a game's polls: scenes are
+// rendered when they end, so what they signal is signalled once those pending now are finished.
+i32 sceGxmWaitEvent() {
+    if (!state().initialized) return err::kUninitialized;
+    finish_scenes();
+    return 0;
+}
+
+// A fence between vertex processing and what follows: draws are rendered in order, so there is nothing to wait for.
+i32 sceGxmVertexFence(u32 context) { return context ? 0 : err::kInvalidPointer; }
+
+// The parameter buffer's size for geometry: the size given at sceGxmInitialize, or the default (none of it is
+// reserved here).
+i32 sceGxmGetParameterBufferThreshold(Ptr<u32> size) {
+    if (!state().initialized) return err::kUninitialized;
+    if (!size || !valid(size.address, 4)) return err::kInvalidPointer;
+    const u32 given = state().init.parameter_buffer_size;
+    *size = given ? given : 16u * 1024 * 1024;  // (SCE_GXM_DEFAULT_PARAMETER_BUFFER_SIZE when none was given)
+    return 0;
+}
+
 i32 sceGxmFinish(u32 context) {
     if (!context) return err::kInvalidPointer;
     finish_scenes();
@@ -313,6 +334,9 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0x889AE88C, sceGxmSyncObjectDestroy),
     HLE_FUNCTION(0x9F448E79, sceGxmNotificationWait),
     HLE_FUNCTION(0x0733D8AE, sceGxmFinish),
+    HLE_FUNCTION(0x8BD94593, sceGxmWaitEvent),
+    HLE_FUNCTION(0xE05277D6, sceGxmVertexFence),
+    HLE_FUNCTION(0x6ABF3F76, sceGxmGetParameterBufferThreshold),
     HLE_FUNCTION(0xEC5C26B5, sceGxmDisplayQueueAddEntry),
     HLE_FUNCTION(0xB98C5B0D, sceGxmDisplayQueueFinish),
     HLE_FUNCTION(0x3D25FCE9, sceGxmPadHeartbeat),

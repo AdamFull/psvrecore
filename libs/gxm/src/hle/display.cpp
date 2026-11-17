@@ -1,6 +1,7 @@
 // The display (SceDisplay): the frame buffer shown, and vertical blanks at the display's refresh rate on the host
 // clock. Also the thread of GXM's display queue, which calls the game's display callback for each queued frame.
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -160,6 +161,117 @@ i32 sceDisplayWaitSetFrameBuf() { return sceDisplayWaitVblankStart(); }
 i32 sceDisplayWaitSetFrameBufMulti(u32 count) { return sceDisplayWaitVblankStartMulti(count); }
 i32 sceDisplayWaitSetFrameBufCB() { return sceDisplayWaitVblankStartCB(); }
 
+i32 sceDisplayWaitSetFrameBufMultiCB(u32 count) { return sceDisplayWaitVblankStartMultiCB(count); }
+
+// Vertical blank callbacks: each registered callback is notified at every blank, by a thread of the runtime's (as
+// the display driver notifies them); it runs when its thread checks callbacks (a CB wait).
+struct VblankCallbacks {
+    nx::mutex lock;
+    nx::vector<i32> uids;
+    bool stop = false;
+    nx::thread thread;
+};
+VblankCallbacks& vblank_callbacks() {
+    static VblankCallbacks v;
+    return v;
+}
+
+void vblank_main() {
+    VblankCallbacks& v = vblank_callbacks();
+    runtime::Kernel& k = runtime::runtime().kernel();
+    k.adopt_host_thread("SceDisplayVblank", 64);
+    try {
+        u64 next = vcount_at(now_ns()) + 1;
+        while (true) {
+            nx::vector<i32> uids;
+            {
+                nx::scoped_lock<nx::mutex> held(v.lock);
+                if (v.stop || v.uids.empty()) break;
+            }
+            const u64 at = static_cast<u64>(std::ceil(static_cast<f64>(next) * period_ns()));
+            if (const u64 t = now_ns(); t < at) k.delay_thread(static_cast<u32>((at - t + 999) / 1000), false);
+            const u64 vcount = vcount_at(now_ns());
+            if (vcount < next) continue;
+            next = vcount + 1;
+            {
+                nx::scoped_lock<nx::mutex> held(v.lock);
+                uids = v.uids;
+            }
+            for (i32 uid : uids) k.notify_callback(uid, 0);
+        }
+    } catch (...) {
+        // (the kernel shutting down ends the thread's wait)
+    }
+    k.release_host_thread();
+}
+
+// (the thread ended, waited for without the guest CPU the caller holds)
+void stop_vblank_thread() {
+    VblankCallbacks& v = vblank_callbacks();
+    nx::thread ended;
+    {
+        nx::scoped_lock<nx::mutex> held(v.lock);
+        v.stop = true;
+        ended = std::move(v.thread);
+    }
+    if (ended.joinable()) {
+        if (runtime::Kernel::current()) {
+            runtime::Kernel::Blocking blocking(runtime::runtime().kernel());
+            ended.join();
+        } else {
+            ended.join();
+        }
+    }
+}
+
+i32 sceDisplayRegisterVblankStartCallback(i32 uid) {
+    if (runtime::runtime().kernel().callback_count(uid) < 0) return kErrorInvalidValue;
+    VblankCallbacks& v = vblank_callbacks();
+    bool start = false;
+    {
+        nx::scoped_lock<nx::mutex> held(v.lock);
+        if (std::find(v.uids.begin(), v.uids.end(), uid) != v.uids.end()) return kErrorInvalidValue;
+        v.uids.push_back(uid);
+        start = v.uids.size() == 1;
+    }
+    if (start) {
+        stop_vblank_thread();  // (one that ended, joined)
+        nx::scoped_lock<nx::mutex> held(v.lock);
+        v.stop = false;
+        nx::thread_options options;
+        options.name = "display vblank callbacks";
+        v.thread = nx::thread([] { vblank_main(); }, options);
+    }
+    return 0;
+}
+i32 sceDisplayUnregisterVblankStartCallback(i32 uid) {
+    VblankCallbacks& v = vblank_callbacks();
+    bool last = false;
+    {
+        nx::scoped_lock<nx::mutex> held(v.lock);
+        auto it = std::find(v.uids.begin(), v.uids.end(), uid);
+        if (it == v.uids.end()) return kErrorInvalidValue;
+        v.uids.erase(it);
+        last = v.uids.empty();
+    }
+    if (last) stop_vblank_thread();
+    return 0;
+}
+
+// The output's resolution (the LCD's: 960x544 at the refresh rate), for display head 0 (the main display).
+struct ResolutionInfo {
+    u32 size, screen_mode, width, height, output_format, scan_mode;
+    f32 fps;
+};
+static_assert(sizeof(ResolutionInfo) == 28);
+i32 sceDisplayGetResolutionInfoInternal(i32 head, Ptr<ResolutionInfo> info, Ptr<const u32> opt) {
+    if (!info || !opt || !runtime::runtime().memory().valid(info.address, sizeof(ResolutionInfo), true)) return kErrorInvalidValue;
+    if (head != 0 || info->size != sizeof(ResolutionInfo)) return kErrorInvalidValue;
+    ResolutionInfo r{sizeof(ResolutionInfo), 0, 960, 544, 0, 0, static_cast<f32>(runtime::runtime().config().refresh_hz)};
+    *info = r;
+    return 0;
+}
+
 i32 sceDisplayGetVcount() { return static_cast<i32>(vcount_at(now_ns()) & 0xFFFF); }
 
 i32 sceDisplayGetRefreshRate(Ptr<f32> hz) {
@@ -182,6 +294,9 @@ const runtime::hle::Function kDisplayFunctions[] = {
     HLE_FUNCTION(0x9423560C, sceDisplayWaitSetFrameBuf),
     HLE_FUNCTION(0x7D9864A8, sceDisplayWaitSetFrameBufMulti),
     HLE_FUNCTION(0x814C90AF, sceDisplayWaitSetFrameBufCB),
+    HLE_FUNCTION(0x3E796EF5, sceDisplayWaitSetFrameBufMultiCB),
+    HLE_FUNCTION(0x6BDF4C4D, sceDisplayRegisterVblankStartCallback),
+    HLE_FUNCTION(0x98436A80, sceDisplayUnregisterVblankStartCallback),
     HLE_FUNCTION(0xB6FDE0BA, sceDisplayGetVcount),
     HLE_FUNCTION(0xA08CA60D, sceDisplayGetRefreshRate),
     HLE_FUNCTION(0xF51523CB, sceDisplaySetFrameBuf),  // (_sceDisplaySetFrameBuf)
@@ -191,6 +306,7 @@ const runtime::hle::Function kDisplayUserFunctions[] = {
     HLE_FUNCTION(0x7A410B64, sceDisplaySetFrameBuf),
     HLE_FUNCTION(0x42AE6BBC, sceDisplayGetFrameBuf),
     HLE_FUNCTION(0x8848ADDD, sceDisplayGetMaximumFrameBufResolution),
+    HLE_FUNCTION(0x0BFB78C6, sceDisplayGetResolutionInfoInternal),
 };
 
 // ---- The display queue thread ----------------------------------------------------------------------------------
@@ -284,6 +400,13 @@ void stop_display_queue() {
 }
 
 void register_display() {
+    {
+        // (a new runtime: callbacks of the one before forgotten, its thread ended with its kernel)
+        VblankCallbacks& v = vblank_callbacks();
+        nx::scoped_lock<nx::mutex> held(v.lock);
+        v.uids.clear();
+    }
+    stop_vblank_thread();
     runtime::hle::register_library({"SceDisplay", kSceDisplay, kDisplayFunctions});
     runtime::hle::register_library({"SceDisplayUser", kSceDisplayUser, kDisplayUserFunctions});
 }

@@ -100,8 +100,9 @@ add_executable(psvrecore_platform_tests
     "${_nxtest_dir}/nxtest.cpp"
     platform/platform_tests.cpp
     platform/frontend_tests.cpp
+    platform/gxm_hle_tests.cpp
 )
-target_include_directories(psvrecore_platform_tests PRIVATE "${_nxtest_dir}" "${PSVRECORE_DIR}/libs/gxm/src/hle")
+target_include_directories(psvrecore_platform_tests PRIVATE "${_nxtest_dir}" "${PSVRECORE_DIR}/libs/gxm/src/hle" runtime)
 target_link_libraries(psvrecore_platform_tests PRIVATE psvrecore::platform psvrecore::frontend nx::foundation)
 psvrecore_target_defaults(psvrecore_platform_tests)
 add_test(NAME psvrecore_platform_tests COMMAND psvrecore_platform_tests)

@@ -118,6 +118,40 @@ u32 sceGxmProgramParameterGetName(u32 p) {
     const u32 offset = word(p, 0);
     return offset ? p + offset : 0;
 }
+// A parameter's index in its program's records (as sceGxmProgramGetParameter counts them), or the count when the
+// pointer is not one of the program's records.
+u32 sceGxmProgramParameterGetIndex(u32 program, u32 p) {
+    const usse::Gxp* g = gxp_at(program);
+    if (!g) return 0;
+    for (usize i = 0; i < g->parameters.size(); ++i)
+        if (program + g->parameters[i].offset == p) return static_cast<u32>(i);
+    return static_cast<u32>(g->parameters.size());
+}
+// Whether a vertex attribute is read in its declared format (the program's register format mask), not as f32.
+u32 sceGxmProgramParameterIsRegFormat(u32 program, u32 p) {
+    const usse::Gxp* g = gxp_at(program);
+    if (!g) return 0;
+    for (const usse::Parameter& q : g->parameters)
+        if (program + q.offset == p) return q.reg_format ? 1 : 0;
+    return 0;
+}
+// Two programs are the same program when their GXPs are the same bytes.
+u32 sceGxmProgramIsEquivalent(u32 a, u32 b) {
+    if (!a || !b) return 0;
+    if (a == b) return 1;
+    const u32 size = sceGxmProgramGetSize(a);
+    if (size < 16 || size != sceGxmProgramGetSize(b) || !memory().valid(a, size) || !memory().valid(b, size)) return 0;
+    return std::memcmp(memory().host(a), memory().host(b), size) == 0 ? 1 : 0;
+}
+// A fragment program's output register format: its type (SceGxmParameterType) and component count.
+i32 sceGxmProgramGetOutputRegisterFormat(u32 program, Ptr<u32> type, Ptr<u32> components) {
+    if (!program || !type || !components) return err::kInvalidPointer;
+    const usse::Gxp* g = gxp_at(program);
+    if (!g || g->type != usse::ShaderType::Fragment) return err::kInvalidValue;
+    *type = static_cast<u32>(g->output_type);
+    *components = g->output_components;
+    return 0;
+}
 
 // ---- The patcher -------------------------------------------------------------------------------------------------
 
@@ -425,6 +459,22 @@ u32 sceGxmFragmentProgramIsEnabled(u32 program) {
     auto it = state().fragment_programs.find(program);
     return it != state().fragment_programs.end() && !it->second->mask_update ? 1 : 0;
 }
+// How the hardware must run a fragment program (SceGxmPassType): a mask update, one replacing the depth, one that
+// discards, one that blends (or reads the colour it blends with), or opaque.
+u32 sceGxmFragmentProgramGetPassType(u32 program) {
+    constexpr u32 kOpaque = 0, kTranslucent = 0x02000000u, kDiscard = 0x04000000u, kMaskUpdate = 0x06000000u,
+                  kDepthReplace = 0x0A000000u;
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    auto it = state().fragment_programs.find(program);
+    if (it == state().fragment_programs.end()) return kOpaque;
+    const FragmentProgram& f = *it->second;
+    if (f.mask_update) return kMaskUpdate;
+    const usse::Gxp* g = f.program ? &f.program->gxp : nullptr;
+    if (g && g->depth_replace) return kDepthReplace;
+    if (g && g->discard) return kDiscard;
+    if (f.blend_enabled || (g && g->frag_color)) return kTranslucent;
+    return kOpaque;
+}
 
 const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xED8B6C69, sceGxmProgramCheck),
@@ -454,6 +504,10 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xDBA8D061, sceGxmProgramParameterGetArraySize),
     HLE_FUNCTION(0x5C79D59A, sceGxmProgramParameterGetResourceIndex),
     HLE_FUNCTION(0x6AF88A5D, sceGxmProgramParameterGetName),
+    HLE_FUNCTION(0x6E61DDF5, sceGxmProgramParameterGetIndex),
+    HLE_FUNCTION(0x871E5009, sceGxmProgramParameterIsRegFormat),
+    HLE_FUNCTION(0xE23C838C, sceGxmProgramIsEquivalent),
+    HLE_FUNCTION(0xE11603B1, sceGxmProgramGetOutputRegisterFormat),
     HLE_FUNCTION(0x05032658, sceGxmShaderPatcherCreate),
     HLE_FUNCTION(0xEAA5B100, sceGxmShaderPatcherDestroy),
     HLE_FUNCTION(0x96A7E6DD, sceGxmShaderPatcherGetUserData),
@@ -478,6 +532,7 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xBC52320E, sceGxmVertexProgramGetProgram),
     HLE_FUNCTION(0xE0E3B3F8, sceGxmFragmentProgramGetProgram),
     HLE_FUNCTION(0x5748367E, sceGxmFragmentProgramIsEnabled),
+    HLE_FUNCTION(0xCE0B0A76, sceGxmFragmentProgramGetPassType),
 };
 
 }  // namespace
