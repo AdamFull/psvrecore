@@ -2,7 +2,7 @@
 """Packages an Android application from a game's (or sample's) libmain.so with the Android SDK's own tools: no Gradle.
 
 The application is SDL's Java activity (third_party/SDL/android-project, compiled here) under the caller's subclass,
-the caller's manifest and resources, and the native library (built by the android-arm64 presets; debug information
+the caller's manifest and resources (and its launcher icon, made from a picture: --icon), and the native library (built by the android-arm64 presets; debug information
 stripped for the package). It is signed with the Android debug key (~/.android/debug.keystore, made with keytool when
 missing), so it installs for development only.
 
@@ -57,11 +57,89 @@ def jdk_tool(name):
     return Path(found)
 
 
+# The launcher icon (@mipmap/ic_launcher): the legacy icon (48 dp) at each density, and the adaptive icon (two 108 dp
+# layers, of which a mask shows the middle 72 dp at most).
+DENSITIES = {"mdpi": 1, "hdpi": 1.5, "xhdpi": 2, "xxhdpi": 3, "xxxhdpi": 4}
+ICON_SPAN = 64  # (dp: the picture's artwork in the adaptive icon, a round logo's ends inside the masks' 66 dp safe zone)
+LEGACY_SPAN = 44  # (dp, of the legacy icon's 48)
+
+
+def write_icon(picture, res, background=None):
+    """The launcher icon from a picture (a game's icon0.png, or a logo): its artwork (what differs from its corner's
+    colour, or is not transparent) made square, over the corner's colour (or the background given; white for a
+    transparent picture), in the middle of the legacy icon and of the adaptive icon's layers."""
+    try:
+        from PIL import Image, ImageChops
+    except ImportError:
+        raise SystemExit("--icon needs Pillow (pip install pillow)")
+    src = Image.open(picture).convert("RGBA")
+    corner = src.getpixel((0, 0))
+    if corner[3] < 255:
+        box = src.getchannel("A").point(lambda a: 255 if a > 16 else 0).getbbox()
+        fill = (255, 255, 255)
+    else:
+        flat = Image.new("RGBA", src.size, corner)
+        box = ImageChops.difference(src, flat).convert("L").point(lambda d: 255 if d > 24 else 0).getbbox()
+        fill = corner[:3]
+    if background:
+        fill = tuple(int(background.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    art = src.crop(box or (0, 0, *src.size))
+    side = max(art.size)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(art, ((side - art.width) // 2, (side - art.height) // 2))
+    for name, scale in DENSITIES.items():
+        folder = res / f"mipmap-{name}"
+        folder.mkdir(parents=True)
+        legacy, span = round(48 * scale), round(LEGACY_SPAN * scale)
+        icon = Image.new("RGBA", (legacy, legacy), fill + (255,))
+        piece = square.resize((span, span), Image.LANCZOS)
+        icon.alpha_composite(piece, ((legacy - span) // 2, (legacy - span) // 2))
+        icon.save(folder / "ic_launcher.png")
+        layer, span = round(108 * scale), round(ICON_SPAN * scale)
+        foreground = Image.new("RGBA", (layer, layer), (0, 0, 0, 0))
+        foreground.alpha_composite(square.resize((span, span), Image.LANCZOS), ((layer - span) // 2, (layer - span) // 2))
+        foreground.save(folder / "ic_launcher_foreground.png")
+    write_adaptive(res, "#%02X%02X%02X" % fill, "@mipmap/ic_launcher_foreground")
+
+
+def write_placeholder_icon(res):
+    """An icon for a manifest that names @mipmap/ic_launcher when there is no picture for it: a light triangle (play)
+    on dark grey, as a vector (every device the package installs on takes adaptive icons)."""
+    drawable = res / "drawable"
+    drawable.mkdir(parents=True)
+    (drawable / "ic_launcher_foreground.xml").write_text(
+        '<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" '
+        'android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">\n'
+        '    <path android:fillColor="#E0E0E0" android:pathData="M44,36 L74,54 L44,72 Z" />\n'
+        '</vector>\n', encoding="utf-8")
+    write_adaptive(res, "#202124", "@drawable/ic_launcher_foreground")
+
+
+def write_adaptive(res, background, foreground):
+    values = res / "values"
+    values.mkdir(parents=True, exist_ok=True)
+    (values / "ic_launcher.xml").write_text(
+        f'<resources>\n    <color name="ic_launcher_background">{background}</color>\n</resources>\n',
+        encoding="utf-8")
+    folder = res / "mipmap-anydpi-v26"
+    folder.mkdir(parents=True)
+    (folder / "ic_launcher.xml").write_text(
+        '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <background android:drawable="@color/ic_launcher_background" />\n'
+        f'    <foreground android:drawable="{foreground}" />\n'
+        '</adaptive-icon>\n', encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--manifest", required=True, help="AndroidManifest.xml (its package names the application)")
     parser.add_argument("--java", action="append", default=[], help="a folder of Java sources (the activity)")
     parser.add_argument("--res", help="a resources folder (res/)")
+    parser.add_argument("--icon", help="a picture (a game's icon0.png, a logo) made into the launcher icon, "
+                                       "@mipmap/ic_launcher (without it, a manifest naming that gets a plain "
+                                       "placeholder; needs Pillow)")
+    parser.add_argument("--icon-background", help="the icon's background colour, #RRGGBB (default: the picture's "
+                                                  "corner's)")
     parser.add_argument("--lib", required=True, help="libmain.so (arm64-v8a)")
     parser.add_argument("--out", required=True, help="the .apk to write")
     parser.add_argument("--version-code", type=int, default=1)
@@ -89,6 +167,15 @@ def main():
         if args.res:
             run([build_tools / f"aapt2{EXE}", "compile", "--dir", args.res, "-o", tmp / "res.zip"])
             flat = [tmp / "res.zip"]
+        icon = tmp / "icon"
+        if args.icon:
+            write_icon(Path(args.icon), icon, args.icon_background)
+        elif "@mipmap/ic_launcher" in Path(args.manifest).read_text(encoding="utf-8") and not (
+                args.res and any(Path(args.res).glob("mipmap*/ic_launcher.*"))):
+            write_placeholder_icon(icon)
+        if icon.is_dir():
+            run([build_tools / f"aapt2{EXE}", "compile", "--dir", icon, "-o", tmp / "icon.zip"])
+            flat.append(tmp / "icon.zip")
         gen = tmp / "gen"
         gen.mkdir()
         base = tmp / "base.apk"
