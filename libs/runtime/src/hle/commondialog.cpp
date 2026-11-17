@@ -6,7 +6,8 @@
 // - save data: confirmations are confirmed, the fixed slot is the one the game named (it exists if its save data
 //   does: savedata0:'s slots), the list's focused slot is chosen;
 // - network check: offline, the player declines to connect (user canceled, PSN not reached);
-// - trophy setup: done (trophies are local).
+// - trophy setup: done (trophies are local);
+// - text input (IME): the text confirmed as the game gave it (its initial text, in the input buffer).
 // Every message's text is logged, to see what the game asks.
 
 #include "hle_common.hpp"
@@ -22,11 +23,11 @@ constexpr u32 kSceCommonDialog = 0xE537816C;
 constexpr i32 kBusy = err::code(0x80020401), kNull = err::code(0x80020402), kNotRunning = err::code(0x80020404),
               kNotFinished = err::code(0x80020410), kNotInUse = err::code(0x80020411);
 constexpr i32 kStatusNone = 0, kStatusRunning = 1, kStatusFinished = 2;
-constexpr i32 kResultOk = 0, kResultUserCanceled = 1;
+constexpr i32 kResultOk = 0, kResultUserCanceled = 1, kResultAborted = 2;
 constexpr u32 kCommonParam = 4;  // (every dialog's parameters: the SDK version, then SceCommonDialogParam (76 bytes))
 constexpr u32 kParamBody = kCommonParam + 76;
 
-enum class Kind : u8 { None, Message, SaveData, NetCheck, TrophySetup };
+enum class Kind : u8 { None, Message, SaveData, NetCheck, TrophySetup, Ime };
 
 struct Dialog {
     nx::mutex lock;
@@ -94,6 +95,14 @@ i32 sceCommonDialogUpdate(Ptr<const void> param) {
     return 0;
 }
 
+// SceCommonDialogConfigParam: the SDK version, the dialogs' language and enter button (the system's when out of
+// range), reserved. Nothing is drawn, so nothing uses them.
+i32 sceCommonDialogSetConfigParam(Ptr<const u8> param) {
+    if (!param || !memory().valid(param.address, 0x2C)) return kNull;
+    nx::logd(logs::hle, "dialogs: language {}, enter button {}", word(param.address + 4), word(param.address + 8));
+    return 0;
+}
+
 // ---- message dialog
 
 i32 sceMsgDialogInit(Ptr<const u8> param) {
@@ -124,6 +133,95 @@ i32 sceMsgDialogInit(Ptr<const u8> param) {
 }
 i32 sceMsgDialogGetStatus() { return status_of(Kind::Message); }
 i32 sceMsgDialogTerm() { return term(Kind::Message); }
+// SceMsgDialogResult: mode, result, the button chosen, reserved (32 bytes).
+i32 sceMsgDialogGetResult(Ptr<u8> result) {
+    if (!result) return kNull;
+    if (!writable(result.address, 44)) return err::code(0x80020403);
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (d.kind != Kind::Message || d.status == kStatusNone) return kNotInUse;
+    if (d.status != kStatusFinished) return kNotFinished;
+    std::memset(result.get(), 0, 44);
+    psv_st32(result.address, static_cast<u32>(d.mode));
+    psv_st32(result.address + 4, static_cast<u32>(d.result));
+    psv_st32(result.address + 8, static_cast<u32>(d.button));
+    return 0;
+}
+// (closed by the game: finished, aborted, no button chosen)
+i32 sceMsgDialogAbort() {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (d.kind != Kind::Message || d.status != kStatusRunning) return kNotRunning;
+    d.status = kStatusFinished;
+    d.result = kResultAborted;
+    d.button = 0;
+    return 0;
+}
+
+// ---- text input dialog (IME)
+
+// SceImeDialogParam (0xA8 bytes): ... the title at 0x28, the longest text at 0x2C, the initial text at 0x30 and the
+// buffer the text goes to at 0x34 (UTF-16), SceCommonDialogParam at 0x38.
+constexpr i32 kImeButtonEnter = 2;
+
+nx::string utf16_text(u32 address, u32 max) {
+    nx::string out;
+    for (u32 i = 0; address && i < max && memory().valid(address + 2 * i, 2); ++i) {
+        const u16 c = static_cast<u16>(psv_ld16(address + 2 * i));
+        if (!c) break;
+        if (c < 0x80) out.push_back(static_cast<char>(c));
+        else if (c < 0x800) out.push_back(static_cast<char>(0xC0 | c >> 6)), out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        else
+            out.push_back(static_cast<char>(0xE0 | c >> 12)), out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F))),
+                out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    }
+    return out;
+}
+
+i32 sceImeDialogInit(Ptr<const u8> param) {
+    if (!param || !memory().valid(param.address, 0xA8)) return kNull;
+    const u32 p = param.address;
+    const u32 max_length = word(p + 0x2C), initial = word(p + 0x30), buffer = word(p + 0x34);
+    if (!buffer || !max_length || !writable(buffer, 2 * (max_length + 1))) return err::code(0x80102001);  // (SCE_IME_DIALOG_ERROR_PARAM)
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (const i32 r = start(Kind::Ime, false); r < 0) return r;
+    d.button = kImeButtonEnter;
+    // (the text as given: the initial text, cut to the longest allowed)
+    u32 n = 0;
+    for (; initial && n < max_length && memory().valid(initial + 2 * n, 2); ++n) {
+        const u32 c = psv_ld16(initial + 2 * n);
+        if (!c) break;
+        psv_st16(buffer + 2 * n, c);
+    }
+    psv_st16(buffer + 2 * n, 0);
+    nx::logi(logs::hle, "text input dialog \"{}\": \"{}\" confirmed", utf16_text(word(p + 0x28), 128), utf16_text(buffer, max_length));
+    return 0;
+}
+i32 sceImeDialogGetStatus() { return status_of(Kind::Ime); }
+// SceImeDialogResult: the result, the button (enter), reserved.
+i32 sceImeDialogGetResult(Ptr<u8> result) {
+    if (!result) return kNull;
+    if (!writable(result.address, 0x24)) return err::code(0x80020403);
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (d.kind != Kind::Ime || d.status == kStatusNone) return kNotInUse;
+    if (d.status != kStatusFinished) return kNotFinished;
+    std::memset(result.get(), 0, 0x24);
+    psv_st32(result.address, static_cast<u32>(d.result));
+    psv_st32(result.address + 4, static_cast<u32>(d.button));
+    return 0;
+}
+i32 sceImeDialogAbort() {
+    Dialog& d = dialog();
+    nx::scoped_lock<nx::mutex> held(d.lock);
+    if (d.kind != Kind::Ime || d.status != kStatusRunning) return kNotRunning;
+    d.status = kStatusFinished;
+    d.result = kResultAborted;
+    d.button = 0;
+    return 0;
+}
+i32 sceImeDialogTerm() { return term(Kind::Ime); }
 
 // ---- save data dialog
 
@@ -274,6 +372,14 @@ const Function kCommonDialog[] = {
     HLE_FUNCTION(0x755FF270, sceMsgDialogInit),
     HLE_FUNCTION(0x4107019E, sceMsgDialogGetStatus),
     HLE_FUNCTION(0x81ACF695, sceMsgDialogTerm),
+    HLE_FUNCTION(0xBB3BFC89, sceMsgDialogGetResult),
+    HLE_FUNCTION(0x0CC66115, sceMsgDialogAbort),
+    HLE_FUNCTION(0xBECD35C8, sceCommonDialogSetConfigParam),
+    HLE_FUNCTION(0x1E7043BF, sceImeDialogInit),
+    HLE_FUNCTION(0xCF0431FD, sceImeDialogGetStatus),
+    HLE_FUNCTION(0x2EB3D046, sceImeDialogGetResult),
+    HLE_FUNCTION(0x594A220E, sceImeDialogAbort),
+    HLE_FUNCTION(0x838A3AF4, sceImeDialogTerm),
     HLE_FUNCTION(0xBF5248FA, sceSaveDataDialogInit),
     HLE_FUNCTION(0x6E258046, sceSaveDataDialogGetStatus),
     HLE_FUNCTION(0xBA0542CA, sceSaveDataDialogGetSubStatus),

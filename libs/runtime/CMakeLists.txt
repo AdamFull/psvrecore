@@ -14,12 +14,14 @@ add_library(psvrecore_runtime STATIC
     src/hle/iofilemgr.cpp
     src/hle/libkernel.cpp
     src/hle/modulemgr.cpp
+    src/hle/motion.cpp
     src/hle/ngs.cpp
     src/hle/np.cpp
     src/hle/processmgr.cpp
     src/hle/rtc.cpp
     src/hle/sysmem.cpp
     src/hle/system.cpp
+    src/hle/systemgesture.cpp
     src/hle/threadmgr.cpp
     src/hle/touch.cpp
     src/hle/videodec.cpp

@@ -308,6 +308,8 @@ void register_system_libraries() {
     register_ctrl();
     register_audioout();
     register_touch();
+    register_systemgesture();
+    register_motion();
     register_apputil();
     register_ngs();
     register_avplayer();

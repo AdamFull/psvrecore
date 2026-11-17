@@ -169,3 +169,83 @@ TEST_CASE("ctrl: a pad filter changes each sample a read returns, on port 0 only
     REQUIRE(call32(ctx, kSceCtrl, kPeek, {0, buf, 1}) == 1);
     CHECK(data(t, buf, 0).buttons == 0);
 }
+
+TEST_CASE("system gestures: a tap, a drag, and touches cancelled when updates stop") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kGesture = 0xAF3FE2D3, kInit = 0x6078A08B, kUpdatePrimitive = 0xDF4C665A, kCreate = 0xC3367370,
+                  kUpdate = 0x851FB144, kCount = 0x13AD2218, kByIndex = 0x74724147;
+    const u32 touch = scratch(144), tap = scratch(307 * 8), drag = scratch(307 * 8), event = scratch(144);
+    // (one finger, report id 7, at x, y; or none) at a time in microseconds
+    auto frame = [&](u64 time, bool pressed, i16 x, i16 y) {
+        u8 d[144] = {};
+        std::memcpy(d, &time, 8);
+        const u32 count = pressed ? 1 : 0;
+        std::memcpy(d + 12, &count, 4);
+        d[16] = 7;
+        std::memcpy(d + 18, &x, 2);
+        std::memcpy(d + 20, &y, 2);
+        std::memcpy(t.rt.memory().host(touch), d, 144);
+        CHECK(call32(ctx, kGesture, kUpdatePrimitive, {touch, 0}) == 0);
+        CHECK(call32(ctx, kGesture, kUpdate, {tap}) == 0);
+        CHECK(call32(ctx, kGesture, kUpdate, {drag}) == 0);
+    };
+    struct Seen {
+        u32 state, type;
+        i16 a, b, c, d;
+        u8 count;
+    };
+    auto first = [&](u32 recognizer) {
+        Seen s{};
+        if (call32(ctx, kGesture, kCount, {recognizer}) < 1) return s;
+        CHECK(call32(ctx, kGesture, kByIndex, {recognizer, 0, event}) == 0);
+        const u8* e = t.rt.memory().host(event);
+        std::memcpy(&s.state, e + 4, 4);
+        std::memcpy(&s.type, e + 8, 4);
+        std::memcpy(&s.a, e + 24 + 2, 2);
+        std::memcpy(&s.b, e + 24 + 4, 2);
+        std::memcpy(&s.c, e + 24 + 6, 2);
+        std::memcpy(&s.d, e + 24 + 8, 2);
+        s.count = e[24 + 6];
+        return s;
+    };
+    CHECK(call32(ctx, kGesture, kInit, {0}) == 0);
+    CHECK(call32(ctx, kGesture, kCreate, {tap, 1, 0, 0, 0}) == 0);
+    CHECK(call32(ctx, kGesture, kCreate, {drag, 3, 0, 0, 0}) == err::code(0x80890002));  // (no such gesture)
+    CHECK(call32(ctx, kGesture, kCreate, {drag, 2, 0, 0, 0}) == 0);
+    CHECK(call32(ctx, kGesture, kCreate, {drag, 2, 0, 0, 0}) == 0);
+
+    // A tap: pressed and released in place; the event at the press, once.
+    frame(1'000'000, true, 500, 400);
+    Seen d = first(drag);
+    CHECK(d.state == 1);  // (a drag begins when pressed)
+    CHECK(call32(ctx, kGesture, kCount, {tap}) == 0);
+    frame(1'016'000, true, 503, 401);
+    CHECK(first(drag).state == 2);
+    frame(1'033'000, false, 0, 0);
+    Seen s = first(tap);
+    CHECK(s.type == 1);
+    CHECK(s.state == 2);
+    CHECK(s.a == 500);
+    CHECK(s.b == 400);
+    CHECK(s.count == 1);
+    CHECK(first(drag).state == 3);
+    frame(1'050'000, false, 0, 0);
+    CHECK(call32(ctx, kGesture, kCount, {tap}) == 0);
+    CHECK(call32(ctx, kGesture, kCount, {drag}) == 0);
+
+    // A drag that moves too far for a tap: its deltas and positions; no tap.
+    frame(2'000'000, true, 100, 100);
+    frame(2'016'000, true, 300, 100);
+    d = first(drag);
+    CHECK(d.state == 2);
+    CHECK(d.a == 200);  // (delta x)
+    CHECK(d.c == 300);  // (current x)
+    frame(2'033'000, false, 0, 0);
+    CHECK(call32(ctx, kGesture, kCount, {tap}) == 0);
+
+    // Updates more than 200 ms apart cancel what was pressed.
+    frame(3'000'000, true, 100, 100);
+    frame(3'500'000, true, 100, 100);
+    CHECK(first(drag).state == 4);
+}
