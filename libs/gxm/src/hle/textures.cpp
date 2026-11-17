@@ -1,8 +1,10 @@
 // Textures (SceGxmTexture): the control words in the hardware's layout (gxm/texture.hpp), set up and read back.
 
 #include "psvrecore/gxm/texture.hpp"
+#include "psvrecore/log.hpp"
 #include "prefetch.hpp"
 #include "state.hpp"
+#include "core/foundation/strings/format.h"
 
 namespace psvrecore::gxm::hle {
 
@@ -18,12 +20,17 @@ bool pow2(u32 v) { return v && !(v & (v - 1)); }
 
 i32 init(Ptr<Words> out, u32 data, u32 format, u32 width, u32 height, u32 mips, u32 type, u32 stride = 0) {
     if (!out) return err::kInvalidPointer;
-    if (!width || !height || width > 4096 || height > 4096 || mips > 13) return err::kInvalidValue;
-    if (!texel_bits(base_of(format))) return err::kInvalidValue;
+    const auto refuse = [&](i32 error) {
+        nx::logw(logs::gxm, "texture init (type {}, format 0x{:08x}, {}x{}, {} mips, data 0x{:08x}): refused (0x{:08x})", type,
+                 format, width, height, mips, data, static_cast<u32>(error));
+        return error;
+    };
+    if (!width || !height || width > 4096 || height > 4096 || mips > 13) return refuse(err::kInvalidValue);
+    if (!texel_bits(base_of(format))) return refuse(err::kInvalidValue);
     const bool pow2_only = type == texture_type::kSwizzled || type == texture_type::kCube;
-    if (pow2_only && (!pow2(width) || !pow2(height))) return err::kInvalidValue;
-    if (type == texture_type::kTiled && (width < 32 || height < 32)) return err::kInvalidValue;
-    if (data & 3) return err::kInvalidAlignment;
+    if (pow2_only && (!pow2(width) || !pow2(height))) return refuse(err::kInvalidValue);
+    if (type == texture_type::kTiled && (width < 32 || height < 32)) return refuse(err::kInvalidValue);
+    if (data & 3) return refuse(err::kInvalidAlignment);
     TextureInfo t;
     t.type = type;
     t.base_format = base_of(format);

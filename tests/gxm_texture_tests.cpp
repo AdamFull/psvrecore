@@ -283,3 +283,38 @@ TEST_CASE("gxm textures: BC blocks kept for the device are the texture's blocks 
         }
     }
 }
+
+TEST_CASE("gxm textures: unsigned packed floats (U2F10F10F10, F11F11F10) come out as halves") {
+    auto halves = [](u32 base_format, u32 word) {
+        Memory m;
+        m.bytes.resize(4);
+        std::memcpy(m.bytes.data(), &word, 4);
+        TextureInfo t;
+        t.base_format = base_format;
+        t.type = texture_type::kLinear;
+        t.width = t.height = 1;
+        t.stride = 4;
+        auto texels = read_texels(t, [&](u32 address, void* out, u32 size) { return m.read(address, out, size); });
+        REQUIRE(texels);
+        REQUIRE(texels->bytes == 8);
+        nx::vector<u16> h(4);
+        std::memcpy(h.data(), texels->data.data(), 8);
+        return h;
+    };
+    // (a 10-bit float is a half's top 10 bits: 1.0 0x1E0, 2.0 0x200, 0.5 0x1C0, the largest 0x3DF = 64512)
+    auto a = halves(0x9A000000, 0x1E0u | 0x200u << 10 | 0x1C0u << 20 | 3u << 30);
+    CHECK(a[0] == 0x3C00);
+    CHECK(a[1] == 0x4000);
+    CHECK(a[2] == 0x3800);
+    CHECK(a[3] == 0x3C00);
+    auto b = halves(0x9A000000, 0x3DFu | 1u << 30);
+    CHECK(b[0] == 0x7BE0);
+    CHECK(b[1] == 0);
+    CHECK(b[3] == 0x3555);  // (1/3)
+    // (11-bit floats: a half's top 11 bits: 1.0 0x3C0, 0.25 0x340; 4.0 as a 10-bit float 0x220)
+    auto c = halves(0x1A000000, 0x3C0u | 0x340u << 11 | 0x220u << 22);
+    CHECK(c[0] == 0x3C00);
+    CHECK(c[1] == 0x3400);
+    CHECK(c[2] == 0x4400);
+    CHECK(c[3] == 0x3C00);
+}

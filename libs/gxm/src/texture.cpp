@@ -144,6 +144,26 @@ bool components(u32 code, u32 mode, u64 texel, f32 c[4], u32& count, bool& wide)
         case kS5S5U6: packed({6, 5, 5}, false); return true;
         case kU1U5U5U5: alpha_low ? packed({1, 5, 5, 5}, false) : packed({5, 5, 5, 1}, false); return true;
         case kU2U10U10U10: alpha_low ? packed({2, 10, 10, 10}, false) : packed({10, 10, 10, 2}, false); wide = true; return true;
+        case kU2F10F10F10: {
+            // (unsigned 10-bit floats: a half's exponent and top five mantissa bits; alpha two bits, as U2U10U10U10's)
+            const u32 v = static_cast<u32>(texel);
+            const u32 at = alpha_low ? 2 : 0;
+            for (u32 k = 0; k < 3; ++k) c[k] = half_to_float(static_cast<u16>(((v >> (at + 10 * k)) & 0x3FF) << 5));
+            c[3] = unorm(alpha_low ? v & 3 : v >> 30, 2);
+            count = 4;
+            wide = true;
+            return true;
+        }
+        case kF11F11F10: {
+            // (unsigned floats of 11, 11 and 10 bits from bit 0: a half's exponent and top 6 or 5 mantissa bits)
+            const u32 v = static_cast<u32>(texel);
+            c[0] = half_to_float(static_cast<u16>((v & 0x7FF) << 4));
+            c[1] = half_to_float(static_cast<u16>(((v >> 11) & 0x7FF) << 4));
+            c[2] = half_to_float(static_cast<u16>(((v >> 22) & 0x3FF) << 5));
+            count = 3;
+            wide = true;
+            return true;
+        }
         case kU8U3U3U2: packed({2, 3, 3, 8}, false); return true;
         case kU16: packed({16}, false); wide = true; return true;
         case kS16: packed({16}, true); wide = true; return true;
@@ -713,7 +733,7 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     if (code >= kYUV420P2 && code <= kYUV422) return read_yuv(t, code, read);
     if (code >= kUBC4 && code <= kSBC5) return failure("texture: format not implemented");
     if (code == kX8S8S8U8 || code == kX8U24 || code == kU32 || code == kS32 || code == kSE5M9M9M9 ||
-        code == kF11F11F10 || code == kU2F10F10F10 || code == kU32U32)
+        code == kU32U32)
         return failure(nx::format("texture: format 0x{:08x} not implemented", t.base_format));
     const u32 size = texture_size(t);
     nx::vector<u8> raw(size + 8, 0);

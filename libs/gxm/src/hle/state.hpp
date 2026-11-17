@@ -102,7 +102,7 @@ struct ColorSurface {
     u32 clip_min;       //   the clip rectangle's first pixel x | y << 16
     u32 clip_max;       //   and last pixel x | y << 16
     u32 output_register_size;
-    u32 background[4];  // (unused)
+    u32 background[4];  // a texture of the surface's pixels (SceGxmTexture), as the console's (surfaces.cpp)
 };
 static_assert(sizeof(ColorSurface) == 48);
 

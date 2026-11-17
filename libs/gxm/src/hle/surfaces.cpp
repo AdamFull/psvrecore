@@ -3,7 +3,10 @@
 
 #include <cstring>
 
+#include "psvrecore/gxm/texture.hpp"
+#include "psvrecore/log.hpp"
 #include "state.hpp"
+#include "core/foundation/strings/format.h"
 
 namespace psvrecore::gxm::hle {
 
@@ -17,13 +20,75 @@ u32 modes_of(u32 type, u32 scale, u32 gamma, u32 dither) {
     return (type >> 26) | (scale << 4) | ((gamma >> 12) << 8) | ((dither >> 3) << 12) | kEnabled;
 }
 
+// The texture format that reads a colour format's pixels (0: none), with its swizzle as the colour's (exact for
+// four components; for one or two, the mode of the same number).
+u32 texture_format_of(u32 color) {
+    static const struct {
+        u32 color, texture;
+    } kBases[] = {
+        {0x00000000u, 0x0C000000u},  // U8U8U8U8
+        {0x10000000u, 0x98000000u},  // U8U8U8
+        {0x30000000u, 0x05000000u},  // U5U6U5
+        {0x40000000u, 0x04000000u},  // U1U5U5U5
+        {0x50000000u, 0x02000000u},  // U4U4U4U4
+        {0x60000000u, 0x03000000u},  // U8U3U3U2
+        {0xF0000000u, 0x0B000000u},  // F16
+        {0x00800000u, 0x11000000u},  // F16F16
+        {0x10800000u, 0x12000000u},  // F32
+        {0x20800000u, 0x0A000000u},  // S16
+        {0x30800000u, 0x10000000u},  // S16S16
+        {0x40800000u, 0x09000000u},  // U16
+        {0x50800000u, 0x0F000000u},  // U16U16
+        {0x60800000u, 0x0E000000u},  // U2U10U10U10
+        {0x80800000u, 0x00000000u},  // U8
+        {0x90800000u, 0x01000000u},  // S8
+        {0xA0800000u, 0x06000000u},  // S5S5U6
+        {0xB0800000u, 0x07000000u},  // U8U8
+        {0xC0800000u, 0x08000000u},  // S8S8
+        {0xE0800000u, 0x0D000000u},  // S8S8S8S8
+        {0x01000000u, 0x1B000000u},  // F16F16F16F16
+        {0x11000000u, 0x1E000000u},  // F32F32
+        {0x21000000u, 0x1A000000u},  // F11F11F10
+        {0x31000000u, 0x19000000u},  // SE5M9M9M9
+        {0x41000000u, 0x9A000000u},  // U2F10F10F10
+    };
+    const u32 base = color & 0xF1800000u;
+    for (const auto& b : kBases)
+        if (b.color == base) return b.texture | ((color >> 8) & 0x7000u);
+    return 0;
+}
+
+// The surface's background texture (SceGxmColorSurface's last four words, as the console fills them): the surface's
+// pixels as a texture (games read the surface's size and data from it).
+void set_background(ColorSurface& c) {
+    std::memset(c.background, 0, sizeof c.background);
+    const u32 format = texture_format_of(c.format);
+    if (!format || !(c.modes & kEnabled)) return;
+    TextureInfo t;
+    const u32 type = (c.modes & 3) << 26;
+    t.type = type == 0x04000000u ? texture_type::kTiled : type == 0x08000000u ? texture_type::kSwizzled : texture_type::kLinearStrided;
+    t.base_format = format & 0x9F000000u;
+    t.swizzle = (format >> 12) & 7;
+    t.width = c.size & 0xFFFF;
+    t.height = c.size >> 16;
+    t.address = c.data;
+    t.stride = c.stride * texel_bits(t.base_format) / 8;
+    encode_texture(t, c.background);
+}
+
 i32 sceGxmColorSurfaceInit(Ptr<ColorSurface> s, u32 format, u32 type, u32 scale, u32 register_size, u32 width,
                            u32 height, u32 stride, u32 data) {
     if (!s) return err::kInvalidPointer;
+    const auto refuse = [&](i32 error) {
+        nx::logw(logs::gxm, "sceGxmColorSurfaceInit(format 0x{:08x}, type 0x{:x}, scale {}, register size {}, {}x{}, stride {}, "
+                 "data 0x{:08x}): refused (0x{:08x})", format, type, scale, register_size, width, height, stride, data,
+                 static_cast<u32>(error));
+        return error;
+    };
     if (!width || !height || width > 4096 || height > 4096 || stride < width || scale > 1 || register_size > 1)
-        return err::kInvalidValue;
-    if (type != 0 && type != 0x04000000u && type != 0x08000000u) return err::kInvalidValue;
-    if (data & 3) return err::kInvalidAlignment;
+        return refuse(err::kInvalidValue);
+    if (type != 0 && type != 0x04000000u && type != 0x08000000u) return refuse(err::kInvalidValue);
+    if (data & 3) return refuse(err::kInvalidAlignment);
     ColorSurface c{};
     c.format = format;
     c.data = data;
@@ -33,6 +98,7 @@ i32 sceGxmColorSurfaceInit(Ptr<ColorSurface> s, u32 format, u32 type, u32 scale,
     c.clip_min = 0;
     c.clip_max = (width - 1) | (height - 1) << 16;
     c.output_register_size = register_size;
+    set_background(c);
     *s = c;
     return 0;
 }
@@ -64,12 +130,14 @@ i32 sceGxmColorSurfaceSetData(Ptr<ColorSurface> s, u32 data) {
     if (!s) return err::kInvalidPointer;
     if (data & 3) return err::kInvalidAlignment;
     s->data = data;
+    set_background(*s);
     return 0;
 }
 u32 sceGxmColorSurfaceGetFormat(Ptr<const ColorSurface> s) { return s ? s->format : 0; }
 i32 sceGxmColorSurfaceSetFormat(Ptr<ColorSurface> s, u32 format) {
     if (!s) return err::kInvalidPointer;
     s->format = format;
+    set_background(*s);
     return 0;
 }
 u32 sceGxmColorSurfaceGetType(Ptr<const ColorSurface> s) { return s ? (s->modes & 3) << 26 : 0; }

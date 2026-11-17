@@ -60,13 +60,23 @@ runtime::GuestMemory& memory() { return runtime::runtime().memory(); }
 
 // ---- Formats ---------------------------------------------------------------------------------------------------
 
-struct ColorFormat {
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    u32 bytes = 0;
-    u8 swizzle[4] = {0, 1, 2, 3};  // (FragmentShader::swizzle)
+// How a surface's pixels are kept in its image when no image format has their layout: converted from guest memory
+// when the scene loads them and back when it writes them back (the image a wider format that holds every value).
+enum class Packing : u8 {
+    None,
+    U2F10F10F10,  // (A in the top 2 bits, then B, G and R as unsigned 10-bit floats from bit 20, 10 and 0) as F16x4
 };
 
-// The image format whose memory layout is the surface's, and the order the output register's lanes go to it.
+struct ColorFormat {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    u32 bytes = 0;  // per pixel in the image
+    u8 swizzle[4] = {0, 1, 2, 3};  // (FragmentShader::swizzle)
+    Packing packing = Packing::None;
+    u32 guest_bytes() const { return packing == Packing::None ? bytes : 4; }  // per pixel in guest memory
+};
+
+// The image format whose memory layout is the surface's (or that holds it: `packing`), and the order the output
+// register's lanes go to it.
 bool color_format(u32 gxm, ColorFormat& out) {
     switch (gxm) {
         case 0x00000000u: out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {0, 1, 2, 3}}; return true;      // U8U8U8U8_ABGR
@@ -77,7 +87,51 @@ bool color_format(u32 gxm, ColorFormat& out) {
         case 0x00800000u: out = {VK_FORMAT_R16G16_SFLOAT, 4, {0, 1, 4, 5}}; return true;       // F16F16_GR
         case 0x10800000u: out = {VK_FORMAT_R32_SFLOAT, 4, {0, 4, 4, 5}}; return true;          // F32_R
         case 0x11000000u: out = {VK_FORMAT_R32G32_SFLOAT, 8, {0, 1, 4, 5}}; return true;       // F32F32_GR
+        case 0x41000000u:  // U2F10F10F10_ABGR
+            out = {VK_FORMAT_R16G16B16A16_SFLOAT, 8, {0, 1, 2, 3}, Packing::U2F10F10F10};
+            return true;
         default: return false;
+    }
+}
+
+// An unsigned 10-bit float is a half's exponent and top five mantissa bits (the same bias). To one: rounded to
+// nearest (ties to even); negative values are 0, large ones the largest finite value; infinity and NaN kept.
+u32 half_to_f10(u16 h) {
+    if (h & 0x8000) return 0;
+    if ((h & 0x7C00) == 0x7C00) return (h & 0x3FF) ? 0x3FF : 0x3E0;
+    const u32 r = (u32{h} + 0xF + ((h >> 5) & 1)) >> 5;
+    return nx::min<u32>(r, 0x3DF);
+}
+u16 f10_to_half(u32 v) { return static_cast<u16>((v & 0x3FF) << 5); }
+// A half's value (finite; infinity and NaN as large values).
+f32 half_value(u16 h) {
+    const u32 e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    const f32 v = e ? std::ldexp(static_cast<f32>(m | 0x400), static_cast<i32>(e) - 25) : std::ldexp(static_cast<f32>(m), -24);
+    return (h & 0x8000) ? -v : v;
+}
+
+// A surface's pixels from guest memory into its image's (`packing`), and back: `count` pixels.
+void unpack_pixels(Packing packing, const u8* guest, u8* image, usize count) {
+    if (packing == Packing::U2F10F10F10) {
+        static const u16 kAlpha[4] = {0x0000, 0x3555, 0x3955, 0x3C00};  // (0, 1/3, 2/3, 1)
+        for (usize i = 0; i < count; ++i) {
+            u32 v;
+            std::memcpy(&v, guest + i * 4, 4);
+            const u16 h[4] = {f10_to_half(v), f10_to_half(v >> 10), f10_to_half(v >> 20), kAlpha[v >> 30]};
+            std::memcpy(image + i * 8, h, 8);
+        }
+    }
+}
+void pack_pixels(Packing packing, const u8* image, u8* guest, usize count) {
+    if (packing == Packing::U2F10F10F10) {
+        for (usize i = 0; i < count; ++i) {
+            u16 h[4];
+            std::memcpy(h, image + i * 8, 8);
+            const f32 a = nx::clamp(half_value(h[3]), 0.0f, 1.0f);
+            const u32 a2 = static_cast<u32>(a * 3.0f + 0.5f);
+            const u32 v = half_to_f10(h[0]) | half_to_f10(h[1]) << 10 | half_to_f10(h[2]) << 20 | a2 << 30;
+            std::memcpy(guest + i * 4, &v, 4);
+        }
     }
 }
 
@@ -3167,7 +3221,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             nx::logw(logs::gxm, "colour surface type {} not implemented: scene not rendered", layout.kind);
             return false;
         }
-        layout.stride = stride, layout.bytes = cf.bytes, layout.width = width, layout.height = height;
+        layout.stride = stride, layout.bytes = cf.guest_bytes(), layout.width = width, layout.height = height;
         if (!width || !height || layout.span() > 0xFFFFFFFFu || !memory().valid(cs.data, static_cast<u32>(layout.span()), true))
             return false;
         target = color_target(r, cs.data, cs.format, cf.format, layout);
@@ -3198,7 +3252,13 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if ((scale == 1 && !kept) || (scale > 1 && !changes.tiles.empty())) {
             if (g_profile.on) ++g_profile.colour_uploads;
             nx::vector<u8> texels(usize{width} * height * cf.bytes);
-            gather(layout, cs.data, texels.data());
+            if (cf.packing == Packing::None) {
+                gather(layout, cs.data, texels.data());
+            } else {
+                nx::vector<u8> packed(usize{width} * height * cf.guest_bytes());
+                gather(layout, cs.data, packed.data());
+                unpack_pixels(cf.packing, packed.data(), texels.data(), usize{width} * height);
+            }
             const VkImageLayout layout = scale > 1 ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             if (auto done = vk::upload_image(d, target->image, texels, 0, layout); !done) {
                 nx::logw(logs::gpu, "{}", done.error().message);
@@ -4232,7 +4292,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     pending.depth_sources[0] = aspect_from[0], pending.depth_sources[1] = aspect_from[1];
     const bool stores_depth = store_depth && depth.image;
     pending.finish = [&r, &d, stamps, color = color != nullptr, readback, mem_buf, depth_buf, buffers = std::move(buffers),
-                      layout, data = cs.data, width, height, bytes = cf.bytes, target,
+                      layout, data = cs.data, width, height, bytes = cf.guest_bytes(), packing = cf.packing, target,
                       buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
                       stores_depth, ds, dl, unorm24, samples, depth_target, kept_depth, depth, pool, sets,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
@@ -4262,6 +4322,12 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (ok && color) {
             vk::invalidate(d, *readback);
             const u8* src = static_cast<const u8*>(readback->mapped);
+            nx::vector<u8> packed;
+            if (packing != Packing::None) {
+                packed.resize(usize{width} * height * bytes);
+                pack_pixels(packing, src, packed.data(), usize{width} * height);
+                src = packed.data();
+            }
             scatter(layout, data, src);
             // (what guest memory holds now, to know whether the image (or the scaled one) is still the surface)
             target->written.assign(src, src + usize{width} * height * bytes);
