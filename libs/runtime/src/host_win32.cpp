@@ -68,6 +68,16 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
     }
     if (!handler) return EXCEPTION_CONTINUE_SEARCH;
     handler(address - base, r->ExceptionInformation[0] == 1);
+    // (where on the host: the module and offset, for llvm-symbolizer --obj=<module> 0x<offset> with its PDB)
+    HMODULE module = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(r->ExceptionAddress), &module))
+        GetModuleFileNameA(module, name, MAX_PATH);
+    std::fprintf(stderr, "  host pc %s+0x%llx\n", name,
+                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(r->ExceptionAddress) -
+                                                 reinterpret_cast<uintptr_t>(module)));
+    std::fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;  // (the handler reports; the process then ends as for any access violation)
 }
 
