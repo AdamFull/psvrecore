@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generates, builds and packages a game for one platform, named and iconed from its own sce_sys folder (param.sfo's
-title, localized titles, title ID and version; icon0.png). A game repository calls it from its scripts/package.py,
-which gives --root and --name; the user gives the platform and the game's folder:
+title, localized titles, title ID and version; icon0.png; the LiveArea's pictures as the launch screen). A game
+repository calls it from its scripts/package.py, which gives --root and --name; the user gives the platform and the
+game's folder:
 
     python scripts/package.py windows [--game "game/<the game's folder>"]   # build/package/windows/<name>/
     python scripts/package.py linux   [--game "game/<the game's folder>"]   # build/package/linux/<name>/
@@ -12,18 +13,21 @@ Without --game, the one folder in <root>/game/ that holds app/ (a copy of the co
 Steps:
   1. sce_sys: the pictures and files made from the game's sce_sys go to <root>/generated/package/ (never committed):
      <name>.ico (16-256 px) and <name>.rc (the icon and the version information) for Windows, hicolor/ and
-     <name>.desktop for Linux, sce_sys.json (what was read). The game's CMakeLists.txt calls
-     psvrecore_game_package(<name>), which compiles <name>.rc into the Windows program.
+     <name>.desktop for Linux, launch.png (the launch screen: the LiveArea's background and gate, when the game has a
+     sce_sys/livearea folder), sce_sys.json (what was read). The game's CMakeLists.txt calls
+     psvrecore_game_package(<name>), which compiles <name>.rc into the Windows program and copies launch.png beside
+     the program in the build folder.
   2. code: when <root>/generated/code is empty (or --generate always), psvrecomp is built (the host's release preset)
      and the game's scripts/generate_code.py recompiles the game.
   3. build: the platform's preset (release unless --preset), only the game's target.
   4. package:
-     - windows: a folder to copy anywhere: the program, psvrecore.dll, install.ps1 (a Start menu shortcut; -Uninstall
-       removes it).
+     - windows: a folder to copy anywhere: the program, psvrecore.dll, launch.png, install.ps1 (a Start menu shortcut;
+       -Uninstall removes it).
      - linux: a folder (what CI uploads): the program, libpsvrecore.so.N (found next to the program: $ORIGIN), the
-       .desktop entry and the hicolor icons next to them, install.sh (installs the entry and icons for this user,
+       .desktop entry, the hicolor icons and launch.png next to them, install.sh (installs the entry and icons for this user,
        pointing at the folder; --uninstall).
-     - android: the APK (scripts/android_apk.py: the label and its translations, the version, the launcher icon).
+     - android: the APK (scripts/android_apk.py: the label and its translations, the version, the launcher icon, the
+       launch screen and the system's splash screen in its colours).
 
 The icon is the game's icon0.png, shown in the console's round bubble; or a picture of your own: --icon, or
 <root>/game/icon.png when there is one (made square from its artwork, not rounded).
@@ -85,10 +89,18 @@ def make_assets(meta, name, picture, bubble, out):
     if not rc_path.is_file() or rc_path.read_text(encoding="utf-8") != rc:
         rc_path.write_text(rc, encoding="utf-8")
     (out / f"{name}.desktop").write_text(sce_sys.desktop_entry(meta, name), encoding="utf-8", newline="\n")
+    # (the launch screen: the LiveArea's background and gate; none without a livearea folder)
+    launch = sce_sys.launch_picture(*meta.livearea())
+    if launch:
+        launch[0].save(out / sce_sys.LAUNCH_FILE, optimize=True)
+    else:
+        (out / sce_sys.LAUNCH_FILE).unlink(missing_ok=True)
     info = meta.describe()
     info["picture"] = str(picture) if picture else None
+    info["launch"] = {"file": sce_sys.LAUNCH_FILE, "colour": "#%02X%02X%02X" % launch[1]} if launch else None
     (out / "sce_sys.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"sce_sys: {meta.title} ({meta.title_id} {meta.app_ver}); icon {picture or 'none'} -> {out}")
+    print(f"sce_sys: {meta.title} ({meta.title_id} {meta.app_ver}); icon {picture or 'none'}; launch screen "
+          f"{'from the LiveArea' if launch else 'none (no LiveArea)'} -> {out}")
 
 
 # --- 4. packages ----------------------------------------------------------------------------------------------------
@@ -147,6 +159,12 @@ echo "${{1:-installed}}: $entry"
 """
 
 
+def copy_launch(assets, folder):
+    """The launch screen's picture beside the program, where the frontend looks for it."""
+    if (assets / sce_sys.LAUNCH_FILE).is_file():
+        shutil.copy2(assets / sce_sys.LAUNCH_FILE, folder)
+
+
 def package_windows(meta, name, build_dir, assets, out):
     folder = out / name
     shutil.rmtree(folder, ignore_errors=True)
@@ -157,6 +175,7 @@ def package_windows(meta, name, build_dir, assets, out):
     shutil.copy2(exe, folder)
     for dll in build_dir.glob("*.dll"):
         shutil.copy2(dll, folder)
+    copy_launch(assets, folder)
     title = meta.title.replace("'", "''")
     (folder / "install.ps1").write_text(
         INSTALL_PS1.format(name=name, shortcut=shortcut_name(meta.title).replace("'", "''"), title=title),
@@ -176,6 +195,7 @@ def package_linux(meta, name, build_dir, assets, out):
     for lib in libraries:  # (the SONAME's file: libpsvrecore.so.<ABI version>)
         shutil.copy2(lib, folder / lib.name, follow_symlinks=True)
     shutil.copy2(assets / f"{name}.desktop", folder)
+    copy_launch(assets, folder)
     if (assets / "hicolor").is_dir():
         shutil.copytree(assets / "hicolor", folder / "icons" / "hicolor")
     script = folder / "install.sh"

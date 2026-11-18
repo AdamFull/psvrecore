@@ -360,6 +360,32 @@ void open_settings() {
 #endif
 }
 
+// The window's first image on the screen (its presenting thread). Android: the activity's own copy of the launch
+// picture, over the window until then, taken away (PsvrecoreActivity.hideLaunchPicture).
+void on_first_presented() {
+#if defined(__ANDROID__)
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!env || !activity) return;
+    jclass cls = env->GetObjectClass(activity);
+    if (jmethodID hide = env->GetMethodID(cls, "hideLaunchPicture", "()V")) env->CallVoidMethod(activity, hide);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(cls);
+    env->DeleteLocalRef(activity);
+#endif
+}
+
+// The launch screen's picture: launch.png beside the program (scripts/package.py makes it from the game's LiveArea).
+// Android: in the application's files, else in the APK's assets (SDL looks there for a relative path).
+nx::string launch_picture() {
+#if defined(__ANDROID__)
+    return "launch.png";
+#else
+    const char* base = SDL_GetBasePath();
+    return base ? nx::format("{}launch.png", base) : nx::string("launch.png");
+#endif
+}
+
 // The game's ad hoc connection made or ended (any thread). Android: a Wi-Fi multicast lock held meanwhile
 // (PsvrecoreActivity.setMulticastLock), without which the Wi-Fi chip may drop the broadcasts other players send.
 void on_adhoc(bool connected) {
@@ -619,6 +645,8 @@ int run_game(const Game& game, int argc, char** argv) {
     window_options.controls = static_cast<platform::TouchControls::Mode>(s.on_screen);
     window_options.controls_opacity = s.controls_opacity;
     window_options.controls_scale = s.controls_scale;
+    if (s.launch_screen) window_options.launch_picture = launch_picture();
+    window_options.first_presented = on_first_presented;
     auto window = platform::Window::open(window_options);
     if (!window) return fail(window.error().message, cl.hidden);
     nx::unique_ptr<platform::AudioDevice> speaker;

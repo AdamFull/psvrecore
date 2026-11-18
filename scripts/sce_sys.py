@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A game's sce_sys folder made into what each platform's package needs: its param.sfo (read here: the title, the
-localized titles, the title ID, the application's version) and its icon (icon0.png).
+localized titles, the title ID, the application's version), its icon (icon0.png) and its LiveArea's pictures
+(livearea/contents/template.xml, read here too: the background and the gate, made into the launch screen's picture).
 
 Used by scripts/package.py and scripts/android_apk.py; on its own it shows what it reads:
 
@@ -8,11 +9,13 @@ Used by scripts/package.py and scripts/android_apk.py; on its own it shows what 
 
 The game's folder is a copy of the console's folders (app/<title ID>/, patch/<title ID>/), an application folder
 (eboot.bin and sce_sys/ at its top), or an sce_sys folder itself. The update's param.sfo, when there is one, is read
-over the game's (its APP_VER is the version that runs); icon0.png is the update's if it has one, else the game's.
+over the game's (its APP_VER is the version that runs); icon0.png is the update's if it has one, else the game's, and
+so are the LiveArea's template and pictures.
 """
 
 import argparse
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -90,6 +93,10 @@ class SceSys:
         self.icon = icon  # icon0.png (None: none)
         self.folders = folders  # the sce_sys folders read, the game's first
 
+    def livearea(self):
+        """The LiveArea's pictures: (background, gate), each a path or None (see read_livearea)."""
+        return read_livearea(self.folders)
+
     @property
     def title(self):
         return self.sfo.get("TITLE") or self.sfo.get("STITLE") or self.title_id
@@ -122,8 +129,11 @@ class SceSys:
         return major * 100 + minor
 
     def describe(self):
+        background, gate = self.livearea()
         return {"title": self.title, "titles": {LANGUAGES[i][1]: t for i, t in self.titles().items()},
                 "title_id": self.title_id, "app_ver": self.app_ver, "icon": str(self.icon) if self.icon else None,
+                "livearea": {"background": str(background) if background else None,
+                             "gate": str(gate) if gate else None},
                 "sce_sys": [str(f) for f in self.folders]}
 
 
@@ -153,6 +163,128 @@ def find(game, title_id=None):
         sfo.update(parse_sfo((folder / "param.sfo").read_bytes()))
     icons = [f / "icon0.png" for f in reversed(folders) if (f / "icon0.png").is_file()]
     return SceSys(sfo, icons[0] if icons else None, folders)
+
+
+# --- LiveArea -------------------------------------------------------------------------------------------------------
+
+# A tag, a comment, a declaration or CDATA of an XML text, read without a full XML parser: the console's LiveArea
+# templates are small, hand-written and not always well-formed (a byte order mark, quotes of either kind, comments,
+# an element left open).
+_XML_TOKEN = re.compile(
+    r"<!--.*?-->|<!\[CDATA\[(?P<cdata>.*?)\]\]>|<[?!].*?>"
+    r"|<(?P<close>/?)\s*(?P<name>[A-Za-z_][\w.:-]*)(?P<attrs>(?:\s+[^\s=/>]+(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))?)*)"
+    r"\s*(?P<empty>/?)>", re.S)
+_XML_ATTR = re.compile(r"([^\s=/>]+)(?:\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+)))?")
+_XML_ENTITIES = {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}
+
+
+def _xml_unescape(s):
+    def entity(m):
+        name = m.group(1)
+        if name.startswith("#x") or name.startswith("#X"):
+            return chr(int(name[2:], 16))
+        if name.startswith("#"):
+            return chr(int(name[1:]))
+        return _XML_ENTITIES.get(name, m.group(0))
+    return re.sub(r"&(#[xX][0-9a-fA-F]+|#[0-9]+|\w+);", entity, s)
+
+
+class XmlElement:
+    def __init__(self, name, attrs):
+        self.name, self.attrs, self.children, self.text = name, attrs, [], ""
+
+    def find_all(self, *path):
+        """The elements at a path of names below this one (names compared without case)."""
+        found = [self]
+        for name in path:
+            found = [c for f in found for c in f.children if c.name.lower() == name.lower()]
+        return found
+
+    def descendants(self, name):
+        """The elements of a name anywhere below this one, in document order (names compared without case)."""
+        out = []
+        for c in self.children:
+            if c.name.lower() == name.lower():
+                out.append(c)
+            out += c.descendants(name)
+        return out
+
+
+def parse_xml(text):
+    """A small XML text as XmlElements: the root (a made-up element named "", holding the document's top elements).
+    Tolerant: a closing tag closes the open element of its name (and those inside it left open); one that matches
+    none is ignored."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8-sig", errors="replace")
+    text = text.lstrip("﻿")
+    root = XmlElement("", {})
+    stack = [root]
+    at = 0
+    for m in _XML_TOKEN.finditer(text):
+        stack[-1].text += _xml_unescape(text[at:m.start()])
+        at = m.end()
+        if m.group("cdata") is not None:
+            stack[-1].text += m.group("cdata")
+        if not m.group("name"):
+            continue
+        name = m.group("name")
+        if m.group("close"):
+            for i in range(len(stack) - 1, 0, -1):
+                if stack[i].name.lower() == name.lower():
+                    del stack[i:]
+                    break
+            continue
+        attrs = {}
+        for a in _XML_ATTR.finditer(m.group("attrs") or ""):
+            value = next((v for v in a.groups()[1:] if v is not None), "")
+            attrs[a.group(1)] = _xml_unescape(value)
+        element = XmlElement(name, attrs)
+        stack[-1].children.append(element)
+        if not m.group("empty"):
+            stack.append(element)
+    stack[-1].text += _xml_unescape(text[at:])
+    return root
+
+
+def _picture_name(elements):
+    """The file an element of a template names: the first without a language's (lang/language attribute) if any,
+    else the first."""
+    names = [(e.text.strip(), e.attrs) for e in elements if e.text.strip()]
+    plain = [n for n, attrs in names if not any(k.lower() in ("lang", "language") for k in attrs)]
+    return (plain or [n for n, _ in names] or [None])[0]
+
+
+def livearea_pictures(template):
+    """The background's and the gate's file names in a LiveArea template (template.xml's text): (background, gate),
+    each None when the template names none."""
+    root = parse_xml(template)
+    # (anywhere below: an element left open holds the ones after it)
+    return (_picture_name([i for e in root.descendants("livearea-background") for i in e.find_all("image")]),
+            _picture_name([i for e in root.descendants("gate") for i in e.find_all("startup-image")]))
+
+
+def read_livearea(folders):
+    """The LiveArea pictures of a game's sce_sys folders (the game's first; the update's template and pictures are
+    taken over the game's): (background, gate), each the path of a PNG file or None. Without a livearea folder (or a
+    template), (None, None)."""
+    for folder in reversed(folders):
+        contents = folder / "livearea" / "contents"
+        template = contents / "template.xml"
+        if not template.is_file():
+            continue
+        names = livearea_pictures(template.read_bytes())
+
+        def picture(name):
+            parts = name.replace("\\", "/").split("/") if name else []
+            if not parts or name.startswith(("/", "\\")) or any(p in ("", ".", "..") for p in parts):
+                return None  # (a file in the contents folder only)
+            for f in reversed(folders):
+                path = f / "livearea" / "contents" / name
+                if path.is_file():
+                    return path
+            return None
+        return picture(names[0]), picture(names[1])
+    return None, None
 
 
 # --- Pictures ---------------------------------------------------------------------------------------------------
@@ -217,6 +349,67 @@ def write_ico(square, path):
         entries += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(png), offset + len(blobs))
         blobs += png
     path.write_bytes(header + entries + blobs)
+
+
+LAUNCH_SIZE = (960, 544)  # (the launch picture: the console's screen)
+LAUNCH_FILE = "launch.png"  # (its name beside the program, and in an APK's assets: the frontend looks for it there)
+LIVEAREA_SIZE, GATE_SIZE = (840, 500), (280, 158)  # (how large the console shows the background and the gate)
+
+
+def ring_colour(picture):
+    """The mean colour of a picture's outermost pixels, (r, g, b) rounded: the colour of the bars around it. The
+    frontend works it out the same way from the launch picture (platform::Window's launch screen)."""
+    rgb = picture.convert("RGB")
+    w, h = rgb.size
+    px = rgb.load()
+    ring = {(x, y) for x in range(w) for y in (0, h - 1)} | {(x, y) for y in range(h) for x in (0, w - 1)}
+    total = [0, 0, 0]
+    for xy in ring:
+        for i, v in enumerate(px[xy]):
+            total[i] += v
+    return tuple((t + len(ring) // 2) // len(ring) for t in total)
+
+
+def _fit(w, h, box_w, box_h):
+    scale = min(box_w / w, box_h / h)
+    return max(1, round(w * scale)), max(1, round(h * scale))
+
+
+def launch_picture(background, gate):
+    """The launch screen's picture from a game's LiveArea pictures (read_livearea): the background as large as fits
+    in the console's screen (960 x 544, its aspect kept; the bars in the colour of its edges), the gate in its middle
+    at the size the console shows it (280 x 158 of the background's 840 x 500). Indexed pictures and transparent ones
+    (over black) are taken as they are. (picture (RGB), colour (r, g, b): ring_colour of the picture, for the bars of
+    a screen of another shape), or None without either picture."""
+    if not background and not gate:
+        return None
+    Image, _, _ = _pil()
+
+    def opened(path):
+        with Image.open(path) as p:
+            return p.convert("RGBA")
+
+    width, height = LAUNCH_SIZE
+    back = None
+    if background:
+        src = opened(background)
+        back = Image.new("RGBA", src.size, (0, 0, 0, 255))
+        back.alpha_composite(src)
+        back = back.convert("RGB")
+    front = opened(gate) if gate else None
+    canvas = Image.new("RGB", LAUNCH_SIZE, ring_colour(back if back else front))
+    # (the background's place on the screen, and the console's pixel there)
+    if back:
+        bw, bh = _fit(*back.size, width, height)
+        unit = min(bw / LIVEAREA_SIZE[0], bh / LIVEAREA_SIZE[1])
+        canvas.paste(back.resize((bw, bh), Image.LANCZOS), ((width - bw) // 2, (height - bh) // 2))
+    else:
+        unit = min(width / LIVEAREA_SIZE[0], height / LIVEAREA_SIZE[1])
+    if front:
+        gw, gh = _fit(*front.size, GATE_SIZE[0] * unit, GATE_SIZE[1] * unit)
+        piece = front.resize((gw, gh), Image.LANCZOS)
+        canvas.paste(piece, ((width - gw) // 2, (height - gh) // 2), piece)
+    return canvas, ring_colour(canvas)
 
 
 def write_hicolor(square, folder, name):

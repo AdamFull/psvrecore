@@ -48,6 +48,14 @@ public:
         f32 controls_opacity = 0.5f;
         f32 controls_scale = 1.0f;
         bool fps_overlay = false;  // the frame rate and a graph of the frame times over the picture
+        // The launch screen: a picture (PNG; on Android a relative path is looked for in the application's files,
+        // then in the APK's assets) shown, as large as fits with bars of the colour of its edges, until the game's
+        // first frame, which it then fades into. Read on the presenting thread: the game's start does not wait for
+        // it. Empty, or no such file: none (black until the first frame).
+        nx::string launch_picture;
+        // Called once, on the presenting thread, after the window's first image is presented (Android: the
+        // activity's own copy of the launch picture, over the window until then, is taken away).
+        void (*first_presented)() = nullptr;
     };
 
     static Result<nx::unique_ptr<Window>> open(const Options& options);
@@ -70,6 +78,8 @@ public:
 
     // Frames presented so far.
     u64 presented() const { return presented_.load(); }
+    // Whether the launch screen is still drawn (shown, or fading into the game's first frame).
+    bool launch_screen() const;
     // Waits until `count` frames have been presented (false on timeout).
     bool wait_presented(u64 count, u32 timeout_ms);
     // The window's last presented image as RGBA (for tests: kept once `keep_last(true)`, where the swapchain allows).

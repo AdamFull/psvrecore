@@ -2,7 +2,14 @@ package io.github.adamfull.psvrecore;
 
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.wifi.WifiManager;
+import android.os.Bundle;
+import android.view.ViewGroup;
+import android.widget.ImageView;
+
+import java.io.InputStream;
 
 import org.libsdl.app.SDLActivity;
 
@@ -17,9 +24,66 @@ import org.libsdl.app.SDLActivity;
  * Paused, it suspends the game and lets the window's surface go at once, on this thread, before the system takes
  * the surface away (SDL's own notice of the pause reaches the game's side only after that); resumed, it lets the
  * game go on.
+ *
+ * The launch screen: when the package has one (scripts/android_apk.py: the colour psvrecore_launch and the asset
+ * launch.png, made from the game's LiveArea), the picture is shown over SDL's surface from the activity's first
+ * frame, as the native side shows it (as large as fits, the bars in that colour), until the native side's first
+ * image is on the screen (hideLaunchPicture); the native side then shows it until the game's first frame. The picture
+ * is read on a thread of its own: until then, and if it is slow, the colour alone.
  */
 public class PsvrecoreActivity extends SDLActivity {
     private static native void nativeSetBackground(boolean background);
+
+    // (the native side's first image presented in this process: no launch picture over it again)
+    private static volatile boolean nativeShown;
+    private ImageView launchView;
+
+    @Override
+    protected void onCreate(Bundle state) {
+        super.onCreate(state);
+        showLaunchPicture();
+    }
+
+    private void showLaunchPicture() {
+        int colour = getResources().getIdentifier("psvrecore_launch", "color", getPackageName());
+        if (colour == 0 || nativeShown || mLayout == null) return;
+        final ImageView view = new ImageView(this);
+        view.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        view.setBackgroundColor(getResources().getColor(colour, null));
+        mLayout.addView(view, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        launchView = view;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final Bitmap picture;
+                try (InputStream in = getAssets().open("launch.png")) {
+                    picture = BitmapFactory.decodeStream(in);
+                } catch (Exception e) {
+                    return;
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (launchView == view && picture != null) view.setImageBitmap(picture);
+                    }
+                });
+            }
+        }, "psvrecore launch picture").start();
+    }
+
+    // From the native side (its presenting thread): its first image is on the screen.
+    public void hideLaunchPicture() {
+        nativeShown = true;
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (launchView == null) return;
+                if (mLayout != null) mLayout.removeView(launchView);
+                launchView = null;
+            }
+        });
+    }
 
     @Override
     protected String[] getLibraries() {

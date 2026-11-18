@@ -8,6 +8,8 @@
 #   it (no package made yet) the program builds as before.
 # - Linux: the program finds the runtime library next to itself ($ORIGIN), so a package folder runs wherever it is
 #   copied.
+# - Windows and Linux: <folder>/launch.png (the launch screen, made from the game's LiveArea) copied beside the
+#   program after each build, when it is there, where the frontend looks for it.
 # The cache variable PSVRECORE_PACKAGE_FOLDER overrides the folder.
 
 function(psvrecore_game_package target)
@@ -32,5 +34,11 @@ function(psvrecore_game_package target)
     elseif(UNIX AND NOT APPLE AND NOT ANDROID)
         # (the build folder's own paths made relative to the program: $ORIGIN, where the library is beside it)
         set_target_properties(${target} PROPERTIES BUILD_RPATH_USE_ORIGIN ON INSTALL_RPATH "\$ORIGIN")
+    endif()
+    if(NOT ANDROID AND EXISTS "${_folder}/launch.png")
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${_folder}/launch.png" "$<TARGET_FILE_DIR:${target}>/launch.png"
+            VERBATIM)
+        message(STATUS "${target}: launch screen ${_folder}/launch.png")
     endif()
 endfunction()

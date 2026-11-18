@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Tests of the packaging scripts (sce_sys.py, package.py) on a made-up game: a param.sfo written here and a drawn
-icon0.png, no game files. Needs Pillow.
+"""Tests of the packaging scripts (sce_sys.py, package.py, android_apk.py's resources) on a made-up game: a
+param.sfo written here, a drawn icon0.png and LiveArea (template.xml, an indexed background, a gate), no game files.
+Needs Pillow.
 
     python scripts/package_tests.py [--build <a psvrecore build folder>]
     python scripts/package_tests.py --make-game <folder>   # only writes the made-up game's folder (CI packages it)
@@ -21,6 +22,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import android_apk  # noqa: E402
 import sce_sys  # noqa: E402
 
 BUILD = None
@@ -30,8 +32,45 @@ SFO_PATCH = {"TITLE": "Test Game: One®", "TITLE_ID": "TEST00001", "APP_VER": "0
              "TITLE_00": "テストゲーム", "TITLE_02": "Jeu d'essai"}
 
 
-def make_game(folder, patch=True):
-    """app/TEST00001/sce_sys (param.sfo, a 128 px opaque icon0.png) and, with patch, patch/TEST00001/sce_sys."""
+# The made-up LiveArea: as the console's templates are written (a byte order mark, single quotes, a comment, frames).
+TEMPLATE = """\ufeff<?xml version='1.0' encoding='utf-8'?>
+
+<livearea style='a1' format-ver='01.00' content-rev='1'>
+\t<livearea-background>
+\t\t<image>bg0.png</image>
+\t</livearea-background>
+\t<!-- <gate><startup-image>old.png</startup-image></gate> -->
+\t<gate>
+\t\t<startup-image>startup.png</startup-image>
+\t</gate>
+\t<frame id='frame1'>
+\t\t<liveitem>
+\t\t\t<background>frame1.png</background>
+\t\t\t<text align='center' valign='bottom'><str color='#ffffff' size='24' ></str></text>
+\t\t</liveitem>
+\t</frame>
+</livearea>
+"""
+BG_EDGE, BG_INSIDE, GATE = (20, 60, 140), (90, 30, 30), (240, 240, 240)
+
+
+def make_livearea(contents):
+    """template.xml, bg0.png (840 x 500, indexed: its edge, a darker inside and a transparent square) and startup.png
+    (280 x 158)."""
+    from PIL import Image
+    contents.mkdir(parents=True)
+    (contents / "template.xml").write_bytes(TEMPLATE.encode("utf-8"))
+    bg = Image.new("P", (840, 500), 0)
+    bg.putpalette([*BG_EDGE, *BG_INSIDE, 255, 0, 255] + [0] * (256 - 3) * 3)
+    bg.paste(1, (60, 40, 780, 460))
+    bg.paste(2, (100, 100, 200, 200))  # (transparent: black on the screen)
+    bg.save(contents / "bg0.png", transparency=2)
+    Image.new("RGB", (280, 158), GATE).save(contents / "startup.png")
+
+
+def make_game(folder, patch=True, livearea=True):
+    """app/TEST00001/sce_sys (param.sfo, a 128 px opaque icon0.png, with livearea a LiveArea) and, with patch,
+    patch/TEST00001/sce_sys."""
     from PIL import Image, ImageDraw
     app = folder / "app" / "TEST00001" / "sce_sys"
     app.mkdir(parents=True)
@@ -39,6 +78,8 @@ def make_game(folder, patch=True):
     icon = Image.new("RGBA", (128, 128), (200, 40, 90, 255))
     ImageDraw.Draw(icon).rectangle((40, 40, 88, 88), fill=(255, 255, 255, 255))
     icon.save(app / "icon0.png")
+    if livearea:
+        make_livearea(app / "livearea" / "contents")
     if patch:
         p = folder / "patch" / "TEST00001" / "sce_sys"
         p.mkdir(parents=True)
@@ -100,6 +141,84 @@ class Find(unittest.TestCase):
         with self.assertRaises(SystemExit):
             sce_sys.find(self.tmp / "game")
         self.assertEqual(sce_sys.find(self.tmp / "game", "TEST00002").app_ver, "01.00")
+
+
+class LiveArea(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="psvrecore_package_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_templates(self):
+        self.assertEqual(sce_sys.livearea_pictures(TEMPLATE.encode("utf-8")), ("bg0.png", "startup.png"))
+        # (double quotes, a declaration, entities, an element left open, a language's picture and the default)
+        text = """<?xml version="1.0"?><!DOCTYPE livearea>
+<livearea style="a5"><livearea-background><image lang="ja">bg_ja.png</image><image>b&amp;g.png</image>
+<gate><startup-image> gate.png </startup-image></gate></livearea>"""
+        self.assertEqual(sce_sys.livearea_pictures(text), ("b&g.png", "gate.png"))
+        self.assertEqual(sce_sys.livearea_pictures("<livearea><gate><startup-image>g.png</startup-image></gate>"
+                                                   "</livearea>"), (None, "g.png"))
+        self.assertEqual(sce_sys.livearea_pictures("<livearea><frame id='frame1'/></livearea>"), (None, None))
+        self.assertEqual(sce_sys.livearea_pictures("not xml at all"), (None, None))
+        self.assertEqual(sce_sys.livearea_pictures(
+            "<livearea><livearea-background><image><![CDATA[bg1.png]]></image></livearea-background>"
+            "</livearea>"), ("bg1.png", None))
+
+    def test_folders(self):
+        game = make_game(self.tmp / "game")
+        app = game / "app" / "TEST00001" / "sce_sys" / "livearea" / "contents"
+        meta = sce_sys.find(game)
+        self.assertEqual(meta.livearea(), (app / "bg0.png", app / "startup.png"))
+        # (the update's template over the game's; its pictures where they are, the update's first)
+        patch = game / "patch" / "TEST00001" / "sce_sys" / "livearea" / "contents"
+        patch.mkdir(parents=True)
+        (patch / "template.xml").write_text("<livearea><livearea-background><image>bg0.png</image>"
+                                            "</livearea-background><gate><startup-image>../../param.sfo"
+                                            "</startup-image></gate></livearea>", encoding="utf-8")
+        self.assertEqual(sce_sys.find(game).livearea(), (app / "bg0.png", None))
+        shutil.copy(app / "bg0.png", patch / "bg0.png")
+        self.assertEqual(sce_sys.find(game).livearea(), (patch / "bg0.png", None))
+        # (no livearea folder: no pictures)
+        self.assertEqual(sce_sys.find(make_game(self.tmp / "plain", livearea=False)).livearea(), (None, None))
+        self.assertIsNone(sce_sys.launch_picture(None, None))
+
+    def test_launch_picture(self):
+        game = make_game(self.tmp / "game")
+        picture, colour = sce_sys.launch_picture(*sce_sys.find(game).livearea())
+        self.assertEqual(picture.size, sce_sys.LAUNCH_SIZE)
+        self.assertEqual(picture.mode, "RGB")
+        # (840 x 500 fitted: 914 x 544 from x 23; bars of the edge's colour; the gate in the middle, 305 x 172)
+        self.assertEqual(colour, sce_sys.ring_colour(picture))
+        self.assertTrue(all(abs(a - b) <= 2 for a, b in zip(colour, BG_EDGE)), colour)
+        self.assertEqual(picture.getpixel((5, 272)), BG_EDGE)
+        self.assertEqual(picture.getpixel((480, 272)), GATE)
+        self.assertEqual(picture.getpixel((480 - 140, 272)), GATE)
+        self.assertEqual(picture.getpixel((480 - 170, 272)), BG_INSIDE)
+        self.assertEqual(picture.getpixel((23 + 163, 163)), (0, 0, 0))  # (the transparent square)
+
+    def test_android_resources(self):
+        res = self.tmp / "res"
+        manifest = ('<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="x">\n'
+                    '    <application android:label="X" android:theme="@android:style/Theme.Black.NoTitleBar">\n'
+                    '    </application>\n</manifest>\n')
+        (res / "mipmap-anydpi-v26").mkdir(parents=True)
+        text = android_apk.write_launch(res, (20, 60, 140), manifest)
+        self.assertIn('android:theme="@style/PsvrecoreLaunch"', text)
+        self.assertNotIn("Theme.Black.NoTitleBar", text)
+        values = (res / "values" / "psvrecore_launch.xml").read_text(encoding="utf-8")
+        self.assertIn('<color name="psvrecore_launch">#143C8C</color>', values)
+        self.assertIn('parent="@android:style/Theme.Black.NoTitleBar"', values)
+        self.assertIn("@drawable/psvrecore_launch_window", values)
+        self.assertNotIn("windowSplashScreen", values)
+        v31 = (res / "values-v31" / "psvrecore_launch.xml").read_text(encoding="utf-8")
+        self.assertIn('<item name="android:windowSplashScreenBackground">@color/psvrecore_launch</item>', v31)
+        window = (res / "drawable" / "psvrecore_launch_window.xml").read_text(encoding="utf-8")
+        self.assertIn("@mipmap/ic_launcher", window)
+        # (a manifest without a theme gets one)
+        plain = android_apk.write_launch(self.tmp / "res2", (0, 0, 0), manifest.replace(
+            ' android:theme="@android:style/Theme.Black.NoTitleBar"', ""))
+        self.assertIn('<application android:theme="@style/PsvrecoreLaunch" android:label="X">', plain)
 
 
 class Assets(unittest.TestCase):
@@ -172,6 +291,24 @@ class Assets(unittest.TestCase):
         self.assertEqual(big.getpixel((2, 128)), (10, 200, 30, 255))
         self.assertEqual(big.getpixel((128, 2))[3], 0)
 
+    def test_launch_screen(self):
+        from PIL import Image
+        with Image.open(self.out / sce_sys.LAUNCH_FILE) as f:
+            self.assertEqual(f.size, sce_sys.LAUNCH_SIZE)
+        import json
+        info = json.loads((self.out / "sce_sys.json").read_text(encoding="utf-8"))
+        self.assertEqual(info["launch"]["file"], sce_sys.LAUNCH_FILE)
+        self.assertTrue(info["livearea"]["background"].endswith("bg0.png"))
+        # (a game without a LiveArea: none, and an earlier one's removed)
+        root = self.tmp / "repo3"
+        (root / "generated" / "package").mkdir(parents=True)
+        (root / "generated" / "package" / sce_sys.LAUNCH_FILE).write_bytes(b"old")
+        package("assets", "--root", root, "--name", "testgame", "--game",
+                make_game(self.tmp / "plain", livearea=False))
+        self.assertFalse((root / "generated" / "package" / sce_sys.LAUNCH_FILE).exists())
+        info = json.loads((root / "generated" / "package" / "sce_sys.json").read_text(encoding="utf-8"))
+        self.assertIsNone(info["launch"])
+
 
 class Program(unittest.TestCase):
     """psvrecore_shared_tests packaged as a game's program, and run from the package's folder."""
@@ -197,10 +334,11 @@ class Program(unittest.TestCase):
             if platform == "windows":
                 self.assertIn("psvrecore.dll", names)
                 self.assertIn("install.ps1", names)
+                self.assertIn(sce_sys.LAUNCH_FILE, names)
                 program = moved / "psvrecore_shared_tests.exe"
             else:
                 self.assertTrue(any(n.startswith("libpsvrecore.so.") for n in names), names)
-                for n in ("psvrecore_shared_tests.desktop", "install.sh", "icons"):
+                for n in ("psvrecore_shared_tests.desktop", "install.sh", "icons", sce_sys.LAUNCH_FILE):
                     self.assertIn(n, names)
                 program = moved / "psvrecore_shared_tests"
                 data = tmp / "data"

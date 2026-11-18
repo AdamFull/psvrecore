@@ -268,8 +268,8 @@ python scripts/package.py android   # build/package/android/<name>.apk
 ```
 
 - What is made from `sce_sys` goes to the game repository's `generated/package/` (git-ignored, never committed):
-  `<name>.ico` (16 to 256 px), `<name>.rc`, `hicolor/`, `<name>.desktop`, `icon.png` (256 px) and `sce_sys.json`
-  (what was read). `python scripts/package.py assets` makes only these.
+  `<name>.ico` (16 to 256 px), `<name>.rc`, `hicolor/`, `<name>.desktop`, `icon.png` (256 px), `launch.png` (the
+  launch screen, below) and `sce_sys.json` (what was read). `python scripts/package.py assets` makes only these.
 - The icon: the game's `icon0.png` in the console's round bubble; or the repository's `game/icon.png` when there is
   one, or `--icon <picture>` (a logo: its artwork made square, not rounded).
 - Windows: the game's `CMakeLists.txt` calls `psvrecore_game_package(<target>)` (`cmake/PsvrecorePackage.cmake`),
@@ -289,6 +289,24 @@ python scripts/package.py android   # build/package/android/<name>.apk
   other options through (`--install`, `--debuggable`).
 - The window's title is the game's own at run time too: the frontend reads `sce_sys/param.sfo` from the game's folder
   (`TITLE_xx` in `[system] language`, else `TITLE`); the title the game's program gives is used without one.
+- The launch screen, from the game's LiveArea (`sce_sys/livearea/contents/`, the update's over the game's): its
+  `template.xml` (read by our own small parser in `sce_sys.py`, tolerant of what the console's templates hold: a byte
+  order mark, either quotes, comments, an element left open) names the background (`<livearea-background><image>`,
+  `bg0.png` as a rule) and the gate (`<gate><startup-image>`: `startup.png`, `gate.png`, `pic0.png`...). `launch.png`
+  is the console's screen, 960 x 544: the background as large as fits (its bars in the mean colour of its edge
+  pixels), the gate over its middle as large as the console shows it (280 x 158 of the background's 840 x 500);
+  indexed and transparent PNGs are read as they are (transparent: over black). A game without a `livearea` folder
+  gets none, and starts as before (black until its first frame).
+  - At run time the frontend shows it from the window's first image until the game's first frame, then fades it out
+    (250 ms): as large as fits the window, the bars in the colour of its edges (worked out the same way). It is read
+    on the window's presenting thread, so the game's start does not wait for it. Setting `[display] launch_screen`
+    (on by default; `--set display.launch_screen=false`). The log says when the first frame came (`display: the
+    game's first frame ... ms after the window opened`).
+  - Windows and Linux: `launch.png` beside the program; `package.py` puts it in the folder, and
+    `psvrecore_game_package` copies it beside the program in the build folder when `generated/package/launch.png` is
+    there when CMake configures.
+  - Android: see "Android applications" below (`android_apk.py`: the picture in the APK's assets, the system splash
+    screen's colour).
 
 `python scripts/package_tests.py [--build <build folder>]` tests these scripts on a made-up game (a `param.sfo`
 written by the test, a drawn icon); with a build folder it packages `psvrecore_shared_tests` as a game's program and
@@ -306,6 +324,22 @@ build-tools and a platform, and a JDK.
 python scripts/android_apk.py --manifest <AndroidManifest.xml> --lib build/android-arm64-release/libmain.so \
     --out game.apk --install
 ```
+
+With `--sce-sys <the game's folder>` (as `package.py android` passes it) and a game with a LiveArea, or with
+`--launch <a picture, or a game's folder>` (`--no-launch`: none; a game repository's
+`scripts/android_apk.py` passes its game's folder), the package gets the launch screen:
+
+- `assets/launch.png` (stored), the picture the native side draws until the game's first frame (the frontend opens
+  `launch.png`: SDL looks in the application's files, then in the assets).
+- `@color/psvrecore_launch`, the colour of the picture's edges, and a theme over the manifest's application theme
+  (`PsvrecoreLaunch`, set on `<application>`): on Android 12 and later the system's splash screen is the launcher
+  icon (the adaptive one) on that colour (`windowSplashScreenBackground`); before 12 the windows' background is that
+  colour with the launcher icon in the middle (`windowBackground`, what shows while the application starts).
+- `PsvrecoreActivity` puts the picture over SDL's surface from its first frame (an `ImageView`, the picture as large as
+  fits on that colour, read on a thread of its own so nothing waits for it) and takes it away when the native side
+  calls `hideLaunchPicture` after its first image (the same picture, drawn the same way). `LauncherActivity` goes on
+  to the game without an animation. So: the splash screen's colour, the picture, then the game's first frame fading
+  in, with no black between.
 
 On the device, the launcher offers Play, Settings, and the game's application folder: chosen with the system's folder
 picker and copied into the application's folder, `Android/data/<package>/files/game`. The settings file and the data

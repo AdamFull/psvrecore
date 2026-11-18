@@ -1,5 +1,7 @@
 #include "quads.hpp"
 
+#include <cstring>
+
 #include "psvrecore/gxm/spirv.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
 #include "spirv/unified1/spirv.h"
@@ -313,14 +315,15 @@ VkDescriptorSet QuadRenderer::texture(u32 set, VkImageView view, bool smooth) {
     return sets_[set];
 }
 
-void QuadRenderer::begin(VkCommandBuffer cmd, u32 image) {
-    VkClearValue black{};
+void QuadRenderer::begin(VkCommandBuffer cmd, u32 image, const f32* clear) {
+    VkClearValue value{};
+    if (clear) std::memcpy(value.color.float32, clear, sizeof(f32) * 4);
     VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     bi.renderPass = pass_;
     bi.framebuffer = framebuffers_[image];
     bi.renderArea = {{0, 0}, extent_};
     bi.clearValueCount = 1;
-    bi.pClearValues = &black;
+    bi.pClearValues = &value;
     vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
     const VkViewport viewport{0, 0, static_cast<f32>(extent_.width), static_cast<f32>(extent_.height), 0, 1};
     const VkRect2D scissor{{0, 0}, extent_};

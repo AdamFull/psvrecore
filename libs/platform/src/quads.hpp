@@ -36,8 +36,9 @@ public:
     // A descriptor set (by index, of the `sets`) pointed at a texture.
     VkDescriptorSet texture(u32 set, VkImageView view, bool smooth);
 
-    // Begins the pass on target `image` (its contents cleared to black; left in PRESENT_SRC at the end).
-    void begin(VkCommandBuffer cmd, u32 image);
+    // Begins the pass on target `image` (its contents cleared to `clear`, RGBA, black without; left in PRESENT_SRC at
+    // the end).
+    void begin(VkCommandBuffer cmd, u32 image, const f32* clear = nullptr);
     void draw(VkCommandBuffer cmd, VkDescriptorSet texture, const Quad& q, bool blend);
     void end(VkCommandBuffer cmd);
 

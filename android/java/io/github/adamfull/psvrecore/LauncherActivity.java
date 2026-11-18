@@ -298,6 +298,8 @@ public class LauncherActivity extends Activity {
         if (!intent.hasExtra("args") && missing(gameFolder()) != null && missing(deployedFolder()) == null)
             intent.putExtra("args", new String[] {"--game", deployedFolder().getAbsolutePath()});
         startActivity(intent);
+        // (no animation: the system's splash screen goes straight to the game's launch screen)
+        overridePendingTransition(0, 0);
         finish();
     }
 

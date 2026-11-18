@@ -13,6 +13,13 @@ With --sce-sys <the game's folder>, the application is named from the game's par
 @string/app_name, with the TITLE_xx translations; APP_VER as the version) and its icon is icon0.png unless --icon
 gives another (scripts/sce_sys.py reads them; scripts/package.py passes it).
 
+The launch screen (with --sce-sys, from the game's LiveArea: sce_sys/livearea/contents/template.xml's background and
+gate; or --launch <a picture, or a game's folder>): the picture goes in the APK's assets as launch.png, which the native side draws until the
+game's first frame (and PsvrecoreActivity over SDL's surface until the native side's first image), and the colour of
+its edges (@color/psvrecore_launch) is the system's splash screen's background (Android 12 and later, around the
+launcher icon) and the windows' background before that (earlier versions: the colour and the icon), through a theme
+over the manifest's application theme. Without a LiveArea, none of it: the package is as before.
+
 Needs ANDROID_HOME (or ANDROID_SDK_ROOT, or C:/Android/Sdk) with build-tools and a platform, the NDK (for llvm-strip),
 and a JDK (javac, keytool) on PATH or in JAVA_HOME.
 """
@@ -122,6 +129,49 @@ def write_placeholder_icon(res):
     write_adaptive(res, "#202124", "@drawable/ic_launcher_foreground")
 
 
+def write_launch(res, colour, manifest_text):
+    """The launch screen's resources: @color/psvrecore_launch, and the theme PsvrecoreLaunch over the application's
+    theme (the manifest's, else a black full-screen one): its windows' background that colour with the launcher icon
+    in the middle (what Android before 12 shows while the application starts), and on Android 12 and later the system
+    splash screen's background (the launcher icon over it is the system's). The manifest's text with the theme set
+    on its <application>."""
+    application = re.search(r"<application\b[^>]*>", manifest_text)
+    if not application:
+        raise SystemExit("the manifest has no <application> element")
+    element = application.group(0)
+    theme = re.search(r'android:theme="([^"]*)"', element)
+    parent = theme.group(1) if theme else "@android:style/Theme.Black.NoTitleBar.Fullscreen"
+    hex_colour = "#%02X%02X%02X" % colour
+    values = res / "values"
+    values.mkdir(parents=True, exist_ok=True)
+    icon = ('        <item android:gravity="center" android:width="160dp" android:height="160dp"\n'
+            '            android:drawable="@mipmap/ic_launcher" />\n') if (res / "mipmap-anydpi-v26").is_dir() else ""
+    drawable = res / "drawable"
+    drawable.mkdir(parents=True, exist_ok=True)
+    (drawable / "psvrecore_launch_window.xml").write_text(
+        '<layer-list xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <item android:drawable="@color/psvrecore_launch" />\n' + icon + '</layer-list>\n', encoding="utf-8")
+
+    def style(extra):
+        return (f'<resources>\n    <color name="psvrecore_launch">{hex_colour}</color>\n'
+                f'    <style name="PsvrecoreLaunch" parent="{parent}">\n'
+                '        <item name="android:windowBackground">@drawable/psvrecore_launch_window</item>\n'
+                f'{extra}    </style>\n</resources>\n')
+    (values / "psvrecore_launch.xml").write_text(style(""), encoding="utf-8")
+    v31 = res / "values-v31"
+    v31.mkdir(parents=True, exist_ok=True)
+    # (Android 12 and later: the splash screen, the launcher icon on this colour; the windows' own background after it
+    # just the colour, under the launch picture)
+    (v31 / "psvrecore_launch.xml").write_text(style(
+        '        <item name="android:windowSplashScreenBackground">@color/psvrecore_launch</item>\n'
+        ).replace("@drawable/psvrecore_launch_window", "@color/psvrecore_launch"), encoding="utf-8")
+    if theme:
+        element = element.replace(theme.group(0), 'android:theme="@style/PsvrecoreLaunch"')
+    else:
+        element = element.replace("<application", '<application android:theme="@style/PsvrecoreLaunch"', 1)
+    return manifest_text[:application.start()] + element + manifest_text[application.end():]
+
+
 def write_adaptive(res, background, foreground):
     values = res / "values"
     values.mkdir(parents=True, exist_ok=True)
@@ -152,6 +202,10 @@ def main():
     parser.add_argument("--sce-sys", metavar="GAME", help="the game's folder: the label, version and icon from its "
                                                            "sce_sys (param.sfo, icon0.png)")
     parser.add_argument("--title-id", help="with --sce-sys: the title, when the game's folder holds several")
+    parser.add_argument("--launch", metavar="PICTURE_OR_GAME",
+                        help="the launch screen: a picture, or a game's folder (made from its LiveArea, when it has "
+                             "one); default with --sce-sys: that game's (needs Pillow)")
+    parser.add_argument("--no-launch", action="store_true", help="no launch screen")
     parser.add_argument("--version-code", type=int, help="default: from APP_VER with --sce-sys (01.04: 104), else 1")
     parser.add_argument("--version-name", help="default: APP_VER with --sce-sys, else 0.1")
     parser.add_argument("--keep-debug", action="store_true", help="keep the library's debug information")
@@ -169,6 +223,22 @@ def main():
         args.version_name = meta.app_ver if meta else "0.1"
     if meta and not args.icon and meta.icon:
         args.icon = str(meta.icon)
+    # The launch screen: (picture, colour of its edges), or None.
+    launch = None
+    if args.no_launch:
+        pass
+    elif args.launch and Path(args.launch).is_dir():
+        launch = sce_sys.launch_picture(*sce_sys.find(args.launch, args.title_id).livearea())
+    elif args.launch:
+        try:
+            from PIL import Image
+        except ImportError:
+            raise SystemExit("--launch needs Pillow (pip install pillow)")
+        with Image.open(args.launch) as opened:
+            picture = opened.convert("RGB")
+        launch = (picture, sce_sys.ring_colour(picture))
+    elif meta:
+        launch = sce_sys.launch_picture(*meta.livearea())
 
     sdk = Path(os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or "C:/Android/Sdk")
     build_tools = newest(sdk / "build-tools")
@@ -195,6 +265,13 @@ def main():
                 args.res and any(Path(args.res).glob("mipmap*/ic_launcher.*"))):
             write_placeholder_icon(icon)
         manifest = Path(args.manifest)
+        if launch:
+            # (the launch screen's colour and theme; its picture goes in the assets below)
+            icon.mkdir(parents=True, exist_ok=True)
+            text = write_launch(icon, launch[1], manifest.read_text(encoding="utf-8"))
+            manifest = tmp / "AndroidManifest.xml"
+            manifest.write_text(text, encoding="utf-8")
+            print("launch screen: the picture %d x %d, colour #%02X%02X%02X" % (*launch[0].size, *launch[1]))
         if meta:
             # (the application's label: @string/app_name, the title and its translations)
             sce_sys.write_android_labels(meta, icon)
@@ -261,9 +338,14 @@ def main():
         # The package: stored native code (loaded from the APK in place, 16 KiB aligned), then signed.
         unaligned = tmp / "unaligned.apk"
         shutil.copyfile(base, unaligned)
+        if launch:
+            launch[0].save(tmp / sce_sys.LAUNCH_FILE, optimize=True)
         with zipfile.ZipFile(unaligned, "a") as z:
             z.write(dex / "classes.dex", "classes.dex", compress_type=zipfile.ZIP_DEFLATED)
             z.write(lib, "lib/arm64-v8a/libmain.so", compress_type=zipfile.ZIP_STORED)
+            if launch:
+                # (stored: read in place, already compressed)
+                z.write(tmp / sce_sys.LAUNCH_FILE, f"assets/{sce_sys.LAUNCH_FILE}", compress_type=zipfile.ZIP_STORED)
         aligned = tmp / "aligned.apk"
         run([build_tools / f"zipalign{EXE}", "-f", "-P", "16", "4", unaligned, aligned])
         keystore = Path.home() / ".android" / "debug.keystore"

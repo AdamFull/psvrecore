@@ -14,6 +14,7 @@
 
 #include "imgui.h"
 #include "nxtest.h"
+#include "psvrecore/io/png.hpp"
 #include "psvrecore/platform/audio.hpp"
 #include "psvrecore/platform/input.hpp"
 #include "psvrecore/platform/system_ui.hpp"
@@ -463,6 +464,79 @@ TEST_CASE("window: overlay quads are blended over the picture, cut from their at
         SDL_Delay(1);
     }
     CHECK(gone);
+}
+
+TEST_CASE("window: the launch screen is drawn until the first frame, with bars of its edges' colour, then fades") {
+    // A picture twice as wide as high (bars above and below in a window of the screen's shape): orange, a teal
+    // middle; written as a PNG and read by the window as the launch screen.
+    constexpr u32 pw = 200, ph = 100;
+    static constexpr u8 kOrange[3] = {230, 120, 30}, kTeal[3] = {0, 128, 128};
+    nx::vector<u8> pixels(usize{pw} * ph * 4);
+    for (u32 y = 0; y < ph; ++y) {
+        for (u32 x = 0; x < pw; ++x) {
+            const bool middle = x >= pw / 4 && x < pw * 3 / 4 && y >= ph / 4 && y < ph * 3 / 4;
+            const u8* c = middle ? kTeal : kOrange;
+            u8* o = &pixels[(usize{y} * pw + x) * 4];
+            o[0] = c[0], o[1] = c[1], o[2] = c[2], o[3] = 255;
+        }
+    }
+    const nx::string path = nx::format("{}/psvrecore_launch_test_{}.png", temp_folder(), nx::os::process_id());
+    REQUIRE(io::write_png(path.c_str(), pw, ph, pixels.data()));
+    Window::Options o;
+    o.title = "psvrecore test";
+    o.hidden = true;
+    o.launch_picture = path;
+    static std::atomic<u32> first{0};
+    o.first_presented = [] { first.fetch_add(1); };
+    auto opened = Window::open(o);
+    if (!opened) {
+        std::remove(path.c_str());
+        SKIP(nx::format("no window: {}", opened.error().message).c_str());
+    }
+    Window& w = **opened;
+    w.keep_last(true);
+    REQUIRE(w.wait_presented(1, 3000));
+    std::remove(path.c_str());
+    Shot shot;
+    if (!w.last_image(&shot.rgba, &shot.w, &shot.h)) SKIP("the window's images cannot be read back");
+    CHECK(first.load() == 1);
+    CHECK(w.launch_screen());
+    // The picture as large as fits, centred; the bars orange (the mean of its edge).
+    bool drawn = false;
+    for (u32 i = 0; i < 3000 && !drawn; ++i) {
+        w.pump(nullptr);
+        drawn = w.last_image(&shot.rgba, &shot.w, &shot.h) && is(shot.at(shot.w / 2, shot.h / 2), kTeal) &&
+                is(shot.at(1, 1), kOrange) && is(shot.at(shot.w - 2, shot.h - 2), kOrange) &&
+                is(shot.at(shot.w / 8, shot.h / 2), kOrange);
+        SDL_Delay(1);
+    }
+    CHECK(drawn);
+    // The game's first frame: the launch screen fades into it, and is gone (the frame fitted, black bars).
+    const nx::vector<u8> picture = quadrants();
+    w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+    const u64 shown_at = nx::os::ticks_ns();
+    for (u32 i = 0; i < 3000 && w.launch_screen(); ++i) {
+        w.pump(nullptr);
+        SDL_Delay(1);
+    }
+    CHECK_FALSE(w.launch_screen());
+    const u64 fade_ms = (nx::os::ticks_ns() - shown_at) / 1'000'000;
+    std::printf("launch screen: faded in %llu ms\n", static_cast<unsigned long long>(fade_ms));
+    CHECK(fade_ms >= 200);
+    CHECK(presented_fitted(w, &shot));
+    CHECK(first.load() == 1);
+}
+
+TEST_CASE("window: without its picture there is no launch screen") {
+    Window::Options o;
+    o.title = "psvrecore test";
+    o.hidden = true;
+    o.launch_picture = nx::format("{}/psvrecore_no_such_launch_{}.png", temp_folder(), nx::os::process_id());
+    auto opened = Window::open(o);
+    if (!opened) SKIP(nx::format("no window: {}", opened.error().message).c_str());
+    Window& w = **opened;
+    REQUIRE(w.wait_presented(1, 3000));
+    CHECK_FALSE(w.launch_screen());
 }
 
 TEST_CASE("touch controls: buttons, slides, the d-pad's diagonals, sticks, auto showing and hiding") {

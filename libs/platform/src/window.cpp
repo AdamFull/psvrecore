@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -26,6 +27,10 @@ namespace psvrecore::platform {
 namespace {
 
 constexpr u32 kFramesInFlight = 2;
+// The quad renderer's descriptor sets a frame in flight: the frame, the overlay's atlas, the frame rate's font, the
+// launch screen.
+constexpr u32 kSetsPerSlot = 4;
+constexpr u64 kLaunchFadeNs = 250'000'000ull;  // (the launch screen fading into the game's first frame)
 constexpr u32 kA2B10G10R10 = 0x50000000u;  // (SCE_DISPLAY_PIXELFORMAT_A2B10G10R10; else A8B8G8R8)
 
 VkSurfaceKHR make_surface(VkInstance instance, void* user) {
@@ -41,12 +46,15 @@ struct Rect {
     f32 x = 0, y = 0, w = 0, h = 0;
 };
 
-// Where the screen goes in a window of w x h: as large as fits, centred, the rest black.
-Rect fit(f32 w, f32 h) {
-    const f32 scale = std::min(w / kScreenWidth, h / kScreenHeight);
-    const f32 sw = kScreenWidth * scale, sh = kScreenHeight * scale;
+// Where a picture of pw x ph goes in a window of w x h: as large as fits, centred (the screen's: the rest black).
+Rect fit(f32 w, f32 h, f32 pw = kScreenWidth, f32 ph = kScreenHeight) {
+    const f32 scale = std::min(w / pw, h / ph);
+    const f32 sw = pw * scale, sh = ph * scale;
     return Rect{(w - sw) * 0.5f, (h - sh) * 0.5f, sw, sh};
 }
+
+// (an sRGB-encoded colour's channel as a linear value, for a clear of an sRGB target)
+f32 srgb_to_linear(f32 c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
 
 bool is_srgb(VkFormat f) {
     return f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
@@ -135,6 +143,20 @@ struct Window::Presenter {
     // The system UI's screens (Dear ImGui), over everything else.
     nx::unique_ptr<Overlay> screens;
 
+    // The launch screen (Options::launch_picture), the presenting thread's: its pixels until made an image, the
+    // colour of its bars (the mean of its edge's pixels, as scripts/sce_sys.py's ring_colour), and when it began to
+    // fade (at the game's first frame). Gone once faded.
+    enum class Launch : u8 { None, Shown, Fading };
+    nx::string launch_path;
+    std::atomic<Launch> launch_state{Launch::None};
+    nx::vector<u8> launch_pixels;
+    u32 launch_w = 0, launch_h = 0;
+    f32 launch_colour[3] = {};
+    u64 fade_start_ns = 0, opened_ns = nx::os::ticks_ns();
+    bool first_frame = false;  // (the game's first frame drawn)
+    vulkan::Image launch;
+    void (*first_presented)() = nullptr;
+
     // The last image presented (keep_last).
     nx::mutex readback_lock;
     std::atomic<bool> keep{false};
@@ -167,6 +189,7 @@ struct Window::Presenter {
         vulkan::destroy_image(*device, gpu_image);
         vulkan::destroy_image(*device, atlas);
         vulkan::destroy_image(*device, stats_atlas);
+        vulkan::destroy_image(*device, launch);
         quads.reset();
         if (pool) vkDestroyCommandPool(d, pool, nullptr);
     }
@@ -207,13 +230,61 @@ struct Window::Presenter {
         wake.notify_one();
     }
 
+    // The launch picture read (on this thread, before its first image: the game starts meanwhile).
+    void load_launch() {
+        if (launch_path.empty()) return;
+        const u64 start = nx::os::ticks_ns();
+        SDL_Surface* loaded = SDL_LoadPNG(launch_path.c_str());
+        if (!loaded) {
+            nx::logi(logs::display, "display: no launch screen ({}: {})", launch_path, SDL_GetError());
+            return;
+        }
+        SDL_Surface* rgba = SDL_ConvertSurface(loaded, SDL_PIXELFORMAT_RGBA32);
+        SDL_DestroySurface(loaded);
+        if (!rgba || rgba->w <= 0 || rgba->h <= 0) {
+            if (rgba) SDL_DestroySurface(rgba);
+            return;
+        }
+        const u32 w = static_cast<u32>(rgba->w), h = static_cast<u32>(rgba->h);
+        launch_pixels.resize(usize{w} * h * 4);
+        for (u32 y = 0; y < h; ++y)
+            std::memcpy(&launch_pixels[usize{y} * w * 4], static_cast<const u8*>(rgba->pixels) + usize{y} * rgba->pitch,
+                        usize{w} * 4);
+        SDL_DestroySurface(rgba);
+        // (the bars: the mean of the outermost pixels, rounded)
+        u64 sum[3] = {}, n = 0;
+        auto add = [&](u32 x, u32 y) {
+            const u8* px = &launch_pixels[(usize{y} * w + x) * 4];
+            for (u32 i = 0; i < 3; ++i) sum[i] += px[i];
+            ++n;
+        };
+        for (u32 x = 0; x < w; ++x) {
+            add(x, 0);
+            if (h > 1) add(x, h - 1);
+        }
+        for (u32 y = 1; y + 1 < h; ++y) {
+            add(0, y);
+            if (w > 1) add(w - 1, y);
+        }
+        for (u32 i = 0; i < 3; ++i) launch_colour[i] = static_cast<f32>((sum[i] + n / 2) / n) / 255.0f;
+        launch_w = w, launch_h = h;
+        launch_state.store(Launch::Shown);
+        nx::logi(logs::display, "display: launch screen {} ({} x {}, bars #{:02X}{:02X}{:02X}; read in {} ms)",
+                 launch_path, w, h, static_cast<u32>((sum[0] + n / 2) / n), static_cast<u32>((sum[1] + n / 2) / n),
+                 static_cast<u32>((sum[2] + n / 2) / n), (nx::os::ticks_ns() - start) / 1'000'000);
+    }
+
     void run() {
         nx::this_thread::set_name("psvrecore display");
         runtime::host::frame_thread();
+        load_launch();
         while (true) {
             {
                 nx::scoped_lock<nx::mutex> held(lock);
-                wake.wait(lock, [&] { return has_pending || redraw || stop; });
+                auto ready = [&] { return has_pending || redraw || stop; };
+                // (fading: drawn again every few milliseconds, whether the game shows frames or not)
+                if (launch_state.load() == Launch::Fading) wake.wait_for(lock, std::chrono::milliseconds(8), ready);
+                else wake.wait(lock, ready);
                 if (stop) return;
                 if (has_pending) {
                     if (!pending_gpu) std::swap(pending, current);
@@ -345,7 +416,7 @@ struct Window::Presenter {
             vkCreateSemaphore(d, &si, nullptr, &s);
             rendered.push_back(s);
         }
-        if (auto r = quads->init(chosen.format, kFramesInFlight * 3); !r) {
+        if (auto r = quads->init(chosen.format, kFramesInFlight * kSetsPerSlot); !r) {
             nx::loge(logs::display, "display: {}", r.error().message);
             failed = true;
             return false;
@@ -483,6 +554,54 @@ struct Window::Presenter {
             }
         }
 
+        if (have && !first_frame) {
+            first_frame = true;
+            nx::logi(logs::display, "display: the game's first frame {} ms after the window opened{}",
+                     (nx::os::ticks_ns() - opened_ns) / 1'000'000,
+                     launch_state.load() == Launch::Shown ? ": the launch screen fades" : "");
+        }
+        // The launch screen: until the game's first frame, then fading into it; its image made at its first draw (in
+        // the swapchain's texture format).
+        f32 launch_alpha = 0;
+        if (launch_state.load() != Launch::None) {
+            const u64 now = nx::os::ticks_ns();
+            if (!launch.image && launch_pixels.empty()) {
+                launch_state.store(Launch::None);
+            } else if (have && launch_state.load() == Launch::Shown) {
+                launch_state.store(Launch::Fading);
+                fade_start_ns = now;
+            }
+            if (launch_state.load() == Launch::Shown) launch_alpha = 1;
+            else if (launch_state.load() == Launch::Fading && now - fade_start_ns < kLaunchFadeNs)
+                launch_alpha = 1.0f - static_cast<f32>(now - fade_start_ns) / static_cast<f32>(kLaunchFadeNs);
+            if (launch_alpha <= 0 && launch_state.load() != Launch::None) {
+                launch_state.store(Launch::None);
+                launch_pixels = {};
+                if (launch.image) {
+                    device->wait_idle();
+                    vulkan::destroy_image(*device, launch);
+                }
+            }
+            if (launch_alpha > 0 && !launch_pixels.empty()) {
+                vulkan::ImageDesc desc;
+                desc.format = texture_format;
+                desc.width = launch_w, desc.height = launch_h;
+                auto image = vulkan::create_image(*device, desc);
+                if (image) {
+                    launch = *image;
+                    if (auto r = vulkan::upload_image(*device, launch, launch_pixels); !r)
+                        nx::loge(logs::display, "display: the launch screen: {}", r.error().message);
+                }
+                launch_pixels = {};
+                if (!launch.image) launch_alpha = 0, launch_state.store(Launch::None);
+            }
+        }
+        f32 clear[4] = {0, 0, 0, 1};
+        if (launch_alpha > 0) {
+            for (u32 i = 0; i < 3; ++i)
+                clear[i] = (is_srgb(format) ? srgb_to_linear(launch_colour[i]) : launch_colour[i]) * launch_alpha;
+        }
+
         nx::scoped_lock<nx::mutex> read_held(readback_lock);
         const bool read = keep.load() && can_read;
         if (read) {
@@ -510,7 +629,7 @@ struct Window::Presenter {
         }
         const u32 slot = static_cast<u32>(&f - frames);
         if (ui) screens->upload(f.cmd, slot);
-        quads->begin(f.cmd, index);
+        quads->begin(f.cmd, index, clear);
         if (have) {
             // (the screen as large as fits, centred; sharp pixels at 1:1)
             const Rect v = fit(static_cast<f32>(extent.width), static_cast<f32>(extent.height));
@@ -518,16 +637,34 @@ struct Window::Presenter {
             q.x0 = std::round(v.x), q.y0 = std::round(v.y);
             q.x1 = std::round(v.x + v.w), q.y1 = std::round(v.y + v.h);
             const bool exact = q.x1 - q.x0 == static_cast<f32>(current_w) && q.y1 - q.y0 == static_cast<f32>(current_h);
-            quads->draw(f.cmd, quads->texture(slot * 3, gpu ? gpu_image.view : f.image.view, smooth && !exact), q,
-                        false);
+            quads->draw(f.cmd, quads->texture(slot * kSetsPerSlot, gpu ? gpu_image.view : f.image.view, smooth && !exact),
+                        q, false);
         }
-        if (atlas.image && !overlay_drawn.empty()) {
-            const VkDescriptorSet sprites = quads->texture(slot * 3 + 1, atlas.view, true);
-            for (const Quad& q : overlay_drawn) quads->draw(f.cmd, sprites, q, true);
+        if (launch_alpha > 0 && launch.image) {
+            // (as large as fits, centred; over the frame while fading)
+            const Rect v = fit(static_cast<f32>(extent.width), static_cast<f32>(extent.height),
+                               static_cast<f32>(launch_w), static_cast<f32>(launch_h));
+            Quad q;
+            q.x0 = std::round(v.x), q.y0 = std::round(v.y);
+            q.x1 = std::round(v.x + v.w), q.y1 = std::round(v.y + v.h);
+            q.a = launch_alpha;
+            quads->draw(f.cmd, quads->texture(slot * kSetsPerSlot + 3, launch.view, true), q, launch_alpha < 1);
         }
-        if (stats_atlas.image && !stats_drawn.empty()) {
-            const VkDescriptorSet font = quads->texture(slot * 3 + 2, stats_atlas.view, false);
-            for (const Quad& q : stats_drawn) quads->draw(f.cmd, font, q, true);
+        // (the on-screen controls and the frame rate: not over the launch screen, coming in as it fades)
+        const f32 overlay_alpha = 1.0f - launch_alpha;
+        if (atlas.image && !overlay_drawn.empty() && overlay_alpha > 0) {
+            const VkDescriptorSet sprites = quads->texture(slot * kSetsPerSlot + 1, atlas.view, true);
+            for (Quad q : overlay_drawn) {
+                q.a *= overlay_alpha;
+                quads->draw(f.cmd, sprites, q, true);
+            }
+        }
+        if (stats_atlas.image && !stats_drawn.empty() && overlay_alpha > 0) {
+            const VkDescriptorSet font = quads->texture(slot * kSetsPerSlot + 2, stats_atlas.view, false);
+            for (Quad q : stats_drawn) {
+                q.a *= overlay_alpha;
+                quads->draw(f.cmd, font, q, true);
+            }
         }
         if (ui) screens->draw(f.cmd, slot, quads->pass());
         quads->end(f.cmd);
@@ -588,7 +725,7 @@ struct Window::Presenter {
         if (r == VK_ERROR_OUT_OF_DATE_KHR) out_of_date = true;
         else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
             nx::loge(logs::display, "display: vkQueuePresentKHR: {}", vulkan::result_name(r));
-        window.presented_.fetch_add(1);
+        if (window.presented_.fetch_add(1) == 0 && first_presented) first_presented();
         return true;
     }
 };
@@ -628,6 +765,8 @@ Result<nx::unique_ptr<Window>> Window::open(const Options& options) {
     w->presenter_->vsync = options.vsync;
     w->presenter_->smooth = options.smooth;
     w->presenter_->show_stats = options.fps_overlay;
+    w->presenter_->launch_path = options.launch_picture;
+    w->presenter_->first_presented = options.first_presented;
     // (the on-screen controls: their atlas once, their quads as they change)
     TouchControls& controls = w->input_.controls();
     controls.set_mode(options.controls);
@@ -901,6 +1040,10 @@ void Window::set_background(bool background) {
 }
 
 vulkan::Device* Window::device() const { return presenter_ ? presenter_->device.get() : nullptr; }
+
+bool Window::launch_screen() const {
+    return presenter_ && presenter_->launch_state.load() != Presenter::Launch::None;
+}
 
 bool Window::wait_presented(u64 count, u32 timeout_ms) {
     const u64 until = SDL_GetTicks() + timeout_ms;
