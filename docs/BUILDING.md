@@ -56,7 +56,7 @@ discrete GPU.
 | `PSVRECORE_BUILD_TOOLS` | ON (OFF on Android) | Host tools |
 | `PSVRECORE_BUILD_TESTS` | ON (OFF on Android) | Unit tests |
 | `PSVRECORE_SHARED` | ON (OFF on Android) | The runtime as one shared library games link (`psvrecore.dll`, `libpsvrecore.so.<ABI version>`): see [The shared runtime library](#the-shared-runtime-library). OFF links it into each game statically |
-| `PSVRECORE_PROFILER` | OFF | Builds Tracy into nx-foundation and compiles profiler zones |
+| `PSVRECORE_TRACY` | OFF | Tracy (nx-foundation's copy of its client) built in: the runtime's zones, plots and frame marks, the game's CPU and GPU markers, the renderer's GPU zones ([PROFILING.md](PROFILING.md)). Off, the hooks compile to nothing. `PSVRECORE_PROFILER`, its earlier name, still turns it on |
 | `PSVRECORE_NID_DB_DIR` | `third_party/vita-headers/db/360` | The NID database the tools load by default |
 | `PSVRECORE_FUZZ_SEED`, `PSVRECORE_FUZZ_BLOCKS` | `0x9E3779B97F4A7C15`, `2000` | Corpus of the generator-versus-interpreter test. A larger or different corpus, for example `scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000`, is a stress run |
 | `PSVRECORE_PROBES_DIR` | empty | Set by `scripts/probe_check.py` to build the probe runners from the code it generated. Leave it empty otherwise |
@@ -392,3 +392,4 @@ environment cannot be given (an Android activity, started with `am start ... --e
 | `PSVRECORE_GXM_SKIP=<address>[,<address>...]` | The draws whose vertex or fragment program is at one of these addresses (as the trace gives them) left out: which draw makes what. |
 | `PSVRECORE_GXM_CAPTURE=<scene>:<draw>:<folder>` | That draw (by index, or the first whose vertex program is at that address, in that scene or a later one) written to the folder as a `psvrender` scene (its programs, vertices, indices, uniforms and uniform buffers), to compare the translation's drawing with the reference renderer's. |
 | `PSVRECORE_RENDER_SCALE=<1-4>` | The SDK sample runner's internal resolution. |
+| `PSVRECORE_GPU_LABELS=1` | The renderer's and the game's debug labels on the GPU commands (`VK_EXT_debug_utils`) for a GPU tool that does not turn them on itself (Nsight, Radeon GPU Profiler); on anyway with the validation layer, under RenderDoc and in a Tracy build ([PROFILING.md](PROFILING.md)). |
