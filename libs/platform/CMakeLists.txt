@@ -24,6 +24,7 @@ add_library(psvrecore_platform STATIC
     src/audio.cpp
     src/frame_stats.cpp
     src/input.cpp
+    src/overlay.cpp
     src/quads.cpp
     src/touch_controls.cpp
     src/window.cpp
@@ -33,3 +34,15 @@ target_include_directories(psvrecore_platform PUBLIC include
     PRIVATE "${PSVRECORE_DIR}/third_party/SPIRV-Headers/include")
 target_link_libraries(psvrecore_platform PUBLIC psvrecore::runtime psvrecore::gxm_hle psvrecore::vulkan SDL3::SDL3)
 psvrecore_target_defaults(psvrecore_platform)
+
+# Dear ImGui (github.com/ocornut/imgui, MIT, submodule in third_party/imgui): the system UI's screens (overlay.cpp),
+# built into this library; the frontend draws its screens with its API.
+set(PSVRECORE_IMGUI "${PSVRECORE_DIR}/third_party/imgui")
+set(_psvrecore_imgui_sources
+    "${PSVRECORE_IMGUI}/imgui.cpp" "${PSVRECORE_IMGUI}/imgui_draw.cpp" "${PSVRECORE_IMGUI}/imgui_tables.cpp"
+    "${PSVRECORE_IMGUI}/imgui_widgets.cpp")
+target_sources(psvrecore_platform PRIVATE ${_psvrecore_imgui_sources})
+set_source_files_properties(${_psvrecore_imgui_sources} PROPERTIES COMPILE_OPTIONS "$<IF:$<BOOL:${MSVC}>,/W0,-w>")
+target_include_directories(psvrecore_platform SYSTEM PUBLIC "${PSVRECORE_IMGUI}")
+target_compile_definitions(psvrecore_platform PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS IMGUI_USE_WCHAR32 IMGUI_DISABLE_DEMO_WINDOWS
+                                                     IMGUI_DISABLE_DEBUG_TOOLS)

@@ -51,8 +51,8 @@ Everything generated stays on the user's machine.
 | `usse` | Shader programs: the GXP container (flags, parameters, vertex outputs, fragment inputs) and the USSE instruction set (decoding into an instruction model, listings in the reference disassembler's syntax) |
 | `gxm` | GXM API, texture formats and layouts, SPIR-V translation of shader programs |
 | `vulkan` | Vulkan backend (volk, VMA): device, memory, buffers, dispatches; knows nothing about GXM |
-| `platform` | SDL3: a window and its Vulkan swapchain (the frames a game displays, scaled to fit), the audio device (a stream per port), and gamepads, keyboard, mouse and touch for the runtime's input; on Android, landscape full screen; later an ImGui overlay and on-screen controls |
-| `frontend` | The program a game becomes: the game's description (`frontend::Game`), the settings file and the command line over it, scripted controls for smoke tests, and the run loop (window, sound, runtime, GXM) |
+| `platform` | SDL3: a window and its Vulkan swapchain (the frames a game displays, scaled to fit), the audio device (a stream per port), and gamepads, keyboard, mouse and touch for the runtime's input; on Android, landscape full screen; the on-screen controls; the system UI's overlay (Dear ImGui, drawn after the picture, the controls routed to it while it shows something) |
+| `frontend` | The program a game becomes: the game's description (`frontend::Game`), the settings file and the command line over it, scripted controls for smoke tests, the system's screens (the dialogs a game opens, the keyboards, notices, the Home menu; `runtime/dialogs.hpp` is their boundary with the system libraries), and the run loop (window, sound, runtime, GXM) |
 
 One shared library, `psvrecore` (`psvrecore.dll`, `libpsvrecore.so.<ABI version>`), holds `core`, `formats`, `arm`,
 `analysis`, `recomp`'s support code, `runtime`, `usse`, `gxm`, `vulkan`, `platform` and `frontend`, with

@@ -20,6 +20,7 @@ constexpr const char* kDateFormats[] = {"yyyy/mm/dd", "dd/mm/yyyy", "mm/dd/yyyy"
 constexpr const char* kTimeFormats[] = {"12h", "24h"};                             // SCE_SYSTEM_PARAM_TIME_FORMAT_*
 constexpr const char* kLogLevels[] = {"debug", "info", "warn", "error"};
 constexpr const char* kOnScreen[] = {"auto", "always", "never"};
+constexpr const char* kDialogs[] = {"auto", "drawn", "answered"};
 
 bool parse_bool(nx::string_view v, bool* out) {
     if (v == "true" || v == "on" || v == "yes" || v == "1") return *out = true, true;
@@ -171,6 +172,14 @@ const Key kKeys[] = {
     {"system", "summer_time", "Summer time (when time_zone is not auto).",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.summer_time); },
      [](const Settings& s) { return nx::string(yes_no(s.summer_time)); }, "true or false"},
+    {"system", "dialogs",
+     "The system's dialogs (messages, saving, the keyboard): drawn for the player to answer, or answered at once as a "
+     "player answers most often; auto draws them, but answers them in --input and --hidden runs.",
+     [](Settings& s, nx::string_view v) {
+         const i32 i = index_of(kDialogs, v);
+         return i >= 0 && (s.dialogs = i, true);
+     },
+     [](const Settings& s) { return nx::string(kDialogs[s.dialogs]); }, nullptr},
 
     {"log", "level", "How much is logged.",
      [](Settings& s, nx::string_view v) { return index_of(kLogLevels, v) >= 0 && (s.log_level = nx::string(v), true); },
@@ -204,7 +213,8 @@ const Schema kSchema[] = {
     {"controls", "scale", K::Float, 0.5f, 2, true, false},  {"system", "language", K::Choice, 0, 0, false, false},
     {"system", "user_name", K::Text, 0, 0, false, false},   {"system", "date_format", K::Choice, 0, 0, false, false},
     {"system", "time_format", K::Choice, 0, 0, false, false}, {"system", "time_zone", K::Text, 0, 0, false, false},
-    {"system", "summer_time", K::Bool, 0, 0, false, false}, {"log", "level", K::Choice, 0, 0, true, false},
+    {"system", "summer_time", K::Bool, 0, 0, false, false}, {"system", "dialogs", K::Choice, 0, 0, false, false},
+    {"log", "level", K::Choice, 0, 0, true, false},
     {"log", "file", K::Text, 0, 0, false, true},
 };
 
@@ -307,6 +317,7 @@ nx::vector<SettingInfo> describe(const Settings& settings) {
         else if (key == "date_format") info.choices = list(kDateFormats);
         else if (key == "time_format") info.choices = list(kTimeFormats);
         else if (key == "on_screen") info.choices = list(kOnScreen);
+        else if (key == "dialogs") info.choices = list(kDialogs);
         else if (key == "level") info.choices = list(kLogLevels);
         out.push_back(std::move(info));
     }

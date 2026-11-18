@@ -5,15 +5,18 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
+#include "imgui.h"
 #include "nxtest.h"
 #include "psvrecore/platform/audio.hpp"
 #include "psvrecore/platform/input.hpp"
+#include "psvrecore/platform/system_ui.hpp"
 #include "psvrecore/platform/touch_controls.hpp"
 #include "psvrecore/platform/window.hpp"
 #include "psvrecore/vulkan/device.hpp"
@@ -613,4 +616,99 @@ TEST_CASE("input: a gamepad connected hides the on-screen controls; the last one
         m.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 1), input, 110);
         CHECK_FALSE(m.controls().visible());
     }
+}
+
+namespace {
+
+// A system UI of one square, drawn while shown.
+struct Square : SystemUi {
+    std::atomic<bool> shown{true};
+    std::atomic<u32> built{0};
+    bool visible() const override { return shown.load(); }
+    bool takes_controls() const override { return false; }
+    void build(const Controls&) override {
+        ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(100, 100), ImVec2(200, 200), IM_COL32(20, 200, 40, 255));
+        ImGui::GetForegroundDrawList()->AddText(ImVec2(300, 300), IM_COL32(255, 255, 255, 255), "A\xE3\x81\x82");
+        built.fetch_add(1);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("window: the system UI's screens are drawn over the picture in its units, and go when hidden") {
+    Window::Options o;
+    o.title = "psvrecore test";
+    o.hidden = true;
+    auto opened = Window::open(o);
+    if (!opened) SKIP(nx::format("no window: {}", opened.error().message).c_str());
+    Window& w = **opened;
+    w.keep_last(true);
+    const nx::vector<u8> picture = quadrants();
+    w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+    Shot shot;
+    REQUIRE(w.wait_presented(1, 3000));
+    if (!w.last_image(&shot.rgba, &shot.w, &shot.h)) SKIP("the window's images cannot be read back");
+    REQUIRE(presented_fitted(w, &shot));
+    if (shot.w != kScreenWidth || shot.h != kScreenHeight) SKIP("the window is not at 1:1");
+    Square square;
+    w.set_system_ui(&square);
+    static constexpr u8 kGreen[3] = {20, 200, 40};
+    bool seen = false;
+    // (no frames from the game meanwhile: the window draws the screens by itself)
+    for (u32 i = 0; i < 3000 && !seen; ++i) {
+        w.pump(nullptr);
+        seen = w.last_image(&shot.rgba, &shot.w, &shot.h) && is(shot.at(150, 150), kGreen);
+        SDL_Delay(1);
+    }
+    REQUIRE(seen);
+    CHECK(square.built.load() > 0);
+    CHECK(is(shot.at(250, 150), kQuadrant[0]));  // (outside the square: the picture)
+    // (the text: Latin and Japanese glyphs from the system fonts, something white where they are)
+    u32 white = 0;
+    for (u32 y = 300; y < 330; ++y)
+        for (u32 x = 300; x < 340; ++x)
+            if (shot.at(x, y)[0] > 200 && shot.at(x, y)[1] > 200 && shot.at(x, y)[2] > 200) ++white;
+    CHECK(white > 20);
+    square.shown.store(false);
+    bool gone = false;
+    for (u32 i = 0; i < 3000 && !gone; ++i) {
+        w.show_pixels(picture.data(), kScreenWidth, kScreenHeight, kScreenWidth, 0);
+        w.pump(nullptr);
+        gone = w.last_image(&shot.rgba, &shot.w, &shot.h) && is(shot.at(150, 150), kQuadrant[0]);
+        SDL_Delay(1);
+    }
+    CHECK(gone);
+    w.set_system_ui(nullptr);
+}
+
+TEST_CASE("input: while the system UI takes the controls the game's are neutral; buttons held across stay released") {
+    InputMapper m;
+    runtime::Input input;
+    m.handle(gamepad_button(1, SDL_GAMEPAD_BUTTON_SOUTH, true), input, 100);
+    CHECK(input.pad_sample(0, 150).buttons == kCross);
+    m.set_captured(true, input, 200);
+    CHECK(m.captured());
+    CHECK(input.pad_sample(150, 250).buttons == 0);
+    // (presses while taken: the system UI's, not the game's)
+    m.handle(gamepad_button(1, SDL_GAMEPAD_BUTTON_EAST, true), input, 300);
+    CHECK(m.pad().buttons == (kCross | kCircle));
+    CHECK(input.pad_sample(250, 350).buttons == 0);
+    // (given back with both held: released for the game until each is let go)
+    m.set_captured(false, input, 400);
+    CHECK(input.pad_sample(350, 450).buttons == 0);
+    m.handle(gamepad_button(1, SDL_GAMEPAD_BUTTON_SOUTH, false), input, 500);
+    m.handle(gamepad_button(1, SDL_GAMEPAD_BUTTON_SOUTH, true), input, 520);
+    CHECK(input.pad_sample(450, 550).buttons == kCross);  // (pressed again: the game's)
+    m.handle(gamepad_button(1, SDL_GAMEPAD_BUTTON_EAST, false), input, 600);
+    m.handle(gamepad_button(1, SDL_GAMEPAD_BUTTON_EAST, true), input, 700);
+    CHECK(input.pad_sample(550, 750).buttons == (kCross | kCircle));
+    // Guide (and Escape on a desktop) ask for the Home menu, once each, and are no button of the game's.
+    CHECK_FALSE(m.take_home_request());
+    m.handle(gamepad_button(1, SDL_GAMEPAD_BUTTON_GUIDE, true), input, 800);
+    CHECK(m.take_home_request());
+    CHECK_FALSE(m.take_home_request());
+#if !defined(__ANDROID__)
+    m.handle(key(SDLK_ESCAPE, true), input, 900);
+    CHECK(m.take_home_request());
+#endif
 }

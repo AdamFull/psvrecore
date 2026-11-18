@@ -7,6 +7,7 @@ add_library(psvrecore_frontend STATIC
     src/layout.cpp
     src/script.cpp
     src/settings.cpp
+    src/system_ui.cpp
 )
 add_library(psvrecore::frontend ALIAS psvrecore_frontend)
 target_include_directories(psvrecore_frontend PUBLIC include)

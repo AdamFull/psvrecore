@@ -2,12 +2,13 @@
 // SceNpScore, SceNpActivity, SceNpTrophy); asking for the user's NP ID or posting an activity answers "signed out";
 // the service state callback is never called (the state does not change). Trophies are local, as on the console:
 // contexts and handles are made, and an unlocked trophy is logged and remembered for the run (unlocking it again
-// answers "already unlocked". Authentication (SceNpCommon's NpAuth), friends and presence (SceNpBasic) and user
-// lookups (SceNpUtility) start, and what would reach PSN answers "signed out".
+// answers "already unlocked"), and the host shows a notice of it. Authentication (SceNpCommon's NpAuth), friends and
+// presence (SceNpBasic) and user lookups (SceNpUtility) start, and what would reach PSN answers "signed out".
 
 #include <cstring>
 
 #include "hle_common.hpp"
+#include "psvrecore/runtime/dialogs.hpp"
 #include "core/foundation/containers/hash_map.h"
 
 namespace psvrecore::runtime::hle {
@@ -101,6 +102,8 @@ i32 sceNpTrophyUnlockTrophy(i32 /*context*/, i32 /*handle*/, i32 trophy, Ptr<i32
     if (np().unlocked.contains(trophy)) return kTrophyAlreadyUnlocked;
     np().unlocked[trophy] = true;
     nx::logi(logs::hle, "trophy {} unlocked", trophy);
+    // (shown by the host: its name and grade are in the game's trophy file, which is encrypted)
+    dialogs::notify(SystemNotice{"Trophy unlocked", nx::format("Trophy #{}", trophy), 0});
     return 0;
 }
 

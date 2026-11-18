@@ -39,6 +39,8 @@ struct Settings {
     bool time_zone_auto = true;  // the host's (else time_zone_minutes)
     i32 time_zone_minutes = 0;
     bool summer_time = false;
+    i32 dialogs = 0;  // the system's dialogs: 0 auto (drawn; answered at once in --input and --hidden runs), 1 drawn,
+                      // 2 answered at once, as a player answers most often (runtime/dialogs.hpp)
     // [log]
     nx::string log_level = "warn";  // debug, info, warn or error
     nx::string log_file;            // also written there (empty: not)

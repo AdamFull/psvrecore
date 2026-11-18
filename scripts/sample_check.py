@@ -168,12 +168,16 @@ def build_sample(name, sample_dir, work, sdk, env, opt):
     sources, steps = project_items(project)
     objects = []
     for source, command, outputs in steps:
-        result = subprocess.run(expand(command, source, sdk, work).strip(), shell=True, env=env, cwd=work,
-                                capture_output=True, text=True)
-        if result.returncode != 0:
-            sys.stdout.write(result.stdout)
-            sys.stderr.write(result.stderr)
-            raise SystemExit(f"failed: the custom build step of {source.name}")
+        # (a step of several lines, as the system samples' shaders have (compile, then make an object): each line in
+        # turn, cmd running only the first of them)
+        for line in expand(command, source, sdk, work).strip().splitlines():
+            if not line.strip():
+                continue
+            result = subprocess.run(line.strip(), shell=True, env=env, cwd=work, capture_output=True, text=True)
+            if result.returncode != 0:
+                sys.stdout.write(result.stdout)
+                sys.stderr.write(result.stderr)
+                raise SystemExit(f"failed: the custom build step of {source.name}")
         for out in expand(outputs, source, sdk, work).split(";"):
             out = out.strip()
             if out.lower().endswith(".obj") and Path(out).exists():
@@ -294,6 +298,10 @@ def main():
                         help="run the sample as a game (psvrecore::frontend): in a window with sound and the host's "
                              "controls, until the window is closed or the timeout; --frames counts the script's shots")
     parser.add_argument("--input", help="scripted controls with --window (see libs/frontend/.../script.hpp)")
+    parser.add_argument("--set", action="append", default=[], metavar="SECTION.KEY=VALUE",
+                        help="a setting for --window (system.dialogs=drawn: the dialogs drawn and answered by --input)")
+    parser.add_argument("--hidden", action="store_true",
+                        help="with --window: no window on screen (its shots are still taken from what it presents)")
     parser.add_argument("--android", action="store_true",
                         help="run the sample as a game on the Android device adb sees: built for arm64, packaged "
                              "(scripts/android_apk.py), installed, its files pushed, run for --timeout seconds with "
@@ -384,6 +392,10 @@ def main():
                 cmd += ["--input", args.input]
             if args.log:
                 cmd += ["--log", args.log]
+            for assignment in args.set:
+                cmd += ["--set", assignment]
+            if args.hidden:
+                cmd += ["--hidden"]
         else:
             cmd = [runner, work / "app", data, frames, str(wanted), str(args.timeout), str(args.audio_seconds)]
         try:

@@ -29,6 +29,7 @@ public:
     // sets are made, one a texture a frame in flight.
     Result<void> init(VkFormat format, u32 sets);
     VkFormat format() const { return format_; }
+    VkRenderPass pass() const { return pass_; }  // (for the system UI's pipeline, drawn in the same pass)
     // The swapchain's images (their views and framebuffers); none: forgets them.
     Result<void> set_targets(std::span<const VkImage> images, VkExtent2D extent);
 

@@ -14,7 +14,7 @@ opened at run time. The Vulkan SDK's validation layer and `spirv-val` are used b
 media decoders come the same way: LibAtrac9 (MIT) and openh264 (BSD-2-Clause) as submodules; the PacketVideo AAC
 decoder (Apache-2.0) is vendored in `third_party/pvaacdec`, minimp3 (CC0) in `third_party/minimp3`, and ScePvf's system fonts, Roboto
 and Noto Sans JP, KR, SC and TC (SIL OFL 1.1), in `third_party/roboto` and `third_party/noto-cjk` (their READMEs say
-where from). The platform layer's SDL3 (zlib) is a submodule as well, built as a static library. (CMake 3.27 for the shared runtime library on
+where from). The platform layer's SDL3 (zlib) is a submodule as well, built as a static library, and so is Dear ImGui (MIT), the system UI's overlay, compiled into the platform library. (CMake 3.27 for the shared runtime library on
 Windows and Linux; with `PSVRECORE_SHARED=OFF`, 3.25 is enough.)
 
 ## Presets

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "nxtest.h"
+#include "psvrecore/runtime/dialogs.hpp"
 #include "runtime_support.hpp"
 
 using namespace psvrecore;
@@ -391,4 +392,228 @@ TEST_CASE("psn: online IDs compared, the platform type kept in an NP ID, statist
     std::memset(t.rt.memory().host(info), 0xAA, 24);
     CHECK(call32(ctx, kSceNpMatching2, 0x7BD39E50 /*sceNpMatching2GetMemoryInfo*/, {info}) == 0);
     CHECK(psv_ld32(info + 8) == 0);
+}
+
+// ---- the system's dialogs drawn by a host (runtime/dialogs.hpp)
+
+namespace {
+
+constexpr u32 kDialogs = 0xE537816C, kUpdate = 0x90530F2F;
+constexpr u32 kMsgInit = 0x755FF270, kMsgStatus = 0x4107019E, kMsgResult = 0xBB3BFC89, kMsgTerm = 0x81ACF695,
+              kMsgClose = 0xC296D396, kBarSetValue = 0x9CDA5E0D, kBarInc = 0x7BE0E08B;
+
+// (the host's side for one test: drawn while it lasts, answered at once again after)
+struct Drawn {
+    Drawn() { dialogs::set_drawn(true); }
+    ~Drawn() { dialogs::set_drawn(false); }
+};
+
+// A message dialog's parameters: user message `buttons` and `text`, or a progress bar (mode 4).
+u32 message_param(u32 mode, u32 buttons, const char* text) {
+    const u32 p = scratch(160), user = scratch(48), bar = scratch(96);
+    std::memset(current_runtime()->memory().host(p), 0, 160);
+    std::memset(current_runtime()->memory().host(user), 0, 48);
+    std::memset(current_runtime()->memory().host(bar), 0, 96);
+    psv_st32(p + 80, mode);
+    psv_st32(p + 84, user);
+    psv_st32(p + 96, bar);
+    psv_st32(user, buttons);
+    psv_st32(user + 4, guest_string(text));
+    psv_st32(bar + 44, guest_string(text));
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("dialogs: a message is answered at once without a host; drawn, it waits for the host's answer") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    const u32 update = scratch(64), result = scratch(48);
+    // (no host: Yes, at its first update)
+    REQUIRE(call32(ctx, kDialogs, kMsgInit, {message_param(1, 1, "Save?")}) == 0);
+    REQUIRE(call32(ctx, kDialogs, kUpdate, {update}) == 0);
+    CHECK(call32(ctx, kDialogs, kMsgStatus, {}) == 2);
+    REQUIRE(call32(ctx, kDialogs, kMsgResult, {result}) == 0);
+    CHECK(psv_ld32(result + 8) == 1);
+    REQUIRE(call32(ctx, kDialogs, kMsgTerm, {}) == 0);
+    DialogView v;
+    CHECK_FALSE(dialogs::current(&v));
+
+    Drawn drawn;
+    REQUIRE(call32(ctx, kDialogs, kMsgInit, {message_param(1, 1, "Save?")}) == 0);
+    for (int i = 0; i < 3; ++i) REQUIRE(call32(ctx, kDialogs, kUpdate, {update}) == 0);
+    CHECK(call32(ctx, kDialogs, kMsgStatus, {}) == 1);  // (still up: the player has not answered)
+    CHECK(dialogs::showing() == DialogView::Kind::Message);
+    REQUIRE(dialogs::current(&v));
+    CHECK(v.text == "Save?");
+    CHECK(v.buttons == DialogView::Buttons::YesNo);
+    dialogs::answer(v.serial + 1, DialogAnswer{0, 1});  // (not this dialog's: ignored)
+    CHECK(call32(ctx, kDialogs, kMsgStatus, {}) == 1);
+    dialogs::answer(v.serial, DialogAnswer{0, 2});  // (No)
+    CHECK(call32(ctx, kDialogs, kMsgStatus, {}) == 2);
+    CHECK_FALSE(dialogs::current(&v));
+    REQUIRE(call32(ctx, kDialogs, kMsgResult, {result}) == 0);
+    CHECK(psv_ld32(result + 4) == 0);
+    CHECK(psv_ld32(result + 8) == 2);
+    REQUIRE(call32(ctx, kDialogs, kMsgTerm, {}) == 0);
+
+    // A progress bar: its value as the game sets it, closed by the game.
+    REQUIRE(call32(ctx, kDialogs, kMsgInit, {message_param(4, 0, "Copying")}) == 0);
+    REQUIRE(call32(ctx, kDialogs, kBarSetValue, {0, 40}) == 0);
+    REQUIRE(call32(ctx, kDialogs, kBarInc, {0, 30}) == 0);
+    CHECK(static_cast<u32>(call32(ctx, kDialogs, kBarInc, {1, 30})) == 0x80100A01u);  // (no such bar)
+    REQUIRE(dialogs::current(&v));
+    CHECK(v.progress);
+    CHECK(v.percent == 70);
+    CHECK(v.text == "Copying");
+    CHECK(v.buttons == DialogView::Buttons::None);
+    REQUIRE(call32(ctx, kDialogs, kMsgClose, {}) == 0);
+    CHECK(call32(ctx, kDialogs, kMsgStatus, {}) == 2);
+    REQUIRE(call32(ctx, kDialogs, kMsgTerm, {}) == 0);
+}
+
+TEST_CASE("dialogs: drawn, a save data list answers the slot chosen and the text input dialog the text typed") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Drawn drawn;
+    constexpr u32 kSaveInit = 0xBF5248FA, kSaveStatus = 0x6E258046, kSaveSub = 0xBA0542CA, kSaveResult = 0xB2FF576E,
+                  kSaveTerm = 0x2192A10A;
+    const u32 p = scratch(160), list = scratch(64), slots = scratch(48), result = scratch(64);
+    std::memset(t.rt.memory().host(p), 0, 160);
+    std::memset(t.rt.memory().host(list), 0, 64);
+    std::memset(t.rt.memory().host(slots), 0, 48);
+    std::memset(t.rt.memory().host(result), 0, 64);
+    for (u32 i = 0; i < 3; ++i) psv_st32(slots + 16 * i, 10 + i);
+    psv_st32(p + 80, 2);  // (list)
+    psv_st32(p + 84, 1);  // (save)
+    psv_st32(p + 92, list);
+    psv_st32(list, slots);
+    psv_st32(list + 4, 3);
+    psv_st32(list + 8, 8);  // (focus: by ID)
+    psv_st32(list + 12, 11);
+    psv_st32(list + 16, guest_string("Pick a slot"));
+    REQUIRE(call32(ctx, kDialogs, kSaveInit, {p}) == 0);
+    REQUIRE(call32(ctx, kDialogs, kUpdate, {scratch(64)}) == 0);
+    CHECK(call32(ctx, kDialogs, kSaveSub, {}) == 1);  // (shown, not answered)
+    DialogView v;
+    REQUIRE(dialogs::current(&v));
+    CHECK(v.kind == DialogView::Kind::SaveData);
+    CHECK(v.title == "Pick a slot");
+    REQUIRE(v.slots.size() == 3);
+    CHECK(v.focus == 1);
+    CHECK(v.slots[2].id == 12);
+    CHECK(v.slots[2].title == "New Saved Data");
+    dialogs::answer(v.serial, DialogAnswer{0, 1, 12});
+    CHECK(call32(ctx, kDialogs, kSaveStatus, {}) == 2);
+    REQUIRE(call32(ctx, kDialogs, kSaveResult, {result}) == 0);
+    CHECK(psv_ld32(result) == 2);
+    CHECK(psv_ld32(result + 4) == 0);
+    CHECK(psv_ld32(result + 12) == 12);
+    REQUIRE(call32(ctx, kDialogs, kSaveTerm, {}) == 0);
+
+    // The text input dialog: its initial text shown, the typed text (UTF-8 to UTF-16, cut to its length) stored.
+    constexpr u32 kImeInit = 0x1E7043BF, kImeStatus = 0xCF0431FD, kImeResult = 0x2EB3D046, kImeTerm = 0x838A3AF4;
+    const u32 ip = scratch(0xA8), initial = scratch(16), buffer = scratch(32), title = scratch(16);
+    std::memset(t.rt.memory().host(ip), 0, 0xA8);
+    const char16_t kInitial[] = u"abc", kTitle[] = u"Name";
+    std::memcpy(t.rt.memory().host(initial), kInitial, sizeof kInitial);
+    std::memcpy(t.rt.memory().host(title), kTitle, sizeof kTitle);
+    psv_st32(ip + 0x28, title);
+    psv_st32(ip + 0x2C, 6);
+    psv_st32(ip + 0x30, initial);
+    psv_st32(ip + 0x34, buffer);
+    REQUIRE(call32(ctx, kDialogs, kImeInit, {ip}) == 0);
+    REQUIRE(call32(ctx, kDialogs, kUpdate, {scratch(64)}) == 0);
+    CHECK(call32(ctx, kDialogs, kImeStatus, {}) == 1);
+    REQUIRE(dialogs::current(&v));
+    CHECK(v.kind == DialogView::Kind::Ime);
+    CHECK(v.title == "Name");
+    CHECK(v.ime_text == "abc");
+    CHECK(v.max_length == 6);
+    dialogs::answer(v.serial, DialogAnswer{0, 2, 0, "h\xC3\xA9llo world"});  // (cut to 6 units)
+    CHECK(call32(ctx, kDialogs, kImeStatus, {}) == 2);
+    const char16_t kTyped[] = u"héllo ";
+    CHECK(std::memcmp(t.rt.memory().host(buffer), kTyped, sizeof kTyped) == 0);
+    REQUIRE(call32(ctx, kDialogs, kImeResult, {result}) == 0);
+    CHECK(psv_ld32(result) == 0);
+    CHECK(psv_ld32(result + 4) == 2);
+    REQUIRE(call32(ctx, kDialogs, kImeTerm, {}) == 0);
+}
+
+TEST_CASE("dialogs: drawn, a trophy unlocked is a notice for the host; without a host it is only logged") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceNpTrophy = 0x4332C10D, kUnlock = 0xB397AA24;
+    SystemNotice n;
+    while (dialogs::take_notice(&n)) {
+    }
+    REQUIRE(call32(ctx, kSceNpTrophy, kUnlock, {1, 1, 3, scratch(4)}) == 0);
+    CHECK_FALSE(dialogs::has_notice());
+    Drawn drawn;
+    REQUIRE(call32(ctx, kSceNpTrophy, kUnlock, {1, 1, 4, scratch(4)}) == 0);
+    REQUIRE(dialogs::take_notice(&n));
+    CHECK(n.title == "Trophy unlocked");
+    CHECK(n.text == "Trophy #4");
+    CHECK_FALSE(dialogs::take_notice(&n));
+}
+
+namespace {
+nx::vector<u32> g_keyboard_events, g_keyboard_carets, g_keyboard_changes;
+void keyboard_handler(PsvContext* ctx, u32) {
+    const u32 e = ctx->r[1];
+    g_keyboard_events.push_back(psv_ld32(e));
+    if (psv_ld32(e) == 1) g_keyboard_carets.push_back(psv_ld32(e + 12)), g_keyboard_changes.push_back(psv_ld32(e + 24));
+}
+}  // namespace
+
+TEST_CASE("dialogs: drawn, the in-game keyboard's text as the player types it, then Enter, reach the game's handler") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Drawn drawn;
+    constexpr u32 kSceIme = 0xD2553017, kOpen = 0x0E050613, kUpdate = 0x71D6898A, kSetText = 0xF3BD9A76,
+                  kClose = 0x889A8421;
+    GuestCode code;
+    const u32 handler = code.add(&keyboard_handler);
+    code.install();
+    g_keyboard_events.clear(), g_keyboard_carets.clear(), g_keyboard_changes.clear();
+    const u32 param = scratch(64), work = scratch(20 * 1024), buffer = scratch(2 * 48), initial = scratch(8);
+    std::memset(t.rt.memory().host(param), 0, 64);
+    const char16_t kHi[] = u"Hi";
+    std::memcpy(t.rt.memory().host(initial), kHi, sizeof kHi);
+    psv_st32(param + 28, work);
+    psv_st32(param + 36, handler);
+    psv_st32(param + 44, initial);
+    psv_st32(param + 48, 16);
+    psv_st32(param + 52, buffer);
+    REQUIRE(call32(ctx, kSceIme, kOpen, {param}) == 0);
+    DialogView v;
+    REQUIRE(dialogs::current(&v));
+    CHECK(v.kind == DialogView::Kind::InGameIme);
+    CHECK(v.ime_text == "Hi");
+    CHECK(v.caret == 2);
+    CHECK(dialogs::showing() == DialogView::Kind::InGameIme);
+    REQUIRE(call32(ctx, kSceIme, kUpdate, {}) == 0);  // (open)
+    REQUIRE(call32(ctx, kSceIme, kUpdate, {}) == 0);  // (nothing typed yet: nothing)
+    dialogs::edit(v.serial, "Hiya", 4);
+    REQUIRE(call32(ctx, kSceIme, kUpdate, {}) == 0);
+    const char16_t kHiya[] = u"Hiya";
+    CHECK(std::memcmp(t.rt.memory().host(buffer), kHiya, sizeof kHiya) == 0);
+    // (the game sets its text itself: the host takes it again)
+    const char16_t kNew[] = u"Yo";
+    const u32 text = scratch(sizeof kNew);
+    std::memcpy(t.rt.memory().host(text), kNew, sizeof kNew);
+    REQUIRE(call32(ctx, kSceIme, kSetText, {text, 2}) == 0);
+    REQUIRE(dialogs::current(&v));
+    CHECK(v.ime_text == "Yo");
+    CHECK(v.revision == 1);
+    dialogs::answer(v.serial, DialogAnswer{0, 2});  // (Enter)
+    REQUIRE(call32(ctx, kSceIme, kUpdate, {}) == 0);
+    REQUIRE(g_keyboard_events.size() == 3);
+    CHECK(g_keyboard_events[0] == 0);  // (open)
+    CHECK(g_keyboard_events[1] == 1);  // (the text updated)
+    CHECK(g_keyboard_carets[0] == 4);
+    CHECK(g_keyboard_changes[0] == 2);
+    CHECK(g_keyboard_events[2] == 5);  // (Enter)
+    CHECK_FALSE(dialogs::current(&v));  // (nothing shown after Enter, until it is opened again)
+    CHECK(call32(ctx, kSceIme, kClose, {}) == 0);
 }

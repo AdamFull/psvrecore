@@ -17,6 +17,7 @@
 #include "psvrecore/gxm/hle.hpp"
 #include "psvrecore/platform/input.hpp"
 #include "psvrecore/platform/quad.hpp"
+#include "psvrecore/platform/system_ui.hpp"
 #include "core/foundation/core/foundation.h"
 
 struct SDL_Window;
@@ -91,6 +92,9 @@ public:
     // The application to the background (on Android: before its window's surface goes) and back: nothing is drawn
     // meanwhile. From any thread.
     void set_background(bool background);
+    // The system's screens drawn over the picture (dialogs, the keyboard, notifications, the Home menu; see
+    // system_ui.hpp), or none. Set from the thread pumping events; `ui` outlives the window or is unset first.
+    void set_system_ui(SystemUi* ui);
     // The device the window presents with, for the GXM layer to render with too (gxm::Options::shared_device).
     vulkan::Device* device() const;
     InputMapper& input() { return input_; }
@@ -102,6 +106,7 @@ private:
     Window() = default;
     void update_view();
     void update_overlay();
+    void sync_system_ui(runtime::Runtime* rt);
 
     SDL_Window* window_ = nullptr;
     Options options_;
@@ -111,6 +116,9 @@ private:
     std::atomic<u64> presented_{0};
     bool closed_ = false;
     u64 overlay_version_ = 0;
+    // The system UI: whether the window takes typed text for it, and when it last asked for a frame to be drawn.
+    bool text_input_ = false;
+    u64 ui_redraw_ns_ = 0, ui_presented_ = 0;
 };
 
 }  // namespace psvrecore::platform

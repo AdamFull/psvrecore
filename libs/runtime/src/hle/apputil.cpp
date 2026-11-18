@@ -661,6 +661,14 @@ const Function kFunctions[] = {
 
 }  // namespace
 
+// (the save data dialog's: a slot's parameters, from the same save data as the calls above, under their lock)
+bool save_data_slot(u32 id, SaveData::SlotParam* out) {
+    AppUtil& a = apputil();
+    nx::scoped_lock<nx::mutex> held(a.lock);
+    SaveData* s = save_data(a);
+    return s && id < SaveData::kSlots && s->slot(id, out);
+}
+
 void register_apputil() {
     // (a new runtime starts with the library not initialized, its save data and safe memory read again)
     AppUtil& a = apputil();

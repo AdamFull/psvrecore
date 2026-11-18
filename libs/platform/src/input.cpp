@@ -126,6 +126,10 @@ bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) 
             break;
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE) {  // (the PS button: the Home menu)
+                if (e.gbutton.down) home_requested_ = true;
+                break;
+            }
             Gamepad& g = gamepads_[e.gbutton.which];
             const u32 bit = gamepad_bit(e.gbutton.button);
             g.buttons = e.gbutton.down ? g.buttons | bit : g.buttons & ~bit;
@@ -153,6 +157,12 @@ bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) 
                 if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) menu_requested_ = true;
                 break;
             }
+#if !defined(__ANDROID__)
+            if (e.key.key == SDLK_ESCAPE) {  // (a desktop's: the Home menu)
+                if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) home_requested_ = true;
+                break;
+            }
+#endif
             const u32 bit = key_bit(e.key.key);
             if (!bit || e.key.repeat) break;
             keys_ = e.key.down ? keys_ | bit : keys_ & ~bit;
@@ -216,16 +226,39 @@ bool InputMapper::handle(const SDL_Event& e, runtime::Input& input, u64 now_ns) 
         const runtime::PadState s = combine();
         if (!(s == pad_)) {
             pad_ = s;
-            input.set_pad(s, now_ns);
+            if (!captured_) send_pad(input, now_ns);
         } else {
             pad = false;
         }
     }
     if (touch) {
         touch_ = touches();
-        input.set_touch(0, touch_, now_ns);
+        if (!captured_) input.set_touch(0, touch_, now_ns);
     }
     return pad || touch;
+}
+
+void InputMapper::send_pad(runtime::Input& input, u64 now_ns) {
+    masked_ &= pad_.buttons;  // (let go: the game's again)
+    runtime::PadState s = pad_;
+    s.buttons &= ~masked_;
+    input.set_pad(s, now_ns);
+}
+
+void InputMapper::set_captured(bool captured, runtime::Input& input, u64 now_ns) {
+    if (captured == captured_) return;
+    captured_ = captured;
+    // (the fingers down, and the mouse's press, belong to neither side across the change)
+    mouse_down_ = false;
+    fingers_.clear();
+    touch_ = touches();
+    input.set_touch(0, touch_, now_ns);
+    if (captured) {
+        input.set_pad(runtime::PadState{}, now_ns);
+    } else {
+        masked_ = pad_.buttons;
+        send_pad(input, now_ns);
+    }
 }
 
 }  // namespace psvrecore::platform

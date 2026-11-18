@@ -10,6 +10,7 @@
 
 #include "psvrecore/log.hpp"
 #include "frame_stats.hpp"
+#include "overlay.hpp"
 #include "quads.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "psvrecore/runtime/runtime.hpp"
@@ -131,6 +132,9 @@ struct Window::Presenter {
     nx::vector<Quad> stats_drawn;
     vulkan::Image stats_atlas;
 
+    // The system UI's screens (Dear ImGui), over everything else.
+    nx::unique_ptr<Overlay> screens;
+
     // The last image presented (keep_last).
     nx::mutex readback_lock;
     std::atomic<bool> keep{false};
@@ -150,6 +154,7 @@ struct Window::Presenter {
         if (thread.joinable()) thread.join();
         if (!device) return;
         device->wait_idle();
+        screens.reset();
         const VkDevice d = device->device();
         destroy_swapchain();
         for (InFlight& f : frames) {
@@ -189,6 +194,7 @@ struct Window::Presenter {
                 return nx::err(vulkan::vk_error("vkCreateFence", r));
         }
         quads = nx::make_unique<QuadRenderer>(*device);
+        screens = nx::make_unique<Overlay>(*device, kFramesInFlight);
         thread = nx::thread([this] { run(); });
         return {};
     }
@@ -440,6 +446,12 @@ struct Window::Presenter {
             }
         }
 
+        // The system UI's screens for this frame (before recording: their textures are copied first).
+        const Rect view = fit(static_cast<f32>(extent.width), static_cast<f32>(extent.height));
+        const bool ui = screens && screens->frame(extent, std::round(view.x), std::round(view.y),
+                                                  std::round(view.x + view.w) - std::round(view.x),
+                                                  std::round(view.y + view.h) - std::round(view.y));
+
         // The frame into this slot's image (unless the renderer copied it into gpu_image).
         const bool gpu = current_gpu && gpu_image.image;
         const bool have = current_w && current_h && (gpu || !current_gpu);
@@ -497,6 +509,7 @@ struct Window::Presenter {
             vulkan::transition(f.cmd, f.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
         const u32 slot = static_cast<u32>(&f - frames);
+        if (ui) screens->upload(f.cmd, slot);
         quads->begin(f.cmd, index);
         if (have) {
             // (the screen as large as fits, centred; sharp pixels at 1:1)
@@ -516,6 +529,7 @@ struct Window::Presenter {
             const VkDescriptorSet font = quads->texture(slot * 3 + 2, stats_atlas.view, false);
             for (const Quad& q : stats_drawn) quads->draw(f.cmd, font, q, true);
         }
+        if (ui) screens->draw(f.cmd, slot, quads->pass());
         quads->end(f.cmd);
         if (read && readback.buffer) {
             auto layout_barrier = [&](VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst,
@@ -654,6 +668,8 @@ void Window::update_view() {
                              static_cast<f32>(safe.x), static_cast<f32>(safe.y), static_cast<f32>(safe.w),
                              static_cast<f32>(safe.h));
     update_overlay();
+    if (presenter_ && presenter_->screens)
+        presenter_->screens->set_view(static_cast<f32>(w), static_cast<f32>(h), v.x, v.y, v.w, v.h);
     if (presenter_) {
         presenter_->pixel_w.store(static_cast<u32>(std::max(pw, 0)));
         presenter_->pixel_h.store(static_cast<u32>(std::max(ph, 0)));
@@ -677,8 +693,40 @@ bool Window::pump(runtime::Runtime* rt, u32 wait_ms) {
         handle(e, rt);
         got = SDL_PollEvent(&e);
     }
+    sync_system_ui(rt);
     update_overlay();
     return !closed_;
+}
+
+void Window::set_system_ui(SystemUi* ui) {
+    if (presenter_ && presenter_->screens) presenter_->screens->set_ui(ui);
+}
+
+// The controls to the system UI or back to the game as it asks, typed text on or off, and frames drawn while it
+// shows something the game's frames do not bring (the game paused under the Home menu, say).
+void Window::sync_system_ui(runtime::Runtime* rt) {
+    Overlay* overlay = presenter_ ? presenter_->screens.get() : nullptr;
+    SystemUi* ui = overlay ? overlay->ui() : nullptr;
+    const bool take = ui && ui->takes_controls();
+    if (rt && take != input_.captured()) {
+        overlay->captured(take, input_.pad().buttons);
+        input_.set_captured(take, rt->input(), rt->kernel().clock_ns());
+    }
+#if !defined(__ANDROID__)
+    // (on Android the system's keyboard would come up: the screens' own keyboard is used there)
+    const bool text = take && ui->takes_text();
+    if (text != text_input_) {
+        if (text) SDL_StartTextInput(window_);
+        else SDL_StopTextInput(window_);
+        text_input_ = text;
+    }
+#endif
+    if (ui && ui->visible()) {
+        const u64 now = nx::os::ticks_ns();
+        const u64 presented = presented_.load();
+        if (presented != ui_presented_) ui_presented_ = presented, ui_redraw_ns_ = now;
+        else if (now - ui_redraw_ns_ >= 16'000'000ull) ui_redraw_ns_ = now, presenter_->request_redraw();
+    }
 }
 
 void Window::update_overlay() {
@@ -723,7 +771,17 @@ void Window::handle(const SDL_Event& e, runtime::Runtime* rt) {
             break;
         default: break;
     }
-    if (rt) input_.handle(e, rt->input(), rt->kernel().clock_ns());
+    sync_system_ui(rt);
+    Overlay* overlay = presenter_ ? presenter_->screens.get() : nullptr;
+    const bool take = overlay && input_.captured();
+    const bool text = take && text_input_;
+    if (take) overlay->event(e, text);
+    // (typed text is the screens' alone: the keyboard's keys are not the console's buttons meanwhile)
+    const bool keyboard = e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP || e.type == SDL_EVENT_TEXT_INPUT;
+    if (rt && !(text && keyboard)) {
+        input_.handle(e, rt->input(), rt->kernel().clock_ns());
+        if (take) overlay->pad(input_.pad().buttons, input_.pad().lx, input_.pad().ly);
+    }
 }
 
 void Window::show(const gxm::Frame& f) {

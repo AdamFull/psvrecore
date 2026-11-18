@@ -9,6 +9,11 @@
 // - The mouse's left button, and fingers on a touch screen, touch the front panel where they are over the picture
 //   (the view: where the frame is drawn in the window); a finger that goes down on an on-screen control
 //   (TouchControls, when they are shown) is that control's instead.
+// - The gamepad's Guide button (the console's PS button) and, on a desktop, Escape ask for the Home menu.
+//
+// While the system UI takes the controls (set_captured), the game gets a neutral controller and no touches; when it
+// gives them back, the buttons still held stay released for the game until they are let go, and the fingers down
+// are forgotten.
 //
 // Every change is stamped with the kernel's clock when the event happened.
 
@@ -41,6 +46,18 @@ public:
         return r;
     }
 
+    // The Home menu asked for (Guide, Escape), once.
+    bool take_home_request() {
+        const bool r = home_requested_;
+        home_requested_ = false;
+        return r;
+    }
+
+    // The controls taken by the system UI (or given back to the game).
+    void set_captured(bool captured, runtime::Input& input, u64 now_ns);
+    bool captured() const { return captured_; }
+
+    // The controls as they are (the game's while it has them).
     const runtime::PadState& pad() const { return pad_; }
     const runtime::TouchState& touch() const { return touch_; }
 
@@ -65,7 +82,10 @@ private:
     u8 next_report_id_ = 1;
     runtime::TouchState touch_;
     TouchControls controls_;
-    bool menu_requested_ = false;
+    bool menu_requested_ = false, home_requested_ = false;
+    bool captured_ = false;
+    u32 masked_ = 0;  // (buttons held when the controls came back: released for the game until let go)
+    void send_pad(runtime::Input& input, u64 now_ns);
     i8 touch_screen_ = -1;  // (-1: ask SDL)
     bool has_touch_screen() const;
     f32 window_w_ = 960, window_h_ = 544, view_x_ = 0, view_y_ = 0, view_w_ = 960, view_h_ = 544;

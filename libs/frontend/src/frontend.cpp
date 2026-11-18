@@ -16,10 +16,12 @@
 
 #include "psvrecore/io/png.hpp"
 #include "psvrecore/frontend/script.hpp"
+#include "system_ui.hpp"
 #include "psvrecore/gxm/hle.hpp"
 #include "psvrecore/log.hpp"
 #include "psvrecore/platform/audio.hpp"
 #include "psvrecore/platform/window.hpp"
+#include "psvrecore/runtime/dialogs.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "psvrecore/vulkan/device.hpp"
@@ -54,6 +56,27 @@ public:
             if (!shots.empty() && !shots_from_window()) return nullptr;
         }
         return window->gpu_frame(width, height);
+    }
+
+    // A shot asked for while the game shows no frames (paused under the Home menu): what the window presents.
+    void shoot_paused() {
+        if (!window || !shots_from_window()) return;
+        nx::string name;
+        {
+            nx::scoped_lock<nx::mutex> held(lock);
+            if (shots.empty()) return;
+            name = shots.front();
+            shots.erase(shots.begin());
+        }
+        window->keep_last(true);
+        const u64 before = window->presented();
+        window->refresh_view();  // (a frame drawn now)
+        nx::vector<u8> pixels;
+        u32 w = 0, h = 0;
+        const nx::string path = nx::format("{}/{}.png", out, name);
+        if (window->wait_presented(before + 1, 500) && window->last_image(&pixels, &w, &h) &&
+            io::write_png(path.c_str(), w, h, pixels.data()))
+            nx::logi(logs::frontend, "shot (the window, the game paused): {}", path);
     }
 
     static bool shots_from_window() {
@@ -604,6 +627,22 @@ int run_game(const Game& game, int argc, char** argv) {
     g_lifecycle.store(&lifecycle);
     StallWatch stall_watch(rt, *window->get(), display, lifecycle);
 
+    // The system's screens over the game: its dialogs drawn for the player to answer (unless the settings say to
+    // answer them at once; auto does in --input and --hidden runs, which depend on it), notices, the Home menu.
+    const bool drawn = s.dialogs == 1 || (s.dialogs == 0 && cl.input.empty() && !cl.hidden);
+    runtime::dialogs::set_drawn(drawn);
+    SystemScreens::Options screens_options;
+    screens_options.title = window_options.title;
+    screens_options.settings_file = settings_file;
+    screens_options.settings_changed = [] { g_settings_changed.store(true); };
+#if defined(__ANDROID__)
+    screens_options.desktop = false;
+#endif
+    SystemScreens screens(std::move(screens_options));
+    (*window)->set_system_ui(&screens);
+    nx::logi(logs::frontend, "system dialogs: {}", drawn ? "drawn" : "answered at once");
+    bool home_paused = false;  // (the Home menu pauses the game)
+
     // Until the window is closed, the game exits, the script quits or the time is up.
     Script script(std::move(script_items));
     {
@@ -642,7 +681,31 @@ int run_game(const Game& game, int argc, char** argv) {
             break;
         }
         if (!(*window)->pump(&rt, 5)) break;
+#if defined(__ANDROID__)
         if ((*window)->input().take_menu_request()) open_settings();
+#else
+        if ((*window)->input().take_menu_request()) screens.home_button();  // (the on-screen menu button)
+#endif
+        if ((*window)->input().take_home_request()) screens.home_button();
+        if (screens.quit_requested()) {
+            ended = "the player quit from the Home menu";
+            break;
+        }
+        if (screens.home_open() != home_paused) {
+            home_paused = !home_paused;
+            if (home_paused) {
+                rt.kernel().suspend();
+                if (speaker) speaker->set_paused(true);
+            } else {
+                nx::scoped_lock<nx::mutex> held(lifecycle.lock);
+                if (!lifecycle.background) {
+                    rt.kernel().resume();
+                    if (speaker && lifecycle.sound.load()) speaker->set_paused(false);
+                }
+            }
+        }
+        if (home_paused && !rt.kernel().suspended()) rt.kernel().suspend();  // (back from the background meanwhile)
+        if (home_paused) display.shoot_paused();
         if (nx::os::ticks_ns() - saved_at > 30'000'000'000ull) {
             gxm::save_caches();  // (now and then: the pipelines made since)
             saved_at = nx::os::ticks_ns();

@@ -348,8 +348,10 @@
 - **The process ends with `_Exit`** when the window is closed or the game exits: guest threads cannot be stopped and
   joined, so nothing is torn down (the window, the audio device, the log are flushed first). A game's own save data
   is written by the time its calls return, so nothing is lost that the game wrote.
-- **The settings screen is Android's only.** On desktops the file is edited by hand (or the command line used), and
-  F11's full screen lasts for the run.
+- **Two settings screens.** Android's own (`SettingsActivity`, from Back or the on-screen menu button) and, on every
+  platform, the Home menu's (Guide on a gamepad; Escape and the on-screen menu button on a desktop). The Home menu
+  shows the text and folder settings but does not edit them (the file or the command line does). F11's full screen
+  lasts for the run.
 - **Some settings apply only at the next start** (marked so on the screen while playing): the display's vsync, the
   sound's latency, the console's settings (the game reads them once), the log file. Sound switched on while playing
   plays only if it was on when the game started (the device is opened then).
@@ -365,6 +367,24 @@
   the home screen).
 - **nx-foundation warns on Android** (`platform/process.cpp`: an unused function `keep`) since the frontend links it
   whole; it is nx-foundation's to fix.
+
+## System UI (dialogs, keyboards, notices, the Home menu)
+
+- **Drawn over the picture, not into the game's surfaces.** The console draws a dialog into the frame the game
+  passes to `sceCommonDialogUpdate`; here it is drawn by the window after the game's frame, so a game reading its
+  own frame back (none seen) would not find it there.
+- **The system's wording is English only** (our own, not the console's), whatever `[system] language` says; the
+  dialogs' buttons and messages from the game are its own.
+- **The save slots' own icons are not shown** (a numbered tile instead): there is no PNG reader in the runtime yet.
+- **The on-screen keyboard has no kana or kanji conversion**, and no layouts but Latin letters, symbols and numbers.
+  A desktop's own input method types any text into it.
+- **The console's own fonts, pictures and sounds are never used**, and loading them from the user's firmware files
+  (optional in the plan) is not done.
+- **The PSN, store and photo dialogs are not drawn**: they are answered at once as before (signed out).
+- **api_libime (SDK sample) stops in its own sprite drawing** (the guest's stack protector, with or without the
+  keyboard drawn), so the in-game keyboard is checked by unit tests only.
+- **With an sRGB swapchain the overlay's colours are slightly off** (its vertex colours are not converted); the
+  window picks a UNORM format wherever there is one.
 
 ## Save data and the application utility
 
