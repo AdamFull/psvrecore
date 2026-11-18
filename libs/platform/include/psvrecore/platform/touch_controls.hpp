@@ -8,8 +8,10 @@
 //
 // They are laid out from the window's height, inside the area the system leaves free (notches, gesture bars), and
 // drawn as quads cut from one atlas made here. Shown: always, never, or (auto) once the screen is touched, until a
-// gamepad or the keyboard is used or a gamepad is connected; when the last gamepad goes, they come back where they
-// can be used (a touch screen, or one touched before).
+// gamepad or the keyboard is used or a gamepad is connected; while a gamepad is connected, touching the screen does
+// not bring them back (the touches are the game's: a handheld with its own controls, a game run by its touch screen),
+// and when the last gamepad goes, they come back where they can be used (a touch screen, or one touched before).
+// Hidden in auto on a touch screen, the menu button alone stays (the settings are always a touch away).
 
 #include "psvrecore/platform/quad.hpp"
 #include "core/foundation/core/foundation.h"
@@ -27,12 +29,16 @@ public:
     void layout(f32 width, f32 height, f32 pixels_per_unit, f32 safe_x, f32 safe_y, f32 safe_w, f32 safe_h);
 
     bool visible() const { return visible_; }
-    // (auto: touching shows them, a gamepad or a key hides them, as does a gamepad connected; when the last gamepad
-    // is gone they are shown again on a touch screen, or once the screen has been touched)
+    // (auto: touching shows them unless a gamepad is connected, a gamepad or a key hides them, as does a gamepad
+    // connected; when the last gamepad is gone they are shown again on a touch screen, or once the screen has been
+    // touched)
     void touched();
     void other_input();
     void gamepad_connected();
     void gamepads_gone(bool touch_screen);
+    // While the system's screens have the controls (a dialog, a keyboard, the Home menu): not drawn and touching
+    // nothing, so a finger on the screens' own buttons (a keyboard's Enter, under the face buttons) is theirs alone.
+    void set_suspended(bool suspended);
 
     // A finger, in the window's coordinates: true when a control has it.
     bool finger_down(u64 id, f32 x, f32 y);
@@ -77,6 +83,10 @@ private:
     f32 opacity_ = 0.5f, scale_ = 1.0f;
     bool visible_ = false;
     bool ever_touched_ = false;
+    bool gamepad_ = false;  // (one is connected)
+    bool suspended_ = false;
+    // (hidden in auto on a touch screen: the menu button alone is drawn and touched)
+    bool menu_only() const { return !visible_ && mode_ == Mode::Auto && ever_touched_; }
     // The layout, in window coordinates.
     f32 width_ = 0, height_ = 0, ppu_ = 1, unit_ = 1;
     f32 dpad_x_ = 0, dpad_y_ = 0, face_x_ = 0, face_y_ = 0;

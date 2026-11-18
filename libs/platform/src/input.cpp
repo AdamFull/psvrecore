@@ -248,6 +248,7 @@ void InputMapper::send_pad(runtime::Input& input, u64 now_ns) {
 void InputMapper::set_captured(bool captured, runtime::Input& input, u64 now_ns) {
     if (captured == captured_) return;
     captured_ = captured;
+    controls_.set_suspended(captured);  // (the screens' touches are theirs alone)
     // (the fingers down, and the mouse's press, belong to neither side across the change)
     mouse_down_ = false;
     fingers_.clear();

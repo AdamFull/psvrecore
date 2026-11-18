@@ -207,14 +207,27 @@ void TouchControls::layout(f32 width, f32 height, f32 pixels_per_unit, f32 sx, f
 }
 
 void TouchControls::touched() {
-    ever_touched_ = true;
-    if (mode_ == Mode::Auto && !visible_) visible_ = true, changed();
+    if (!ever_touched_) ever_touched_ = true, changed();
+    if (mode_ == Mode::Auto && !visible_ && !gamepad_) visible_ = true, changed();
 }
 
-void TouchControls::gamepad_connected() { other_input(); }
+void TouchControls::gamepad_connected() {
+    gamepad_ = true;
+    other_input();
+}
 
 void TouchControls::gamepads_gone(bool touch_screen) {
+    gamepad_ = false;
     if (mode_ == Mode::Auto && !visible_ && (touch_screen || ever_touched_)) visible_ = true, changed();
+}
+
+void TouchControls::set_suspended(bool suspended) {
+    if (suspended == suspended_) return;
+    suspended_ = suspended;
+    // (the fingers on them let go: what they pressed is released)
+    fingers_.clear();
+    stick_[0][0] = stick_[0][1] = stick_[1][0] = stick_[1][1] = 0x80;
+    changed();
 }
 
 void TouchControls::other_input() {
@@ -298,9 +311,9 @@ void TouchControls::press(Finger& f, f32 x, f32 y) {
 }
 
 bool TouchControls::finger_down(u64 id, f32 x, f32 y) {
-    if (!visible_) return false;
+    if (suspended_ || (!visible_ && !menu_only())) return false;
     const Control c = hit(x, y);
-    if (c == Control::None) return false;
+    if (c == Control::None || (!visible_ && c != Control::Menu)) return false;
     fingers_.push_back(Finger{id, c, 0});
     press(fingers_.back(), x, y);
     if (c == Control::Menu) menu_requested_ = true;
@@ -340,7 +353,7 @@ u32 TouchControls::buttons() const {
 
 nx::vector<Quad> TouchControls::quads() const {
     nx::vector<Quad> out;
-    if (!visible_) return out;
+    if (suspended_ || (!visible_ && !menu_only())) return out;
     const u32 pressed = buttons();
     const f32 k = opacity_;
     const Color body{0.08f, 0.08f, 0.1f, std::min(0.9f * k, 1.0f)}, lit{0.6f, 0.6f, 0.65f, std::min(1.2f * k, 1.0f)};
@@ -355,6 +368,16 @@ nx::vector<Quad> TouchControls::quads() const {
         out.push_back(q);
     };
     const f32 u = unit_;
+    // The menu.
+    {
+        const f32 cx = (rect_[4][0] + rect_[4][2]) * 0.5f, cy = (rect_[4][1] + rect_[4][3]) * 0.5f;
+        const f32 hw = (rect_[4][2] - rect_[4][0]) * 0.5f, hh = (rect_[4][3] - rect_[4][1]) * 0.5f;
+        const bool held = std::any_of(fingers_.begin(), fingers_.end(),
+                                      [](const Finger& f) { return f.control == Control::Menu; });
+        add(kPill, cx, cy, hw, hh, held ? lit : body);
+        add(kMenuIcon, cx, cy, hh * 1.3f, hh * 1.3f, label);
+    }
+    if (!visible_) return out;
     // The d-pad: four pads with their arrows.
     add(kRing, dpad_x_, dpad_y_, 1.65f * u, 1.65f * u, Color{1, 1, 1, line.a * 0.4f});
     const struct {
@@ -400,15 +423,6 @@ nx::vector<Quad> TouchControls::quads() const {
         const f32 hw = (rect_[i][2] - rect_[i][0]) * 0.5f, hh = (rect_[i][3] - rect_[i][1]) * 0.5f;
         add(kPill, cx, cy, hw, hh, (pressed & kBits[i]) ? lit : body);
         add(kLabels[i], cx, cy, hh * (i < 2 ? 1.2f : 1.6f), hh * (i < 2 ? 1.2f : 1.6f), label);
-    }
-    // The menu.
-    {
-        const f32 cx = (rect_[4][0] + rect_[4][2]) * 0.5f, cy = (rect_[4][1] + rect_[4][3]) * 0.5f;
-        const f32 hw = (rect_[4][2] - rect_[4][0]) * 0.5f, hh = (rect_[4][3] - rect_[4][1]) * 0.5f;
-        const bool held = std::any_of(fingers_.begin(), fingers_.end(),
-                                      [](const Finger& f) { return f.control == Control::Menu; });
-        add(kPill, cx, cy, hw, hh, held ? lit : body);
-        add(kMenuIcon, cx, cy, hh * 1.3f, hh * 1.3f, label);
     }
     return out;
 }

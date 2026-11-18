@@ -518,11 +518,22 @@ TEST_CASE("touch controls: buttons, slides, the d-pad's diagonals, sticks, auto 
     CHECK(c.take_menu_request());
     CHECK_FALSE(c.take_menu_request());
     c.finger_up(7);
-    // Drawn while shown; nothing once a gamepad is used.
+    // Drawn while shown; once a gamepad is used, only the menu button (a touch screen), which still opens the menu,
+    // while other touches are the game's.
     CHECK(c.quads().size() > 20);
     c.other_input();
     CHECK_FALSE(c.visible());
+    CHECK(c.quads().size() == 2);
+    REQUIRE(c.finger_down(8, 172 + 2238 / 2.0f, 0.7f * u));
+    CHECK(c.take_menu_request());
+    c.finger_up(8);
+    CHECK_FALSE(c.finger_down(9, 172 + 2238 - 2.1f * u, 1080 - 2.0f * u + 1.05f * u));  // (Cross: hidden)
+    // Suspended (a system screen has the controls): nothing drawn or touched, not even the menu; back after.
+    c.set_suspended(true);
     CHECK(c.quads().empty());
+    CHECK_FALSE(c.finger_down(10, 172 + 2238 / 2.0f, 0.7f * u));
+    c.set_suspended(false);
+    CHECK(c.quads().size() == 2);
     // Never: not even when touched.
     c.set_mode(TouchControls::Mode::Never);
     c.touched();
@@ -560,6 +571,18 @@ TEST_CASE("input: fingers on the on-screen controls press them; others touch the
     // A key press hides them (with no finger on them).
     m.handle(key(SDLK_Z, true), input, 130);
     CHECK_FALSE(m.controls().visible());
+    m.handle(key(SDLK_Z, false), input, 135);
+    // While the system's screens have the controls, a finger where Cross is drawn is theirs: nothing pressed.
+    m.handle(finger(SDL_EVENT_FINGER_DOWN, 12, cross_x / 2410, cross_y / 1080), input, 140);
+    REQUIRE(m.controls().visible());
+    m.handle(finger(SDL_EVENT_FINGER_UP, 12, cross_x / 2410, cross_y / 1080), input, 150);
+    m.set_captured(true, input, 160);
+    CHECK(m.controls().quads().empty());
+    m.handle(finger(SDL_EVENT_FINGER_DOWN, 13, cross_x / 2410, cross_y / 1080), input, 170);
+    CHECK(m.pad().buttons == 0);
+    m.handle(finger(SDL_EVENT_FINGER_UP, 13, cross_x / 2410, cross_y / 1080), input, 180);
+    m.set_captured(false, input, 190);
+    CHECK_FALSE(m.controls().quads().empty());
 }
 
 TEST_CASE("input: a gamepad connected hides the on-screen controls; the last one gone shows them again") {
@@ -577,6 +600,9 @@ TEST_CASE("input: a gamepad connected hides the on-screen controls; the last one
         m.controls().touched();
         REQUIRE(m.controls().visible());
         m.handle(device(SDL_EVENT_GAMEPAD_ADDED, 1), input, 100);
+        CHECK_FALSE(m.controls().visible());
+        // (touching the screen meanwhile does not bring them back: the touches are the game's)
+        m.controls().touched();
         CHECK_FALSE(m.controls().visible());
         m.handle(device(SDL_EVENT_GAMEPAD_ADDED, 2), input, 110);
         m.handle(device(SDL_EVENT_GAMEPAD_REMOVED, 1), input, 120);
