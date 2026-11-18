@@ -768,3 +768,41 @@ TEST_CASE("vulkan gpu: render targets' textures made by a compute shader as the 
     gxm::destroy_target_converter(d, c);
     check_no_validation_errors(*g);
 }
+
+TEST_CASE("vulkan gpu: an HDR surface's write-back packed by the compute shader as pack_u2f10f10f10 packs it") {
+    auto g = open(false);
+    Device& d = *g->device;
+    gxm::TargetConverter c;
+    REQUIRE(gxm::create_target_converter(d, c));
+    // (WipEout 2048's race surface, 960 x 544: halves of every kind, through the device's RGBA16F image)
+    constexpr u32 w = 960, h = 544;
+    u32 seed = 4242;
+    auto next = [&] { return seed = seed * 1103515245u + 12345u; };
+    nx::vector<u32> texels(usize{w} * h * 2);
+    for (u32& t : texels) {
+        u32 word = 0;
+        for (u32 half = 0; half < 2; ++half) {
+            const u32 r = next();
+            const u32 kinds = r & 7;
+            u16 v = static_cast<u16>(r >> 16);
+            if (kinds == 0) v = static_cast<u16>(0x7C00 | (r & 0x3FF)) ^ ((r >> 12) & 0x8000);  // (infinity, NaN)
+            else if (kinds == 1) v = static_cast<u16>((r >> 16) & 0x83FF);                       // (denormal)
+            else if (kinds < 5) v = static_cast<u16>((r >> 16) & 0x3FFF);                       // (0-2)
+            word |= u32{v} << (16 * half);
+        }
+        t = word;
+    }
+    const nx::vector<u32> image =
+        through_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, texels, 2, w, h, 1, 0);
+    nx::vector<u32> cpu(usize{w} * h);
+    gxm::pack_u2f10f10f10(reinterpret_cast<const u16*>(image.data()), cpu.data(), cpu.size());
+    const auto gpu = value_or_throw(gxm::run_target_conversion(d, c, gxm::target_pack_constants(w, h), image, {}));
+    REQUIRE(gpu.size() == cpu.size());
+    usize differ = 0, first = 0;
+    for (usize i = 0; i < cpu.size(); ++i)
+        if (gpu[i] != cpu[i] && differ++ == 0) first = i;
+    if (differ) std::fprintf(stderr, "packing: %zu pixels differ, the first %zu (%08x, the CPU's %08x)\n", differ, first, gpu[first], cpu[first]);
+    CHECK(differ == 0);
+    gxm::destroy_target_converter(d, c);
+    check_no_validation_errors(*g);
+}

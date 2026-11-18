@@ -21,6 +21,7 @@ struct Settings {
     bool smooth = true;  // linear filtering when scaled
     bool fps_overlay = false;  // the frame rate and a graph of the frame times over the picture
     bool launch_screen = true;  // the game's LiveArea picture (launch.png) while it starts, until its first frame
+    bool high_frame_rate = true;  // a game's parts it paces slower than the display (Runtime::Config::high_frame_rate)
     u32 render_scale = 1;  // the internal resolution: the game's surfaces drawn at this many times their size
     i32 gpu = -1;        // the Vulkan device's index (-1: a discrete GPU first)
     bool validation = false;

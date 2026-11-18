@@ -241,6 +241,9 @@ unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title I
 (the game's programs translated, the pipelines made, the driver's pipeline cache): what a run drew with is made before
 the next one starts. Deleting it only costs that again. `[display] internal_resolution` (1 to 4) draws the game at
 that many times the console's resolution, the surfaces it draws into and reads back as textures included.
+`[display] high_frame_rate` (on by default) lets a game's own additions run what the game paces slower than its
+menus at 60 frames a second (WipEout 2048's races, 30 on the console), where the game's simulation follows the time
+between frames.
 `[network] adhoc` plays a game's ad hoc mode with other copies on the same local network (off: offline); see
 [ADHOC.md](ADHOC.md).
 

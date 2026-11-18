@@ -72,6 +72,10 @@ struct TargetTextureConstants {
 };
 // The constants' packing fields (alpha1-3) for a source.
 void target_packing(TargetTextureConstants& k);
+// An HDR surface's write-back on the GPU: a width x height image's texels (RGBA16F halves, rows of `width`, from
+// word 0 of the work buffer) to the U2F10F10F10 words guest memory gets (pack_u2f10f10f10), one a pixel from word
+// `out` (16-byte aligned, past the texels).
+TargetTextureConstants target_pack_constants(u32 width, u32 height);
 // Words a texel of the image takes in the work buffer, and that the shader writes.
 inline u32 target_source_words(TargetSource s) { return s == TargetSource::U2F10F10F10 ? 2 : 1; }
 inline u32 target_out_words(const TargetDecode& d) { return d.single ? 1 : 2; }

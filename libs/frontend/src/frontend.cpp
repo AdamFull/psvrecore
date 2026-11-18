@@ -680,6 +680,7 @@ int run_game(const Game& game, int argc, char** argv) {
     config.system.time_zone_minutes = s.time_zone_auto ? host_time_zone_minutes() : s.time_zone_minutes;
     config.system.summer_time = s.time_zone_auto ? host_summer_time() : s.summer_time;
     config.system.safe_memory = join(safe, nx::format("{}.bin", game.title_id));
+    config.high_frame_rate = s.high_frame_rate;
     config.network.adhoc = s.adhoc;
     config.network.adhoc_interface = s.adhoc_interface;
     config.network.on_adhoc = on_adhoc;

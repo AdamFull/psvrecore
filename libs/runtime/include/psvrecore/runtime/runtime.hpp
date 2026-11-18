@@ -30,6 +30,10 @@ public:
         u64 cdram_budget = 0x08000000u;        // and of CDRAM (128 MiB)
         AudioSink* audio = nullptr;            // where audio output goes (none: it is paced and dropped)
         f64 refresh_hz = 59.94005994;          // the display's vertical blanks (input is sampled at them too)
+        // A game's own additions (frontend::Game::prepare) may run what the game paces at a lower rate than the
+        // display (races at 30 frames a second, menus at 60) at the display's rate: where the game's simulation
+        // follows the time between frames, not their count ([display] high_frame_rate).
+        bool high_frame_rate = false;
         // The console's settings as applications read them (sceAppUtilSystemParam*), and where what survives the
         // process is kept besides save data (savedata0:, a mount in `files`).
         struct System {

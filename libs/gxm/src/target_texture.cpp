@@ -227,6 +227,17 @@ void target_packing(TargetTextureConstants& k) {
 
 static_assert(sizeof(TargetTextureConstants) == 21 * 4);
 
+TargetTextureConstants target_pack_constants(u32 width, u32 height) {
+    TargetTextureConstants k;
+    k.width = k.a_width = width, k.height = k.a_height = height;
+    k.src = 0, k.src_pitch = width, k.src_step = 1, k.src_first = 0;
+    k.out = (width * height * 2 + 3) & ~3u;
+    k.source = static_cast<u32>(TargetSource::U2F10F10F10);
+    k.kind = 0, k.mask = ~0u, k.select = 0, k.alpha_low = 0;
+    target_packing(k);
+    return k;
+}
+
 nx::vector<u32> target_texture_shader() {
     using spirv::Builder;
     using spirv::Id;
@@ -657,6 +668,37 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
             check.what = nx::format("format {:08x} swizzle {}, texel ({}, {}): the GPU's bytes differ from the decoder's",
                                     cs.format, cs.swizzle, texel % cs.width, texel / cs.width);
             break;
+        }
+    }
+    // (the write-back's packing on the GPU: halves of every kind, as pack_u2f10f10f10 packs them)
+    if (check.ok) {
+        constexpr u32 w = 37, h = 23;
+        const TargetTextureConstants k = target_pack_constants(w, h);
+        nx::vector<u32> image(usize{w} * h * 2);
+        for (u32& v : image) {
+            u32 word = 0;
+            for (u32 half = 0; half < 2; ++half) {
+                const u32 r = next();
+                const u32 kinds = r & 7;
+                u16 hv = static_cast<u16>(r >> 16);
+                if (kinds == 0) hv = static_cast<u16>(0x7C00 | (r & 0x3FF)) ^ ((r >> 12) & 0x8000);  // (infinity, NaN)
+                else if (kinds == 1) hv = static_cast<u16>((r >> 16) & 0x83FF);                       // (denormal)
+                else if (kinds < 5) hv = static_cast<u16>((r >> 16) & 0x3FFF);                       // (0-2)
+                word |= u32{hv} << (16 * half);
+            }
+            v = word;
+        }
+        nx::vector<u32> cpu(usize{w} * h);
+        pack_u2f10f10f10(reinterpret_cast<const u16*>(image.data()), cpu.data(), cpu.size());
+        auto gpu = run_target_conversion(device, c, k, image, {});
+        if (!gpu || gpu->size() != cpu.size()) {
+            check.ok = false;
+            check.what = "the packing on the GPU: not run";
+        } else if (std::memcmp(gpu->data(), cpu.data(), cpu.size() * 4) != 0) {
+            usize at = 0;
+            while ((*gpu)[at] == cpu[at]) ++at;
+            check.ok = false;
+            check.what = nx::format("the packing on the GPU, pixel {}: {:08x}, the CPU's {:08x}", at, (*gpu)[at], cpu[at]);
         }
     }
     check.ms = static_cast<f64>(nx::os::ticks_ns() - start) / 1e6;

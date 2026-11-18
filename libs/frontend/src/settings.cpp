@@ -108,6 +108,12 @@ const Key kKeys[] = {
      "packaged).",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.launch_screen); },
      [](const Settings& s) { return nx::string(yes_no(s.launch_screen)); }, "true or false"},
+    {"display", "high_frame_rate",
+     "Run what a game paces at a lower frame rate than its menus at the display's 60 frames a second, where the game "
+     "has a way to (WipEout 2048's races, 30 on the console). On a device that cannot keep up, frames come when they "
+     "are ready, between 30 and 60 a second.",
+     [](Settings& s, nx::string_view v) { return parse_bool(v, &s.high_frame_rate); },
+     [](const Settings& s) { return nx::string(yes_no(s.high_frame_rate)); }, "true or false"},
     {"display", "gpu", "The Vulkan device by index (-1: a discrete GPU first; --list-gpus lists them).",
      [](Settings& s, nx::string_view v) { return parse_int(v, &s.gpu) && s.gpu >= -1; },
      [](const Settings& s) { return nx::format("{}", s.gpu); }, "-1 or a device's index"},
@@ -224,6 +230,7 @@ const Schema kSchema[] = {
     {"display", "internal_resolution", K::Int, 1, 4, false, false},
     {"display", "fps_overlay", K::Bool, 0, 0, true, false},
     {"display", "launch_screen", K::Bool, 0, 0, false, false},
+    {"display", "high_frame_rate", K::Bool, 0, 0, false, false},
     {"display", "gpu", K::Int, -1, 8, false, true},         {"display", "validation", K::Bool, 0, 0, false, true},
     {"display", "capture_frame", K::Int, 0, 1000000, false, true},
     {"audio", "enabled", K::Bool, 0, 0, true, false},       {"audio", "latency_ms", K::Int, 20, 2000, false, false},

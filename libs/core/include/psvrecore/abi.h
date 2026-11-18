@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define PSVRECORE_ABI_VERSION 1
+#define PSVRECORE_ABI_VERSION 2
 
 /* PSVRECORE_SHARED: psvrecore is (or is being built as) a shared library. PSVRECORE_BUILDING: this is psvrecore's
  * own code. Both are set by the build (CMakeLists.txt), never by hand. */
