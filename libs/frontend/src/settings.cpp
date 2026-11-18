@@ -183,7 +183,8 @@ const Key kKeys[] = {
 
     {"network", "adhoc",
      "Ad hoc play over the local network: the game's ad hoc mode reaches other copies on the same Wi-Fi network or "
-     "hotspot (UDP port 3658 and the game's own ports must be let through the firewall); off, the console is offline.",
+     "hotspot, once the game opens it (UDP port 3658 must be let through a PC's firewall); off, its ad hoc mode finds "
+     "no network.",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.adhoc); },
      [](const Settings& s) { return nx::string(yes_no(s.adhoc)); }, "true or false"},
     {"network", "adhoc_interface",

@@ -42,7 +42,7 @@ struct Settings {
     i32 dialogs = 0;  // the system's dialogs: 0 auto (drawn; answered at once in --input and --hidden runs), 1 drawn,
                       // 2 answered at once, as a player answers most often (runtime/dialogs.hpp)
     // [network]
-    bool adhoc = false;          // the game's ad hoc mode over the host's local network (else offline)
+    bool adhoc = true;           // the game's ad hoc mode over the host's local network (else offline)
     nx::string adhoc_interface;  // the interface it uses: empty auto, a name (wlan0, Wi-Fi), an IPv4 address, or a
                                  // loopback address (127.0.0.2: instances on one machine)
     // [log]

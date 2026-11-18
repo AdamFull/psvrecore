@@ -6,7 +6,7 @@
 // waits: not at all when the socket does not block (EAGAIN), as long as its time-out says (then EAGAIN, or no events),
 // or until the socket or epoll is aborted (EINTR) or closed. Failures also set the thread's sce_net_errno.
 //
-// Ad hoc mode (Runtime::Config::network.adhoc; off by default): the network check dialog's ad hoc connection is made
+// Ad hoc mode (Runtime::Config::network.adhoc; the frontend's [network] adhoc, on by default): the network check dialog's ad hoc connection is made
 // on a host interface (adhoc_connect), and the sockets made while it is up are the host's own (host_socket.hpp),
 // reaching that interface's network, as the console's ad hoc network reaches the consoles near it:
 // - datagram and stream sockets are UDP and TCP sockets; a P2P datagram socket (SOCK_DGRAM_P2P) is a UDP socket on

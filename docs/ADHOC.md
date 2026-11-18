@@ -5,8 +5,9 @@ Phones and PCs cannot join that kind of network, so psvrecore does not try to: w
 hoc mode runs over an ordinary local network instead, between psvrecore instances. Those can be two phones on one Wi-Fi
 network or on one phone's hotspot, a phone and a PC, or two PCs. A real Vita cannot join in.
 
-The setting is off by default. Off, the console is offline as before: the network check dialog finds no network, and
-no socket reaches anything beyond the loopback.
+The setting is on by default: nothing reaches the network until the game opens its ad hoc mode (the network check
+dialog in its ad hoc mode), and everything else (the internet, PSN) stays offline. Off, the console is offline as before:
+the network check dialog finds no network, and no socket reaches anything beyond the loopback.
 
 ## The setting
 
@@ -33,8 +34,8 @@ connection logs the interface used:
 1. Put both devices on the same network: the same Wi-Fi network, or one device's hotspot with the other joined to it
    (the hotspot's own device takes part too). Guest networks and networks with client isolation ("AP isolation")
    keep devices from reaching each other. Use a home network or a hotspot.
-2. Turn `[network] adhoc` on in each copy. On a phone, open the settings (the on-screen menu button, or Back), then
-   Network. It applies at the game's next start.
+2. Check that `[network] adhoc` is on in each copy (it is unless it was turned off: on a phone, the settings, from the
+   on-screen menu button or Back, then Network). A change applies at the game's next start.
 3. In the game, open its ad hoc mode. One player creates a game and the others find it in the game's list and join,
    as on the console.
 

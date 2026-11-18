@@ -64,7 +64,7 @@ TEST_CASE("settings: the file's text reads back as the settings it was written f
     s.time_zone_auto = false;
     s.time_zone_minutes = -300;
     s.summer_time = true;
-    s.adhoc = true;
+    s.adhoc = false;
     s.adhoc_interface = "Wi-Fi 2";
     s.log_level = "debug";
     s.log_file = "logs/p4d.log";
@@ -89,7 +89,7 @@ TEST_CASE("settings: the file's text reads back as the settings it was written f
     CHECK_FALSE(r.time_zone_auto);
     CHECK(r.time_zone_minutes == -300);
     CHECK(r.summer_time);
-    CHECK(r.adhoc);
+    CHECK_FALSE(r.adhoc);
     CHECK(r.adhoc_interface == "Wi-Fi 2");
     CHECK(r.log_level == "debug");
     CHECK(r.log_file == "logs/p4d.log");
@@ -97,7 +97,7 @@ TEST_CASE("settings: the file's text reads back as the settings it was written f
     Settings d;
     REQUIRE(apply_file_text(&d, file_text(Settings{}).view()));
     CHECK(d.language == 1);
-    CHECK_FALSE(d.adhoc);  // (ad hoc play is off unless asked for)
+    CHECK(d.adhoc);  // (ad hoc play on: nothing reaches the network until a game opens its ad hoc mode)
     CHECK(d.adhoc_interface.empty());
     CHECK(d.time_zone_auto);
     CHECK(d.scale == 1);

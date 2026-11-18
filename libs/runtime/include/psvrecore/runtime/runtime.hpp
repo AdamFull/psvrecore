@@ -41,7 +41,8 @@ public:
             nx::string user_name = "User";
             nx::string safe_memory;  // the host file of the 64 KiB of safe memory (empty: kept in memory only)
         } system{};
-        // Ad hoc mode over the host's local network (hle/net.cpp): off, the console is offline. On, the network
+        // Ad hoc mode over the host's local network (hle/net.cpp; the frontend turns it on unless [network] adhoc is
+        // false): off, the console is offline. On, the network
         // check dialog's ad hoc connection is made on a host interface, SceNetCtl's ad hoc state reports it, and
         // while it is connected SceNet's sockets are the host's, reaching the other consoles (other instances) on that
         // interface's network; nothing else is ever reachable.
