@@ -577,6 +577,7 @@ int run_game(const Game& game, int argc, char** argv) {
     gxm_options.shared_device = (*window)->device();
     gxm_options.cache_folder = join(data, "cache");
     gxm_options.render_scale = s.render_scale;
+    gxm_options.capture_frame = s.capture_frame;
     runtime::Runtime rt(config);
     if (!rt.ok()) return fail("The runtime could not start (see the log).", cl.hidden);
     gxm::register_libraries(gxm_options);
@@ -600,7 +601,6 @@ int run_game(const Game& game, int argc, char** argv) {
     lifecycle.window = window->get();
     lifecycle.sound.store(s.audio);
     SDL_AddEventWatch(on_app_event, &lifecycle);
-    gxm_options.capture_frame = s.capture_frame;
     g_lifecycle.store(&lifecycle);
     StallWatch stall_watch(rt, *window->get(), display, lifecycle);
 

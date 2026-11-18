@@ -108,12 +108,12 @@ const Key kKeys[] = {
     {"display", "validation", "Vulkan's validation layer, when installed (slow; for development).",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.validation); },
      [](const Settings& s) { return nx::string(yes_no(s.validation)); }, "true or false"},
-
     {"display", "capture_frame",
      "A RenderDoc capture of this frame of the game's (counted from 1) when it runs under RenderDoc; F12 captures the "
      "next frame (0: none).",
      [](Settings& s, nx::string_view v) { return parse_int(v, &s.capture_frame); },
      [](const Settings& s) { return nx::format("{}", s.capture_frame); }, "0 or a frame's number"},
+
     {"audio", "enabled", "Play the game's sound.",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.audio); },
      [](const Settings& s) { return nx::string(yes_no(s.audio)); }, "true or false"},
@@ -198,6 +198,7 @@ const Schema kSchema[] = {
     {"display", "internal_resolution", K::Int, 1, 4, false, false},
     {"display", "fps_overlay", K::Bool, 0, 0, true, false},
     {"display", "gpu", K::Int, -1, 8, false, true},         {"display", "validation", K::Bool, 0, 0, false, true},
+    {"display", "capture_frame", K::Int, 0, 1000000, false, true},
     {"audio", "enabled", K::Bool, 0, 0, true, false},       {"audio", "latency_ms", K::Int, 20, 2000, false, false},
     {"controls", "on_screen", K::Choice, 0, 0, true, false}, {"controls", "opacity", K::Float, 0, 1, true, false},
     {"controls", "scale", K::Float, 0.5f, 2, true, false},  {"system", "language", K::Choice, 0, 0, false, false},
@@ -207,7 +208,6 @@ const Schema kSchema[] = {
     {"log", "file", K::Text, 0, 0, false, true},
 };
 
-    {"display", "capture_frame", K::Int, 0, 1000000, false, true},
 template <usize N>
 nx::vector<nx::string> list(const char* const (&names)[N]) {
     nx::vector<nx::string> out;

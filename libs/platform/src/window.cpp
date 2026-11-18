@@ -719,6 +719,7 @@ void Window::handle(const SDL_Event& e, runtime::Runtime* rt) {
             if (e.key.key == SDLK_F11 && !e.key.repeat)
                 SDL_SetWindowFullscreen(window_, !(SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN));
             if (e.key.key == SDLK_F3 && !e.key.repeat) set_fps_overlay(!fps_overlay());
+            if (e.key.key == SDLK_F12 && !e.key.repeat) gxm::request_gpu_capture("F12");  // (under RenderDoc)
             break;
         default: break;
     }
@@ -767,7 +768,6 @@ vulkan::Image* Window::gpu_frame(u32 width, u32 height) {
     return &g;
 }
 
-            if (e.key.key == SDLK_F12 && !e.key.repeat) gxm::request_gpu_capture("F12");  // (under RenderDoc)
 void Window::show_pixels(const u8* pixels, u32 width, u32 height, u32 pitch, u32 pixel_format) {
     if (!presenter_ || !width || !height) return;
     Presenter& p = *presenter_;
