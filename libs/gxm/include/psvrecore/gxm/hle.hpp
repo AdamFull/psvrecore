@@ -61,7 +61,14 @@ struct Options {
     // Where the shader cache is kept (the SPIR-V translated, the pipelines made, the driver's pipeline cache), from
     // one run to the next: empty, nowhere.
     nx::string cache_folder;
+    // A RenderDoc capture of this frame (counted from 1, as the game queues or sets them), when RenderDoc is loaded;
+    // 0: none (docs/PROFILING.md).
+    u32 capture_frame = 0;
 };
+
+// A RenderDoc capture of the game's next frame (its scenes), when RenderDoc is in the process; else logged once and
+// nothing done. `why`: the capture's title. From any thread.
+void request_gpu_capture(nx::string_view why);
 
 // Registers SceGxm and SceDisplay. The options (and the sink) must outlive the runtime.
 void register_libraries(const Options& options);

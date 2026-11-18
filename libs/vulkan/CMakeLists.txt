@@ -14,6 +14,7 @@ add_library(psvrecore_vulkan STATIC
     src/device.cpp
     src/frames.cpp
     src/pipelines.cpp
+    src/renderdoc.cpp
     src/rendering.cpp
     src/resources.cpp
     src/vma.cpp
@@ -25,6 +26,12 @@ target_include_directories(psvrecore_vulkan PUBLIC include)
 # third_party/VulkanMemoryAllocator): header-only, implemented in src/vma.cpp.
 target_include_directories(psvrecore_vulkan SYSTEM PUBLIC "${PSVRECORE_DIR}/third_party/VulkanMemoryAllocator/include")
 target_link_libraries(psvrecore_vulkan PUBLIC psvrecore::core psvrecore_volk)
+# RenderDoc's in-application API header (github.com/baldurk/renderdoc, MIT, third_party/renderdoc): RenderDoc is used
+# when it is in the process, never linked or loaded.
+target_include_directories(psvrecore_vulkan SYSTEM PRIVATE "${PSVRECORE_DIR}/third_party/renderdoc")
+if(NOT WIN32)
+    target_link_libraries(psvrecore_vulkan PRIVATE ${CMAKE_DL_LIBS})
+endif()
 psvrecore_target_defaults(psvrecore_vulkan)
 # (VMA's implementation is third-party code: its warnings are not ours)
 set_source_files_properties(src/vma.cpp PROPERTIES COMPILE_OPTIONS "-w")

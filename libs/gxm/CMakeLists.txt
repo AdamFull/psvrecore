@@ -16,6 +16,7 @@ psvrecore_target_defaults(psvrecore_gxm)
 
 # The GXM and display system libraries on the runtime (HLE): what games call.
 add_library(psvrecore_gxm_hle STATIC
+    src/hle/capture.cpp
     src/hle/context.cpp
     src/hle/core.cpp
     src/hle/display.cpp

@@ -4,6 +4,8 @@
 #include <cstring>
 
 #include "psvrecore/log.hpp"
+#include "psvrecore/profile.hpp"
+#include "psvrecore/vulkan/renderdoc.hpp"
 #include "core/foundation/strings/format.h"
 
 namespace psvrecore::vulkan {
@@ -53,8 +55,28 @@ u32 layer_version(const char* name) {
     return 0;
 }
 
-// The validation layer's version, when it is on (0: off).
-Result<VkInstance> make_instance(const DeviceOptions& options, bool& validation, u32* validation_version = nullptr) {
+bool instance_extension(const char* name) {
+    u32 n = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    nx::vector<VkExtensionProperties> all(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
+    for (const auto& e : all)
+        if (std::strcmp(e.extensionName, name) == 0) return true;
+    return false;
+}
+
+// Whether the commands get debug labels (DeviceOptions::labels).
+bool labels_wanted(const DeviceOptions& options) {
+    const bool renderdoc = renderdoc::loaded();  // (looked for at the start in any case: its capture keys set then)
+    if (options.labels || options.validation || profile::kEnabled || renderdoc) return true;
+    const char* v = std::getenv("PSVRECORE_GPU_LABELS");
+    return v && *v && *v != '0';
+}
+
+// The validation layer's version, when it is on (0: off). `labels`: debug labels wanted, and then whether the
+// instance has them.
+Result<VkInstance> make_instance(const DeviceOptions& options, bool& validation, u32* validation_version = nullptr,
+                                 bool* labels = nullptr) {
     if (const VkResult r = volkInitialize(); r != VK_SUCCESS) return nx::err(vk_error("no Vulkan loader", r));
     const u32 loader = volkGetInstanceVersion();
     if (loader < VK_API_VERSION_1_1) return failure("the Vulkan loader is older than 1.1");
@@ -70,6 +92,11 @@ Result<VkInstance> make_instance(const DeviceOptions& options, bool& validation,
     if (validation) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    if (labels) {
+        if (*labels && !validation) *labels = instance_extension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        if (*labels && !validation) extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        *labels = *labels || validation;
     }
     VkInstanceCreateInfo info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     info.pApplicationInfo = &app;
@@ -144,9 +171,11 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     auto d = nx::make_unique<Device>();
     bool validation = false;
     u32 validation_version = 0;
-    auto instance = make_instance(options, validation, &validation_version);
+    bool labels = labels_wanted(options);
+    auto instance = make_instance(options, validation, &validation_version, &labels);
     if (!instance) return nx::err(instance.error());
     d->instance_ = *instance;
+    d->caps_.labels = labels && vkCmdBeginDebugUtilsLabelEXT;
     if (validation) {
         VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
         info.messageSeverity =
@@ -333,6 +362,14 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         }
     }
 
+#if PSVRECORE_TRACY
+    // (Tracy's GPU zones on the CPU's timeline: the GPU's clock read with the host's)
+    const char* calibrated = has_ext(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)   ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME
+                             : has_ext(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME
+                                                                                   : nullptr;
+    if (calibrated) extensions.push_back(calibrated);
+#endif
+
     const f32 priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue.queueFamilyIndex = d->queue_family_;
@@ -348,6 +385,17 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     if (const VkResult r = vkCreateDevice(gpu, &info, nullptr, &d->device_); r != VK_SUCCESS)
         return nx::err(vk_error("vkCreateDevice", r));
     volkLoadDevice(d->device_);
+#if PSVRECORE_TRACY
+    if (calibrated && std::strcmp(calibrated, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0) {
+        caps.time_domains = vkGetPhysicalDeviceCalibrateableTimeDomainsKHR;
+        caps.calibrated_timestamps = vkGetCalibratedTimestampsKHR;
+    } else if (calibrated) {
+        caps.time_domains = vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+        caps.calibrated_timestamps = vkGetCalibratedTimestampsEXT;
+    }
+    if (!caps.time_domains || !caps.calibrated_timestamps) caps.time_domains = nullptr, caps.calibrated_timestamps = nullptr;
+#endif
+    if (caps.labels) nx::logi(logs::gpu, "Vulkan device: debug labels on");
     vkGetDeviceQueue(d->device_, d->queue_family_, 0, &d->queue_);
     d->present_queue_ = d->queue_;
     if (queues > 1) vkGetDeviceQueue(d->device_, d->queue_family_, 1, &d->present_queue_);
@@ -498,6 +546,45 @@ void invalidate(Device& device, const Buffer& buffer) {
 
 void flush(Device& device, const Buffer& buffer) {
     vmaFlushAllocation(device.allocator(), buffer.allocation, 0, VK_WHOLE_SIZE);
+}
+
+namespace {
+VkDebugUtilsLabelEXT label_of(const char* text, u32 rgb) {
+    VkDebugUtilsLabelEXT l{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    l.pLabelName = text;
+    if (rgb) {
+        l.color[0] = static_cast<f32>((rgb >> 16) & 0xFF) / 255.0f;
+        l.color[1] = static_cast<f32>((rgb >> 8) & 0xFF) / 255.0f;
+        l.color[2] = static_cast<f32>(rgb & 0xFF) / 255.0f;
+        l.color[3] = 1.0f;
+    }
+    return l;
+}
+}  // namespace
+
+void Device::begin_label(VkCommandBuffer cmd, const char* text, u32 rgb) const {
+    if (!caps_.labels) return;
+    const VkDebugUtilsLabelEXT l = label_of(text, rgb);
+    vkCmdBeginDebugUtilsLabelEXT(cmd, &l);
+}
+
+void Device::end_label(VkCommandBuffer cmd) const {
+    if (caps_.labels) vkCmdEndDebugUtilsLabelEXT(cmd);
+}
+
+void Device::insert_label(VkCommandBuffer cmd, const char* text, u32 rgb) const {
+    if (!caps_.labels) return;
+    const VkDebugUtilsLabelEXT l = label_of(text, rgb);
+    vkCmdInsertDebugUtilsLabelEXT(cmd, &l);
+}
+
+void Device::name_object(VkObjectType type, u64 handle, const char* name) const {
+    if (!caps_.labels || !handle || !vkSetDebugUtilsObjectNameEXT) return;
+    VkDebugUtilsObjectNameInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
+    info.objectType = type;
+    info.objectHandle = handle;
+    info.pObjectName = name;
+    vkSetDebugUtilsObjectNameEXT(device_, &info);
 }
 
 }  // namespace psvrecore::vulkan

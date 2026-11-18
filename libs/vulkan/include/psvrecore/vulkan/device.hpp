@@ -19,6 +19,9 @@ struct DeviceOptions {
     bool validation = false;  // the Khronos validation layer, when installed; its errors are logged and counted
     i32 gpu = -1;             // the physical device's index (-1: a discrete GPU first, then any)
     bool render_passes = false;  // draw with render passes even where dynamic rendering exists (to test that path)
+    // Debug labels (VK_EXT_debug_utils) on the commands, for a GPU debugger or profiler: also on with the validation
+    // layer, when RenderDoc is in the process, in a Tracy build, and with PSVRECORE_GPU_LABELS=1 (docs/PROFILING.md).
+    bool labels = false;
     nx::vector<const char*> instance_extensions;  // (e.g. a window system's surface extensions)
     // Called with the instance before the device is chosen; the device must then present to the surface it returns
     // (VK_NULL_HANDLE: no presenting, no swapchain extension).
@@ -52,6 +55,10 @@ struct Capabilities {
     // library is the same for all of them, found in the driver's cache in later runs.
     bool dynamic_state = false;
     VkFormat depth_stencil_format = VK_FORMAT_UNDEFINED;  // D32_SFLOAT_S8_UINT or D24_UNORM_S8_UINT
+    bool labels = false;  // debug labels on (DeviceOptions::labels)
+    // (a Tracy build: VK_KHR_ or VK_EXT_calibrated_timestamps, the GPU's clock read with the host's; null without)
+    PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR time_domains = nullptr;
+    PFN_vkGetCalibratedTimestampsKHR calibrated_timestamps = nullptr;
     u32 vendor_id = 0;
     f32 timestamp_period = 0.0f;  // nanoseconds per timestamp tick (0: the queue has no timestamps)
 };
@@ -86,6 +93,14 @@ public:
     nx::mutex& queue_lock() { return queue_lock_; }
     // Errors the validation layer reported (0 without the layer).
     u32 validation_errors() const { return validation_errors_; }
+
+    // Debug labels: a region of commands (begun and ended in the same command buffer) and a single point, named and
+    // coloured (0xRRGGBB, 0: none) in a GPU debugger's list of commands. Nothing without caps().labels.
+    void begin_label(VkCommandBuffer cmd, const char* text, u32 rgb = 0) const;
+    void end_label(VkCommandBuffer cmd) const;
+    void insert_label(VkCommandBuffer cmd, const char* text, u32 rgb = 0) const;
+    // A name for an object (a debugger shows it instead of its handle). Nothing without caps().labels.
+    void name_object(VkObjectType type, u64 handle, const char* name) const;
 
     // Submits under the queue lock.
     VkResult submit(const VkSubmitInfo& info, VkFence fence);

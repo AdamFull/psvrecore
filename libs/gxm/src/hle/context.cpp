@@ -290,7 +290,25 @@ i32 sceGxmSetYuvProfile(u32, u32 csc, u32 profile) {
     gxm::set_yuv_profile(csc, profile);
     return 0;
 }
-i32 sceGxmSetUserMarker(u32, u32) { return 0; }
+// The game's GPU markers, in the scene (or command list) at their place among its draws: labels in a GPU debugger
+// and zones in Tracy (render.cpp). Within a scene (an immediate context) or a command list (a deferred one) only.
+i32 user_marker(u32 context, UserMarker::Kind kind, Ptr<const char> tag) {
+    if (!context || (kind != UserMarker::Kind::Pop && !tag)) return err::kInvalidPointer;
+    nx::scoped_lock<nx::mutex> held(state().lock);
+    Context* c = context_of(context);
+    if (!c) return err::kInvalidPointer;
+    if (c->deferred ? !c->in_list : !c->in_scene) return c->deferred ? err::kNotWithinCommandList : err::kNotWithinScene;
+    if (!user_markers_wanted()) return 0;  // (as the console's library does without Razor's capture module)
+    UserMarker m;
+    m.kind = kind;
+    m.at = static_cast<u32>(c->scene.draws.size());
+    if (tag) m.tag = runtime::runtime().memory().string(tag.address, 256);
+    c->scene.markers.push_back(std::move(m));
+    return 0;
+}
+i32 sceGxmPushUserMarker(u32 context, Ptr<const char> tag) { return user_marker(context, UserMarker::Kind::Push, tag); }
+i32 sceGxmPopUserMarker(u32 context) { return user_marker(context, UserMarker::Kind::Pop, Ptr<const char>{}); }
+i32 sceGxmSetUserMarker(u32 context, Ptr<const char> tag) { return user_marker(context, UserMarker::Kind::Set, tag); }
 void sceGxmSetValidationEnable(u32, u32) {}
 
 // ---- Uniform buffers and textures ------------------------------------------------------------------------------
@@ -592,7 +610,7 @@ i32 sceGxmEndCommandList(u32 context, Ptr<u32> list) {
     if (!c->in_list) return err::kNotWithinCommandList;
     if (list.get()[0] == kCommandListTag) s.command_lists.erase(list.get()[1]);
     const u32 id = s.next_command_list++;
-    s.command_lists[id] = std::move(c->scene.draws);
+    s.command_lists[id] = State::CommandList{std::move(c->scene.draws), std::move(c->scene.markers)};
     c->scene = Scene{};
     c->in_list = false;
     c->vertex_default_uniforms = c->fragment_default_uniforms = 0;  // (reservations end with the list)
@@ -615,7 +633,12 @@ i32 sceGxmExecuteCommandList(u32 context, Ptr<const u32> list) {
     if (list.get()[0] != kCommandListTag) return err::kInvalidValue;
     auto it = s.command_lists.find(list.get()[1]);
     if (it == s.command_lists.end()) return err::kInvalidValue;
-    for (const Draw& d : it->second) c->scene.draws.push_back(d);
+    const u32 base = static_cast<u32>(c->scene.draws.size());
+    for (const Draw& d : it->second.draws) c->scene.draws.push_back(d);
+    for (const UserMarker& m : it->second.markers) {
+        c->scene.markers.push_back(m);
+        c->scene.markers.back().at += base;
+    }
     return 0;
 }
 
@@ -680,6 +703,8 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0xEED86975, sceGxmSetWBufferEnable),
     HLE_FUNCTION(0xB32917F0, sceGxmSetYuvProfile),
     HLE_FUNCTION(0xC7A8CB77, sceGxmSetUserMarker),
+    HLE_FUNCTION(0x3276C475, sceGxmPushUserMarker),
+    HLE_FUNCTION(0x4FA073A6, sceGxmPopUserMarker),
     HLE_FUNCTION(0x8C6A24C9, sceGxmSetValidationEnable),
     HLE_FUNCTION(0x97118913, sceGxmReserveVertexDefaultUniformBuffer),
     HLE_FUNCTION(0x7B1FABB6, sceGxmReserveFragmentDefaultUniformBuffer),

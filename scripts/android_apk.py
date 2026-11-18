@@ -157,6 +157,9 @@ def main():
     parser.add_argument("--keep-debug", action="store_true", help="keep the library's debug information")
     parser.add_argument("--debuggable", action="store_true", help="debuggable (run-as, a debugger)")
     parser.add_argument("--install", action="store_true", help="install it on the device adb sees")
+    parser.add_argument("--internet", action="store_true",
+                        help="the INTERNET permission (a socket of any kind); added anyway for a library with Tracy's "
+                             "client built in (PSVRECORE_TRACY), which listens for the profiler (docs/PROFILING.md)")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     meta = sce_sys.find(args.sce_sys, args.title_id) if args.sce_sys else None
@@ -208,6 +211,19 @@ def main():
             manifest.write_text(text[:application.start()] + element + text[application.end():], encoding="utf-8")
             print(f"label: {meta.title} ({len(meta.titles())} translations); version {args.version_name} "
                   f"({args.version_code})")
+        # (a Tracy build listens for the profiler on a socket, which Android refuses an application without it)
+        if args.internet or b"___tracy_emit_zone_begin" in Path(args.lib).read_bytes():
+            text = manifest.read_text(encoding="utf-8")
+            permission = '<uses-permission android:name="android.permission.INTERNET" />'
+            if "android.permission.INTERNET" not in text:
+                at = re.search(r"<application\b", text)
+                if not at:
+                    raise SystemExit(f"{manifest}: no <application> element")
+                text = text[:at.start()] + permission + "\n    " + text[at.start():]
+                manifest = tmp / "AndroidManifest.xml"
+                manifest.write_text(text, encoding="utf-8")
+                print("the INTERNET permission added (Tracy's client listens for the profiler)" if not args.internet
+                      else "the INTERNET permission added")
         if icon.is_dir():
             run([build_tools / f"aapt2{EXE}", "compile", "--dir", icon, "-o", tmp / "icon.zip"])
             flat.append(tmp / "icon.zip")

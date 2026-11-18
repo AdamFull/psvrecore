@@ -109,6 +109,11 @@ const Key kKeys[] = {
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.validation); },
      [](const Settings& s) { return nx::string(yes_no(s.validation)); }, "true or false"},
 
+    {"display", "capture_frame",
+     "A RenderDoc capture of this frame of the game's (counted from 1) when it runs under RenderDoc; F12 captures the "
+     "next frame (0: none).",
+     [](Settings& s, nx::string_view v) { return parse_int(v, &s.capture_frame); },
+     [](const Settings& s) { return nx::format("{}", s.capture_frame); }, "0 or a frame's number"},
     {"audio", "enabled", "Play the game's sound.",
      [](Settings& s, nx::string_view v) { return parse_bool(v, &s.audio); },
      [](const Settings& s) { return nx::string(yes_no(s.audio)); }, "true or false"},
@@ -202,6 +207,7 @@ const Schema kSchema[] = {
     {"log", "file", K::Text, 0, 0, false, true},
 };
 
+    {"display", "capture_frame", K::Int, 0, 1000000, false, true},
 template <usize N>
 nx::vector<nx::string> list(const char* const (&names)[N]) {
     nx::vector<nx::string> out;

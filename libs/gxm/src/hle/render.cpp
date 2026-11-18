@@ -41,14 +41,20 @@
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/io/file.hpp"
 #include "psvrecore/log.hpp"
+#include "psvrecore/profile.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
+#include "psvrecore/vulkan/renderdoc.hpp"
 #include "prefetch.hpp"
 #include "shader_cache.hpp"
 #include "core/foundation/platform/os.h"
 #include "state.hpp"
 #include "core/foundation/core/hash.h"
 #include "core/foundation/strings/format.h"
+
+#if PSVRECORE_TRACY
+#include <tracy/TracyVulkan.hpp>
+#endif
 
 namespace psvrecore::gxm::hle {
 
@@ -573,6 +579,9 @@ struct Renderer {
     bool flusher = false;
     nx::hash_map<u64, nx::string> failed_textures;
     u64 scenes = 0;
+#if PSVRECORE_TRACY
+    tracy::VkCtx* gpu_zones = nullptr;  // (Tracy's GPU zones: the scenes' and the game's markers; null: none)
+#endif
 };
 
 // The YUV420 conversion's pipeline (yuv420_shader): unless PSVRECORE_YUV_CPU is set, or the device has none.
@@ -791,6 +800,137 @@ HalfConversion half_conversion_for(vk::Device& d, const nx::string& folder) {
     return c.conversion;
 }
 
+// ---- Debugging and profiling: the game's markers, Tracy's GPU zones, RenderDoc captures ---------------------------
+
+// The game's user markers are recorded (sceGxmPushUserMarker ...) while something shows them: the device's debug
+// labels, or Tracy.
+std::atomic<bool> g_markers_on{profile::kEnabled};
+void markers_on(bool labels) { g_markers_on.store(labels || profile::kEnabled, std::memory_order_relaxed); }
+
+constexpr u32 kSceneRgb = 0x3070C0, kGameRgb = 0xC08030, kPassRgb = 0x60A060;
+
+#if PSVRECORE_TRACY
+// Tracy's GPU context on the device's queue: the scenes' commands timed, each scene a zone and the game's markers
+// zones in it, on the CPU's timeline (calibrated where the device can read its clock with the host's).
+void make_gpu_zones(Renderer& r) {
+    vk::Device& d = *r.device;
+    if (!d.caps().timestamp_period) return;
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pi.queueFamilyIndex = d.queue_family();
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (vkCreateCommandPool(d.device(), &pi, nullptr, &pool) != VK_SUCCESS) return;
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(d.device(), &ai, &cmd) == VK_SUCCESS) {
+        // (the context submits to the queue and waits for it while it is made)
+        nx::scoped_lock<nx::mutex> held(d.queue_lock());
+        r.gpu_zones = TracyVkContextCalibrated(d.physical(), d.device(), d.queue(), cmd, d.caps().time_domains,
+                                               d.caps().calibrated_timestamps);
+    }
+    vkDestroyCommandPool(d.device(), pool, nullptr);
+    if (!r.gpu_zones) return;
+    static constexpr char kName[] = "GXM scenes";
+    TracyVkContextName(r.gpu_zones, kName, sizeof kName - 1);
+    nx::logi(logs::gpu, "Tracy: GPU zones on{}", d.caps().calibrated_timestamps ? " (calibrated)" : "");
+}
+#endif
+
+// The game's markers of a scene into its commands, as its draws are recorded: debug labels and, with Tracy, GPU
+// zones. Balanced within the scene: a pop without its push is left out, a push left open ends with the scene's draws.
+struct MarkerReplay {
+    vk::Device& d;
+    VkCommandBuffer cmd;
+    const nx::vector<UserMarker>& markers;
+    usize next = 0;
+    u32 open = 0;
+#if PSVRECORE_TRACY
+    tracy::VkCtx* zones_ctx = nullptr;
+    nx::vector<nx::unique_ptr<tracy::VkCtxScope>> zones;
+#endif
+
+    // The markers placed before draw `at` (~0u: all that are left).
+    void upto(u32 at) {
+        for (; next < markers.size() && markers[next].at <= at; ++next) {
+            const UserMarker& m = markers[next];
+            switch (m.kind) {
+                case UserMarker::Kind::Push:
+                    d.begin_label(cmd, m.tag.c_str(), kGameRgb);
+                    ++open;
+#if PSVRECORE_TRACY
+                    if (zones_ctx) {
+                        static constexpr char kFile[] = "guest", kFunction[] = "(game GPU marker)";
+                        zones.push_back(nx::make_unique<tracy::VkCtxScope>(
+                            zones_ctx, 0, kFile, sizeof kFile - 1, kFunction, sizeof kFunction - 1, m.tag.data(),
+                            m.tag.size(), cmd, true));
+                    }
+#endif
+                    break;
+                case UserMarker::Kind::Pop:
+                    if (!open) break;
+                    d.end_label(cmd);
+                    --open;
+#if PSVRECORE_TRACY
+                    if (!zones.empty()) zones.pop_back();
+#endif
+                    break;
+                case UserMarker::Kind::Set: d.insert_label(cmd, m.tag.c_str(), kGameRgb); break;
+            }
+        }
+    }
+    void close() {
+        upto(~0u);
+        for (; open; --open) d.end_label(cmd);
+#if PSVRECORE_TRACY
+        while (!zones.empty()) zones.pop_back();  // (innermost first)
+#endif
+    }
+};
+
+// GPU captures (RenderDoc, when it is in the process: sceRazorGpuCaptureSetTrigger*, the frontend's key, its
+// capture_frame setting): the scenes of one frame of the game's, from the first scene after the frame boundary that
+// follows the request to the last before the next boundary. A frame boundary: a frame queued for the display
+// (sceGxmDisplayQueueAddEntry) or set directly (sceDisplaySetFrameBuf outside the display queue's callback).
+struct GpuCapture {
+    nx::mutex lock;
+    bool armed = false;    // (requested: from the next frame on)
+    u64 from = 0, to = 0;  // (the frame's first scene and its last: 0 while not known yet)
+    bool active = false;
+    nx::string title;
+    u64 frames = 0;  // (frame boundaries so far)
+};
+GpuCapture& gpu_capture() {
+    static GpuCapture c;
+    return c;
+}
+
+VkInstance capture_instance() {
+    Renderer& r = renderer();
+    return r.device ? r.device->instance() : VK_NULL_HANDLE;
+}
+
+void capture_end(GpuCapture& c) {
+    vk::renderdoc::end(capture_instance());
+    c.active = false;
+    c.from = c.to = 0;
+}
+
+// Around each scene rendered, by its number.
+void capture_before(u64 number) {
+    GpuCapture& c = gpu_capture();
+    nx::scoped_lock<nx::mutex> held(c.lock);
+    if (!c.from || c.active || number < c.from) return;
+    vk::renderdoc::start(capture_instance(), c.title);
+    c.active = true;
+}
+void capture_after(u64 number) {
+    GpuCapture& c = gpu_capture();
+    nx::scoped_lock<nx::mutex> held(c.lock);
+    if (c.active && c.to && number >= c.to) capture_end(c);
+}
+
 bool ensure(Renderer& r) {
     if (r.tried) return static_cast<bool>(r.device);
     r.tried = true;
@@ -806,6 +946,10 @@ bool ensure(Renderer& r) {
         r.device = r.owned.get();
     }
     vk::Device& d = *r.device;
+    markers_on(d.caps().labels);
+#if PSVRECORE_TRACY
+    make_gpu_zones(r);
+#endif
     prefetch_start(d.caps().texture_bc);
     if (!r.flusher) {
         // (the scenes the GPU is done with finished when nothing else has a while after: their notifications written
@@ -3182,6 +3326,7 @@ void pipeline_ahead(u32 vertex_program, u32 fragment_program) {
 }
 
 bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 number) {
+    PSV_PROFILE_ZONE_COLOR("gxm: render scene", kSceneRgb);
     g_profile.start();
     Renderer& r = renderer();
     if ((!scene.has_color && !scene.has_depth) || !ensure(r)) return false;
@@ -3197,11 +3342,19 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         ~Copies() { finish_target_copies(r, recorded); }
     } copies{r, copies_recorded};
     if (const Trace& t = trace(); t.on && r.scenes >= t.first && r.scenes <= t.last) trace_scene(r.scenes, scene);
-    if (const auto& skip = skipped_programs(); !skip.empty())
-        std::erase_if(scene.draws, [&](const Draw& dr) {
+    if (const auto& skip = skipped_programs(); !skip.empty()) {
+        auto skipped = [&](const Draw& dr) {
             return std::find(skip.begin(), skip.end(), dr.vertex ? dr.vertex->guest : 0) != skip.end() ||
                    std::find(skip.begin(), skip.end(), dr.fragment ? dr.fragment->guest : 0) != skip.end();
-        });
+        };
+        // (the markers stay before the draws they were before)
+        for (UserMarker& m : scene.markers) {
+            u32 gone = 0;
+            for (u32 i = 0; i < m.at && i < scene.draws.size(); ++i) gone += skipped(scene.draws[i]);
+            m.at -= gone;
+        }
+        std::erase_if(scene.draws, skipped);
+    }
     // A scene without draws leaves guest memory as it is: its colour loaded and stored unchanged, its depth too (or
     // not stored). Nothing is rendered or written back (a depth surface loaded and scaled up takes milliseconds); its
     // notifications are written after the scenes before it, an empty submission in their order. One that stores a
@@ -4064,6 +4217,21 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         cleanup();
         return false;
     }
+    // (the scene in a GPU debugger's list of commands, and in Tracy: its number, surface and internal resolution)
+    if (d.caps().labels) {
+        const nx::string label = nx::format("scene {}: {}x{} {} 0x{:08x}{}", number, width, height,
+                                            scene.has_color ? "colour" : "depth", scene.has_color ? cs.data : ds.depth_data,
+                                            scale > 1 ? nx::format(" at {}x", scale) : nx::string());
+        d.begin_label(*cmd, label.c_str(), kSceneRgb);
+    }
+#if PSVRECORE_TRACY
+    std::optional<tracy::VkCtxScope> gpu_scene;
+    if (r.gpu_zones) {
+        TracyVkCollect(r.gpu_zones, *cmd);
+        PSV_PROFILE_LOCATION(kSceneZone, "scene", kSceneRgb);
+        gpu_scene.emplace(r.gpu_zones, &kSceneZone, *cmd, true);
+    }
+#endif
     if (queries) vkCmdResetQueryPool(*cmd, queries, 0, query_count);
     const VkShaderStageFlags push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     bool computed = false;
@@ -4170,6 +4338,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     }
     pass.area = {{0, 0}, {target_w * scale, target_h * scale}};
     if (stamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 1);
+    d.begin_label(*cmd, "draws", kPassRgb);
+    MarkerReplay markers{d, *cmd, scene.markers};
+#if PSVRECORE_TRACY
+    markers.zones_ctx = r.gpu_zones;
+#endif
     if (auto begun = r.passes->begin(*cmd, pass); begun) {
         const VkViewport viewport{0, 0, static_cast<f32>(target_w * scale), static_cast<f32>(target_h * scale), 0, 1};
         vkCmdSetViewport(*cmd, 0, 1, &viewport);
@@ -4196,6 +4369,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         for (usize i = 0; i < plans.size(); ++i) {
             const DrawPlan& p = plans[i];
             const DrawState& st = p.draw->state;
+            if (!scene.markers.empty()) markers.upto(static_cast<u32>(p.draw - scene.draws.data()));
             const bool reads = reads_attachment(*p.draw, cf, color != nullptr);
             if (g_profile.on) ++g_profile.draws, g_profile.colour_reads += reads;
             if (reads && i > 0 && !d.caps().raster_order_attachment) {
@@ -4248,11 +4422,14 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             vkCmdDrawIndexed(*cmd, p.draw->index_count, p.draw->instances, 0, 0, 0);
             if (query) vkCmdEndQuery(*cmd, queries, query_of[i]);
         }
+        markers.close();  // (the labels end in the render pass they began in)
         r.passes->end(*cmd);
         if (stamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 2);
     } else {
         nx::logw(logs::gpu, "{}", begun.error().message);
     }
+    d.end_label(*cmd);  // (draws)
+    d.begin_label(*cmd, "write-back", kPassRgb);
     if (color) {
         // (at the internal resolution, blitted down to the surface's size first: what guest memory gets)
         vk::transition(*cmd, *color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -4293,6 +4470,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
     if (stamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 3);
+    d.end_label(*cmd);  // (write-back)
+#if PSVRECORE_TRACY
+    gpu_scene.reset();
+#endif
+    d.end_label(*cmd);  // (the scene)
     g_profile.mark(4);
     // (the layouts as recorded: the kept depth image's goes with its surface)
     if (depth_keeper) depth_keeper->image.layout = depth.layout;
@@ -4514,7 +4696,10 @@ void render_ended(Renderer& r, Renderer::Ended& e) {
         });
         profile_buffer_wait(nx::os::ticks_ns() - t0);
     }
-    if (!render_scene(e.scene, e.notes, e.number)) {
+    capture_before(e.number);
+    const bool rendered = render_scene(e.scene, e.notes, e.number);
+    capture_after(e.number);
+    if (!rendered) {
         {
             TargetsHeld held(r);
             finish_pending(r, true);  // (the scenes before it first: notifications are written in order)
@@ -4618,6 +4803,52 @@ u64 scenes_rendered() {
     return r.rendered;
 }
 
+bool user_markers_wanted() { return g_markers_on.load(std::memory_order_relaxed); }
+
+void request_gpu_capture(nx::string_view why) {
+    if (!vk::renderdoc::loaded()) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            nx::logi(logs::gpu, "a GPU capture was asked for ({}): RenderDoc is not loaded (start the game from it)", why);
+        return;
+    }
+    GpuCapture& c = gpu_capture();
+    nx::scoped_lock<nx::mutex> held(c.lock);
+    if (c.armed || c.from) return;  // (one at a time)
+    c.armed = true;
+    c.title = nx::format("{} (frame {})", why, c.frames + 1);
+    nx::logi(logs::gpu, "RenderDoc: capturing the next frame ({})", why);
+}
+
+void frame_boundary() {
+    PSV_PROFILE_ZONE("gxm: frame queued");
+    const u64 ended = scenes_submitted();
+    const u64 rendered = scenes_rendered();
+    GpuCapture& c = gpu_capture();
+    bool at_frame = false;
+    {
+        nx::scoped_lock<nx::mutex> held(c.lock);
+        ++c.frames;
+        at_frame = state().options && state().options->capture_frame && c.frames + 1 == state().options->capture_frame;
+        if (c.armed) {
+            c.armed = false;
+            c.from = ended + 1, c.to = 0;
+        } else if (c.from && !c.to && ended >= c.from) {
+            c.to = ended;
+            // (its scenes all rendered by now: the capture ends here, else after its last scene)
+            if (c.active && rendered >= c.to) capture_end(c);
+        }
+    }
+    // (the capture_frame setting: the frame after this boundary)
+    if (at_frame) request_gpu_capture("capture_frame");
+}
+
+bool gpu_capture_in_progress() {
+    GpuCapture& c = gpu_capture();
+    nx::scoped_lock<nx::mutex> held(c.lock);
+    return c.armed || c.from;
+}
+
 void finish_scenes(u64 limit) {
     Renderer& r = renderer();
     t_finish_times = {};
@@ -4636,6 +4867,7 @@ void finish_scenes(u64 limit) {
         // (numbers of scenes not submitted, with nothing to draw, are skipped)
         if (r.finished >= upto || r.pending.front().number > upto) return;
     }
+    PSV_PROFILE_ZONE_COLOR("gxm: waiting for scenes on the GPU", kSceneRgb);
     CpuGivenUp blocking;
     for (;;) {
         {

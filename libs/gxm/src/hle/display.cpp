@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "psvrecore/log.hpp"
+#include "psvrecore/profile.hpp"
 #include "state.hpp"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
@@ -45,6 +46,7 @@ u64 now_ns() { return runtime::runtime().kernel().clock_ns(); }
 u64 vcount_at(u64 t) { return static_cast<u64>(static_cast<f64>(t) / period_ns()); }
 
 void show(DisplaySink* sink, const DisplayFrameBuf& f, u64 vcount) {
+    PSV_PROFILE_ZONE("display: frame shown");
     Frame frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount};
     nx::vector<u8> scaled;
     if (state().options->render_scale > 1) {
@@ -53,6 +55,7 @@ void show(DisplaySink* sink, const DisplayFrameBuf& f, u64 vcount) {
         else if (scaled_frame(f, scaled, &frame.scaled_width, &frame.scaled_height)) frame.scaled = scaled.data();
     }
     sink->show(frame);
+    profile::frame();  // (a frame displayed: Tracy's frame mark)
 }
 
 // The frame set for a blank that has come, to the sink.
@@ -90,6 +93,8 @@ void wait_vblanks(u32 count, bool callbacks) {
 }
 
 i32 set_frame_buf(Ptr<const DisplayFrameBuf> p, i32 sync) {
+    // (a frame set by the game itself, not from the display queue's callback: its scenes all ended)
+    if (t_frame_scenes == ~0ull && p) frame_boundary();
     finish_scenes(t_frame_scenes);  // (the frame drawn into guest memory before it is shown)
     if (sync != 0 && sync != 1) return kErrorInvalidUpdateTiming;  // (immediate, next frame)
     Display& d = display();

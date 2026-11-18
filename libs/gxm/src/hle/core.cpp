@@ -217,6 +217,7 @@ i32 sceGxmDisplayQueueAddEntry(u32 old_buffer, u32 new_buffer, u32 data) {
         last_queued = now;
     }
     s.queue_changed.notify_all();
+    frame_boundary();  // (the frame's scenes all ended)
     return 0;
 }
 
@@ -230,9 +231,17 @@ i32 sceGxmDisplayQueueFinish() {
     return 0;
 }
 
-i32 sceGxmPadHeartbeat(u32 surface, u32 sync) { return surface && sync ? 0 : err::kInvalidPointer; }
+i32 sceGxmPadHeartbeat(u32 surface, u32 sync) {
+    if (!surface || !sync) return err::kInvalidPointer;
+    heartbeat();
+    return 0;
+}
 i32 sceGxmPadTriggerGpuPaTrace() { return 0; }
+// (Razor's capture memory: a RenderDoc capture needs none of the game's)
 i32 sceGxmAddRazorGpuCaptureBuffer(u32, u32) { return 0; }
+i32 sceGxmRemoveRazorGpuCaptureBuffer(u32) { return 0; }
+// (the release library's: no debug checks of the game's use of it)
+u32 sceGxmIsDebugVersion() { return 0; }
 void sceGxmSetWarningEnabled(u32, u32) {}
 
 // ---- Render targets --------------------------------------------------------------------------------------------
@@ -342,6 +351,8 @@ const runtime::hle::Function kFunctions[] = {
     HLE_FUNCTION(0x3D25FCE9, sceGxmPadHeartbeat),
     HLE_FUNCTION(0x47E06984, sceGxmPadTriggerGpuPaTrace),
     HLE_FUNCTION(0xE9E81073, sceGxmAddRazorGpuCaptureBuffer),
+    HLE_FUNCTION(0x0468E3F2, sceGxmRemoveRazorGpuCaptureBuffer),
+    HLE_FUNCTION(0x873B07C0, sceGxmIsDebugVersion),
     HLE_FUNCTION(0x12D18B3D, sceGxmSetWarningEnabled),
     HLE_FUNCTION(0xB291C959, sceGxmGetRenderTargetMemSize),
     HLE_FUNCTION(0x207AF96B, sceGxmCreateRenderTarget),
@@ -370,6 +381,9 @@ void register_libraries(const Options& options) {
     hle::register_textures();
     hle::register_transfer();
     hle::register_precomputed();
+    hle::register_capture();
 }
+
+void request_gpu_capture(nx::string_view why) { hle::request_gpu_capture(why); }
 
 }  // namespace psvrecore::gxm

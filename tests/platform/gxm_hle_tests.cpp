@@ -155,3 +155,34 @@ TEST_CASE("display: vertical blank callbacks notified at each blank until unregi
     CHECK(psv_ld32(info + 12) == 544);
     CHECK(call32(ctx, kSceDisplayUser, kResolution, {1, info, opt}) == kDisplayInvalidValue);
 }
+
+TEST_CASE("gxm: user markers only within a scene or a command list; Razor's capture triggers without RenderDoc") {
+    TestRuntime t;
+    REQUIRE(t.rt.ok());
+    gxm::Options options;
+    gxm::register_libraries(options);
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kPush = 0x3276C475, kPop = 0x4FA073A6, kSet = 0xC7A8CB77;
+    const u32 tag = guest_string("shadows");
+    // (no context: refused; a context that is not one: refused too)
+    CHECK(call32(ctx, kSceGxm, kPush, {0, tag}) == kInvalidPointer);
+    CHECK(call32(ctx, kSceGxm, kPop, {0}) == kInvalidPointer);
+    CHECK(call32(ctx, kSceGxm, kSet, {0x81000000u, tag}) == kInvalidPointer);
+    CHECK(call32(ctx, kSceGxm, kPush, {0x81000000u, 0}) == kInvalidPointer);
+    // (a context outside a scene, and the markers replayed in one: an SDK-built program, docs/PROFILING.md)
+
+    CHECK(call32(ctx, kSceGxm, 0x873B07C0 /*sceGxmIsDebugVersion*/, {}) == 0);
+    const u32 buffer = scratch(4096);
+    CHECK(call32(ctx, kSceGxm, 0xE9E81073 /*AddRazorGpuCaptureBuffer*/, {buffer, 4096}) == 0);
+    CHECK(call32(ctx, kSceGxm, 0x0468E3F2 /*RemoveRazorGpuCaptureBuffer*/, {buffer}) == 0);
+
+    // Razor's GPU capture: no RenderDoc in a test, so nothing is in progress after a trigger.
+    constexpr u32 kSceRazorCapture = 0x7B2A3F18;
+    const u32 file = guest_string("app0:capture.sgx");
+    call(ctx, kSceRazorCapture, 0x9DAA7E9C /*SetTriggerNextFrame*/, {file});
+    call(ctx, kSceRazorCapture, 0x472492DA /*SetTrigger*/, {10, file});
+    call(ctx, kSceRazorCapture, 0xE916B538 /*sceRazorCaptureSetTrigger*/, {10, file});
+    CHECK(call32(ctx, kSceRazorCapture, 0xD2358BFB /*IsInProgress*/, {}) == 0);
+    CHECK(call32(ctx, kSceRazorCapture, 0x911E0AA0 /*sceRazorCaptureIsInProgress*/, {}) == 0);
+    CHECK(call32(ctx, kSceRazorCapture, 0x3F0913CF /*StartSalvageMode*/, {}) == 0);
+}

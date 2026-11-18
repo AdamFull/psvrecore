@@ -270,6 +270,16 @@ struct Draw {
     TextureWords fragment_textures[16] = {}, vertex_textures[4] = {};
 };
 
+// A user marker (sceGxmPushUserMarker, sceGxmPopUserMarker, sceGxmSetUserMarker) at its place among the scene's
+// draws: before draw `at` (the number of draws recorded before it). The renderer replays them as debug labels and,
+// with Tracy, GPU zones (docs/PROFILING.md). Recorded only while something shows them (user_markers_wanted).
+struct UserMarker {
+    enum class Kind : u8 { Push, Pop, Set };
+    Kind kind = Kind::Set;
+    u32 at = 0;
+    nx::string tag;
+};
+
 struct Scene {
     RenderTarget* target = nullptr;
     ColorSurface color{};
@@ -282,6 +292,7 @@ struct Scene {
     u32 fragment_sync = 0;      // (the sync object it waits for; 0: none)
     u64 fragment_holds = 0;     // (the holds placed on it when the scene ended: rendered once that many are released)
     nx::vector<Draw> draws;
+    nx::vector<UserMarker> markers;
 };
 
 struct Context {
@@ -346,7 +357,11 @@ struct State {
     };
     nx::vector<Retired> retired;
     nx::unique_ptr<Program> mask_update_program;  // (made on first use)
-    nx::hash_map<u32, nx::vector<Draw>> command_lists;  // (by id)
+    struct CommandList {
+        nx::vector<Draw> draws;
+        nx::vector<UserMarker> markers;
+    };
+    nx::hash_map<u32, CommandList> command_lists;  // (by id)
     u32 next_command_list = 1;
     nx::vector<std::pair<u32, u32>> mappings;  // (base, size) mapped for the GPU
 
@@ -397,6 +412,13 @@ u64 scenes_rendered();
 // (on the display queue's thread, while it shows a frame: the last of that frame's scenes, which the frame buffer
 // set from its callback waits for, not the next frame's)
 inline thread_local u64 t_frame_scenes = ~0ull;
+// The game's user markers recorded (UserMarker): something shows them (debug labels, Tracy).
+bool user_markers_wanted();
+// GPU captures (RenderDoc; nothing when it is not loaded): the next frame's scenes captured (`why`: the capture's
+// title); a frame's scenes all ended (a frame queued or set); a capture asked for or being made.
+void request_gpu_capture(nx::string_view why);
+void frame_boundary();
+bool gpu_capture_in_progress();
 // (PSVRECORE_GXM_PROFILE: the time a scene's end waited for the display to let its buffer go)
 void profile_buffer_wait(u64 ns);
 // At an internal resolution above 1: the frame buffer's pixels as drawn (tightly packed, at the internal
@@ -417,6 +439,9 @@ void register_context();
 void register_textures();
 void register_transfer();
 void register_precomputed();
+void register_capture();
+// (capture.cpp) A frame as Razor counts them: sceGxmPadHeartbeat.
+void heartbeat();
 
 // Writes a notification's value to its address (if any).
 void notify(Ptr<const Notification> n);

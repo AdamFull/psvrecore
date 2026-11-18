@@ -23,6 +23,7 @@ struct Settings {
     u32 render_scale = 1;  // the internal resolution: the game's surfaces drawn at this many times their size
     i32 gpu = -1;        // the Vulkan device's index (-1: a discrete GPU first)
     bool validation = false;
+    u32 capture_frame = 0;  // a RenderDoc capture of this frame of the game's, under RenderDoc (0: none; F12: the next)
     // [audio]
     bool audio = true;
     u32 audio_latency_ms = 200;  // the most a port may fall behind before what it holds is dropped
