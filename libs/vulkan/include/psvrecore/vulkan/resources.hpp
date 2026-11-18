@@ -65,8 +65,10 @@ private:
     Device& device_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    VkFence fence_ = VK_NULL_HANDLE;  // (submitted with)
+    VkFence own_fence_ = VK_NULL_HANDLE;  // (made, or kept from an earlier one: Device::take_shot)
     bool waited_ = false;
+    bool failed_ = false;  // (a wait failed: the pool and fence are destroyed, not kept)
 };
 
 // Fills mip 0, layer `layer` of an image with tightly packed texels and leaves it in `final_layout`.

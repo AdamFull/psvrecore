@@ -188,12 +188,27 @@ void destroy_buffer(Device& device, DeviceBuffer& buffer) {
 OneShot::OneShot(Device& device) : device_(device) {}
 
 OneShot::~OneShot() {
-    if (fence_ && !waited_) vkWaitForFences(device_.device(), 1, &fence_, VK_TRUE, 30'000'000'000ull);
-    if (fence_) vkDestroyFence(device_.device(), fence_, nullptr);
-    if (pool_) vkDestroyCommandPool(device_.device(), pool_, nullptr);
+    VkDevice d = device_.device();
+    bool reusable = !failed_;
+    if (fence_ && !waited_) reusable &= vkWaitForFences(d, 1, &fence_, VK_TRUE, 30'000'000'000ull) == VK_SUCCESS;
+    // (the pool and fence reset and kept for the next, unless the GPU may still use them)
+    if (pool_ && cmd_ && reusable && vkResetCommandPool(d, pool_, 0) == VK_SUCCESS &&
+        (!fence_ || vkResetFences(d, 1, &fence_) == VK_SUCCESS)) {
+        device_.give_shot({pool_, cmd_, own_fence_});
+        return;
+    }
+    if (own_fence_) vkDestroyFence(d, own_fence_, nullptr);
+    if (pool_) vkDestroyCommandPool(d, pool_, nullptr);
 }
 
 Result<VkCommandBuffer> OneShot::begin() {
+    if (Device::SpareShot s; device_.take_shot(s)) {
+        pool_ = s.pool, cmd_ = s.cmd, own_fence_ = s.fence;
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd_, &bi);
+        return cmd_;
+    }
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     pi.queueFamilyIndex = device_.queue_family();
@@ -221,26 +236,30 @@ bool OneShot::done() const { return fence_ && (waited_ || vkGetFenceStatus(devic
 Result<void> OneShot::wait() {
     if (!fence_) return nx::err(vk_error("vkWaitForFences (nothing submitted)", VK_ERROR_INITIALIZATION_FAILED));
     if (waited_) return {};
-    if (const VkResult r = vkWaitForFences(device_.device(), 1, &fence_, VK_TRUE, 30'000'000'000ull); r != VK_SUCCESS)
+    if (const VkResult r = vkWaitForFences(device_.device(), 1, &fence_, VK_TRUE, 30'000'000'000ull); r != VK_SUCCESS) {
+        failed_ = true;
         return nx::err(vk_error("vkWaitForFences", r));
+    }
     waited_ = true;
     return {};
 }
 
 Result<void> OneShot::submit() {
     if (const VkResult r = vkEndCommandBuffer(cmd_); r != VK_SUCCESS) return nx::err(vk_error("vkEndCommandBuffer", r));
-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (const VkResult r = vkCreateFence(device_.device(), &fi, nullptr, &fence_); r != VK_SUCCESS)
-        return nx::err(vk_error("vkCreateFence", r));
+    if (!own_fence_) {
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (const VkResult r = vkCreateFence(device_.device(), &fi, nullptr, &own_fence_); r != VK_SUCCESS)
+            return nx::err(vk_error("vkCreateFence", r));
+    }
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd_;
-    if (const VkResult r = device_.submit(submit, fence_); r != VK_SUCCESS) {
-        // (nothing to wait for)
-        vkDestroyFence(device_.device(), fence_, nullptr);
-        fence_ = VK_NULL_HANDLE;
+    if (const VkResult r = device_.submit(submit, own_fence_); r != VK_SUCCESS) {
+        // (nothing to wait for; the queue may be lost: nothing kept)
+        failed_ = true;
         return nx::err(vk_error("vkQueueSubmit", r));
     }
+    fence_ = own_fence_;
     return {};
 }
 

@@ -110,6 +110,17 @@ public:
     VkResult present(const VkPresentInfoKHR& info);
     void wait_idle();  // (both queues' locks held)
 
+    // A command pool with its command buffer and a fence, reset, for OneShot: kept rather than destroyed and made
+    // again for each (a scene's commands: destroying a pool took 3.5% of a phone's render thread). take_shot: false
+    // when none is kept.
+    struct SpareShot {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;  // (unsignaled; may be none)
+    };
+    bool take_shot(SpareShot& out);
+    void give_shot(const SpareShot& shot);  // (destroyed when enough are kept)
+
     // Dynamic rendering's entry points (core or KHR), null without it.
     PFN_vkCmdBeginRendering begin_rendering = nullptr;
     PFN_vkCmdEndRendering end_rendering = nullptr;
@@ -137,6 +148,8 @@ private:
     VkPhysicalDeviceProperties properties_{};
     Capabilities caps_;
     nx::mutex queue_lock_, present_lock_;
+    nx::mutex spare_lock_;
+    nx::vector<SpareShot> spare_shots_;
     u32 validation_errors_ = 0;
 };
 

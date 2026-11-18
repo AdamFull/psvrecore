@@ -422,6 +422,32 @@ void unseen_write(const char* what, u32 address, u32 size) {
                  size);
 }
 
+// What a colour surface's write-back left in guest memory: its pixels in order, as guest memory has them. The
+// read-back buffer they came in, kept rather than copied (given back to the free buffers when replaced), or bytes of
+// its own.
+struct Snapshot {
+    nx::vector<u8> bytes;
+    vk::Buffer buffer{};
+    usize buffer_bytes = 0;
+    bool empty() const { return buffer.buffer ? buffer_bytes == 0 : bytes.empty(); }
+    usize size() const { return buffer.buffer ? buffer_bytes : bytes.size(); }
+    const u8* data() const { return buffer.buffer ? static_cast<const u8*>(buffer.mapped) : bytes.data(); }
+    void clear();
+    void assign(const u8* from, const u8* to) {
+        clear();
+        bytes.assign(from, to);
+    }
+    void adopt(vk::Buffer& b, usize n) {  // (b given up: this holds it now)
+        clear();
+        buffer = b, buffer_bytes = n;
+        b = {};
+    }
+    nx::vector<u8> take_bytes() {  // (the bytes' storage, for the next ones; empty)
+        clear();
+        return std::move(bytes);
+    }
+};
+
 struct Target {
     u32 address = 0, format = 0, width = 0, height = 0;
     SurfaceLayout layout;
@@ -431,7 +457,7 @@ struct Target {
     u32 scale = 1;
     // The surface's bytes as last written back. While guest memory still holds them, `image` (and `scaled`) is the
     // surface and is not loaded again; once anything else wrote there, it is loaded from guest memory.
-    nx::vector<u8> written;
+    Snapshot written;
     WrittenWatch watch;  // (the surface's span, once written back)
     u64 generation = 0;  // (a scene drawing it submitted: +1)
 };
@@ -1909,6 +1935,12 @@ void give_descriptor_pool(Renderer& r, VkDescriptorPool pool, u32 sets) {
 }
 
 // And back, once the GPU is done with it.
+void Snapshot::clear() {
+    if (buffer.buffer) give_host_buffer(renderer(), buffer);
+    buffer_bytes = 0;
+    bytes.clear();
+}
+
 void give_host_buffer(Renderer& r, vk::Buffer& b) {
     if (!b.buffer) return;
     r.free_buffers.push_back(b);
@@ -5279,17 +5311,17 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             const bool gpu_packed = pack_set != VK_NULL_HANDLE;  // (the words guest memory gets, read back)
             if (gpu_packed && pack_verify.buffer) verify_packing(d, pack_verify, src, width, height);
             if (packing != Packing::None && !gpu_packed) {
-                packed.swap(target->written);  // (its memory, packed into: `written` again once written back)
+                packed = target->written.take_bytes();  // (its memory, packed into: `written` again once written back)
                 packed.resize(usize{width} * height * bytes);
                 pack_pixels(packing, src, packed.data(), usize{width} * height);
                 src = packed.data();
             }
             const u32 span = static_cast<u32>(layout.span());
             write_back(r, {{data, span}}, nullptr, [&] { scatter(layout, data, src); });
-            // (what guest memory holds now, to know whether the image (or the scaled one) is still the surface)
-            // (a packed surface's bytes are a vector of their own already: kept, not copied)
-            if (packing != Packing::None && !gpu_packed) target->written = std::move(packed);
-            else target->written.assign(src, src + usize{width} * height * bytes);
+            // (what guest memory holds now, to know whether the image (or the scaled one) is still the surface: the
+            // packed bytes, or the read-back buffer itself, kept rather than copied)
+            if (packing != Packing::None && !gpu_packed) target->written.clear(), target->written.bytes = std::move(packed);
+            else target->written.adopt(*readback, usize{width} * height * bytes);
             watch_range(target->watch, data, span);
         } else if (!ok && target) {
             target->written.clear();  // (the image may hold what guest memory does not)

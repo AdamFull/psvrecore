@@ -487,6 +487,10 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
 
 Device::~Device() {
     if (device_) wait_idle();
+    for (const SpareShot& s : spare_shots_) {
+        if (s.fence) vkDestroyFence(device_, s.fence, nullptr);
+        vkDestroyCommandPool(device_, s.pool, nullptr);
+    }
     if (texture_pool_) vmaDestroyPool(allocator_, texture_pool_);
     if (host_pool_) vmaDestroyPool(allocator_, host_pool_);
     if (allocator_) vmaDestroyAllocator(allocator_);
@@ -494,6 +498,26 @@ Device::~Device() {
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
     if (messenger_) vkDestroyDebugUtilsMessengerEXT(instance_, messenger_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
+}
+
+bool Device::take_shot(SpareShot& out) {
+    const nx::scoped_lock<nx::mutex> held(spare_lock_);
+    if (spare_shots_.empty()) return false;
+    out = spare_shots_.back();
+    spare_shots_.pop_back();
+    return true;
+}
+
+void Device::give_shot(const SpareShot& shot) {
+    {
+        const nx::scoped_lock<nx::mutex> held(spare_lock_);
+        if (spare_shots_.size() < 32) {
+            spare_shots_.push_back(shot);
+            return;
+        }
+    }
+    if (shot.fence) vkDestroyFence(device_, shot.fence, nullptr);
+    vkDestroyCommandPool(device_, shot.pool, nullptr);
 }
 
 VkResult Device::submit(const VkSubmitInfo& info, VkFence fence) {
