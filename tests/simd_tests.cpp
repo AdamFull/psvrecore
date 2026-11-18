@@ -4,6 +4,7 @@
 //
 // Encodings were produced by clang's integrated assembler (armv7a, cortex-a9, neon).
 
+#include <cstdio>
 #include <cstring>
 
 #include "nxtest.h"
@@ -39,6 +40,24 @@ struct Neon {
 };
 
 u64 lanes32(u32 lo, u32 hi) { return (u64{hi} << 32) | lo; }
+
+// A float's bits for testing the fast paths: mostly the cases at their edges (zeros, denormals, the smallest
+// normals' binades, infinities, NaNs, exponents that cancel, overflow or underflow together), else random.
+u32 edge_float(u32& seed) {
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    const u32 r = next(), sign = next() & 0x80000000u, mant = next() & 0x7FFFFFu;
+    switch (r % 12) {
+        case 0: return sign;                                     // zero
+        case 1: return sign | mant;                              // denormal (or zero)
+        case 2: return sign | (1u << 23) | mant;                 // the smallest normals
+        case 3: return sign | (2u << 23) | mant;
+        case 4: return sign | 0x7F800000u | ((r >> 8) & 1 ? mant : 0);  // infinity or NaN
+        case 5: return sign | ((60u + (r >> 4) % 8) << 23) | mant;     // ~2^-64: products near the smallest normal
+        case 6: return sign | ((190u + (r >> 4) % 8) << 23) | mant;    // ~2^64: products near overflow
+        case 7: return sign | (127u << 23) | (mant & 0x7Fu);           // near 1: sums that cancel
+        default: return next();
+    }
+}
 
 }  // namespace
 
@@ -146,4 +165,51 @@ TEST_CASE("simd: permutations, table lookup, extraction, structure loads") {
     CHECK(v.ctx.vfp.d[0] == 0x1006100410021000ull);
     CHECK(v.ctx.vfp.d[1] == 0x1007100510031001ull);
     CHECK(v.ctx.r[0] == 0x200);  // (no writeback: Rm = PC)
+}
+
+TEST_CASE("simd: the float arithmetic's fast path gives the interpreter's results") {
+    // psv_nf3 computes the arithmetic forms four lanes at once when no lane needs the exact path: against the
+    // interpreter, Q and D registers, by vector and by scalar, on values at the edges.
+    Neon v;
+    u32 seed = 777;
+    struct Case {
+        u32 word;
+        int op;
+        u32 regs, d, n, m;
+        int scalar;
+    };
+    const Case cases[] = {
+        {0xF2020D44, PSV_NF_ADD, 2, 0, 2, 4, -1},  // vadd.f32 q0, q1, q2
+        {0xF2220D44, PSV_NF_SUB, 2, 0, 2, 4, -1},  // vsub.f32 q0, q1, q2
+        {0xF3020D54, PSV_NF_MUL, 2, 0, 2, 4, -1},  // vmul.f32 q0, q1, q2
+        {0xF2020D54, PSV_NF_MLA, 2, 0, 2, 4, -1},  // vmla.f32 q0, q1, q2
+        {0xF2220D54, PSV_NF_MLS, 2, 0, 2, 4, -1},  // vmls.f32 q0, q1, q2
+        {0xF2010D02, PSV_NF_ADD, 1, 0, 1, 2, -1},  // vadd.f32 d0, d1, d2
+        {0xF2010D12, PSV_NF_MLA, 1, 0, 1, 2, -1},  // vmla.f32 d0, d1, d2
+        {0xF3A20964, PSV_NF_MUL, 2, 0, 2, 4, 1},   // vmul.f32 q0, q1, d4[1]
+        {0xF3A20144, PSV_NF_MLA, 2, 0, 2, 4, 0},   // vmla.f32 q0, q1, d4[0]
+        {0xF2A10564, PSV_NF_MLS, 1, 0, 1, 4, 1},   // vmls.f32 d0, d1, d4[1]
+    };
+    u32 differ = 0;
+    for (u32 i = 0; i < 100000; ++i)
+        for (const Case& c : cases) {
+            // (the lanes: often all normal, so the fast path runs, sometimes one at an edge)
+            const bool plain = (i & 3) != 0;
+            for (u32 reg = 0; reg < 6; ++reg) {
+                u32 lane[2];
+                for (u32& x : lane) {
+                    x = edge_float(seed);
+                    if (plain) x = (x & 0x807FFFFFu) | ((100u + (x >> 23) % 50) << 23);
+                }
+                v.d(reg, lanes32(lane[0], lane[1]));
+            }
+            v.run(c.word);
+            psv_nf3(&v.gen, c.op, c.regs, c.d, c.n, c.m, c.scalar);
+            for (u32 r = 0; r < c.regs; ++r)
+                if (v.ctx.vfp.d[c.d + r] != v.gen.vfp.d[c.d + r] && differ++ < 5)
+                    std::fprintf(stderr, "word %08x d%u: %016llx, the interpreter's %016llx\n", c.word, c.d + r,
+                                 static_cast<unsigned long long>(v.gen.vfp.d[c.d + r]),
+                                 static_cast<unsigned long long>(v.ctx.vfp.d[c.d + r]));
+        }
+    CHECK(differ == 0u);
 }

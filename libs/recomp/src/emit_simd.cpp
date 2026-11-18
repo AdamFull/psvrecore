@@ -367,6 +367,15 @@ bool memory(Emitter& e, const Instruction& in) {
         else regs = 1, inc = list.index;
         const u32 elements = 8 / ebytes;
         u32 offset = 0;
+        // (VLD1/VST1: each register's elements next to each other in memory, in lane order: the register's 8 bytes at
+        // once, each element still read or written whole, as the console's accesses are)
+        if (n == 1) {
+            for (u32 r = 0; r < regs; ++r, offset += 8) {
+                if (load) e.line(nx::format("ctx->vfp.d[{}] = psv_ld64u({} + {}u, {}u);", list.reg + r, base, offset, ebytes));
+                else e.line(nx::format("psv_st64u({} + {}u, ctx->vfp.d[{}], {}u);", base, offset, list.reg + r, ebytes));
+            }
+            regs = 0;
+        }
         for (u32 r = 0; r < regs; ++r)
             for (u32 el = 0; el < elements; ++el)
                 for (u32 i = 0; i < n; ++i) {

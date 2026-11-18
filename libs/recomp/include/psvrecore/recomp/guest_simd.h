@@ -229,7 +229,66 @@ PSV_INLINE uint32_t psv_nf3_element(int op, uint32_t x, uint32_t y, uint32_t acc
     }
 }
 
-PSV_INLINE void psv_nf3(PsvContext* PSV_RESTRICT ctx, int op, uint32_t regs, uint32_t d, uint32_t n, uint32_t m, int scalar) {
+/* The common case of the arithmetic forms, four lanes at once at the host's speed: as psv_fadd32's fast path, taken
+ * when every lane's operands are normal or zero and every lane's results (VMLA's and VMLS's product too) are above
+ * the smallest normal's binade or zero; otherwise nothing is written and the exact path runs. (A D register's
+ * operation leaves its upper lanes zero: they pass, and are not stored.) */
+typedef float psv_f32x4 __attribute__((vector_size(16)));
+typedef uint32_t psv_u32x4 __attribute__((vector_size(16)));
+typedef int32_t psv_i32x4 __attribute__((vector_size(16)));
+
+PSV_INLINE psv_i32x4 psv_fast_in32x4(psv_u32x4 x) {
+    const psv_u32x4 e = (x >> 23) & 0xFFu;
+    return (psv_i32x4)((e - 1u) < 254u) | (psv_i32x4)((x & 0x7FFFFFFFu) == 0);
+}
+PSV_INLINE psv_i32x4 psv_fast_out32x4(psv_u32x4 r) {
+    const psv_u32x4 e = (r >> 23) & 0xFFu;
+    return (psv_i32x4)((e - 2u) < 253u) | (psv_i32x4)((r & 0x7FFFFFFFu) == 0);
+}
+PSV_INLINE int psv_nf3_fast(PsvContext* PSV_RESTRICT ctx, int op, uint32_t regs, uint32_t d, uint32_t n, uint32_t m, int scalar) {
+    if (op != PSV_NF_ADD && op != PSV_NF_SUB && op != PSV_NF_MUL && op != PSV_NF_MLA && op != PSV_NF_MLS) return 0;
+    psv_u32x4 a = {0, 0, 0, 0}, b = {0, 0, 0, 0}, acc = {0, 0, 0, 0};
+    memcpy(&a, &ctx->vfp.d[n], regs * 8u);
+    if (scalar >= 0) {
+        const uint32_t y = (uint32_t)(ctx->vfp.d[m] >> (32u * (uint32_t)scalar));
+        b = (psv_u32x4){y, y, y, y};
+        if (regs == 1) b[2] = b[3] = 0;
+    } else {
+        memcpy(&b, &ctx->vfp.d[m], regs * 8u);
+    }
+    psv_i32x4 ok = psv_fast_in32x4(a) & psv_fast_in32x4(b);
+    psv_f32x4 fa, fb, fr;
+    memcpy(&fa, &a, 16);
+    memcpy(&fb, &b, 16);
+    if (op == PSV_NF_ADD) {
+        fr = fa + fb;
+    } else if (op == PSV_NF_SUB) {
+        fr = fa - fb;
+    } else {
+        fr = fa * fb;
+        if (op != PSV_NF_MUL) {
+            psv_u32x4 pr;
+            memcpy(&pr, &fr, 16);
+            ok &= psv_fast_out32x4(pr);
+            memcpy(&acc, &ctx->vfp.d[d], regs * 8u);
+            ok &= psv_fast_in32x4(acc);
+            psv_f32x4 fc;
+            memcpy(&fc, &acc, 16);
+            fr = op == PSV_NF_MLA ? fc + fr : fc - fr;
+        }
+    }
+    psv_u32x4 r;
+    memcpy(&r, &fr, 16);
+    ok &= psv_fast_out32x4(r);
+    uint64_t w[2];
+    memcpy(w, &ok, 16);
+    if ((w[0] & w[1]) != ~0ull) return 0;
+    memcpy(&ctx->vfp.d[d], &r, regs * 8u);
+    return 1;
+}
+
+/* The exact path, every lane as psv_nf3_element computes it. */
+PSV_INLINE void psv_nf3_exact(PsvContext* PSV_RESTRICT ctx, int op, uint32_t regs, uint32_t d, uint32_t n, uint32_t m, int scalar) {
     const PsvVec a = psv_vget(ctx, n, regs), acc = psv_vget(ctx, d, regs);
     const PsvVec b = psv_vget(ctx, m, scalar >= 0 ? 1 : regs);
     PsvVec r = acc;
@@ -244,6 +303,17 @@ PSV_INLINE void psv_nf3(PsvContext* PSV_RESTRICT ctx, int op, uint32_t regs, uin
         }
     }
     psv_vput(ctx, d, regs, r);
+}
+/* (out of line: the arithmetic forms' rare lanes, after their fast path) */
+PSV_COLD void psv_nf3_exact_cold(PsvContext* PSV_RESTRICT ctx, int op, uint32_t regs, uint32_t d, uint32_t n, uint32_t m, int scalar) {
+    psv_nf3_exact(ctx, op, regs, d, n, m, scalar);
+}
+PSV_INLINE void psv_nf3(PsvContext* PSV_RESTRICT ctx, int op, uint32_t regs, uint32_t d, uint32_t n, uint32_t m, int scalar) {
+    if (op == PSV_NF_ADD || op == PSV_NF_SUB || op == PSV_NF_MUL || op == PSV_NF_MLA || op == PSV_NF_MLS) {
+        if (!psv_nf3_fast(ctx, op, regs, d, n, m, scalar)) psv_nf3_exact_cold(ctx, op, regs, d, n, m, scalar);
+        return;
+    }
+    psv_nf3_exact(ctx, op, regs, d, n, m, scalar);
 }
 
 /* ---- Long, wide and narrow operations ----------------------------------------------------------------------------

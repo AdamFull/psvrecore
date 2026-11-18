@@ -45,6 +45,81 @@ nx::string comment_text(nx::string_view text) {
     return out;
 }
 
+bool identifier_char(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+// A function's body with the condition flags (N, Z, C, V) in a local, `fl`, instead of the context: the C compiler
+// then drops the flags no instruction reads (stores to the context it cannot drop: the guest's memory accesses
+// between them are atomic). They are written to the context before whatever may read them there (a call, a jump, an
+// import, a system call, a trap, a return, MRS and MSR) and read back after what returns here.
+nx::string localize_flags(nx::string_view body) {
+    auto replaced = [](nx::string_view line) {
+        nx::string out;
+        for (usize i = 0; i < line.size();) {
+            if (line.substr(i, 7) == "psv_nz(" && line.substr(i + 7, 4) == "ctx,") {
+                out += "psv_nz_fl(&fl,", i += 11;
+                continue;
+            }
+            if (line.substr(i, 9) == "psv_adds(" && line.substr(i + 9, 4) == "ctx,") {
+                out += "psv_adds_fl(&fl,", i += 13;
+                continue;
+            }
+            if (line.substr(i, 5) == "ctx->" && i + 6 <= line.size() && nx::string_view("nzcv").find(line[i + 5]) != nx::string_view::npos &&
+                (i + 6 == line.size() || !identifier_char(line[i + 6])) && (i == 0 || !identifier_char(line[i - 1]))) {
+                out += "fl.", out += line[i + 5], i += 6;
+                continue;
+            }
+            out += line[i++];
+        }
+        return out;
+    };
+    auto has = [](nx::string_view line, nx::string_view what) { return line.find(what) != nx::string_view::npos; };
+    nx::string out;
+    usize at = 0;
+    while (at < body.size()) {
+        usize end = body.find('\n', at);
+        if (end == nx::string_view::npos) end = body.size();
+        nx::string line = replaced(body.substr(at, end - at));
+        at = end + 1;
+        // (a call to recompiled code, `f_XXXXXXXX(ctx, ...)`, or to the runtime)
+        bool call = false;
+        for (usize p = line.find("f_"); p != nx::string::npos; p = line.find("f_", p + 2))
+            if ((p == 0 || !identifier_char(line[p - 1])) && p + 15 <= line.size() && line.substr(p + 10, 5) == "(ctx,") call = true;
+        call |= has(line, "psv_call(") || has(line, "psv_call_import(") || has(line, "psv_jump(") || has(line, "psv_svc(") ||
+                has(line, "psv_yield(") || has(line, "psv_trap(") || has(line, "psv_read_apsr(") || has(line, "psv_write_apsr(") ||
+                has(line, "psv_import_missing(");
+        // (each return written as one that stores the flags first)
+        nx::string fixed;
+        for (usize p = 0;;) {
+            const usize r = line.find("return;", p);
+            if (r == nx::string::npos) {
+                fixed += line.substr(p);
+                break;
+            }
+            fixed += line.substr(p, r - p);
+            fixed += "{ PSV_FL_OUT(fl); return; }";
+            p = r + 7;
+        }
+        if (call) {
+            const usize indent = fixed.find_first_not_of(' ');
+            const nx::string pad = fixed.substr(0, indent == nx::string::npos ? 0 : indent);
+            const bool returns = has(line, "return;") || has(line, "psv_trap(");
+            const nx::string_view rest = nx::string_view(fixed).substr(pad.size());
+            if (rest.substr(0, 5) == "case " || rest.substr(0, 8) == "default:") {
+                // (a jump table's case: stored after its label, where the switch lands)
+                const usize colon = fixed.find(':');
+                out += fixed.substr(0, colon + 1) + " PSV_FL_OUT(fl);" + fixed.substr(colon + 1) + "\n";
+                if (!returns) out += pad + "PSV_FL_IN(fl);\n";
+                continue;
+            }
+            out += pad + "PSV_FL_OUT(fl);\n" + fixed + "\n";
+            if (!returns) out += pad + "PSV_FL_IN(fl);\n";
+        } else {
+            out += fixed + "\n";
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 void Emitter::trap(const Instruction& in, const char* kind, nx::string_view what) {
@@ -188,7 +263,7 @@ nx::string Emitter::function() {
     const bool entry_first = !code.empty() && code.front().address == fn_.start();
     if (!entry_first) labels_.insert(fn_.start());
 
-    nx::string out = nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n", function_name(fn_.entry));
+    nx::string out;
     if (!entry_first) out += nx::format("    goto {};\n", label_name(fn_.start()));
     for (usize i = 0; i < code.size(); ++i) {
         const auto& in = code[i];
@@ -220,9 +295,10 @@ nx::string Emitter::function() {
         if (addresses.contains(next)) out += nx::format("    goto {};\n", label_name(next));
         else out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n", hex(next));
     }
-    out += "}\n";
     ++stats_.functions;
-    return out;
+    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n    PsvFlags fl;\n    PSV_FL_IN(fl);\n",
+                      function_name(fn_.entry)) +
+           localize_flags(out) + "}\n";
 }
 
 }  // namespace detail

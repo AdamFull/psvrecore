@@ -4,6 +4,7 @@
 //
 // Encodings were produced by clang's integrated assembler (armv7a, cortex-a9, neon-fp16).
 
+#include <cstdio>
 #include <cstring>
 
 #include "nxtest.h"
@@ -46,6 +47,24 @@ struct Vfp {
 constexpr u32 kVaddF32 = 0xEE300A81, kVmulF32 = 0xEE200A81, kVsubF32 = 0xEE300AC1, kVdivF32 = 0xEE800A81;
 constexpr u32 kVnmulF32 = 0xEE200AC1, kVmulF64 = 0xEE210B02, kVsqrtF64 = 0xEEB10BC1;
 
+
+// A float's bits for testing the fast paths: mostly the cases at their edges (zeros, denormals, the smallest
+// normals' binades, infinities, NaNs, exponents that cancel, overflow or underflow together), else random.
+u32 edge_float(u32& seed) {
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    const u32 r = next(), sign = next() & 0x80000000u, mant = next() & 0x7FFFFFu;
+    switch (r % 12) {
+        case 0: return sign;                                     // zero
+        case 1: return sign | mant;                              // denormal (or zero)
+        case 2: return sign | (1u << 23) | mant;                 // the smallest normals
+        case 3: return sign | (2u << 23) | mant;
+        case 4: return sign | 0x7F800000u | ((r >> 8) & 1 ? mant : 0);  // infinity or NaN
+        case 5: return sign | ((60u + (r >> 4) % 8) << 23) | mant;     // ~2^-64: products near the smallest normal
+        case 6: return sign | ((190u + (r >> 4) % 8) << 23) | mant;    // ~2^64: products near overflow
+        case 7: return sign | (127u << 23) | (mant & 0x7Fu);           // near 1: sums that cancel
+        default: return next();
+    }
+}
 }  // namespace
 
 TEST_CASE("float: round to nearest, ties to even") {
@@ -154,4 +173,30 @@ TEST_CASE("float: conversions") {
     CHECK(psv_f32_to_f16(0, 0x33800000) == 0x0001u);
     CHECK(psv_f32_to_f16(0, 0x33000000) == 0x0000u);
     CHECK(psv_f16_to_f32(0, 0x0001) == 0x33800000u);
+}
+
+TEST_CASE("float: the helpers' fast paths give the interpreter's results") {
+    // psv_fadd32 & co. take the host's binary32 operation for normal operands and results: against the interpreter's
+    // soft float, in every FZ and DN mode, on values at the edges where the fast path must give way.
+    Vfp v;
+    u32 seed = 12345;
+    const u32 modes[4] = {0, kFz, kDn, kFz | kDn};
+    struct Op {
+        u32 word;
+        u32 (*fn)(u32, u32, u32);
+    };
+    const Op ops[4] = {{kVaddF32, psv_fadd32}, {kVsubF32, psv_fsub32}, {kVmulF32, psv_fmul32}, {kVdivF32, psv_fdiv32}};
+    u32 differ = 0, checked = 0;
+    for (u32 i = 0; i < 250000; ++i) {
+        const u32 a = edge_float(seed), b = edge_float(seed);
+        for (const Op& op : ops)
+            for (u32 mode : modes) {
+                const u32 want = v.s3(op.word, a, b, mode), got = op.fn(mode, a, b);
+                ++checked;
+                if (got != want && differ++ < 5)
+                    std::fprintf(stderr, "word %08x mode %08x: %08x, %08x: %08x, the interpreter's %08x\n", op.word, mode, a, b, got, want);
+            }
+    }
+    CHECK(differ == 0u);
+    CHECK(checked == 4'000'000u);
 }

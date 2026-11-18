@@ -28,6 +28,8 @@ extern "C" {
 #endif
 
 #define PSV_INLINE static inline __attribute__((always_inline))
+/* (the rare paths of inline helpers: a call, not their code at every use) */
+#define PSV_COLD static __attribute__((noinline, cold))
 #define PSV_NORETURN __attribute__((noreturn))
 
 /* ---- CPU state ---------------------------------------------------------------------------------------------- */
@@ -170,6 +172,30 @@ PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { psv_st32(a, (uint32_t)v); psv
 #else
 PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { PSV_STORE(uint64_t, a, v); }
 #endif
+/* A D register's 8 bytes in order, at any alignment: VLD1/VST1's elements of `ebytes` each (each element single-copy
+ * atomic as the console's are, which one 8-byte host access keeps when they are aligned). */
+#ifdef PSV_ADDRESS_MASK /* (element by element, each folded, as the interpreter makes them) */
+PSV_INLINE uint64_t psv_ld64u(uint32_t a, uint32_t ebytes) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < 8; i += ebytes) {
+        const uint64_t e = ebytes == 1 ? psv_ld8(a + i) : ebytes == 2 ? psv_ld16(a + i) : ebytes == 4 ? psv_ld32(a + i) : psv_ld64(a + i);
+        v |= e << (8 * i);
+    }
+    return v;
+}
+PSV_INLINE void psv_st64u(uint32_t a, uint64_t v, uint32_t ebytes) {
+    for (uint32_t i = 0; i < 8; i += ebytes) {
+        const uint64_t e = v >> (8 * i);
+        if (ebytes == 1) psv_st8(a + i, (uint32_t)e & 0xFFu);
+        else if (ebytes == 2) psv_st16(a + i, (uint32_t)e & 0xFFFFu);
+        else if (ebytes == 4) psv_st32(a + i, (uint32_t)e);
+        else psv_st64(a + i, e);
+    }
+}
+#else
+PSV_INLINE uint64_t psv_ld64u(uint32_t a, uint32_t ebytes) { (void)ebytes; return PSV_LOAD(uint64_t, a); }
+PSV_INLINE void psv_st64u(uint32_t a, uint64_t v, uint32_t ebytes) { (void)ebytes; PSV_STORE(uint64_t, a, v); }
+#endif
 
 /* Exclusive loads and stores. A store succeeds (returns 0) when the monitor holds this address and the memory still
  * holds the value the exclusive load saw; it is then written atomically. (A value changed and changed back in
@@ -259,6 +285,26 @@ PSV_INLINE uint32_t psv_shift_reg_c(uint32_t x, uint32_t type, uint32_t s, uint3
 PSV_INLINE void psv_nz(PsvContext* PSV_RESTRICT ctx, uint32_t r) {
     ctx->n = r >> 31;
     ctx->z = r == 0;
+}
+/* Generated functions keep N, Z, C and V in a local (PsvFlags fl), written to the context before anything that may
+ * read them there and read back after: the flags no instruction reads are then not computed. */
+typedef struct PsvFlags {
+    uint32_t n, z, c, v;
+} PsvFlags;
+#define PSV_FL_IN(f) ((f).n = ctx->n, (f).z = ctx->z, (f).c = ctx->c, (f).v = ctx->v)
+#define PSV_FL_OUT(f) (ctx->n = (f).n, ctx->z = (f).z, ctx->c = (f).c, ctx->v = (f).v)
+PSV_INLINE void psv_nz_fl(PsvFlags* f, uint32_t r) {
+    f->n = r >> 31;
+    f->z = r == 0;
+}
+PSV_INLINE uint32_t psv_adds_fl(PsvFlags* f, uint32_t a, uint32_t b, uint32_t carry_in) {
+    const uint64_t wide = (uint64_t)a + b + carry_in;
+    const uint32_t r = (uint32_t)wide;
+    f->n = r >> 31;
+    f->z = r == 0;
+    f->c = (uint32_t)(wide >> 32);
+    f->v = ((a ^ r) & (b ^ r)) >> 31;
+    return r;
 }
 /* AddWithCarry: a + b + carry_in, setting NZCV. */
 PSV_INLINE uint32_t psv_adds(PsvContext* PSV_RESTRICT ctx, uint32_t a, uint32_t b, uint32_t carry_in) {
@@ -480,18 +526,32 @@ PSV_INLINE uint64_t psv_flush_result64(double r, int below) {
     return psv_b64(r);
 }
 
-#define PSV_VFP_BINARY32(name, expr)                                                                  \
-    PSV_INLINE uint32_t name(uint32_t fpscr, uint32_t a, uint32_t b) {                                \
+/* The common case at the host's speed: operands normal or zero, and a result above the smallest normal's binade
+ * (flush-to-zero cannot apply, tininess before rounding included) or zero (an underflow to zero keeps the exact
+ * result's sign, as flushing does). There the host's binary32 operation rounds to nearest as the VFP does, whatever
+ * FPSCR's FZ and DN say: no denormal, infinity or NaN is involved. Anything else takes the exact path. */
+PSV_INLINE int psv_fast_in32(uint32_t x) { return ((x >> 23) & 0xFFu) - 1u < 254u || (x & 0x7FFFFFFFu) == 0; }
+PSV_INLINE int psv_fast_out32(uint32_t r) { return ((r >> 23) & 0xFFu) - 2u < 253u || (r & 0x7FFFFFFFu) == 0; }
+
+#define PSV_VFP_BINARY32(name, op, expr)                                                              \
+    PSV_COLD uint32_t name##_exact(uint32_t fpscr, uint32_t a, uint32_t b) {                        \
         a = psv_flush32(fpscr, a);                                                                    \
         b = psv_flush32(fpscr, b);                                                                    \
         if (psv_nan32(a) || psv_nan32(b)) return psv_nans32(fpscr, a, b);                             \
-        const double x = (double)psv_f32(a), y = (double)psv_f32(b);                                   \
+        const double x = (double)psv_f32(a), y = (double)psv_f32(b);                                  \
         return psv_round32(fpscr, expr);                                                              \
+    }                                                                                                 \
+    PSV_INLINE uint32_t name(uint32_t fpscr, uint32_t a, uint32_t b) {                                \
+        if (__builtin_expect(psv_fast_in32(a) && psv_fast_in32(b), 1)) {                              \
+            const uint32_t r = psv_b32(psv_f32(a) op psv_f32(b));                                     \
+            if (__builtin_expect(psv_fast_out32(r), 1)) return r;                                     \
+        }                                                                                             \
+        return name##_exact(fpscr, a, b);                                                             \
     }
-PSV_VFP_BINARY32(psv_fadd32, x + y)
-PSV_VFP_BINARY32(psv_fsub32, x - y)
-PSV_VFP_BINARY32(psv_fmul32, x * y)
-PSV_VFP_BINARY32(psv_fdiv32, x / y)
+PSV_VFP_BINARY32(psv_fadd32, +, x + y)
+PSV_VFP_BINARY32(psv_fsub32, -, x - y)
+PSV_VFP_BINARY32(psv_fmul32, *, x * y)
+PSV_VFP_BINARY32(psv_fdiv32, /, x / y)
 #undef PSV_VFP_BINARY32
 
 PSV_INLINE uint32_t psv_fsqrt32(uint32_t fpscr, uint32_t a) {
