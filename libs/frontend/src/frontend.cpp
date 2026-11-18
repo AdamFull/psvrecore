@@ -247,8 +247,11 @@ private:
                  "present {:.1f} s ago",
                  static_cast<f64>(since_shown) / 1e9, static_cast<f64>(since_presented) / 1e9);
         const gxm::RendererState g = gxm::renderer_state();
+        // (? where the renderer held the lock the number is under, then)
+        auto count = [](u64 n) { return n == gxm::RendererState::kUnknown ? nx::string("?") : nx::format("{}", n); };
         nx::logw(logs::frontend, "  the renderer: {} scenes ended, {} rendered, {} submitted, {} finished, {} pending on the "
-                 "GPU{}", g.ended, g.rendered, g.submitted, g.finished, g.pending, g.busy ? " (a lock held now)" : "");
+                 "GPU{}", count(g.ended), count(g.rendered), count(g.submitted), count(g.finished), g.pending,
+                 g.busy ? " (a lock held now)" : "");
         // (the host threads busy over the next second: a spinning or working one, or none)
         struct Used {
             u64 id, ns;

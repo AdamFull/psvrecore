@@ -89,9 +89,10 @@ struct PlayStats {
 PlayStats play_stats();
 // Where the renderer is (for a report when the picture stands still): the scenes ended, rendered, submitted to the
 // GPU and finished, and how many the GPU still has. Read without waiting for the renderer: `busy` when a lock was
-// held (those numbers then 0).
+// held, the numbers under it then kUnknown.
 struct RendererState {
-    u64 ended = 0, rendered = 0, submitted = 0, finished = 0;
+    static constexpr u64 kUnknown = ~u64{0};
+    u64 ended = kUnknown, rendered = kUnknown, submitted = kUnknown, finished = kUnknown;
     u32 pending = 0;
     bool busy = false;
 };
