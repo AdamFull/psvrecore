@@ -356,3 +356,293 @@ TEST_CASE("net: MAC addresses to text and back, the socket IDs in use, RUDP's se
     CHECK(call32(ctx, kSceLibRudp, 0x68A52861 /*sceRudpGetMaxSegmentSize*/, {mss}) == 0);
     CHECK(psv_ld16(mss) == 1200);
 }
+
+// ---- ad hoc mode over the host's loopback (Runtime::Config::network, interface 127.0.0.1)
+
+namespace {
+
+constexpr u32 kSceCommonDialog = 0xE537816C;
+constexpr u32 kNetCheckInit = 0xA38A4A0D, kNetCheckGetStatus = 0x8027292A, kNetCheckGetResult = 0xB05FCE9E,
+              kNetCheckTerm = 0x8BE51C15, kDialogUpdate = 0x90530F2F;
+constexpr u32 kCtlInit = 0x495CA1DB, kCtlCheckCallback = 0xDFFC3ED4, kCtlAdhocRegister = 0xFFA9D594,
+              kCtlAdhocGetState = 0x0961A561, kCtlAdhocGetInAddr = 0x7118C99D, kCtlAdhocDisconnect = 0xED43B79A,
+              kCtlInetGetState = 0x6D26AC68;
+
+Runtime::Config adhoc_config(const char* interface_spec = "127.0.0.1") {
+    Runtime::Config c;
+    c.network.adhoc = true;
+    c.network.adhoc_interface = interface_spec;
+    return c;
+}
+
+// The network check dialog in its ad hoc mode, run to its end: its result.
+i32 adhoc_dialog(PsvContext* ctx) {
+    const u32 param = scratch(0x50 + 0x80);
+    std::memset(current_runtime()->memory().host(param), 0, 0x50 + 0x80);
+    psv_st32(param + 0x50, 1);  // (SCE_NETCHECK_DIALOG_MODE_ADHOC_CONN)
+    std::memcpy(current_runtime()->memory().host(param + 0x54), "TEST00000", 9);
+    if (call32(ctx, kSceCommonDialog, kNetCheckInit, {param}) != 0) return -1;
+    const u32 update = scratch(64);
+    for (int i = 0; i < 4 && call32(ctx, kSceCommonDialog, kNetCheckGetStatus, {}) == 1; ++i)
+        call32(ctx, kSceCommonDialog, kDialogUpdate, {update});
+    if (call32(ctx, kSceCommonDialog, kNetCheckGetStatus, {}) != 2) return -2;
+    const u32 result = scratch(128);
+    if (call32(ctx, kSceCommonDialog, kNetCheckGetResult, {result}) != 0) return -3;
+    call32(ctx, kSceCommonDialog, kNetCheckTerm, {});
+    return static_cast<i32>(psv_ld32(result));
+}
+
+i32 start_net(PsvContext* ctx) {
+    const u32 param = scratch(12);
+    psv_st32(param + 4, 0x20000);
+    return call32(ctx, kSceNet, kInit, {param});
+}
+
+// A socket's own port (from sceNetGetsockname).
+u16 port_of(PsvContext* ctx, i32 s) {
+    const u32 name = scratch(16), length = scratch(4);
+    psv_st32(length, 16);
+    if (call32(ctx, kSceNet, kGetsockname, {u(s), name, length}) != 0) return 0;
+    const u8* p = current_runtime()->memory().host(name);
+    return static_cast<u16>(p[2] << 8 | p[3]);
+}
+// A P2P address: as sockaddr, and its virtual port.
+u32 p2p_sockaddr(u8 a, u8 b, u8 c, u8 d, u16 port, u16 vport) {
+    const u32 at = sockaddr(a, b, c, d, port);
+    u8* p = current_runtime()->memory().host(at);
+    p[8] = static_cast<u8>(vport >> 8), p[9] = static_cast<u8>(vport);
+    return at;
+}
+i32 set_int(PsvContext* ctx, i32 s, u32 level, u32 name, u32 value) {
+    const u32 v = scratch(4);
+    psv_st32(v, value);
+    return call32(ctx, kSceNet, kSetsockopt, {u(s), level, name, v, 4});
+}
+std::string_view guest_text(u32 at, u32 n) {
+    return std::string_view(reinterpret_cast<const char*>(current_runtime()->memory().host(at)), n);
+}
+
+nx::vector<u32> g_netctl_events;
+
+}  // namespace
+
+TEST_CASE("ad hoc: off, the dialog's ad hoc mode stays offline and ad hoc is disconnected") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlInit, {}) == 0);
+    CHECK(adhoc_dialog(ctx) == 1);  // (user canceled)
+    const u32 state = scratch(4), addr = scratch(4);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlAdhocGetState, {state}) == 0);
+    CHECK(psv_ld32(state) == 0);
+    CHECK(u(call32(ctx, kSceNetCtl, kCtlAdhocGetInAddr, {addr})) == 0x80412108u);
+    REQUIRE(start_net(ctx) == 0);
+    const i32 s = call32(ctx, kSceNet, kSocket, {0, 2, 2, 0});
+    CHECK(u(call32(ctx, kSceNet, kSendto, {u(s), scratch(4), 4, 0, sockaddr(192, 168, 1, 2, 3658), 16})) == net_error(51));
+}
+
+TEST_CASE("ad hoc: the dialog connects; SceNetCtl reports the address and calls back; disconnected again") {
+    TestRuntime t(adhoc_config());
+    PsvContext* ctx = t.ctx();
+    GuestCode code;
+    const u32 callback = code.add([](PsvContext* c, uint32_t) { g_netctl_events.push_back(c->r[0] << 16 | c->r[1]); });
+    code.install();
+    g_netctl_events.clear();
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlInit, {}) == 0);
+    const u32 cid = scratch(4), state = scratch(4), addr = scratch(4);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlAdhocRegister, {callback, 0x77, cid}) == 0);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlAdhocGetState, {state}) == 0);
+    CHECK(psv_ld32(state) == 0);
+    REQUIRE(start_net(ctx) == 0);
+    const i32 before = call32(ctx, kSceNet, kSocket, {0, 2, 2, 0});  // (made offline: stays so)
+
+    CHECK(adhoc_dialog(ctx) == 0);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlAdhocGetState, {state}) == 0);
+    CHECK(psv_ld32(state) == 3);  // (IPOBTAINED)
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlAdhocGetInAddr, {addr}) == 0);
+    CHECK(psv_ld32(addr) == 0x0100007Fu);  // (127.0.0.1, network order)
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlInetGetState, {state}) == 0);
+    CHECK(psv_ld32(state) == 0);  // (the infrastructure connection: still none)
+    CHECK(g_netctl_events.empty());  // (callbacks run at the check, in the caller's thread)
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlCheckCallback, {}) == 0);
+    REQUIRE(g_netctl_events.size() == 1);
+    CHECK(g_netctl_events[0] == (3u << 16 | 0x77));
+    CHECK(u(call32(ctx, kSceNet, kSendto, {u(before), scratch(4), 4, 0, sockaddr(127, 0, 0, 5, 9), 16})) == 4);
+    // (a MAC address of its own, from the interface's address)
+    const u32 mac = scratch(6);
+    REQUIRE(call32(ctx, kSceNet, 0x06C05518 /*sceNetGetMacAddress*/, {mac, 0}) == 0);
+    CHECK(t.rt.memory().host(mac)[2] == 127);
+    CHECK(t.rt.memory().host(mac)[5] == 1);
+
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlAdhocDisconnect, {}) == 0);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlAdhocGetState, {state}) == 0);
+    CHECK(psv_ld32(state) == 0);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlCheckCallback, {}) == 0);
+    REQUIRE(g_netctl_events.size() == 2);
+    CHECK(g_netctl_events[1] == (2u << 16 | 0x77));  // (DISCONNECT_REQ_FINISHED)
+}
+
+TEST_CASE("ad hoc: datagram sockets are the host's; broadcasts, errno, time-outs, epoll, the unreachable") {
+    TestRuntime t(adhoc_config());
+    PsvContext* ctx = t.ctx();
+    REQUIRE(start_net(ctx) == 0);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlInit, {}) == 0);
+    REQUIRE(adhoc_dialog(ctx) == 0);
+    const i32 a = call32(ctx, kSceNet, kSocket, {guest_string("a"), 2, 2, 0});
+    const i32 b = call32(ctx, kSceNet, kSocket, {guest_string("b"), 2, 2, 0});
+    REQUIRE(a > 0);
+    REQUIRE(b > 0);
+    REQUIRE(call32(ctx, kSceNet, kBind, {u(a), sockaddr(0, 0, 0, 0, 0), 16}) == 0);
+    const u16 pa = port_of(ctx, a);
+    REQUIRE(pa != 0);
+
+    // Sent to the address, received with who sent it.
+    const u32 message = guest_string("hello"), buffer = scratch(64), from = scratch(16), from_length = scratch(4);
+    CHECK(call32(ctx, kSceNet, kSendto, {u(b), message, 5, 0, sockaddr(127, 0, 0, 1, pa), 16}) == 5);
+    psv_st32(from_length, 16);
+    REQUIRE(call32(ctx, kSceNet, kRecvfrom, {u(a), buffer, 64, 0, from, from_length}) == 5);
+    CHECK(guest_text(buffer, 5) == "hello");
+    const u8* f = t.rt.memory().host(from);
+    CHECK(f[0] == 16);
+    CHECK(f[1] == 2);
+    CHECK(static_cast<u16>(f[2] << 8 | f[3]) == port_of(ctx, b));
+    CHECK((f[4] == 127 && f[5] == 0 && f[6] == 0 && f[7] == 1));
+
+    // Nothing more: a socket that does not block says so (and errno), one with a time-out waits that long.
+    REQUIRE(set_int(ctx, a, 0xFFFF, 0x1100, 1) == 0);
+    CHECK(u(call32(ctx, kSceNet, kRecv, {u(a), buffer, 64, 0})) == net_error(35));
+    CHECK(psv_ld32(u(call32(ctx, kSceNet, kErrnoLoc, {}))) == 35);
+    REQUIRE(set_int(ctx, a, 0xFFFF, 0x1100, 0) == 0);
+    REQUIRE(set_int(ctx, a, 0xFFFF, 0x1006, 30'000) == 0);
+    const u64 started = t.rt.kernel().clock_ns();
+    CHECK(u(call32(ctx, kSceNet, kRecv, {u(a), buffer, 64, 0})) == net_error(35));
+    CHECK(t.rt.kernel().clock_ns() - started >= 25'000'000);
+    // An aborted wait ends.
+    REQUIRE(set_int(ctx, a, 0xFFFF, 0x1006, 0) == 0);
+    REQUIRE(call32(ctx, kSceNet, kAbort, {u(a), 0}) == 0);
+    CHECK(u(call32(ctx, kSceNet, kRecv, {u(a), buffer, 64, 0})) == net_error(4));
+    REQUIRE(set_int(ctx, a, 0xFFFF, 0x1006, 2'000'000) == 0);  // (what is sent below arrives at once: never waits long)
+
+    // A broadcast (every address that reads as one) reaches the loopback's instances, this one among them.
+    for (const u32 to : {sockaddr(255, 255, 255, 255, pa), sockaddr(127, 255, 255, 255, pa), sockaddr(127, 0, 0, 255, pa)}) {
+        CHECK(call32(ctx, kSceNet, kSendto, {u(b), message, 3, 0, to, 16}) == 3);
+        CHECK(call32(ctx, kSceNet, kRecv, {u(a), buffer, 64, 0}) == 3);
+    }
+    // Beyond the ad hoc network: no route.
+    CHECK(u(call32(ctx, kSceNet, kSendto, {u(b), message, 5, 0, sockaddr(8, 8, 8, 8, 53), 16})) == net_error(51));
+    CHECK(u(call32(ctx, kSceNet, kConnect, {u(b), sockaddr(10, 1, 2, 3, 80), 16})) == net_error(51));
+
+    // A peek leaves the datagram; epoll says what is readable.
+    const i32 ep = call32(ctx, kSceNet, kEpollCreate, {guest_string("ep"), 0});
+    const u32 ev = scratch(32), events = scratch(32 * 4);
+    std::memset(t.rt.memory().host(ev), 0, 32);
+    psv_st32(ev, 0x1);
+    psv_st32(ev + 24, 0x1234);
+    REQUIRE(call32(ctx, kSceNet, kEpollControl, {u(ep), 1, u(a), ev}) == 0);
+    CHECK(call32(ctx, kSceNet, kEpollWait, {u(ep), events, 4, 0}) == 0);
+    CHECK(call32(ctx, kSceNet, kEpollWait, {u(ep), events, 4, 20'000}) == 0);
+    CHECK(call32(ctx, kSceNet, kSendto, {u(b), message, 5, 0, sockaddr(127, 0, 0, 1, pa), 16}) == 5);
+    REQUIRE(call32(ctx, kSceNet, kEpollWait, {u(ep), events, 4, 1'000'000}) == 1);
+    CHECK(psv_ld32(events) == 0x1);
+    CHECK(psv_ld32(events + 24) == 0x1234);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(a), buffer, 64, 0x2 /*MSG_PEEK*/}) == 5);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(a), buffer, 2, 0}) == 2);  // (the rest of a datagram is dropped)
+    CHECK(u(call32(ctx, kSceNet, kRecv, {u(a), buffer, 64, 0x80})) == net_error(35));
+    REQUIRE(call32(ctx, kSceNet, kEpollDestroy, {u(ep)}) == 0);
+
+    // A connected datagram socket sends without an address. Options reach the host or are kept.
+    REQUIRE(call32(ctx, kSceNet, kConnect, {u(b), sockaddr(127, 0, 0, 1, pa), 16}) == 0);
+    CHECK(call32(ctx, kSceNet, kSend, {u(b), message, 4, 0}) == 4);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(a), buffer, 64, 0}) == 4);
+    CHECK(set_int(ctx, a, 0xFFFF, 0x1002, 0x10000) == 0);  // SO_RCVBUF
+    const u32 value = scratch(8), length = scratch(4);
+    psv_st32(length, 4);
+    REQUIRE(call32(ctx, kSceNet, kGetsockopt, {u(a), 0xFFFF, 0x1002, value, length}) == 0);
+    CHECK(psv_ld32(value) == 0x10000);
+    psv_st32(value, 1), psv_st32(value + 4, 3);
+    CHECK(call32(ctx, kSceNet, kSetsockopt, {u(a), 0xFFFF, 0x80, value, 8}) == 0);  // SO_LINGER
+    psv_st32(value, 0), psv_st32(value + 4, 0), psv_st32(length, 8);
+    REQUIRE(call32(ctx, kSceNet, kGetsockopt, {u(a), 0xFFFF, 0x80, value, length}) == 0);
+    CHECK((psv_ld32(value) == 1 && psv_ld32(value + 4) == 3));
+    CHECK(call32(ctx, kSceNet, kClose, {u(a)}) == 0);
+    CHECK(call32(ctx, kSceNet, kClose, {u(b)}) == 0);
+}
+
+TEST_CASE("ad hoc: P2P datagram sockets share a UDP port, told apart by virtual port; virtual port 0 takes the rest") {
+    TestRuntime t(adhoc_config());
+    PsvContext* ctx = t.ctx();
+    REQUIRE(start_net(ctx) == 0);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlInit, {}) == 0);
+    REQUIRE(adhoc_dialog(ctx) == 0);
+    constexpr u16 kPort = 47658;  // (not 3658: a game may be running on this machine)
+    REQUIRE(set_int(ctx, 0, 0, 0, 0) != 0);  // (no socket 0)
+    i32 s[4];
+    for (i32& k : s) k = call32(ctx, kSceNet, kSocket, {0, 2, 6 /*SOCK_DGRAM_P2P*/, 0});
+    REQUIRE(call32(ctx, kSceNet, kBind, {u(s[0]), p2p_sockaddr(0, 0, 0, 0, kPort, 10), 16}) == 0);
+    REQUIRE(call32(ctx, kSceNet, kBind, {u(s[1]), p2p_sockaddr(0, 0, 0, 0, kPort, 20), 16}) == 0);
+    REQUIRE(call32(ctx, kSceNet, kBind, {u(s[2]), p2p_sockaddr(0, 0, 0, 0, kPort, 0), 16}) == 0);
+    CHECK(u(call32(ctx, kSceNet, kBind, {u(s[3]), p2p_sockaddr(0, 0, 0, 0, kPort, 20), 16})) == net_error(48));
+    CHECK(port_of(ctx, s[1]) == kPort);
+
+    const u32 message = guest_string("ping"), buffer = scratch(64), from = scratch(16), from_length = scratch(4);
+    CHECK(call32(ctx, kSceNet, kSendto, {u(s[0]), message, 4, 0, p2p_sockaddr(127, 0, 0, 1, kPort, 20), 16}) == 4);
+    psv_st32(from_length, 16);
+    REQUIRE(call32(ctx, kSceNet, kRecvfrom, {u(s[1]), buffer, 64, 0, from, from_length}) == 4);
+    CHECK(guest_text(buffer, 4) == "ping");
+    const u8* f = t.rt.memory().host(from);
+    CHECK(static_cast<u16>(f[2] << 8 | f[3]) == kPort);
+    CHECK(static_cast<u16>(f[8] << 8 | f[9]) == 10);  // (the sender's virtual port)
+    // To a virtual port nobody is bound to: the socket of virtual port 0; a broadcast too.
+    CHECK(call32(ctx, kSceNet, kSendto, {u(s[0]), message, 2, 0, p2p_sockaddr(127, 0, 0, 1, kPort, 99), 16}) == 2);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(s[2]), buffer, 64, 0}) == 2);
+    CHECK(call32(ctx, kSceNet, kSendto, {u(s[0]), message, 3, 0, p2p_sockaddr(255, 255, 255, 255, kPort, 20), 16}) == 3);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(s[1]), buffer, 64, 0}) == 3);
+    // Nothing for the others.
+    REQUIRE(set_int(ctx, s[0], 0xFFFF, 0x1100, 1) == 0);
+    CHECK(u(call32(ctx, kSceNet, kRecv, {u(s[0]), buffer, 64, 0})) == net_error(35));
+    REQUIRE(call32(ctx, kSceNet, kClose, {u(s[3])}) == 0);
+    for (i32 i = 0; i < 3; ++i) REQUIRE(call32(ctx, kSceNet, kClose, {u(s[i])}) == 0);
+    // The port's host socket closed with its last P2P socket: the port can be bound again.
+    const i32 again = call32(ctx, kSceNet, kSocket, {0, 2, 6, 0});
+    CHECK(call32(ctx, kSceNet, kBind, {u(again), p2p_sockaddr(0, 0, 0, 0, kPort, 10), 16}) == 0);
+}
+
+TEST_CASE("ad hoc: stream sockets connect, accept, send and receive over the host's TCP") {
+    TestRuntime t(adhoc_config());
+    PsvContext* ctx = t.ctx();
+    REQUIRE(start_net(ctx) == 0);
+    REQUIRE(call32(ctx, kSceNetCtl, kCtlInit, {}) == 0);
+    REQUIRE(adhoc_dialog(ctx) == 0);
+    const i32 listener = call32(ctx, kSceNet, kSocket, {0, 2, 1, 0});
+    const i32 client = call32(ctx, kSceNet, kSocket, {0, 2, 1, 0});
+    REQUIRE(call32(ctx, kSceNet, kBind, {u(listener), sockaddr(0, 0, 0, 0, 0), 16}) == 0);
+    const u16 port = port_of(ctx, listener);
+    REQUIRE(call32(ctx, kSceNet, kListen, {u(listener), 4}) == 0);
+    REQUIRE(set_int(ctx, listener, 0xFFFF, 0x1100, 1) == 0);
+    CHECK(u(call32(ctx, kSceNet, kAccept, {u(listener), 0, 0})) == net_error(35));
+    CHECK(u(call32(ctx, kSceNet, kSend, {u(client), guest_string("x"), 1, 0})) == net_error(57));
+    REQUIRE(call32(ctx, kSceNet, kConnect, {u(client), sockaddr(127, 0, 0, 1, port), 16}) == 0);
+    REQUIRE(set_int(ctx, listener, 0xFFFF, 0x1100, 0) == 0);
+    const u32 peer = scratch(16), peer_length = scratch(4);
+    psv_st32(peer_length, 16);
+    const i32 accepted = call32(ctx, kSceNet, kAccept, {u(listener), peer, peer_length});
+    REQUIRE(accepted > 0);
+    CHECK(static_cast<u16>(t.rt.memory().host(peer)[2] << 8 | t.rt.memory().host(peer)[3]) == port_of(ctx, client));
+    REQUIRE(set_int(ctx, client, 6 /*IPPROTO_TCP*/, 1 /*TCP_NODELAY*/, 1) == 0);
+
+    const u32 buffer = scratch(64);
+    CHECK(call32(ctx, kSceNet, kSend, {u(client), guest_string("abc"), 3, 0}) == 3);
+    CHECK(call32(ctx, kSceNet, kSend, {u(client), guest_string("def"), 3, 0}) == 3);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(accepted), buffer, 6, 0x40 /*MSG_WAITALL*/}) == 6);
+    CHECK(guest_text(buffer, 6) == "abcdef");
+    CHECK(call32(ctx, kSceNet, kSend, {u(accepted), guest_string("back"), 4, 0}) == 4);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(client), buffer, 4, 0x40}) == 4);
+    REQUIRE(call32(ctx, kSceNet, kGetpeername, {u(client), peer, peer_length}) == 0);
+    CHECK(static_cast<u16>(t.rt.memory().host(peer)[2] << 8 | t.rt.memory().host(peer)[3]) == port);
+    // The end of the stream: 0 bytes.
+    REQUIRE(call32(ctx, kSceNet, kShutdown, {u(client), 1}) == 0);
+    CHECK(call32(ctx, kSceNet, kRecv, {u(accepted), buffer, 64, 0}) == 0);
+    // Nobody listening: refused.
+    const i32 lonely = call32(ctx, kSceNet, kSocket, {0, 2, 1, 0});
+    CHECK(u(call32(ctx, kSceNet, kConnect, {u(lonely), sockaddr(127, 0, 0, 1, 1), 16})) == net_error(61));
+    for (const i32 k : {listener, client, accepted, lonely}) CHECK(call32(ctx, kSceNet, kClose, {u(k)}) == 0);
+}

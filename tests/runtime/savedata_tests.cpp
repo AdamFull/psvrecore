@@ -377,7 +377,9 @@ TEST_CASE("apputil: safe memory survives the process; the system's settings") {
         const u32 value = scratch(4);
         CHECK(call32(ctx, kSceAppUtil, kSysInt, {1, value}) == 0);
         CHECK(*t.rt.memory().host_as<i32>(value) == 18);
-        CHECK(call32(ctx, kSceAppUtil, kSysInt, {2, value}) == kParameter);
+        CHECK(call32(ctx, kSceAppUtil, kSysInt, {2, value}) == 0);  // (the enter button: cross, as not Japanese)
+        CHECK(*t.rt.memory().host_as<i32>(value) == 1);
+        CHECK(call32(ctx, kSceAppUtil, kSysInt, {8, value}) == kParameter);
         const u32 name = scratch(32);
         CHECK(call32(ctx, kSceAppUtil, kSysString, {3, name, 16}) == kParameter);
         CHECK(call32(ctx, kSceAppUtil, kSysString, {3, name, 17}) == 0);

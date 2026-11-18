@@ -54,6 +54,14 @@ void register_fiber();
 void register_np();
 void register_online();
 void register_net();
+// SceNet's ad hoc mode over the host's local network (net.cpp; Runtime::Config::network): whether it is on, the
+// connection made (the network check dialog's ad hoc mode: 0, or why not, in `why`) and ended, and its address (in
+// network order) while it is up. SceNetCtl (system.cpp) is told of each change to give its callbacks.
+bool adhoc_enabled();
+bool adhoc_connect(nx::string* description);
+void adhoc_disconnect();
+bool adhoc_address(u32* network_order);
+void netctl_adhoc_event(i32 event_type);
 void register_psn();
 void register_services();
 void register_audiodec();

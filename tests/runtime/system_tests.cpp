@@ -388,6 +388,13 @@ TEST_CASE("audio in, motion sensors, cameras, video decoder memory: silence at t
     CHECK(call32(ctx, kSceMotion, kMag, {}) == 0);
 
     constexpr u32 kSceCamera = 0xDA91B3ED;
+    // (none: not mounted, but the size of the resolution asked for is filled in, as games size their buffers by it)
+    const u32 camera_info = scratch(64);
+    std::memset(t.rt.memory().host(camera_info), 0, 64);
+    psv_st32(camera_info, 64);
+    psv_st16(camera_info + 8, 6);  // (SCE_CAMERA_RESOLUTION_PSP1)
+    CHECK(u(call32(ctx, kSceCamera, 0xA462F801 /*Open*/, {0, camera_info})) == 0x802E0010u);
+    CHECK((psv_ld16(camera_info + 12) == 480 && psv_ld16(camera_info + 14) == 272));
     CHECK(u(call32(ctx, kSceCamera, 0x62AFF0B8 /*SetEV*/, {0, 1})) == 0x802E0004u);  // (not open)
     CHECK(u(call32(ctx, kSceCamera, 0xE9D2CFB1 /*SetEffect*/, {0, 1})) == 0x802E0004u);
 
@@ -827,6 +834,9 @@ TEST_CASE("jpeg: a picture decoded by the split decoder, its data given in two p
     // A picture to decode: the encoder's (64 x 32, grey).
     const u32 enc = scratch(0x100), planes = scratch(64 * 32 * 2), file = scratch(0x8000);
     std::memset(t.rt.memory().host(planes), 128, 64 * 32 * 2);
+    // (the hardware colour conversion's pitch flag (16) taken with a format, as WipEout 2048 gives it: 4:2:2 + 16)
+    REQUIRE(call32(ctx, kSceJpegEncUser, 0x88DA92B4 /*Init*/, {enc, 64, 32, 9 + 16, file, 0x8000}) == 0);
+    CHECK(u(call32(ctx, kSceJpegEncUser, 0x88DA92B4, {enc, 64, 32, 2, file, 0x8000})) == 0x80650203u);
     REQUIRE(call32(ctx, kSceJpegEncUser, 0x88DA92B4 /*Init*/, {enc, 64, 32, 8, file, 0x8000}) == 0);
     const i32 size = call32(ctx, kSceJpegEncUser, 0xC60DE94C /*Encode*/, {enc, planes});
     REQUIRE(size > 200);

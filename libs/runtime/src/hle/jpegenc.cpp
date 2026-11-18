@@ -63,8 +63,12 @@ u8 clamp8(f32 v) { return static_cast<u8>(std::clamp(static_cast<i32>(std::lroun
 
 i32 sceJpegEncoderGetContextSize() { return kContextSize; }
 
+// (SCE_JPEGENC_PITCH_HW_CSC (16) may be added to the format: the input's rows laid out for the hardware's colour
+// conversion; here, as without it)
+constexpr u32 kPitchHwCsc = 16;
 i32 sceJpegEncoderInit(u32 context, i32 width, i32 height, u32 pixel_format, u32 output, u32 output_size) {
     if (!context || !writable(context, kContextSize) || !output) return kInvalidPointer;
+    pixel_format &= ~kPitchHwCsc;
     if (width <= 0 || height <= 0 || width > 65535 || height > 65535) return kImageSize;
     if (!known_format(pixel_format)) return kInvalidPixelFormat;
     Encoders& all = encoders();

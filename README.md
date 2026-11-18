@@ -39,7 +39,7 @@ Games are processed from the user's own files on the user's machine. Nothing der
 | `scripts/hle_coverage.py` | Which system functions the runtime implements, per library, against the SDK's stubs and what given games import (needs the SDK) |
 | `tests` | Unit tests, the generator-versus-interpreter test and the runtime's tests (no game data or SDK files needed); `tests/probes` and `tests/programs` (sources for the SDK-built checks) |
 | `cmake`, `scripts` | Build helpers |
-| `docs` | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Status](docs/STATUS.md) · [Known issues](docs/KNOWN_ISSUES.md) · [Building](docs/BUILDING.md) |
+| `docs` | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Status](docs/STATUS.md) · [Known issues](docs/KNOWN_ISSUES.md) · [Building](docs/BUILDING.md) · [Ad hoc play](docs/ADHOC.md) |
 
 ## Building
 

@@ -6,7 +6,8 @@
 //   closes them (sceSaveDataDialogFinish), as on the console;
 // - save data: confirmations are confirmed, the fixed slot is the one the game named (it exists if its save data
 //   does: savedata0:'s slots), the list's focused slot is chosen;
-// - network check: offline, the player declines to connect (user canceled, PSN not reached);
+// - network check: offline, the player declines to connect (user canceled, PSN not reached); in ad hoc mode over the
+//   local network (net.cpp), its ad hoc modes connect at once (OK);
 // - trophy setup: done (trophies are local);
 // - text input (IME): the text confirmed as the game gave it (its initial text, in the input buffer);
 // - PSN, store and photo dialogs (messages, profiles, friends, Facebook, checkout, photo import, a game's custom data,
@@ -697,6 +698,23 @@ i32 sceNetCheckDialogInit(Ptr<const u8> param) {
     nx::scoped_lock<nx::mutex> held(d.lock);
     if (const i32 r = start(Kind::NetCheck, false); r < 0) return r;
     d.mode = static_cast<i32>(word(param.address + kParamBody));
+    // (ad hoc: the ad hoc connection (1), PSP ad hoc's (5-7, by its group name: all are one network here))
+    if (d.mode == 1 || (d.mode >= 5 && d.mode <= 7)) {
+        const nx::string id = text(param.address + kParamBody + 4, 9);
+        const u32 group = word(param.address + kParamBody + 20);
+        nx::string why;
+        if (adhoc_connect(&why)) {
+            // (made at once: it finishes at the next update, drawn or not, with nothing to answer)
+            d.result = kResultOk;
+            d.host = false;
+            netctl_adhoc_event(3);  // (SCE_NET_CTL_EVENT_TYPE_IPOBTAINED)
+            nx::logi(logs::hle, "network check dialog (ad hoc, mode {}, {}{}): connected on {}", d.mode,
+                     id.empty() ? "no communication ID" : id.c_str(),
+                     group ? nx::format(", group '{}'", text(group, 8)) : nx::string(), why);
+            return 0;
+        }
+        if (adhoc_enabled()) nx::logw(logs::hle, "network check dialog (ad hoc): not connected: {}", why);
+    }
     d.result = kResultUserCanceled;
     d.view.kind = DialogView::Kind::NetCheck;
     d.view.mode = d.mode;

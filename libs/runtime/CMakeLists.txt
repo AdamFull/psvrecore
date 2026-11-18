@@ -25,6 +25,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/motion.cpp
     src/hle/mspace.cpp
     src/hle/net.cpp
+    src/hle/host_socket.cpp
     src/hle/ngs.cpp
     src/hle/np.cpp
     src/hle/online.cpp
@@ -60,7 +61,7 @@ add_library(psvrecore_runtime STATIC
 )
 if(WIN32)
     target_sources(psvrecore_runtime PRIVATE src/host_win32.cpp)
-    target_link_libraries(psvrecore_runtime PRIVATE dbghelp)
+    target_link_libraries(psvrecore_runtime PRIVATE dbghelp ws2_32 iphlpapi)
 else()
     target_sources(psvrecore_runtime PRIVATE src/host_posix.cpp)
 endif()

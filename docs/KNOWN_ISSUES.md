@@ -396,6 +396,25 @@
 - **With an sRGB swapchain the overlay's colours are slightly off** (its vertex colours are not converted); the
   window picks a UNORM format wherever there is one.
 
+## Network (ad hoc over a local network)
+
+See [ADHOC.md](ADHOC.md).
+
+- **Only other psvrecore copies can join.** A Vita's ad hoc network is a Wi-Fi network of its own (IBSS), which
+  phones and PCs cannot join; the traffic is carried over the local network instead, with psvrecore's own header on
+  P2P datagrams.
+- **One copy per device on a real network**: the ad hoc port (3658) is bound once. Copies on one machine need
+  loopback addresses of their own (`adhoc_interface = 127.0.0.2`).
+- **A P2P stream socket's virtual port is not carried**: it is a plain TCP socket on its port, so two of them on one
+  port with different virtual ports would clash (no game seen uses them).
+- **SceNetCtl's ad hoc peer list is empty**: peers are known only from what they send. SceNetAdhocMatching and the
+  PSP-style ad hoc library still find nobody (no game seen needs them with ad hoc over the network).
+- **A guest thread waiting on a socket wakes in slices** (20 ms; 4 ms for a P2P port shared by several sockets, whose
+  datagrams one reader hands to the others), so a datagram for a P2P socket whose port another thread is reading
+  may wait up to 4 ms more.
+- **Windows asks to let the program through its firewall** the first time it listens on the network; until allowed,
+  the other players' datagrams do not arrive.
+
 ## Save data and the application utility
 
 - **The save data dialog is not implemented**, so the SDK's save data samples cannot run.

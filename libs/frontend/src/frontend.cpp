@@ -326,6 +326,24 @@ void open_settings() {
 #endif
 }
 
+// The game's ad hoc connection made or ended (any thread). Android: a Wi-Fi multicast lock held meanwhile
+// (PsvrecoreActivity.setMulticastLock), without which the Wi-Fi chip may drop the broadcasts other players send.
+void on_adhoc(bool connected) {
+#if defined(__ANDROID__)
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!env || !activity) return;
+    jclass cls = env->GetObjectClass(activity);
+    if (jmethodID set = env->GetMethodID(cls, "setMulticastLock", "(Z)V"))
+        env->CallVoidMethod(activity, set, connected ? JNI_TRUE : JNI_FALSE);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(cls);
+    env->DeleteLocalRef(activity);
+#else
+    (void)connected;
+#endif
+}
+
 bool on_app_event(void* user, SDL_Event* e) {
     Lifecycle& l = *static_cast<Lifecycle*>(user);
     if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) l.set_background(true);
@@ -594,6 +612,9 @@ int run_game(const Game& game, int argc, char** argv) {
     config.system.time_zone_minutes = s.time_zone_auto ? host_time_zone_minutes() : s.time_zone_minutes;
     config.system.summer_time = s.time_zone_auto ? host_summer_time() : s.summer_time;
     config.system.safe_memory = join(safe, nx::format("{}.bin", game.title_id));
+    config.network.adhoc = s.adhoc;
+    config.network.adhoc_interface = s.adhoc_interface;
+    config.network.on_adhoc = on_adhoc;
     gxm::Options gxm_options;
     gxm_options.display = &display;
     gxm_options.device.validation = s.validation;

@@ -241,6 +241,8 @@ unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title I
 (the game's programs translated, the pipelines made, the driver's pipeline cache): what a run drew with is made before
 the next one starts. Deleting it only costs that again. `[display] internal_resolution` (1 to 4) draws the game at
 that many times the console's resolution, the surfaces it draws into and reads back as textures included.
+`[network] adhoc` plays a game's ad hoc mode with other copies on the same local network (off: offline); see
+[ADHOC.md](ADHOC.md).
 
 Keys while playing: arrows (the d-pad), Z Cross, X Circle, A Square, S Triangle, Q L, W R, Enter Start, Right Shift
 Select, F11 full screen. Gamepads work as they are plugged in; the mouse touches the front panel. On a touch screen the

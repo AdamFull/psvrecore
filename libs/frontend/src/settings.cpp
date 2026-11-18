@@ -181,6 +181,17 @@ const Key kKeys[] = {
      },
      [](const Settings& s) { return nx::string(kDialogs[s.dialogs]); }, nullptr},
 
+    {"network", "adhoc",
+     "Ad hoc play over the local network: the game's ad hoc mode reaches other copies on the same Wi-Fi network or "
+     "hotspot (UDP port 3658 and the game's own ports must be let through the firewall); off, the console is offline.",
+     [](Settings& s, nx::string_view v) { return parse_bool(v, &s.adhoc); },
+     [](const Settings& s) { return nx::string(yes_no(s.adhoc)); }, "true or false"},
+    {"network", "adhoc_interface",
+     "The network interface ad hoc play uses: empty for the local network (Wi-Fi or Ethernet), an interface's name "
+     "or IPv4 address, or a loopback address (127.0.0.2) for copies on one machine, each with its own.",
+     [](Settings& s, nx::string_view v) { return s.adhoc_interface = nx::string(v), true; },
+     [](const Settings& s) { return s.adhoc_interface; }, "empty, a name or an IPv4 address"},
+
     {"log", "level", "How much is logged.",
      [](Settings& s, nx::string_view v) { return index_of(kLogLevels, v) >= 0 && (s.log_level = nx::string(v), true); },
      [](const Settings& s) { return s.log_level; }, nullptr},
@@ -214,6 +225,7 @@ const Schema kSchema[] = {
     {"system", "user_name", K::Text, 0, 0, false, false},   {"system", "date_format", K::Choice, 0, 0, false, false},
     {"system", "time_format", K::Choice, 0, 0, false, false}, {"system", "time_zone", K::Text, 0, 0, false, false},
     {"system", "summer_time", K::Bool, 0, 0, false, false}, {"system", "dialogs", K::Choice, 0, 0, false, false},
+    {"network", "adhoc", K::Bool, 0, 0, false, false},      {"network", "adhoc_interface", K::Text, 0, 0, false, false},
     {"log", "level", K::Choice, 0, 0, true, false},
     {"log", "file", K::Text, 0, 0, false, true},
 };

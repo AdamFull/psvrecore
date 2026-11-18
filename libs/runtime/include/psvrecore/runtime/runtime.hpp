@@ -41,6 +41,20 @@ public:
             nx::string user_name = "User";
             nx::string safe_memory;  // the host file of the 64 KiB of safe memory (empty: kept in memory only)
         } system{};
+        // Ad hoc mode over the host's local network (hle/net.cpp): off, the console is offline. On, the network
+        // check dialog's ad hoc connection is made on a host interface, SceNetCtl's ad hoc state reports it, and
+        // while it is connected SceNet's sockets are the host's, reaching the other consoles (other instances) on that
+        // interface's network; nothing else is ever reachable.
+        struct Network {
+            bool adhoc = false;
+            // The interface: empty (auto: the host's local network: Wi-Fi or Ethernet, with a gateway first), an
+            // interface's name (wlan0, Wi-Fi) or IPv4 address, or a loopback address (127.0.0.2): instances on one
+            // machine, each with an address of its own, a broadcast reaching 127.0.0.1 to 127.0.0.16.
+            nx::string adhoc_interface;
+            // Told when the ad hoc connection is made (true) and ends (false), from a guest thread (Android holds a
+            // Wi-Fi multicast lock meanwhile, so broadcasts are received).
+            void (*on_adhoc)(bool connected) = nullptr;
+        } network{};
     };
 
     explicit Runtime(const Config& config);

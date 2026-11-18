@@ -1,13 +1,14 @@
 // The system's services a game asks about that have nothing to do on the host:
 // - the application's state (SceAppMgrUser): in front, nothing of the system's over it, no system events;
 // - the power configuration (ScePower): taken, the host's power is its own;
-// - the network libraries' start (SceNetCtl, SceHttp, SceSsl), as on a console that is offline (SceNet: net.cpp);
+// - the network libraries' start (SceNetCtl, SceHttp, SceSsl), as on a console that is offline (SceNet: net.cpp), but
+//   for SceNetCtl's ad hoc state in ad hoc mode over the local network;
 // - the development kit's debug LEDs (SceDebugLed): a retail console has none; what a game sets is logged (debug);
 // - the system's screenshots (SceScreenShot: the PS button and Start): the host has none of its own, so what a game
 //   sets for them (titles, an overlay picture, screenshots allowed or not) is checked and kept nowhere;
 // - the camera's shutter sound (SceShutterSound): not played;
-// - the cameras (SceCamera): none, as on a PlayStation TV: opening one answers "not mounted", and what needs one open
-//   "not open".
+// - the cameras (SceCamera): none, as on a PlayStation TV: opening one answers "not mounted" (the size of the
+//   resolution asked for filled in all the same), and what needs one open "not open".
 
 #include "hle_common.hpp"
 
@@ -127,8 +128,20 @@ i32 sceScreenShotGetParam(Ptr<const char> path, Ptr<u8> info) {
 
 constexpr i32 kCameraParam = err::code(0x802E0000), kCameraNotOpen = err::code(0x802E0004),
               kCameraNotMounted = err::code(0x802E0010);
+// SceCameraInfo: size, priority, format, resolution, frame rate, then the width and height Open fills in from the
+// resolution. Filled in even without a camera: games size their own buffers by them (WipEout 2048's player photos in
+// its ad hoc races, which it sets up whatever Open answered).
 i32 sceCameraOpen(i32 device, Ptr<void> info) {
     if (device < 0 || device > 1 || !info) return kCameraParam;
+    if (writable(info.address, 16)) {
+        static constexpr u16 kSizes[][2] = {{0, 0},     {640, 480}, {320, 240}, {160, 120}, {352, 288},
+                                            {176, 144}, {480, 272}, {0, 0},     {640, 360}};
+        const u16 resolution = psv_ld16(info.address + 8);
+        if (resolution < 9 && kSizes[resolution][0]) {
+            psv_st16(info.address + 12, kSizes[resolution][0]);
+            psv_st16(info.address + 14, kSizes[resolution][1]);
+        }
+    }
     nx::logi(logs::hle, "camera {}: none on the host (not mounted)", device);
     return kCameraNotMounted;
 }
@@ -153,15 +166,25 @@ i32 started(const char* what) {
     nx::logi(logs::hle, "{}: started (offline: nothing connects)", what);
     return 0;
 }
-// ---- SceNetCtl: offline, the connection and ad hoc both disconnected; nothing ever changes, so callbacks never run
+// ---- SceNetCtl: offline, the connection disconnected and nothing ever changing, so its callbacks never run. Ad hoc
+// too, unless ad hoc mode is on (net.cpp): then the network check dialog's ad hoc connection obtains the interface's
+// address (IPOBTAINED), sceNetCtlAdhocDisconnect ends it (DISCONNECT_REQ_FINISHED), and the ad hoc callbacks are told
+// of each, in the thread that calls sceNetCtlCheckCallback, as on the console.
 constexpr i32 kNetCtlNotInitialized = err::code(0x80412101), kNetCtlCallbackMax = err::code(0x80412103),
               kNetCtlIdNotFound = err::code(0x80412104), kNetCtlInvalidId = err::code(0x80412105),
               kNetCtlInvalidAddr = err::code(0x80412107), kNetCtlNotConnected = err::code(0x80412108);
 constexpr u32 kNetCtlCallbacks = 8;
+constexpr i32 kNetCtlStateDisconnected = 0, kNetCtlStateIpObtained = 3;
+constexpr i32 kNetCtlEventDisconnectReqFinished = 2, kNetCtlEventIpObtained = 3;
+struct NetCtlCallback {
+    bool used = false;
+    u32 function = 0, arg = 0;
+};
 struct NetCtl {
     nx::mutex lock;
     bool initialized = false;
-    bool inet[kNetCtlCallbacks] = {}, adhoc[kNetCtlCallbacks] = {};
+    NetCtlCallback inet[kNetCtlCallbacks] = {}, adhoc[kNetCtlCallbacks] = {};
+    nx::vector<i32> adhoc_events;  // (to give the ad hoc callbacks at the next check)
 };
 NetCtl& netctl() {
     static NetCtl n;
@@ -173,13 +196,18 @@ i32 sceNetCtlInit() {
         nx::scoped_lock<nx::mutex> held(n.lock);
         n.initialized = true;
     }
+    if (adhoc_enabled()) {
+        nx::logi(logs::hle, "SceNetCtl: started (offline; ad hoc over the local network)");
+        return 0;
+    }
     return started("SceNetCtl");
 }
 i32 sceNetCtlTerm() {
     NetCtl& n = netctl();
     nx::scoped_lock<nx::mutex> held(n.lock);
     n.initialized = false;
-    for (u32 i = 0; i < kNetCtlCallbacks; ++i) n.inet[i] = n.adhoc[i] = false;
+    for (u32 i = 0; i < kNetCtlCallbacks; ++i) n.inet[i] = n.adhoc[i] = NetCtlCallback{};
+    n.adhoc_events.clear();
     return 0;
 }
 i32 netctl_ready() {
@@ -187,41 +215,66 @@ i32 netctl_ready() {
     nx::scoped_lock<nx::mutex> held(n.lock);
     return n.initialized ? 0 : kNetCtlNotInitialized;
 }
-i32 sceNetCtlCheckCallback() { return netctl_ready(); }
-i32 register_callback(bool* slots, Ptr<i32> cid) {
+// (the events that came since the last check, to each ad hoc callback registered: event type, its argument)
+i32 sceNetCtlCheckCallback(PsvContext* ctx) {
+    nx::vector<i32> events;
+    nx::vector<NetCtlCallback> callbacks;
+    {
+        NetCtl& n = netctl();
+        nx::scoped_lock<nx::mutex> held(n.lock);
+        if (!n.initialized) return kNetCtlNotInitialized;
+        events = std::move(n.adhoc_events);
+        n.adhoc_events.clear();
+        for (const NetCtlCallback& c : n.adhoc)
+            if (c.used && c.function) callbacks.push_back(c);
+    }
+    for (const i32 event : events)
+        for (const NetCtlCallback& c : callbacks) {
+            nx::logi(logs::hle, "SceNetCtl: ad hoc event {} to its callback {:#010x}", event, c.function);
+            const u32 args[] = {static_cast<u32>(event), c.arg};
+            call_guest(ctx, c.function, args);
+        }
+    return 0;
+}
+i32 register_callback(NetCtlCallback* slots, u32 function, u32 arg, Ptr<i32> cid) {
     NetCtl& n = netctl();
     nx::scoped_lock<nx::mutex> held(n.lock);
     if (!n.initialized) return kNetCtlNotInitialized;
     if (!cid || !writable(cid.address, 4)) return kNetCtlInvalidAddr;
     for (u32 i = 0; i < kNetCtlCallbacks; ++i)
-        if (!slots[i]) {
-            slots[i] = true;
+        if (!slots[i].used) {
+            slots[i] = NetCtlCallback{true, function, arg};
             *cid = static_cast<i32>(i);
             return 0;
         }
     return kNetCtlCallbackMax;
 }
-i32 unregister_callback(bool* slots, i32 cid) {
+i32 unregister_callback(NetCtlCallback* slots, i32 cid) {
     NetCtl& n = netctl();
     nx::scoped_lock<nx::mutex> held(n.lock);
     if (!n.initialized) return kNetCtlNotInitialized;
     if (cid < 0 || cid >= static_cast<i32>(kNetCtlCallbacks)) return kNetCtlInvalidId;
-    if (!slots[cid]) return kNetCtlIdNotFound;
-    slots[cid] = false;
+    if (!slots[cid].used) return kNetCtlIdNotFound;
+    slots[cid] = NetCtlCallback{};
     return 0;
 }
-i32 sceNetCtlInetRegisterCallback(Ptr<const void>, Ptr<void>, Ptr<i32> cid) { return register_callback(netctl().inet, cid); }
+i32 sceNetCtlInetRegisterCallback(Ptr<const void> f, Ptr<void> arg, Ptr<i32> cid) {
+    return register_callback(netctl().inet, f.address, arg.address, cid);
+}
 i32 sceNetCtlInetUnregisterCallback(i32 cid) { return unregister_callback(netctl().inet, cid); }
-i32 sceNetCtlAdhocRegisterCallback(Ptr<const void>, Ptr<void>, Ptr<i32> cid) { return register_callback(netctl().adhoc, cid); }
+i32 sceNetCtlAdhocRegisterCallback(Ptr<const void> f, Ptr<void> arg, Ptr<i32> cid) {
+    return register_callback(netctl().adhoc, f.address, arg.address, cid);
+}
 i32 sceNetCtlAdhocUnregisterCallback(i32 cid) { return unregister_callback(netctl().adhoc, cid); }
-i32 get_state(Ptr<i32> state) {
+i32 get_state(Ptr<i32> state, bool adhoc) {
     if (const i32 r = netctl_ready(); r < 0) return r;
     if (!state || !writable(state.address, 4)) return kNetCtlInvalidAddr;
-    *state = 0;  // (SCE_NET_CTL_STATE_DISCONNECTED)
+    u32 address = 0;
+    *state = adhoc && adhoc_address(&address) ? kNetCtlStateIpObtained : kNetCtlStateDisconnected;
     return 0;
 }
-i32 sceNetCtlInetGetState(Ptr<i32> state) { return get_state(state); }
-i32 sceNetCtlAdhocGetState(Ptr<i32> state) { return get_state(state); }
+i32 sceNetCtlInetGetState(Ptr<i32> state) { return get_state(state, false); }
+i32 sceNetCtlAdhocGetState(Ptr<i32> state) { return get_state(state, true); }
 // (the result of the last event: there was none)
 i32 get_result(i32 /*event*/, Ptr<i32> error) {
     if (const i32 r = netctl_ready(); r < 0) return r;
@@ -237,12 +290,24 @@ i32 sceNetCtlInetGetInfo(i32 code, Ptr<void> info) {
     nx::logd(logs::hle, "network information {}: not connected", code);
     return kNetCtlNotConnected;
 }
-i32 sceNetCtlAdhocGetInAddr(Ptr<void> address) {
+// (SceNetInAddr: the ad hoc address, in network order)
+i32 sceNetCtlAdhocGetInAddr(Ptr<u32> address) {
     if (const i32 r = netctl_ready(); r < 0) return r;
-    if (!address) return kNetCtlInvalidAddr;
-    return kNetCtlNotConnected;
+    if (!address || !writable(address.address, 4)) return kNetCtlInvalidAddr;
+    u32 a = 0;
+    if (!adhoc_address(&a)) return kNetCtlNotConnected;
+    *address = a;
+    return 0;
 }
-i32 sceNetCtlAdhocDisconnect() { return netctl_ready(); }
+i32 sceNetCtlAdhocDisconnect() {
+    if (const i32 r = netctl_ready(); r < 0) return r;
+    u32 a = 0;
+    if (adhoc_address(&a)) {
+        adhoc_disconnect();
+        netctl_adhoc_event(kNetCtlEventDisconnectReqFinished);
+    }
+    return 0;
+}
 // (the NAT type is found by asking a STUN server: not connected)
 i32 sceNetCtlGetNatInfo(Ptr<u32> info) {
     if (const i32 r = netctl_ready(); r < 0) return r;
@@ -406,9 +471,22 @@ const Function kScreenShot[] = {
 
 }  // namespace
 
+void netctl_adhoc_event(i32 event_type) {
+    NetCtl& n = netctl();
+    nx::scoped_lock<nx::mutex> held(n.lock);
+    if (n.initialized && n.adhoc_events.size() < 16) n.adhoc_events.push_back(event_type);
+}
+
 void register_system() {
     g_ssl_started = false;
     g_screenshots_disabled = false;
+    {
+        NetCtl& n = netctl();
+        nx::scoped_lock<nx::mutex> held(n.lock);
+        n.initialized = false;
+        for (u32 i = 0; i < kNetCtlCallbacks; ++i) n.inet[i] = n.adhoc[i] = NetCtlCallback{};
+        n.adhoc_events.clear();
+    }
     register_library({"SceAppMgrUser", kSceAppMgrUser, kAppMgrUser});
     register_library({"ScePower", kScePower, kPower});
     register_library({"SceNetCtl", kSceNetCtl, kNetCtl});

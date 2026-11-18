@@ -451,6 +451,9 @@ i32 sceAppUtilSystemParamGetInt(u32 id, Ptr<i32> value) {
     const auto& sys = runtime().config().system;
     switch (id) {
         case 1: *value = sys.language; return 0;
+        // (the enter button, an ID the SDK came to leave unnamed (2): circle (0) on a Japanese console, cross (1)
+        // elsewhere; games of the first firmware ask for it to set up their dialogs)
+        case 2: *value = sys.language == 0 ? 0 : 1; return 0;
         case 4: *value = sys.date_format; return 0;
         case 5: *value = sys.time_format; return 0;
         case 6: *value = sys.time_zone_minutes; return 0;
