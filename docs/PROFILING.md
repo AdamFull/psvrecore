@@ -75,6 +75,25 @@ What a game shows in Tracy:
 `sceRazorCpuIsCapturing` answers whether a profiler is connected; `sceRazorCpuStartCapture` and
 `sceRazorCpuStopCapture` do nothing else (what is recorded is what Tracy records while connected).
 
+## Frame times, and sampling the CPU on an Android phone
+
+`PSVRECORE_FRAME_TIMES=<file>` writes each frame's time (microseconds, from one frame shown to the next) a line at a
+time, so a run stopped from outside keeps them all; on Android give it through the launcher's arguments
+(`--esa args "...,--env,PSVRECORE_FRAME_TIMES=/data/user/0/<package>/files/ft.txt"`) and read it back with `adb
+exec-out run-as <package> cat files/ft.txt`.
+
+Where a thread's time goes, without a Tracy build: Android's `simpleperf` samples the game's process. The shell user
+may not profile another application, but a debuggable package (`android_apk.py --debuggable`, as `android_deploy.py`
+makes it) may profile itself, so run it through `run-as`, user space only, and pull the data the same way:
+
+    adb shell "run-as <package> /system/bin/simpleperf record -p $(adb shell pidof <package>) -e task-clock:u -f 2000 --duration 15 -o files/perf.data"
+    adb exec-out run-as <package> cat files/perf.data > perf.data
+    simpleperf report -i perf.data --sort comm                                    (the NDK's simpleperf/bin/<host>)
+    simpleperf report -i perf.data --symdir <a folder with the unstripped libmain.so> --comms <thread> --sort symbol
+
+The build folder's `libmain.so` has the symbols (the package's is stripped); the game's own threads are named as the
+game named them (cut to 15 characters), the recompiled code's functions `f_<address>`.
+
 ## GPU debug labels
 
 The renderer names its commands with `VK_EXT_debug_utils` labels, which RenderDoc, Nsight Graphics and Radeon GPU
