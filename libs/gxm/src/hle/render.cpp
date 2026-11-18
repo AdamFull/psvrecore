@@ -427,9 +427,12 @@ struct CachedTexture {
 // least recently used go first past it): a texture's content changing every frame (a render target read back as a
 // texture) makes a new one each time. Under kTextureKeep, kept a minute: a song in Persona 4: Dancing All Night
 // went back to a stage of 44 textures 45 s after, and kept for a second or two they were decoded again each time
-// (10-18 ms of that scene on a phone); past it, a second or two.
+// (10-18 ms of that scene on a phone); past it, a second or two. The budget: an eighth of the device's largest
+// device-local heap, from 256 MiB to 512 MiB (texture_budget): WipEout 2048's races sample up to about 400 MiB of
+// textures (PVRTC decoded to RGBA8, 8 bytes a texel for each half byte), and under 256 MiB a stretch of track evicted
+// and decoded its textures again each frame (100-120 ms frames on a PC for seconds).
 constexpr u64 kTextureUnusedScenes = 180, kTextureKeptScenes = 3600;
-constexpr u64 kTextureKeep = 96ull << 20, kTextureBudget = 256ull << 20;
+constexpr u64 kTextureKeep = 96ull << 20, kTextureBudgetLeast = 256ull << 20, kTextureBudgetMost = 512ull << 20;
 
 struct Renderer {
     bool tried = false;
@@ -464,6 +467,7 @@ struct Renderer {
     VkSampler sampler = VK_NULL_HANDLE;
     nx::hash_map<u64, CachedTexture> textures;
     u64 texture_bytes = 0;  // (the cached textures' texels)
+    u64 texture_budget = 0;  // (texture_budget: found once)
     // (by a hash of the control words: the content key last cached for them, whose image the next content those
     // words show is uploaded into: a render target read as a texture is one image, not one a frame)
     nx::hash_map<u64, u64> by_words;
@@ -2529,14 +2533,27 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
 
 // The cached textures no scene has used for a while, and the least recently used past the budget, let go (at a
 // scene's start; the scenes before may still be on the GPU: retire_image keeps what they sample until they are done).
+u64 texture_budget(Renderer& r) {
+    if (r.texture_budget) return r.texture_budget;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(r.device->physical(), &mp);
+    VkDeviceSize heap = 0;
+    for (u32 i = 0; i < mp.memoryHeapCount; ++i)
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = nx::max(heap, mp.memoryHeaps[i].size);
+    r.texture_budget = nx::clamp<u64>(heap / 8, kTextureBudgetLeast, kTextureBudgetMost);
+    nx::logi(logs::gxm, "texture cache: {} MiB at most", r.texture_budget >> 20);
+    return r.texture_budget;
+}
+
 void evict_textures(Renderer& r) {
-    if (r.scenes % 32 != 0 && r.texture_bytes <= kTextureBudget) return;
+    const u64 budget = texture_budget(r);
+    if (r.scenes % 32 != 0 && r.texture_bytes <= budget) return;
     nx::vector<std::pair<u64, u64>> by_age;  // (last used, key)
     for (const auto& [key, t] : r.textures) by_age.push_back({t.used, key});
     std::sort(by_age.begin(), by_age.end());
     for (const auto& [used, key] : by_age) {
         const u64 kept = r.texture_bytes > kTextureKeep ? kTextureUnusedScenes : kTextureKeptScenes;
-        if (used + kept >= r.scenes && r.texture_bytes <= kTextureBudget) break;
+        if (used + kept >= r.scenes && r.texture_bytes <= budget) break;
         auto it = r.textures.find(key);
         r.texture_bytes -= it->second.bytes;
         retire_image(r, it->second.image);
