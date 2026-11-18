@@ -224,6 +224,56 @@ TEST_CASE("ngs: PCM played through the master buss comes out sample for sample; 
     CHECK(psv_ld32(st + 12) == 4000);
 }
 
+TEST_CASE("ngs: Scream's voices are a player, envelope, distortion, EQ, filter and pauser, two outputs, no generator") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    constexpr u32 kDefScream = 0xCE53BC33, kDefScreamAt9 = 0xCD63A2BF;
+    const u32 master = ngs.rack(kDefMaster, 1, 2)[0];
+    const u32 voice = ngs.rack(kDefScream, 1, 2)[0];
+    const u32 at9 = ngs.rack(kDefScreamAt9, 1, 2)[0];
+    // (each module locked with its own type's parameters, as WipEout 2048's Scream writes them)
+    const u32 ids[6] = {kPlayerParamsId, kEnvelopeParamsId, 0x01015CE2, kEqParamsId, 0x01015CE4, 0x01015CE5};
+    for (u32 m = 0; m < 6; ++m) {
+        const u32 info = scratch(8);
+        CHECK(call32(ctx, kSceNgs, kLock, {voice, m, ids[m], info}) == 0);
+        CHECK(call32(ctx, kSceNgs, kUnlock, {voice, m}) == 0);
+        if (m == 0) continue;
+        CHECK(call32(ctx, kSceNgs, kLock, {at9, m, ids[m], info}) == 0);
+        CHECK(call32(ctx, kSceNgs, kUnlock, {at9, m}) == 0);
+    }
+    CHECK(call32(ctx, kSceNgs, kLock, {at9, 0, 0x01015CAA, scratch(8)}) == 0);
+    CHECK(call32(ctx, kSceNgs, kUnlock, {at9, 0}) == 0);
+    CHECK(call32(ctx, kSceNgs, kLock, {voice, 1, kGeneratorParamsId, scratch(8)}) == kParamTypeMismatch);
+    CHECK(call32(ctx, kSceNgs, kLock, {voice, 6, kEqParamsId, scratch(8)}) != 0);  // (six modules)
+    // (outputs 0 and 1 patch; 2 does not)
+    auto patch_from = [&](u32 output) {
+        const u32 setup = scratch(20);
+        const i32 s[5] = {static_cast<i32>(voice), static_cast<i32>(output), -1, static_cast<i32>(master), 0};
+        std::memcpy(t.rt.memory().host(setup), s, sizeof s);
+        return call32(ctx, kSceNgs, kPatchCreate, {setup, scratch(4)});
+    };
+    REQUIRE(patch_from(0) == 0);
+    CHECK(patch_from(2) != 0);
+    // (modules 1-5 bypassed until the game turns them on: the player's samples come out as they are)
+    nx::vector<i16> data(2 * kG);
+    for (u32 i = 0; i < kG; ++i) {
+        data[2 * i] = static_cast<i16>(static_cast<i32>(i * 97 % 16000) - 8000);
+        data[2 * i + 1] = static_cast<i16>(-data[2 * i]);
+    }
+    PlayerParams p = player(2);
+    p.buffs[0] = PlayerBuffer{pcm(data), static_cast<i32>(data.size() * 2), 0, -1};
+    REQUIRE(set_params(ctx, voice, 0, p) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {voice}) == 0);
+    REQUIRE(call32(ctx, kSceNgs, kPlay, {master}) == 0);
+    ngs.update();
+    const nx::vector<i16> out = ngs.output(master);
+    bool same = true;
+    for (u32 i = 0; i < 2 * kG; ++i) same &= out[i] == data[i];
+    CHECK(same);
+    CHECK(patch_from(1) == 0);  // (the second output: a send)
+}
+
 TEST_CASE("ngs: streaming swaps buffers with a callback; loops, lead-in and the sample limit are exact") {
     TestRuntime t;
     PsvContext* ctx = t.ctx();

@@ -34,7 +34,7 @@ constexpr u32 kSceNgs = 0xB01598D9;
 
 // ---- voice definitions
 
-enum class Kind { Buss, Master, MixerBuss, SideChain, SasEmu, Simple, Template1 };
+enum class Kind { Buss, Master, MixerBuss, SideChain, SasEmu, Simple, Template1, Scream };
 
 struct Definition {
     const char* name;
@@ -68,10 +68,20 @@ constexpr Definition kDefinitions[] = {
      Kind::Template1,
      {kAt9Player, kGenerator, kMixer, kParamEq, kEnvelope, kDistortion, kParamEq, kParamEq, kParamEq, kParamEq},
      10, 0, 4, 0b1111111010},
+    // Scream's voices (the sound library games link, sceNgsVoiceDefGetScreamVoice): not in the SDK's documents. Their
+    // layout as WipEout 2048's Scream writes their parameters (each block names its module's type) and patches them:
+    // a player, an envelope, a distortion, an EQ, a filter and a pauser, in that order, two outputs; the game turns
+    // modules 1-4 on itself, so they start bypassed. (Template 1's layout in their place put a 440 Hz generator,
+    // turned on as the "envelope", over every sound, and refused the envelope's, distortion's, filter's and pauser's
+    // parameters.)
+    {"Scream voice", Kind::Scream, {kPlayer, kEnvelope, kDistortion, kParamEq, kFilter, kPauser}, 6, 0, 2, 0b111110},
+    {"Scream ATRAC9 voice", Kind::Scream, {kAt9Player, kEnvelope, kDistortion, kParamEq, kFilter, kPauser}, 6, 0, 2,
+     0b111110},
 };
 enum DefinitionIndex : u32 {
     kMasterBuss, kMixerBuss, kCompressorBuss, kSideChainBuss, kDelayBuss, kDistortionBuss, kEnvelopeBuss, kEqBuss,
-    kPauserBuss, kPitchShiftBuss, kReverbBuss, kSasEmu, kSimple, kSimpleAt9, kTemplate1, kAt9Voice, kDefinitionCount
+    kPauserBuss, kPitchShiftBuss, kReverbBuss, kSasEmu, kSimple, kSimpleAt9, kTemplate1, kAt9Voice, kScream,
+    kScreamAt9, kDefinitionCount
 };
 
 // ---- the guest's structures
@@ -501,10 +511,18 @@ void process_voice(Ngs& n, Voice& v) {
         }
         case Kind::SasEmu:
         case Kind::Simple:
-        case Kind::Template1: {
+        case Kind::Template1:
+        case Kind::Scream: {
             bool ended = false;
             if (!mods[0]->bypassed) render_player(*mods[0], c, a, &ended);
             if (ended) v.ended = v.finished = true;
+            if (d.kind == Kind::Scream) {
+                for (u32 m = 1; m <= 4; ++m) effect(m, a);
+                pause_stage(5, a);
+                v.outputs[0] = a;
+                v.outputs[1] = a;
+                break;
+            }
             if (d.kind == Kind::SasEmu) {
                 effect(1, a);
                 v.outputs[0] = a;
@@ -1276,15 +1294,9 @@ u32 sceNgsVoiceDefGetSimpleVoice() { return definition(kSimple); }
 u32 sceNgsVoiceDefGetSimpleAtrac9Voice() { return definition(kSimpleAt9); }
 u32 sceNgsVoiceDefGetTemplate1() { return definition(kTemplate1); }
 u32 sceNgsVoiceDefGetAtrac9Voice() { return definition(kAt9Voice); }
-// (Scream's voices: their layout is not documented; the template 1 voices stand in)
-u32 sceNgsVoiceDefGetScreamVoice() {
-    nx::logw(logs::audio, "ngs: the Scream voice definition is played as a template 1 voice");
-    return definition(kTemplate1);
-}
-u32 sceNgsVoiceDefGetScreamAtrac9Voice() {
-    nx::logw(logs::audio, "ngs: the Scream ATRAC9 voice definition is played as an ATRAC9 voice");
-    return definition(kAt9Voice);
-}
+// (Scream's voices: their layout found from what a game writes to them, kDefinitions)
+u32 sceNgsVoiceDefGetScreamVoice() { return definition(kScream); }
+u32 sceNgsVoiceDefGetScreamAtrac9Voice() { return definition(kScreamAt9); }
 
 // ---- ATRAC9 sections
 
