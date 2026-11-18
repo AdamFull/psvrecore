@@ -284,7 +284,41 @@ private:
             nx::logw(logs::frontend, "{}", nx::string_view(threads).substr(at, end - at));
             at = end + 1;
         }
+        snapshot();
     }
+
+    // PSVRECORE_STALL_SNAPSHOT=<file>: the first time the picture stands still, the guest's memory (every mapped
+    // page) written to the file, for reading the game's state offline: records of a guest address, a byte count
+    // (both u32, little-endian) and the bytes, one for each run of mapped pages.
+    void snapshot() {
+        const char* path = std::getenv("PSVRECORE_STALL_SNAPSHOT");
+        if (!path || !*path || snapshot_taken_) return;
+        snapshot_taken_ = true;
+        std::FILE* f = std::fopen(path, "wb");
+        if (!f) {
+            nx::logw(logs::frontend, "  the memory snapshot: cannot write '{}'", path);
+            return;
+        }
+        const runtime::GuestMemory& memory = rt_.memory();
+        constexpr u32 kPage = runtime::GuestMemory::kPageSize;
+        u64 written = 0;
+        for (u64 a = 0; a < (1ull << 32);) {
+            if (!memory.valid(static_cast<u32>(a), kPage)) {
+                a += kPage;
+                continue;
+            }
+            u64 end = a + kPage;
+            while (end < (1ull << 32) && memory.valid(static_cast<u32>(end), kPage)) end += kPage;
+            const u32 header[2] = {static_cast<u32>(a), static_cast<u32>(end - a)};
+            std::fwrite(header, sizeof header, 1, f);
+            std::fwrite(memory.host(static_cast<u32>(a)), 1, static_cast<usize>(end - a), f);
+            written += end - a;
+            a = end;
+        }
+        std::fclose(f);
+        nx::logw(logs::frontend, "  the memory snapshot: {} MiB in '{}'", written >> 20, path);
+    }
+    bool snapshot_taken_ = false;
 
     runtime::Runtime& rt_;
     platform::Window& window_;
@@ -512,7 +546,10 @@ int run_game(const Game& game, int argc, char** argv) {
         for (int i = 2; i >= 1; --i)
             std::rename(join(user, nx::format("output.{}.txt", i)).c_str(), join(user, nx::format("output.{}.txt", i + 1)).c_str());
         std::rename(output.c_str(), join(user, "output.1.txt").c_str());
-        if (std::freopen(output.c_str(), "w", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, 0);
+        // (both appending, to a file made empty first: a stream that is not would write over the other's lines from
+        // its own position)
+        if (std::FILE* made = std::fopen(output.c_str(), "w")) std::fclose(made);
+        if (std::freopen(output.c_str(), "a", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, 0);
         if (std::freopen(output.c_str(), "a", stderr)) std::setvbuf(stderr, nullptr, _IONBF, 0);
     }
 #endif
