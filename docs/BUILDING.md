@@ -247,6 +247,50 @@ controls are drawn over the picture (`[controls] on_screen`: auto, always or nev
 them from the start on Android and once the screen is touched elsewhere, and hides them while a gamepad or the keyboard
 is used.
 
+## Packaging a game
+
+`scripts/package.py` makes a game's package for one platform from the game's folder, with one command: it reads the
+game's `sce_sys` (its own SFO reader, `scripts/sce_sys.py`: `TITLE` and the translated `TITLE_00`..`TITLE_19`,
+`TITLE_ID`, `APP_VER`, the update's `param.sfo` over the game's; `icon0.png`), recompiles the game when
+`generated/code` is empty (the game's `scripts/generate_code.py`, with psvrecomp from the host's release preset),
+builds the platform's release preset (only the game's target; `--preset`, `--build-dir` choose others) and packages
+it. A game repository calls it from its own `scripts/package.py`, which gives `--root` (the repository) and `--name`
+(the game's program); the game's folder is the one in the repository's `game/` (or `--game <folder>`):
+
+```
+python scripts/package.py windows   # build/package/windows/<name>/: the program, psvrecore.dll, install.ps1
+python scripts/package.py linux     # build/package/linux/<name>/: the program, libpsvrecore.so.N, <name>.desktop,
+                                    #   icons/hicolor/<n>x<n>/apps/<name>.png, install.sh
+python scripts/package.py android   # build/package/android/<name>.apk
+```
+
+- What is made from `sce_sys` goes to the game repository's `generated/package/` (git-ignored, never committed):
+  `<name>.ico` (16 to 256 px), `<name>.rc`, `hicolor/`, `<name>.desktop`, `icon.png` (256 px) and `sce_sys.json`
+  (what was read). `python scripts/package.py assets` makes only these.
+- The icon: the game's `icon0.png` in the console's round bubble; or the repository's `game/icon.png` when there is
+  one, or `--icon <picture>` (a logo: its artwork made square, not rounded).
+- Windows: the game's `CMakeLists.txt` calls `psvrecore_game_package(<target>)` (`cmake/PsvrecorePackage.cmake`),
+  which compiles `generated/package/<name>.rc` into the program when it is there: the icon (Explorer's and the
+  window's: SDL takes the program's first icon) and the version information (the title, `APP_VER` as the file
+  version, the title ID). The folder runs wherever it is copied; `install.ps1` adds a Start menu shortcut
+  (`-Uninstall` removes it).
+- Linux: `psvrecore_game_package` makes the program find `libpsvrecore.so.N` beside itself (`$ORIGIN`), so the
+  folder runs wherever it is copied (CI uploads it as an artefact; there it packages a made-up game around the
+  shared-library test program, since no game's code reaches CI). The `.desktop` entry is named after the program,
+  as SDL names the window (Wayland's application ID, X11's class), with the translated titles; `install.sh` installs
+  it and the icons for the user (`$XDG_DATA_HOME`, `~/.local/share`) pointing at the folder (`--uninstall`).
+  AppImage or Flatpak: not yet.
+- Android: `scripts/android_apk.py --sce-sys <the game's folder>` names the application `@string/app_name` (the
+  title, its translations as `values-<language>/strings.xml`), takes `APP_VER` as the version name and code (01.04:
+  104) and `icon0.png` as the launcher icon unless `--icon` gives another. `package.py android` passes it, and its
+  other options through (`--install`, `--debuggable`).
+- The window's title is the game's own at run time too: the frontend reads `sce_sys/param.sfo` from the game's folder
+  (`TITLE_xx` in `[system] language`, else `TITLE`); the title the game's program gives is used without one.
+
+`python scripts/package_tests.py [--build <build folder>]` tests these scripts on a made-up game (a `param.sfo`
+written by the test, a drawn icon); with a build folder it packages `psvrecore_shared_tests` as a game's program and
+runs it from the package's folder. Needs Pillow.
+
 ## Android applications
 
 `scripts/android_apk.py` packages a `libmain.so` built by an android-arm64 preset as an APK, with the Android SDK's

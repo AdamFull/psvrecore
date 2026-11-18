@@ -10,5 +10,6 @@ add_library(psvrecore_frontend STATIC
 )
 add_library(psvrecore::frontend ALIAS psvrecore_frontend)
 target_include_directories(psvrecore_frontend PUBLIC include)
-target_link_libraries(psvrecore_frontend PUBLIC psvrecore::platform psvrecore::gxm_hle psvrecore::runtime)
+target_link_libraries(psvrecore_frontend PUBLIC psvrecore::platform psvrecore::gxm_hle psvrecore::runtime
+                                         PRIVATE psvrecore::formats)
 psvrecore_target_defaults(psvrecore_frontend)

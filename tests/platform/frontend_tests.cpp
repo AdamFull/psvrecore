@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <initializer_list>
 #include <optional>
+#include <utility>
 
 #include "nxtest.h"
 #include "psvrecore/frontend/frontend.hpp"
@@ -473,5 +476,60 @@ TEST_CASE("layout: an application folder, or a copy of the console's app/, patch
     auto none = find_layout(root + "/empty", "TEST00000");
     REQUIRE_FALSE(none.has_value());
     CHECK(none.error().message.view().find("has no eboot.bin") != nx::string_view::npos);
+    (void)nx::fs::remove_all(nx::fs::path_view(root));
+}
+
+namespace {
+
+// A param.sfo of text entries (the layout sfo::parse reads), written at `path`.
+void write_sfo(const nx::string& path, std::initializer_list<std::pair<const char*, const char*>> entries) {
+    nx::vector<u8> index, keys, values;
+    const auto put32 = [](nx::vector<u8>& v, u32 x) {
+        for (int i = 0; i < 4; ++i) v.push_back(static_cast<u8>(x >> (8 * i)));
+    };
+    for (const auto& [key, value] : entries) {
+        const u32 length = static_cast<u32>(std::strlen(value)) + 1, size = (length + 3) & ~3u;
+        put32(index, static_cast<u32>(keys.size()) | (0x0204u << 16));  // (key offset, UTF-8 text)
+        put32(index, length);
+        put32(index, size);
+        put32(index, static_cast<u32>(values.size()));
+        for (const char* k = key; *k; ++k) keys.push_back(static_cast<u8>(*k));
+        keys.push_back(0);
+        for (u32 i = 0; i < size; ++i) values.push_back(i + 1 < length ? static_cast<u8>(value[i]) : 0);
+    }
+    while (keys.size() % 4) keys.push_back(0);
+    nx::vector<u8> file;
+    put32(file, 0x46535000);
+    put32(file, 0x0101);
+    put32(file, static_cast<u32>(20 + index.size()));
+    put32(file, static_cast<u32>(20 + index.size() + keys.size()));
+    put32(file, static_cast<u32>(entries.size()));
+    for (const auto* part : {&index, &keys, &values}) file.insert(file.end(), part->begin(), part->end());
+    (void)nx::fs::create_directories(nx::fs::path_view(nx::fs::path::parent_path(path.view())));
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    REQUIRE(f != nullptr);
+    std::fwrite(file.data(), 1, file.size(), f);
+    std::fclose(f);
+}
+
+}  // namespace
+
+TEST_CASE("layout: the game's title from its param.sfo, the update's over the game's, in the console's language") {
+    const nx::string root = temp_file("title");
+    (void)nx::fs::remove_all(nx::fs::path_view(root));
+    GameLayout layout;
+    layout.app = root + "/app/TEST00000";
+    CHECK(game_title(layout, 1).empty());  // (no param.sfo)
+
+    write_sfo(layout.app + "/sce_sys/param.sfo", {{"TITLE", "Game"}, {"TITLE_00", "ゲーム"}, {"TITLE_ID", "TEST00000"}});
+    CHECK(game_title(layout, 1) == "Game");
+    CHECK(game_title(layout, 0) == "ゲーム");  // (Japanese)
+    CHECK(game_title(layout, 18) == "Game");  // (English, UK: no TITLE_18)
+
+    layout.update = root + "/patch/TEST00000";
+    CHECK(game_title(layout, 1) == "Game");  // (an update without a param.sfo: the game's)
+    write_sfo(layout.update + "/sce_sys/param.sfo", {{"APP_VER", "01.01"}, {"TITLE", "Game®"}});
+    CHECK(game_title(layout, 1) == "Game®");
+    CHECK(game_title(layout, 0) == "Game®");  // (the update's own, without translations)
     (void)nx::fs::remove_all(nx::fs::path_view(root));
 }

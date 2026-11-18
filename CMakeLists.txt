@@ -45,6 +45,7 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(PsvrecoreCompilerOptions)
+include(PsvrecorePackage)
 
 # nx-foundation (github.com/AdamFull/nx-foundation, submodule in libs/nx-foundation), unless the including project
 # provides it. Its own third-party code is in submodules too (git submodule update --init --recursive).

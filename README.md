@@ -51,6 +51,9 @@ scripts\build.ps1                      # Windows: configure, build, test (window
 cmake --preset linux-x64-debug && cmake --build --preset linux-x64-debug && ctest --preset linux-x64-debug
 ```
 
+A game's package for Windows, Linux or Android, named and iconed from the game's own `sce_sys`, is one command:
+`scripts/package.py` (see [docs/BUILDING.md](docs/BUILDING.md), "Packaging a game").
+
 ## Tools
 
 `psvinfo` inspects a module (SELF or ELF), an SFO file or a CPK archive:

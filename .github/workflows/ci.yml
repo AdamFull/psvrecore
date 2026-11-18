@@ -20,6 +20,11 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/build.ps1 -Preset ${{ matrix.preset }}
+      - name: Packaging scripts
+        shell: pwsh
+        run: |
+          python -m pip install --quiet pillow
+          python scripts/package_tests.py --build build/${{ matrix.preset }}
       - name: LLVM for the disassembler check
         # (the reference is llvm-objdump 22: older ones print some operands wrongly and track IT blocks otherwise)
         if: matrix.preset == 'windows-x64-release'
@@ -48,13 +53,29 @@ jobs:
           sudo apt-get update && sudo apt-get install -y clang ninja-build
           libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev
           libwayland-dev wayland-protocols libegl1-mesa-dev libasound2-dev libpulse-dev libudev-dev
-          mesa-vulkan-drivers libvulkan1 vulkan-validationlayers
+          mesa-vulkan-drivers libvulkan1 vulkan-validationlayers python3-pil desktop-file-utils
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+      - name: Packaging scripts
+        run: python3 scripts/package_tests.py --build build/${{ matrix.preset }}
+      - name: Package folder
+        # (what scripts/package.py linux makes of a game, here of a made-up one around the shared-library test
+        # program: no game's code reaches CI)
+        if: matrix.preset == 'linux-x64-release'
+        run: |
+          python3 scripts/package_tests.py --make-game build/package-test/game
+          python3 scripts/package.py linux --root build/package-test --name psvrecore_shared_tests \
+            --game build/package-test/game --no-build --build-dir build/${{ matrix.preset }} --out build/package-test/out
+      - name: Upload the package folder
+        if: matrix.preset == 'linux-x64-release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-linux-x64
+          path: build/package-test/out
 
   android-configure:
     runs-on: ubuntu-24.04

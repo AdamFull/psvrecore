@@ -527,7 +527,9 @@ int run_game(const Game& game, int argc, char** argv) {
 
     // The window and the audio device.
     platform::Window::Options window_options;
-    window_options.title = title;
+    // (the game's own title, from its param.sfo in the console's language; else the one the game's program gives)
+    const nx::string sfo_title = game_title(*layout, s.language);
+    window_options.title = sfo_title.empty() ? title : sfo_title;
     window_options.scale = s.scale;
     window_options.fullscreen = s.fullscreen;
     window_options.vsync = s.vsync;
@@ -588,7 +590,7 @@ int run_game(const Game& game, int argc, char** argv) {
     boot.args = {boot.main};
     auto main_thread = rt.loader().boot(boot);
     if (!main_thread) return fail(nx::format("The game could not start: {}", main_thread.error().message), cl.hidden);
-    nx::logi(logs::frontend, "{} started from {}{}{}; data in {}", game.title, layout->app,
+    nx::logi(logs::frontend, "{} started from {}{}{}; data in {}", window_options.title, layout->app,
              layout->update.empty() ? nx::string() : nx::format(", update {}", layout->update),
              layout->addcont.empty() ? nx::string() : nx::format(", add-ons {}", layout->addcont), data);
 

@@ -4,6 +4,7 @@
 #   scripts\build.ps1 -Preset windows-x64-release -NoTest
 #   scripts\build.ps1 -Preset android-arm64-release    # ANDROID_NDK_HOME, or the newest NDK in the Android SDK
 #   scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000  # cache variables for the configure step
+#   scripts\build.ps1 -Preset windows-x64-release -BuildDir build-mine  # the preset in another folder than its own
 #
 # -Root builds another project with the same presets: a game repository calls this script with its own root.
 param(
@@ -11,7 +12,8 @@ param(
     [switch]$NoTest,
     [string[]]$Target,
     [string]$Root = (Split-Path -Parent $PSScriptRoot),
-    [string[]]$Define
+    [string[]]$Define,
+    [string]$BuildDir
 )
 $ErrorActionPreference = 'Stop'
 $root = $Root
@@ -52,13 +54,22 @@ $ErrorActionPreference = 'Continue'
 Push-Location $root
 try {
     $defines = @($Define | Where-Object { $_ } | ForEach-Object { "-D$_" })
-    cmake --preset $Preset @defines
-    if ($LASTEXITCODE) { throw "configure failed ($LASTEXITCODE)" }
-    if ($Target) { cmake --build --preset $Preset --target @Target }
-    else { cmake --build --preset $Preset }
+    if ($BuildDir) {
+        # (the preset's settings in another folder: the build and test presets name the preset's own folder)
+        cmake --preset $Preset -B $BuildDir @defines
+        if ($LASTEXITCODE) { throw "configure failed ($LASTEXITCODE)" }
+        if ($Target) { cmake --build $BuildDir --target @Target }
+        else { cmake --build $BuildDir }
+    } else {
+        cmake --preset $Preset @defines
+        if ($LASTEXITCODE) { throw "configure failed ($LASTEXITCODE)" }
+        if ($Target) { cmake --build --preset $Preset --target @Target }
+        else { cmake --build --preset $Preset }
+    }
     if ($LASTEXITCODE) { throw "build failed ($LASTEXITCODE)" }
     if (-not $NoTest -and -not $Target -and $Preset -notlike 'android-*') {
-        ctest --preset $Preset
+        if ($BuildDir) { ctest --test-dir $BuildDir --output-on-failure }
+        else { ctest --preset $Preset }
         if ($LASTEXITCODE) { throw "tests failed ($LASTEXITCODE)" }
     }
 } finally {

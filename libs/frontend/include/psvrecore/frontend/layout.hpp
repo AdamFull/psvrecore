@@ -27,4 +27,9 @@ struct GameLayout {
 // The layout of `folder` for the game `title_id`, or an error saying what is missing.
 Result<GameLayout> find_layout(const nx::string& folder, nx::string_view title_id);
 
+// The game's title from its sce_sys/param.sfo (the update's, else the game's): TITLE_<language> (the console's
+// language, SCE_SYSTEM_PARAM_LANG_*: TITLE_00 Japanese, TITLE_01 English, ...) when it has one, else TITLE. Empty
+// when neither has a title.
+nx::string game_title(const GameLayout& layout, i32 language);
+
 }  // namespace psvrecore::frontend

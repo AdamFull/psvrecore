@@ -3,7 +3,10 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <span>
 
+#include "psvrecore/formats/sfo.hpp"
+#include "psvrecore/io/file.hpp"
 #include "core/foundation/platform/filesystem.h"
 #include "core/foundation/strings/format.h"
 
@@ -53,6 +56,21 @@ Result<GameLayout> find_layout(const nx::string& folder, nx::string_view title_i
     const nx::string addcont = join(join(folder, "addcont"), title_id);
     if (is_directory(addcont)) layout.addcont = addcont;
     return layout;
+}
+
+nx::string game_title(const GameLayout& layout, i32 language) {
+    for (const nx::string* folder : {&layout.update, &layout.app}) {
+        if (folder->empty()) continue;
+        auto bytes = io::read_file(nx::fs::path_view(join(*folder, "sce_sys/param.sfo")));
+        if (!bytes) continue;
+        auto sfo = sfo::parse(std::span<const u8>(bytes->data(), bytes->size()));
+        if (!sfo) continue;
+        if (language >= 0 && language <= 99) {
+            if (auto t = sfo->text(nx::format("TITLE_{:02d}", language)); t && !t->empty()) return nx::string(*t);
+        }
+        if (auto t = sfo->text("TITLE"); t && !t->empty()) return nx::string(*t);
+    }
+    return {};
 }
 
 }  // namespace psvrecore::frontend

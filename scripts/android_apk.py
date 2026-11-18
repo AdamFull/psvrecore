@@ -9,12 +9,17 @@ missing), so it installs for development only.
     python scripts/android_apk.py --manifest android/AndroidManifest.xml --java android/java \\
         --lib build/android-arm64-release/libmain.so --out build/android-arm64-release/game.apk [--install]
 
+With --sce-sys <the game's folder>, the application is named from the game's param.sfo (its TITLE as the label,
+@string/app_name, with the TITLE_xx translations; APP_VER as the version) and its icon is icon0.png unless --icon
+gives another (scripts/sce_sys.py reads them; scripts/package.py passes it).
+
 Needs ANDROID_HOME (or ANDROID_SDK_ROOT, or C:/Android/Sdk) with build-tools and a platform, the NDK (for llvm-strip),
 and a JDK (javac, keytool) on PATH or in JAVA_HOME.
 """
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +28,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sce_sys  # noqa: E402
 SDL_JAVA = ROOT / "third_party" / "SDL" / "android-project" / "app" / "src" / "main" / "java"
 PSVRECORE_JAVA = ROOT / "android" / "java"  # (PsvrecoreActivity)
 MIN_SDK = 29  # (the android-arm64 presets' ANDROID_PLATFORM)
@@ -142,12 +149,23 @@ def main():
                                                   "corner's)")
     parser.add_argument("--lib", required=True, help="libmain.so (arm64-v8a)")
     parser.add_argument("--out", required=True, help="the .apk to write")
-    parser.add_argument("--version-code", type=int, default=1)
-    parser.add_argument("--version-name", default="0.1")
+    parser.add_argument("--sce-sys", metavar="GAME", help="the game's folder: the label, version and icon from its "
+                                                           "sce_sys (param.sfo, icon0.png)")
+    parser.add_argument("--title-id", help="with --sce-sys: the title, when the game's folder holds several")
+    parser.add_argument("--version-code", type=int, help="default: from APP_VER with --sce-sys (01.04: 104), else 1")
+    parser.add_argument("--version-name", help="default: APP_VER with --sce-sys, else 0.1")
     parser.add_argument("--keep-debug", action="store_true", help="keep the library's debug information")
     parser.add_argument("--debuggable", action="store_true", help="debuggable (run-as, a debugger)")
     parser.add_argument("--install", action="store_true", help="install it on the device adb sees")
     args = parser.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    meta = sce_sys.find(args.sce_sys, args.title_id) if args.sce_sys else None
+    if args.version_code is None:
+        args.version_code = meta.version_code() if meta else 1
+    if args.version_name is None:
+        args.version_name = meta.app_ver if meta else "0.1"
+    if meta and not args.icon and meta.icon:
+        args.icon = str(meta.icon)
 
     sdk = Path(os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or "C:/Android/Sdk")
     build_tools = newest(sdk / "build-tools")
@@ -173,13 +191,30 @@ def main():
         elif "@mipmap/ic_launcher" in Path(args.manifest).read_text(encoding="utf-8") and not (
                 args.res and any(Path(args.res).glob("mipmap*/ic_launcher.*"))):
             write_placeholder_icon(icon)
+        manifest = Path(args.manifest)
+        if meta:
+            # (the application's label: @string/app_name, the title and its translations)
+            sce_sys.write_android_labels(meta, icon)
+            text = manifest.read_text(encoding="utf-8")
+            application = re.search(r"<application\b[^>]*>", text)
+            if not application:
+                raise SystemExit(f"{manifest}: no <application> element")
+            element = application.group(0)
+            if re.search(r'android:label="[^"]*"', element):
+                element = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', element)
+            else:
+                element = element.replace("<application", '<application android:label="@string/app_name"', 1)
+            manifest = tmp / "AndroidManifest.xml"
+            manifest.write_text(text[:application.start()] + element + text[application.end():], encoding="utf-8")
+            print(f"label: {meta.title} ({len(meta.titles())} translations); version {args.version_name} "
+                  f"({args.version_code})")
         if icon.is_dir():
             run([build_tools / f"aapt2{EXE}", "compile", "--dir", icon, "-o", tmp / "icon.zip"])
             flat.append(tmp / "icon.zip")
         gen = tmp / "gen"
         gen.mkdir()
         base = tmp / "base.apk"
-        run([build_tools / f"aapt2{EXE}", "link", "-I", android_jar, "--manifest", args.manifest,
+        run([build_tools / f"aapt2{EXE}", "link", "-I", android_jar, "--manifest", manifest,
              "--min-sdk-version", MIN_SDK, "--target-sdk-version", target_sdk,
              "--version-code", args.version_code, "--version-name", args.version_name,
              "--java", gen, "-o", base, *(["--debug-mode"] if args.debuggable else []), *flat])
