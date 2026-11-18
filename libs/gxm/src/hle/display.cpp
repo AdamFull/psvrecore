@@ -94,8 +94,9 @@ void wait_vblanks(u32 count, bool callbacks) {
 
 i32 set_frame_buf(Ptr<const DisplayFrameBuf> p, i32 sync) {
     // (a frame set by the game itself, not from the display queue's callback: its scenes all ended)
-    if (t_frame_scenes == ~0ull && p) frame_boundary();
-    finish_scenes(t_frame_scenes);  // (the frame drawn into guest memory before it is shown)
+    const u64 frame_scenes = g_frame_scenes.get();
+    if (frame_scenes == ~0ull && p) frame_boundary();
+    finish_scenes(frame_scenes);  // (the frame drawn into guest memory before it is shown)
     if (sync != 0 && sync != 1) return kErrorInvalidUpdateTiming;  // (immediate, next frame)
     Display& d = display();
     latch();  // (one set before, whose blank has come)
@@ -334,8 +335,8 @@ void late_frame_why(const DisplayEntry& e, u64 finishing) {
              "{:.1f}, the GPU {:.1f}, writing back {:.1f})",
              static_cast<f64>(interval) / 1e6, static_cast<f64>(e.since_last_ns) / 1e6,
              static_cast<f64>(finishing - e.queued_ns) / 1e6, static_cast<f64>(done - finishing) / 1e6,
-             static_cast<f64>(t_finish_times.lock_ns) / 1e6, static_cast<f64>(t_finish_times.gpu_ns) / 1e6,
-             static_cast<f64>(t_finish_times.finish_ns) / 1e6);
+             static_cast<f64>(g_finish_times.get().lock_ns) / 1e6, static_cast<f64>(g_finish_times.get().gpu_ns) / 1e6,
+             static_cast<f64>(g_finish_times.get().finish_ns) / 1e6);
 }
 
 void display_queue_main() {
@@ -360,9 +361,9 @@ void display_queue_main() {
         late_frame_why(entry, finishing);
         if (s.init.display_queue_callback) {
             const u32 args[] = {entry.data};
-            t_frame_scenes = entry.scenes;
+            g_frame_scenes.get() = entry.scenes;
             runtime::hle::call_guest(&runtime::Kernel::current()->ctx, s.init.display_queue_callback, args);
-            t_frame_scenes = ~0ull;
+            g_frame_scenes.get() = ~0ull;
         }
         {
             nx::scoped_lock<nx::mutex> held(s.queue_lock);

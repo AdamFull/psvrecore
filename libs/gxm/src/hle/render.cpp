@@ -644,19 +644,20 @@ Renderer& renderer() {
 u32 g_finish_why = 0;
 
 // A guest thread's CPU given up (Kernel::Blocking) while the host works or waits on its behalf, and taken back at the
-// end (which may wait for a CPU): once, nothing inside an outer one.
-thread_local bool t_cpu_given_up = false;
+// end (which may wait for a CPU): once, nothing inside an outer one. (The guest thread's: read again after each of
+// these, which may move it to another host thread.)
+runtime::GuestLocal<bool> g_cpu_given_up{false};
 struct CpuGivenUp {
     std::optional<runtime::Kernel::Blocking> blocking;
     CpuGivenUp() {
-        if (!t_cpu_given_up && runtime::Kernel::current()) {
+        if (!g_cpu_given_up.get() && runtime::Kernel::current()) {
             blocking.emplace(runtime::runtime().kernel());
-            t_cpu_given_up = true;
+            g_cpu_given_up.get() = true;
         }
     }
     void reset() {
         if (!blocking) return;
-        t_cpu_given_up = false;
+        g_cpu_given_up.get() = false;
         blocking.reset();
     }
     ~CpuGivenUp() noexcept(false) { reset(); }
@@ -670,13 +671,13 @@ struct CpuGivenUp {
 struct CpuLent {
     bool lent = false;
     CpuLent() {
-        if (t_cpu_given_up || !runtime::Kernel::current()) return;
+        if (g_cpu_given_up.get() || !runtime::Kernel::current()) return;
         lent = runtime::runtime().kernel().lend_cpu();
-        t_cpu_given_up = lent;
+        g_cpu_given_up.get() = lent;
     }
     ~CpuLent() noexcept(false) {
         if (!lent) return;
-        t_cpu_given_up = false;
+        g_cpu_given_up.get() = false;
         runtime::runtime().kernel().reclaim_cpu();
     }
     CpuLent(const CpuLent&) = delete;
@@ -4851,7 +4852,7 @@ bool gpu_capture_in_progress() {
 
 void finish_scenes(u64 limit) {
     Renderer& r = renderer();
-    t_finish_times = {};
+    g_finish_times.get() = {};
     wait_rendered(r, limit);
     if (!r.pending_count.load(std::memory_order_acquire)) return;
     // The scenes pending now up to `limit` (not those submitted while this waits), waited for without the renderer's
@@ -4861,7 +4862,7 @@ void finish_scenes(u64 limit) {
     {
         const u64 t0 = nx::os::ticks_ns();
         TargetsHeld held(r);
-        t_finish_times.lock_ns += nx::os::ticks_ns() - t0;
+        g_finish_times.get().lock_ns += nx::os::ticks_ns() - t0;
         if (r.pending.empty()) return;
         upto = nx::min(limit, r.pending.back().number);
         // (numbers of scenes not submitted, with nothing to draw, are skipped)
@@ -4878,13 +4879,13 @@ void finish_scenes(u64 limit) {
             const u64 before = r.finished;
             finish_pending(r, false);
             const u64 t2 = nx::os::ticks_ns();
-            t_finish_times.lock_ns += t1 - t0;
-            (r.finished != before ? t_finish_times.finish_ns : t_finish_times.gpu_ns) += t2 - t1;
+            g_finish_times.get().lock_ns += t1 - t0;
+            (r.finished != before ? g_finish_times.get().finish_ns : g_finish_times.get().gpu_ns) += t2 - t1;
             if (r.finished >= upto || r.pending.empty() || r.pending.front().number > upto) return;
         }
         const u64 t3 = nx::os::ticks_ns();
         nx::this_thread::sleep_for(std::chrono::microseconds(100));
-        t_finish_times.gpu_ns += nx::os::ticks_ns() - t3;
+        g_finish_times.get().gpu_ns += nx::os::ticks_ns() - t3;
     }
 }
 

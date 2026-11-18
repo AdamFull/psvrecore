@@ -52,8 +52,9 @@ stretch from the command line and look at it afterwards:
 What a game shows in Tracy:
 
 - **A lane for each guest thread, named as the game named it** (`sceKernelCreateThread`), and one for each of its
-  fibers (`sceFiberInitialize`'s name). Guest threads run on host threads the kernel reuses, so each is a Tracy
-  "fiber": what a guest thread did is in its lane whichever host thread ran it. Two threads alive at once with the
+  fibers (`sceFiberInitialize`'s name). A guest thread may run on more than one host thread (with the
+  fiber backend, and a thread started again gets another), so each is a Tracy "fiber": what a guest thread did is in
+  its lane whichever host thread ran it. Two threads alive at once with the
   same name get "name 2", "name 3". Host threads (the renderer's, the audio's, the display queue's) are threads of
   their own, named after their host names.
 - **The game's CPU markers**: `sceRazorCpuPushMarker`, `sceRazorCpuPushMarkerWithHud` (with its colour),

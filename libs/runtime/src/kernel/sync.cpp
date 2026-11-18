@@ -584,7 +584,7 @@ i32 Kernel::notify_callback(Uid uid, i32 arg) {
     if (!cb) return err::kUnknownCallbackId;
     ++cb->notify_count;
     cb->notify_arg = arg;
-    Impl::wake(cb->thread);  // (a thread in a CB wait runs it)
+    impl_->wake(cb->thread);  // (a thread in a CB wait runs it)
     return err::kOk;
 }
 

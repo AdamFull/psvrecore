@@ -404,14 +404,14 @@ void finish_scenes(u64 upto = ~0ull);  // (the scenes ended up to this one, numb
 struct FinishTimes {
     u64 lock_ns = 0, gpu_ns = 0, finish_ns = 0;
 };
-inline thread_local FinishTimes t_finish_times;
+inline runtime::GuestLocal<FinishTimes> g_finish_times;
 // The number of the last scene ended (0: none yet).
 u64 scenes_submitted();
 // The number of the last scene the renderer's thread is done with (submitted, or found to have nothing to draw).
 u64 scenes_rendered();
 // (on the display queue's thread, while it shows a frame: the last of that frame's scenes, which the frame buffer
 // set from its callback waits for, not the next frame's)
-inline thread_local u64 t_frame_scenes = ~0ull;
+inline runtime::GuestLocal<u64> g_frame_scenes{~0ull};
 // The game's user markers recorded (UserMarker): something shows them (debug labels, Tracy).
 bool user_markers_wanted();
 // GPU captures (RenderDoc; nothing when it is not loaded): the next frame's scenes captured (`why`: the capture's

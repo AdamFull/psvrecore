@@ -52,6 +52,14 @@ FrameStats::FrameStats() {
         const f64 s = std::atof(v);
         if (s > 0) log_period_ = static_cast<u64>(s * 1e9);
     }
+    if (const char* v = std::getenv("PSVRECORE_FRAME_TIMES"); v && *v) {
+        times_file_ = std::fopen(v, "w");
+        if (!times_file_) nx::logw(logs::display, "PSVRECORE_FRAME_TIMES: cannot write {}", v);
+    }
+}
+
+FrameStats::~FrameStats() {
+    if (times_file_) std::fclose(times_file_);
 }
 
 void FrameStats::record(u64 ns) {
@@ -60,6 +68,7 @@ void FrameStats::record(u64 ns) {
         at_[next_] = ns;
         next_ = (next_ + 1) % kHistory;
         count_ = nx::min(count_ + 1, kHistory);
+        if (times_file_) std::fprintf(times_file_, "%llu\n", static_cast<unsigned long long>((ns - last_) / 1000));
         if (log_period_) {
             if (!log_from_) log_from_ = ns;
             // (a frame that took half again as long as the period's median so far, or as 50 ms: when, and how long)

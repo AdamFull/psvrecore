@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -656,6 +657,27 @@ TEST_CASE("kernel: shutting down ends threads blocked in the kernel") {
         delay(ctx, 5000);
     }
     CHECK(nx::os::ticks_ns() - before < 1'500'000'000ull);  // (well before the shutdown's give-up time)
+}
+
+TEST_CASE("kernel: a thread started again and again runs each time (the rate printed: what a start costs)") {
+    TestRuntime t(kernel::kUserCpuCount, 100);
+    static std::atomic<u32> ran{0};
+    ran = 0;
+    GuestCode code;
+    const u32 entry = code.add([](PsvContext*, uint32_t) { ++ran; });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    const i32 uid = create_thread(ctx, "again", entry, 120);
+    constexpr u32 kStarts = 300;
+    const u64 from = nx::os::ticks_ns();
+    for (u32 i = 0; i < kStarts; ++i) {
+        CHECK(start_thread(ctx, uid) == 0);
+        CHECK(wait_end(ctx, uid) == 0);
+    }
+    const f64 ms = static_cast<f64>(nx::os::ticks_ns() - from) / 1e6;
+    CHECK(ran.load() == kStarts);
+    std::printf("kernel: %u starts of a thread, each waited for, in %.1f ms: %.0f a second\n", kStarts, ms,
+                kStarts * 1000.0 / ms);
 }
 
 TEST_CASE("kernel: suspended, no thread runs and the clock stands still; resumed, both go on from there") {

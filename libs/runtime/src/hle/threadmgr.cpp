@@ -136,8 +136,8 @@ i32 sceKernelCheckThreadStack(PsvContext* ctx) {
 
 i32 sceKernelChangeThreadVfpException(i32 clear, i32 set) {
     // (Floating-point exception traps are not modeled: the masks are kept and reported, never acted on.)
-    static thread_local i32 mask = 0;
-    mask = (mask & ~clear) | set;
+    static GuestLocal<i32> mask{0};  // (the calling thread's)
+    mask.get() = (mask.get() & ~clear) | set;
     return err::kOk;
 }
 i32 sceKernelGetCurrentThreadVfpException() { return 0; }

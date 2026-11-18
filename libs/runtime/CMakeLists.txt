@@ -41,6 +41,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/touch.cpp
     src/hle/videodec.cpp
     src/hle/voice.cpp
+    src/kernel/backend_native.cpp
     src/kernel/scheduler.cpp
     src/kernel/sync.cpp
     src/kernel/threads.cpp

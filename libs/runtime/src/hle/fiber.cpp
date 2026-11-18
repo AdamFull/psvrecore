@@ -5,7 +5,9 @@
 // Recompiled code keeps a guest call chain on the host's stack as well as the guest's, so each fiber has a host
 // stack of its own (nx::fiber's contexts) besides the guest stack the game gives it (its context memory). A switch
 // saves the guest registers of the side that leaves, switches host stacks, and the side that resumes restores its
-// own. Everything stays on the thread's OS thread: the kernel's current thread is the same throughout.
+// own. The kernel's current thread is the same throughout; its OS thread may not be (with fibers the kernel moves a
+// guest thread between host threads at its waits), so what a thread knows of its fibers is the guest thread's
+// (GuestLocal), read again after every switch.
 
 #include <array>
 #include <atomic>
@@ -64,12 +66,12 @@ Fibers& fibers() {
     return f;
 }
 
-thread_local ThreadFibers* t_fibers = nullptr;
+GuestLocal<ThreadFibers> g_thread_fibers;  // (one per guest thread's run that runs a fiber)
 
 ThreadFibers& this_thread(PsvContext* ctx) {
-    if (!t_fibers) t_fibers = new ThreadFibers;  // (one per OS thread that ever runs a fiber; kept)
-    t_fibers->ctx = ctx;
-    return *t_fibers;
+    ThreadFibers& t = g_thread_fibers.get();
+    t.ctx = ctx;
+    return t;
 }
 
 Fiber* find(u32 guest) {
@@ -102,7 +104,7 @@ u32 resume(ThreadFibers& t, Fiber* to, u32 value) {
     }
     const nx::fiber::Transfer back = nx::fiber::switch_to(from_host, to_host, &hand);
     // (resumed: this side's registers back)
-    ThreadFibers& now = *t_fibers;
+    ThreadFibers& now = g_thread_fibers.get();
     *now.ctx = from ? from->regs : now.regs;
     return static_cast<const Hand*>(back.data)->value;
 }
@@ -112,7 +114,7 @@ void fiber_main(nx::fiber::Transfer t) {
     const Hand* hand = static_cast<const Hand*>(t.data);
     Fiber* f = hand->to;
     const u32 arg_on_run = hand->value;
-    ThreadFibers& tf = *t_fibers;
+    ThreadFibers& tf = g_thread_fibers.get();
     PsvContext* ctx = tf.ctx;
     // (its registers start as the resumer's were, its stack at the top of its context memory; a fiber made without
     // context memory runs on the stack of the side that resumed it, below where that side waits: libult's workers

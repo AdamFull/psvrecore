@@ -6,6 +6,7 @@
 #include <atomic>
 #include <optional>
 
+#include "backend.hpp"
 #include "psvrecore/log.hpp"
 #include "psvrecore/runtime/kernel.hpp"
 #include "core/foundation/containers/hash_map.h"
@@ -49,17 +50,15 @@ struct Kernel::Impl {
     u32 host_threads = 0;  // host threads running a guest thread
     nx::cond_var host_threads_changed;
 
-    // Host threads kept running for guest threads to start on: starting an OS thread can take tens of
-    // milliseconds, starting a guest thread on a waiting one takes microseconds, as on the console.
-    struct HostWorker {
-        nx::thread_parker parker;
-        kernel::Thread* job = nullptr;
-        bool quit = false;
-    };
-    nx::vector<HostWorker*> idle_workers;
-    u32 workers_alive = 0, workers_starting = 0;
-    void spawn_worker();
-    void worker_loop(HostWorker* w);
+    // (PSVRECORE_THREAD_STATS=1) The threads started, and how long each took from the start call to running on its
+    // host thread (microseconds); logged at shutdown.
+    bool thread_stats = false;
+    u64 first_start_ns = 0, last_start_ns = 0;
+    nx::vector<u32> start_latency_us;
+    void log_thread_stats();
+
+    // How guest threads run on the host (kernel/backend.hpp).
+    kernel::BackendHost backend_host();
 
     // ---- objects
     Uid new_uid();
@@ -91,8 +90,8 @@ struct Kernel::Impl {
     void dispatch();
     void wait_for_cpu(kernel::Thread* t);
     // The calling thread (t) waits, without the lock, until woken or the deadline; then takes the lock again.
-    void park(kernel::Thread* t, std::optional<u64> deadline_ns = std::nullopt);
-    static void wake(kernel::Thread* t) { t->parker.unpark(); }
+    void park(kernel::Thread* t, std::optional<u64> deadline_ns = std::nullopt) { backend->park(t, deadline_ns); }
+    void wake(kernel::Thread* t) { backend->unpark(t); }
     // The current thread waits: gives up its CPU until the wait ends (end_wait, a timeout, a callback notification
     // when `callbacks`, or shutdown) and it has a CPU again. Returns the wait's result. `queue` (if any) must already
     // hold the thread. Throws ThreadExit on shutdown.
@@ -109,7 +108,7 @@ struct Kernel::Impl {
     u64 now_ns() const;
 
     // ---- threads
-    void run_thread(kernel::Thread* t);       // a guest thread's host thread (no lock held)
+    void run_thread(kernel::Thread* t);       // a guest thread's run, on its host context (no lock held)
     void finish_thread(kernel::Thread* t, i32 status, bool delete_thread);
     void free_thread_memory(kernel::Thread* t);
     void unlock_owned_mutexes(kernel::Thread* t);
@@ -121,6 +120,9 @@ struct Kernel::Impl {
     void pump_msg_pipe(kernel::MsgPipe* p, kernel::Thread* self);
     i32 transfer_msg_pipe(Uid uid, bool send, u32 buffer, u32 size, u32 mode, u32* moved, const kernel::Timeout& timeout,
                           bool callbacks);
+
+    // Last: made last, gone first (its host threads use the lock and the rest).
+    nx::unique_ptr<kernel::ThreadBackend> backend;
 };
 
 // The priority a create or change call asks for: SCE_KERNEL_DEFAULT_PRIORITY_USER (+/- offset) means the game

@@ -6,7 +6,8 @@
 // Tracy's client is built on demand (TRACY_ON_DEMAND): it records only while a profiler is connected, and a running
 // game is profiled by connecting to it (docs/PROFILING.md).
 //
-// Guest threads run on host threads the kernel reuses, and a guest thread's fibers on its thread, so each guest thread
+// A guest thread may run on several host threads (the fiber backend moves it; started again, it gets another), and a
+// guest thread's fibers on its thread, so each guest thread
 // and each guest fiber is a lane of its own in Tracy (a Tracy "fiber", named after the guest's name): what a guest
 // thread does is in its lane, whichever host thread ran it. A host thread that runs no lane (the renderer's, the
 // audio's) is its own thread in Tracy, named after its host name.

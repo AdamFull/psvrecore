@@ -259,9 +259,11 @@
 - **Guest threads that never end keep the process alive.** At shutdown, threads blocked in the kernel end, but one
   running guest code without kernel calls cannot be stopped. Its host thread is left to the process exit, and the
   kernel's state stays allocated for it.
-- **Timing on the development machine.** Starting an OS thread there takes 30-100 ms, and while one starts, other
-  threads' timed wake-ups are late by about 10-15 ms. Guest threads start on pooled host threads, so this only
-  happens when the pool grows. Elsewhere, timed waits (delays, timeouts) end within a millisecond of their deadline.
+- **Timing on the development machine.** Starting an OS thread there took 30-100 ms in October 2026, with other
+  threads' timed wake-ups 10-15 ms late meanwhile, so guest threads ran on pooled host threads until 2026-11-18.
+  Now a start takes 0.1-0.9 ms (a median of 0.34 ms in P4D) and costs no frame time, and each start makes an OS
+  thread of its own ([THREAD_BACKENDS.md](THREAD_BACKENDS.md)). Timed waits (delays, timeouts) end within a
+  millisecond of their deadline.
 - **Memory budgets are fixed defaults.** Main memory 256 MiB and CDRAM 128 MiB for memory blocks, set in
   `Runtime::Config`. The console's figures for a game are not reproduced exactly.
 - **Run on Windows and Android.** The POSIX host layer (faults, files, decommit) runs on Android arm64 (the SDK

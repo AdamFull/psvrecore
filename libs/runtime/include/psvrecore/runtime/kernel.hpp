@@ -2,8 +2,9 @@
 
 // The kernel: guest threads, their scheduling, and the objects they synchronise with.
 //
-// Every guest thread runs on a host thread of its own, but runs only while it holds one of the console's CPUs (the
-// three a game has). The kernel hands CPUs out as the console's scheduler does:
+// Every guest thread runs on a host context of its own (an OS thread of its own, or with PSVRECORE_GUEST_FIBERS a
+// fiber: kernel/backend.hpp), but runs only while it holds one of the console's CPUs (the three a game has). The
+// kernel hands CPUs out as the console's scheduler does:
 //   - fixed priorities (a lower number is a higher priority), FIFO among equal priorities;
 //   - no time slicing: a running thread keeps its CPU until it waits, ends, or a thread of higher priority needs it;
 //   - a thread runs only on the CPUs its affinity mask allows.
@@ -11,11 +12,14 @@
 // priority. The thread that loses its CPU stops at its next kernel call: a host thread cannot be stopped between two
 // guest instructions, so until then both run (KNOWN_ISSUES.md).
 //
-// One lock guards all kernel state. A thread waits on a host condition variable of its own; whoever ends the wait
-// (a signal, a timeout, deletion of the object) records the result and makes the thread ready.
+// One lock guards all kernel state. A thread waits through the thread backend (its own parker, or its fiber
+// suspended); whoever ends the wait (a signal, a timeout, deletion of the object) records the result and makes the
+// thread ready.
 
 #include <atomic>
 #include <memory>
+#include <optional>
+#include <type_traits>
 #include <utility>
 
 #include "psvrecore/recomp/guest.h"
@@ -27,11 +31,42 @@
 #include "core/foundation/threading/sync.h"
 #include "core/foundation/threading/thread.h"
 
+namespace psvrecore::profile {
+struct Track;
+}
+
 namespace psvrecore::runtime {
 
 using Uid = i32;
 
 namespace kernel {
+
+// The runtime's own state of a guest thread's run, not of the host thread running it (with fibers a guest thread
+// moves between host threads; natively a host thread is made for each run): GuestLocal<T>'s slots. Made on first use,
+// freed when the thread starts again or goes.
+inline constexpr u32 kLocalSlots = 16;
+struct LocalSlots {
+    struct Slot {
+        void* value = nullptr;
+        void (*destroy)(void*) = nullptr;
+    };
+    Slot slots[kLocalSlots];
+    LocalSlots() = default;
+    ~LocalSlots() { clear(); }
+    LocalSlots(const LocalSlots&) = delete;
+    LocalSlots& operator=(const LocalSlots&) = delete;
+    void clear() {
+        for (Slot& s : slots) {
+            if (s.value) s.destroy(s.value);
+            s = Slot{};
+        }
+    }
+};
+// A new slot's index (each GuestLocal takes one, at its construction).
+u32 new_local_slot();
+// The calling thread's slots: its guest thread's, or (a host thread that runs none) its own. Not inlined: read
+// again after every kernel call, which may have moved the guest thread to another host thread.
+NX_NO_INLINE LocalSlots& current_local_slots();
 
 inline constexpr i32 kHighestPriority = 64;
 inline constexpr i32 kLowestPriority = 191;
@@ -148,7 +183,11 @@ struct Thread : Object {
     std::atomic<bool> lost_cpu{false};  // set when its CPU was taken while it runs guest code
     // (the time it has held a CPU, and been ready without one: host clock, ns)
     u64 held_ns = 0, held_since = 0, ready_ns = 0, ready_since = 0;
+    u64 start_called_ns = 0;  // (PSVRECORE_THREAD_STATS: when the start call came)
     nx::thread_parker parker;  // its host thread waits here (to the microsecond, which a futex timeout is not)
+    void* backend = nullptr;   // the thread backend's own state of its run (with fibers: its fiber)
+    profile::Track* track = nullptr;  // (its lane in the profiler while it runs)
+    LocalSlots locals;
 
     Wait wait;
     i32 exit_status = 0;
@@ -433,6 +472,9 @@ public:
         u64 held_ns, ready_ns;
     };
     nx::vector<CpuUse> cpu_use();
+    // (PSVRECORE_THREAD_STATS=1) The threads started so far and how long each took to run, to the log; also at
+    // shutdown.
+    void log_thread_stats();
     // Called on a host thread that runs no guest thread (a test, the process start-up): adopt it as a guest thread
     // with this name, priority and stack, holding a CPU, so it can make kernel calls. Ended by release_host_thread().
     Uid adopt_host_thread(nx::string_view name, i32 priority = kernel::kGamePriority, u32 stack_size = kernel::kMainStackSize);
@@ -445,6 +487,32 @@ private:
     struct Impl;
     nx::unique_ptr<Impl> impl_;
     GuestMemory& memory_;
+};
+
+// A variable of each guest thread (and of each host thread that runs none), for the runtime's code that runs on guest
+// threads: thread_local is the host thread's, which with fibers is not the guest thread's, and natively belongs to
+// one run. `get()` is read again after anything that may wait (a kernel call), never kept across one.
+template <class T>
+class GuestLocal {
+public:
+    GuestLocal() = default;
+    explicit GuestLocal(T init) : init_(std::move(init)) {}
+    GuestLocal(const GuestLocal&) = delete;
+    GuestLocal& operator=(const GuestLocal&) = delete;
+
+    T& get() {
+        kernel::LocalSlots::Slot& s = kernel::current_local_slots().slots[slot_];
+        if (!s.value) {
+            if constexpr (std::is_copy_constructible_v<T>) s.value = init_ ? new T(*init_) : new T();
+            else s.value = new T();
+            s.destroy = [](void* p) { delete static_cast<T*>(p); };
+        }
+        return *static_cast<T*>(s.value);
+    }
+
+private:
+    std::optional<T> init_;
+    u32 slot_ = kernel::new_local_slot();
 };
 
 }  // namespace psvrecore::runtime

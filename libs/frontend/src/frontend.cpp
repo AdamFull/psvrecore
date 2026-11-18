@@ -719,6 +719,7 @@ int run_game(const Game& game, int argc, char** argv) {
     }
     const i32 code = rt.exited() ? rt.exit_code() : 0;
     gxm::save_caches();
+    rt.kernel().log_thread_stats();
     nx::log::flush();
     const gxm::PlayStats made = gxm::play_stats();
     std::fprintf(stderr,

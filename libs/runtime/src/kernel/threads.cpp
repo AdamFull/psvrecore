@@ -1,4 +1,4 @@
-// Guest threads: creation, the host thread each one runs on, ending, waiting for an end, delays, priorities.
+// Guest threads: creation, the host context each one runs on (through the thread backend), ending, waiting for an end, delays, priorities.
 
 #include <algorithm>
 #include <cstring>
@@ -9,6 +9,7 @@
 #include "psvrecore/recomp/support.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "core/foundation/strings/format.h"
+#include "core/foundation/platform/os.h"
 #include "core/foundation/threading/thread.h"
 
 namespace psvrecore::runtime {
@@ -20,10 +21,8 @@ void set_current_thread(Thread* t);
 namespace {
 
 constexpr u32 kMaxThreads = 128;
-constexpr usize kWorkerStack = usize{4} << 20;  // the host stack of pooled host threads
-constexpr u32 kSpareWorkers = 4;                // kept waiting
 
-// The host stack a guest thread's host thread gets: recompiled functions use more stack than the guest's (their
+// The host stack a guest thread's host context gets: recompiled functions use more stack than the guest's (their
 // frames hold temporaries), and guest recursion is host recursion.
 usize host_stack_size(u32 guest_stack) {
     const u64 size = std::max<u64>(u64{4} << 20, u64{guest_stack} * 16);
@@ -34,57 +33,16 @@ usize host_stack_size(u32 guest_stack) {
 
 // ---- host side
 
-void Kernel::Impl::spawn_worker() {
-    // (lock held) The worker joins the idle list once its OS thread runs.
-    ++workers_alive;
-    ++workers_starting;
-    auto* w = new HostWorker;
-    nx::thread_options options;
-    options.name = "guest thread";
-    options.stack_size = kWorkerStack;
-    nx::thread host([this, w] { worker_loop(w); }, options);
-    host.detach();
-}
-
-void Kernel::Impl::worker_loop(HostWorker* w) {
-    host::frame_thread();  // (guest threads run here: the frames' work)
-    {
-        Lock guard(lock);
-        --workers_starting;
-        if (!shutting_down) idle_workers.push_back(w);
-        else w->quit = true;
-    }
-    for (;;) {
-        Thread* job = nullptr;
-        {
-            Lock guard(lock);
-            while (!w->job && !w->quit) {
-                lock.unlock();
-                w->parker.park();
-                lock.lock();
-            }
-            if (!w->job) break;
-            job = w->job;
-        }
-        nx::this_thread::set_name(job->name.c_str());
-        run_thread(job);
-        Lock guard(lock);
-        w->job = nullptr;
-        if (shutting_down) break;
-        idle_workers.push_back(w);
-    }
-    Lock guard(lock);
-    idle_workers.erase(std::remove(idle_workers.begin(), idle_workers.end(), w), idle_workers.end());
-    delete w;
-    --workers_alive;
-    host_threads_changed.notify_all();
-}
-
 void Kernel::Impl::run_thread(Thread* t) {
     set_current_thread(t);
+    if (thread_stats) {
+        const u64 n = nx::os::ticks_ns();
+        Lock guard(lock);
+        start_latency_us.push_back(static_cast<u32>(nx::min<u64>((n - t->start_called_ns) / 1000, ~0u)));
+    }
     // (its own lane in the profiler, named after it, whichever host thread runs it)
-    profile::Track* track = profile::acquire(t->name);
-    profile::enter(track);
+    t->track = profile::acquire(t->name);
+    profile::enter(t->track);
     {
         Lock guard(lock);
         wait_for_cpu(t);
@@ -109,9 +67,10 @@ void Kernel::Impl::run_thread(Thread* t) {
         ended = true;
     }
     (void)ended;
-    profile::release(track);
-    profile::enter(nullptr);
     Lock guard(lock);
+    profile::release(t->track);
+    t->track = nullptr;
+    profile::enter(nullptr);
     finish_thread(t, status, delete_thread);
     set_current_thread(nullptr);
     --host_threads;
@@ -126,6 +85,7 @@ void Kernel::Impl::finish_thread(Thread* t, i32 status, bool delete_thread) {
     t->state = ThreadState::Dormant;
     t->exit_status = status;
     t->lost_cpu.store(false, std::memory_order_relaxed);
+    backend->end(t);
     while (!t->end_waiters.empty()) {
         Thread* w = t->end_waiters.front();
         w->wait.restore_count = static_cast<u32>(status);  // (the exit status, for the waiter)
@@ -148,6 +108,24 @@ void Kernel::Impl::free_thread_memory(Thread* t) {
     if (t->stack) memory.unmap(t->stack);
     if (t->tls) memory.unmap(t->tls);
     t->stack = t->tls = 0;
+}
+
+void Kernel::Impl::log_thread_stats() {
+    // (lock held)
+    if (!thread_stats || start_latency_us.empty()) return;
+    nx::vector<u32> sorted = start_latency_us;
+    std::sort(sorted.begin(), sorted.end());
+    u64 total = 0;
+    for (u32 v : sorted) total += v;
+    const f64 seconds = static_cast<f64>(nx::os::ticks_ns() - start_ns) / 1e9;
+    const f64 span = static_cast<f64>(last_start_ns - first_start_ns) / 1e9;
+    nx::logi(logs::kernel, "threads: {} started in {:.1f} s ({:.2f} a second; {:.1f} s from the first start to the last); "
+             "from the start call to running on a host thread: mean {:.0f} us, median {}, 99% {}, worst {}; backend {}, "
+             "{} host threads made",
+             sorted.size(), seconds, static_cast<f64>(sorted.size()) / seconds, span,
+             static_cast<f64>(total) / static_cast<f64>(sorted.size()), sorted[sorted.size() / 2],
+             sorted[nx::min(sorted.size() - 1, sorted.size() * 99 / 100)], sorted.back(), backend->name(),
+             backend->host_threads_made());
 }
 
 // ---- threads
@@ -215,24 +193,16 @@ i32 Kernel::start_thread(Uid uid, u32 arg_size, u32 arg_block) {
     t->terminate = false;
     t->signal = 0;
     t->lost_cpu.store(false, std::memory_order_relaxed);
+    if (impl_->thread_stats) {
+        t->start_called_ns = nx::os::ticks_ns();
+        if (!impl_->first_start_ns) impl_->first_start_ns = t->start_called_ns;
+        impl_->last_start_ns = t->start_called_ns;
+    }
+
+    t->locals.clear();  // (a new run: nothing of the last)
 
     ++impl_->host_threads;
-    const usize host_stack = host_stack_size(t->stack_size);
-    if (host_stack <= kWorkerStack && !impl_->idle_workers.empty()) {
-        Impl::HostWorker* w = impl_->idle_workers.back();
-        impl_->idle_workers.pop_back();
-        w->job = t;
-        w->parker.unpark();
-    } else {
-        // (a stack larger than the pool's, or no worker waiting: an OS thread of its own)
-        nx::thread_options options;
-        options.name = t->name.c_str();
-        options.stack_size = host_stack;
-        Impl* impl = impl_.get();
-        nx::thread host([impl, t] { impl->run_thread(t); }, options);
-        host.detach();
-    }
-    if (impl_->idle_workers.size() + impl_->workers_starting < kSpareWorkers && !impl_->shutting_down) impl_->spawn_worker();
+    impl_->backend->start(t, host_stack_size(t->stack_size));
     impl_->make_ready(t);
     return err::kOk;
 }
@@ -453,6 +423,11 @@ nx::vector<Kernel::CpuUse> Kernel::cpu_use() {
     return out;
 }
 
+void Kernel::log_thread_stats() {
+    Lock guard(impl_->lock);
+    impl_->log_thread_stats();
+}
+
 nx::string Kernel::describe_threads() {
     Lock guard(impl_->lock);
     nx::string out;
@@ -466,6 +441,7 @@ nx::string Kernel::describe_threads() {
                                                                : "deleted";
         out += nx::format("  0x{:08x} '{}': {}, priority {}, affinity 0x{:x}, cpu {}, lr {:08x} sp {:08x}", static_cast<u32>(uid),
                           t->name, state, t->priority, static_cast<u32>(t->affinity), t->cpu, t->ctx.r[14], t->ctx.r[13]);
+        if (const nx::string where = impl_->backend->where(t); !where.empty()) out += nx::format(" [{}]", where);
         if (t->state == ThreadState::Waiting) {
             const auto it = impl_->objects.find(t->wait.object);
             out += nx::format(" (wait type 0x{:x} on 0x{:08x} '{}'", static_cast<u32>(t->wait.type),

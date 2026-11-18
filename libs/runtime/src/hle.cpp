@@ -64,12 +64,13 @@ struct TraceEvent {
     u64 start = 0, end = 0;
 };
 struct ThreadTrace {
+    Uid uid = 0;
     nx::string name;
     std::atomic<u64> next{0};
     TraceEvent events[kTraceEvents];
 };
 nx::vector<ThreadTrace*> g_traces;  // (under g_lock; never freed: a thread's may be read after it ends)
-thread_local ThreadTrace* t_trace = nullptr;
+GuestLocal<ThreadTrace*> g_trace{nullptr};  // (the calling thread's; a thread started again keeps its ring)
 
 }  // namespace
 
@@ -86,16 +87,21 @@ namespace {
 bool tracing_calls() { return tracing(); }
 
 void trace_call(u32 slot, u64 start, u64 end) {
-    if (!t_trace) {
-        auto* t = new ThreadTrace;
-        if (kernel::Thread* k = Kernel::current()) t->name = k->name;
+    ThreadTrace*& trace = g_trace.get();
+    if (!trace) {
+        kernel::Thread* k = Kernel::current();
         nx::scoped_lock<nx::mutex> held(g_lock);
-        g_traces.push_back(t);
-        t_trace = t;
+        for (ThreadTrace* t : g_traces)
+            if (k && t->uid == k->uid) trace = t;
+        if (!trace) {
+            trace = new ThreadTrace;
+            if (k) trace->uid = k->uid, trace->name = k->name;
+            g_traces.push_back(trace);
+        }
     }
-    const u64 n = t_trace->next.load(std::memory_order_relaxed);
-    t_trace->events[n % kTraceEvents] = TraceEvent{slot, start, end};
-    t_trace->next.store(n + 1, std::memory_order_release);
+    const u64 n = trace->next.load(std::memory_order_relaxed);
+    trace->events[n % kTraceEvents] = TraceEvent{slot, start, end};
+    trace->next.store(n + 1, std::memory_order_release);
 }
 
 template <u32 I>

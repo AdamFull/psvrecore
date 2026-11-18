@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <atomic>
 #include <optional>
 
 #include "kernel_impl.hpp"
@@ -17,6 +19,8 @@ using namespace kernel;
 
 namespace {
 thread_local Thread* t_current = nullptr;
+thread_local LocalSlots t_host_locals;  // (GuestLocal on a host thread that runs no guest thread)
+std::atomic<u32> g_local_slots{0};
 
 #if PSVRECORE_TRACY
 // The profiler's zone for a wait, by what it waits for.
@@ -55,7 +59,25 @@ const tracy::SourceLocationData* wait_location(WaitType type) {
 #endif
 }  // namespace
 
-void set_current_thread(Thread* t) { t_current = t; }
+NX_NO_INLINE void set_current_thread(Thread* t) { t_current = t; }
+
+namespace kernel {
+
+u32 new_local_slot() {
+    const u32 slot = g_local_slots.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= kLocalSlots) {
+        nx::loge(logs::kernel, "more than {} GuestLocal variables: raise kernel::kLocalSlots", kLocalSlots);
+        std::abort();
+    }
+    return slot;
+}
+
+NX_NO_INLINE LocalSlots& current_local_slots() {
+    Thread* t = t_current;
+    return t ? t->locals : t_host_locals;
+}
+
+}  // namespace kernel
 
 // ---- wait queues
 
@@ -79,6 +101,22 @@ Kernel::Impl::Impl(Kernel& k, GuestMemory& m, const Config& c) : kernel(k), memo
     if (config.cpu_count == 0 || config.cpu_count > kUserCpuCount) config.cpu_count = kUserCpuCount;
     cpus.assign(config.cpu_count, nullptr);
     start_ns = nx::os::ticks_ns();
+    if (const char* v = std::getenv("PSVRECORE_THREAD_STATS"); v && *v && *v != '0') thread_stats = true;
+    backend = make_native_backend(backend_host());
+}
+
+BackendHost Kernel::Impl::backend_host() {
+    BackendHost h;
+    h.lock = &lock;
+    h.cpu_count = config.cpu_count;
+    h.impl = this;
+    h.changed = &host_threads_changed;
+    h.run = [](void* impl, Thread* t) { static_cast<Impl*>(impl)->run_thread(t); };
+    h.now = [](const void* impl) { return static_cast<const Impl*>(impl)->now_ns(); };
+    h.name_of = [](const Thread* t) { return t->name.c_str(); };
+    h.set_current = [](Thread* t) { set_current_thread(t); };
+    h.enter_lane = [](Thread* t) { profile::enter(t ? t->track : nullptr); };
+    return h;
 }
 
 Uid Kernel::Impl::new_uid() {
@@ -175,7 +213,7 @@ void Kernel::Impl::dispatch() {
                 t->held_since = n;
             }
             t->lost_cpu.store(false, std::memory_order_relaxed);
-            wake(t);
+            backend->give_cpu(t);
             changed = true;
             break;  // (the queue changed: sort again)
         }
@@ -189,22 +227,17 @@ void Kernel::Impl::dispatch() {
 }
 
 void Kernel::Impl::wait_for_cpu(Thread* t) {
-    if (t->cpu >= 0 || t->terminate) return;
-    // (ready, behind threads of higher priority or its own: a CPU handed over to it when one is free)
-    PSV_PROFILE_ZONE_COLOR("waiting for a CPU", 0xD0A020);
-    while (t->cpu < 0 && !t->terminate) park(t);
-}
-
-void Kernel::Impl::park(Thread* t, std::optional<u64> deadline_ns) {
-    lock.unlock();
-    if (deadline_ns) {
-        const u64 now = now_ns();
-        const u64 left = *deadline_ns > now ? *deadline_ns - now : 0;
-        t->parker.park_until(std::chrono::steady_clock::now() + std::chrono::nanoseconds(left));
-    } else {
-        t->parker.park();
+    for (;;) {
+        if (t->cpu < 0 && !t->terminate) {
+            // (ready, behind threads of higher priority or its own: a CPU handed over to it when one is free)
+            PSV_PROFILE_ZONE_COLOR("waiting for a CPU", 0xD0A020);
+            while (t->cpu < 0 && !t->terminate) park(t);
+        }
+        if (t->terminate) return;
+        // (on to guest code where its CPU runs: a fiber moves to the CPU's worker, and may lose the CPU meanwhile)
+        if (backend->on_cpu(t)) break;
     }
-    lock.lock();
+    t->lost_cpu.store(false, std::memory_order_relaxed);
 }
 
 i32 Kernel::Impl::block(Thread* t, WaitQueue* queue, std::optional<u64> deadline_ns, bool callbacks) {
@@ -324,17 +357,7 @@ i32 resolve_priority(i32 priority) {
 // ---- Kernel
 
 Kernel::Kernel(GuestMemory& memory, const Config& config)
-    : impl_(nx::make_unique<Impl>(*this, memory, config)), memory_(memory) {
-    Lock guard(impl_->lock);
-    for (u32 i = 0; i < 4; ++i) impl_->spawn_worker();
-    // (until they run: the first guest threads should not wait for OS threads to start either)
-    const u64 give_up = nx::os::ticks_ns() + 2'000'000'000ull;
-    while (impl_->workers_starting > 0 && nx::os::ticks_ns() < give_up) {
-        impl_->lock.unlock();
-        nx::this_thread::sleep_for(std::chrono::microseconds(200));
-        impl_->lock.lock();
-    }
-}
+    : impl_(nx::make_unique<Impl>(*this, memory, config)), memory_(memory) {}
 
 Kernel::~Kernel() {
     if (!impl_) return;
@@ -346,7 +369,7 @@ Kernel::~Kernel() {
     }
 }
 
-Thread* Kernel::current() { return t_current; }
+NX_NO_INLINE Thread* Kernel::current() { return t_current; }
 
 void Kernel::checkpoint() {
     Thread* t = t_current;
@@ -369,6 +392,7 @@ void Kernel::begin_blocking() {
     t->wait = Wait{};
     impl_->stop_running(t);
     impl_->dispatch();
+    impl_->backend->begin_host_work(t);  // (with fibers: off its CPU's worker, onto a helper)
 }
 
 bool Kernel::lend_cpu() {
@@ -381,6 +405,7 @@ bool Kernel::lend_cpu() {
     impl_->release_cpu(t);
     t->lent_cpu = cpu;
     impl_->dispatch();
+    impl_->backend->begin_host_work(t);
 #if PSVRECORE_TRACY
     PSV_PROFILE_LOCATION(kLent, "CPU lent (host work)", 0x5090A0);
     profile::begin(&kLent);
@@ -396,7 +421,13 @@ void Kernel::reclaim_cpu() {
     Lock guard(impl_->lock);
     const i32 cpu = t->lent_cpu;
     t->lent_cpu = -1;
-    if (t->cpu >= 0) return;  // (one again already: a wait inside the work ended with one)
+    impl_->backend->end_host_work(t);
+    if (t->cpu >= 0) {
+        // (one again already: a wait inside the work ended with one)
+        impl_->wait_for_cpu(t);
+        if (t->terminate) throw ThreadExit{err::kWaitCancel};
+        return;
+    }
     if (impl_->suspended) {
         // (no CPU for anyone until resume(): in line as any thread)
         impl_->make_ready(t);
@@ -417,6 +448,7 @@ void Kernel::reclaim_cpu() {
         t->held_since = impl_->now_ns();
         t->lost_cpu.store(false, std::memory_order_relaxed);
         impl_->dispatch();  // (the borrower to another CPU, if one is free)
+        impl_->wait_for_cpu(t);  // (with fibers: onto the CPU's worker, once the borrower has left it)
     }
     if (t->terminate) throw ThreadExit{err::kWaitCancel};
 }
@@ -426,6 +458,7 @@ void Kernel::end_blocking() {
     if (!t) return;
     profile::pop();  // (begin_blocking's zone)
     Lock guard(impl_->lock);
+    impl_->backend->end_host_work(t);
     impl_->make_ready(t);
     impl_->wait_for_cpu(t);
     if (t->terminate) throw ThreadExit{err::kWaitCancel};
@@ -465,21 +498,24 @@ bool Kernel::suspended() const { return impl_->suspended_at.load(std::memory_ord
 void Kernel::shutdown() {
     if (!impl_) return;
     Lock guard(impl_->lock);
+    if (!impl_->shutting_down) impl_->log_thread_stats();
     impl_->shutting_down = true;
     for (auto& [uid, object] : impl_->objects)
         if (object->cls == ObjectClass::Thread) {
             auto* t = static_cast<Thread*>(object.get());
             t->terminate = true;
-            Impl::wake(t);
+            impl_->wake(t);
         }
-    for (Impl::HostWorker* w : impl_->idle_workers) {
-        w->quit = true;
-        w->parker.unpark();
-    }
     // Threads blocked in the kernel end now; one running guest code ends at its next kernel call, or never (then
-    // its host thread is left to the process exit).
+    // its host thread is left to the process exit). Then the backend's own host threads end.
     const u64 give_up = nx::os::ticks_ns() + 2'000'000'000ull;
-    while (impl_->host_threads > 0 || impl_->workers_alive > 0) {
+    bool stopping = false;
+    while (impl_->host_threads > 0 || !impl_->backend->stopped()) {
+        if (impl_->host_threads == 0 && !stopping) {
+            impl_->backend->stop();
+            stopping = true;
+            continue;
+        }
         const u64 now = nx::os::ticks_ns();
         if (now >= give_up) {
             nx::logw(logs::kernel, "{} guest threads did not end", impl_->host_threads);

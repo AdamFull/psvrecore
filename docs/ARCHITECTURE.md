@@ -122,7 +122,11 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
   - Whole SDK-built programs (start-up code, libc, threads, files, memory) are recompiled and booted from an
     application folder, and their output is compared with what is expected (`scripts/program_check.py`, local).
 - **Threads** (`runtime/kernel.hpp`).
-  - Each guest thread runs on a host thread of its own, but only while it holds one of the three CPUs a game has.
+  - Each guest thread runs on a host context of its own, but only while it holds one of the three CPUs a game has.
+    The thread backend (`src/kernel/backend.hpp`) is the boundary: start a thread, park the calling one, wake one,
+    give one a CPU, host work that may block, the end of a run. The kernel's objects and its scheduler use only that.
+    The native backend makes an OS thread for each start, named after the guest thread, and ends it with the run
+    (nothing is reused); the fiber backend ([THREAD_BACKENDS.md](THREAD_BACKENDS.md)) is an option.
   - The kernel hands CPUs out as the console's scheduler does:
     - fixed priorities, FIFO among equal ones;
     - no time slicing;
@@ -132,7 +136,8 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     instructions.
   - One lock guards the kernel's state. Each thread waits on a parker of its own, which gives microsecond deadlines
     where a Windows futex timeout rounds to the timer tick.
-  - Guest threads start on pooled host threads, so a start takes microseconds on every host.
+  - A start makes an OS thread: 0.1-0.9 ms from the start call to the thread running (P4D starts 27 in a song).
+  - The runtime's own state of a guest thread is `GuestLocal<T>` (per guest thread's run), not `thread_local`.
   - Wait queues are FIFO or priority-ordered. Timeouts write back the time left, and objects deleted under a waiter
     wake it with an error.
   - `sceKernelExitThread` from any depth ends the thread by unwinding its host stack (a C++ exception through the

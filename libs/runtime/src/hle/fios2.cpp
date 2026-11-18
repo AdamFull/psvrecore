@@ -47,8 +47,8 @@ i32 sceFiosOverlayResolveSync02(i32 /*process*/, i32 flags, Ptr<const char> in, 
     return resolve_to_itself(flags, in, out, max_length);
 }
 
-thread_local bool g_overlays_disabled = false;  // (guest threads are host threads)
-i32 sceFiosOverlayThreadIsDisabled02() { return g_overlays_disabled ? 1 : 0; }
+GuestLocal<bool> g_overlays_disabled{false};  // (the calling guest thread's)
+i32 sceFiosOverlayThreadIsDisabled02() { return g_overlays_disabled.get() ? 1 : 0; }
 
 // The scheduler a path's I/O goes to: the first (only a development kit's host0: paths go to another).
 i32 sceFiosOverlayGetRecommendedScheduler02(i32 /*scheduler_count*/, Ptr<const char> /*path*/, Ptr<void> /*args*/) {
@@ -57,7 +57,7 @@ i32 sceFiosOverlayGetRecommendedScheduler02(i32 /*scheduler_count*/, Ptr<const c
 
 i32 sceFiosOverlayThreadSetDisabled02(i32 disabled) {
     nx::logd(logs::io, "fios overlays for this thread {}", disabled ? "off" : "on");
-    g_overlays_disabled = disabled != 0;
+    g_overlays_disabled.get() = disabled != 0;
     return err::kOk;
 }
 
@@ -118,7 +118,7 @@ i32 _sceFiosKernelOverlayGetRecommendedScheduler(i32 available, Ptr<const char> 
     return 0;
 }
 i32 _sceFiosKernelOverlayThreadSetDisabled(i32 disabled) { return sceFiosOverlayThreadSetDisabled02(disabled); }
-i32 _sceFiosKernelOverlayThreadIsDisabled() { return g_overlays_disabled ? 1 : 0; }
+i32 _sceFiosKernelOverlayThreadIsDisabled() { return g_overlays_disabled.get() ? 1 : 0; }
 i32 _sceFiosKernelOverlayAdd() { return unsupported("_sceFiosKernelOverlayAdd"); }
 i32 _sceFiosKernelOverlayAddForProcess() { return unsupported("_sceFiosKernelOverlayAddForProcess"); }
 i32 _sceFiosKernelOverlayModify() { return unsupported("_sceFiosKernelOverlayModify"); }
