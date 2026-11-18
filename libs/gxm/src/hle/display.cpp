@@ -271,7 +271,25 @@ i32 sceDisplayGetResolutionInfoInternal(i32 head, Ptr<ResolutionInfo> info, Ptr<
     return 0;
 }
 
-i32 sceDisplayGetVcount() { return static_cast<i32>(vcount_at(now_ns()) & 0xFFFF); }
+// A thread that reads the same count again and again is waiting for the next blank in its own loop (WipEout 2048's
+// display queue callback, 30 frames a second in its races: about 5 million calls a second, a host core and one of
+// the console's CPUs held for most of each frame): after kPollsBeforeWait such reads it waits (without its CPU) for
+// that blank, and reads the count it was waiting for. It sees the same counts as before, in the same order.
+constexpr u32 kPollsBeforeWait = 64;
+
+i32 sceDisplayGetVcount() {
+    thread_local u64 last = ~0ull;
+    thread_local u32 same = 0;
+    u64 v = vcount_at(now_ns());
+    if (v != last) {
+        last = v, same = 0;
+    } else if (++same >= kPollsBeforeWait) {
+        runtime::runtime().kernel().wait_until(static_cast<u64>(std::ceil(static_cast<f64>(v + 1) * period_ns())));
+        v = vcount_at(now_ns());
+        last = v, same = 0;
+    }
+    return static_cast<i32>(v & 0xFFFF);
+}
 
 i32 sceDisplayGetRefreshRate(Ptr<f32> hz) {
     if (!hz) return kErrorInvalidValue;

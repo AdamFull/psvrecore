@@ -156,6 +156,34 @@ TEST_CASE("display: vertical blank callbacks notified at each blank until unregi
     CHECK(call32(ctx, kSceDisplayUser, kResolution, {1, info, opt}) == kDisplayInvalidValue);
 }
 
+TEST_CASE("display: a thread polling the vertical blank count waits for the next blank instead of spinning") {
+    TestRuntime t;
+    REQUIRE(t.rt.ok());
+    gxm::Options options;
+    gxm::register_libraries(options);
+    PsvContext* ctx = t.ctx();
+    Kernel& k = t.rt.kernel();
+    constexpr u32 kSceDisplay = 0x5ED8F994, kGetVcount = 0xB6FDE0BA;
+    // (as WipEout 2048's display queue callback waits: the count read until it changes, three blanks in a row)
+    for (int blank = 0; blank < 3; ++blank) {
+        const u32 from = static_cast<u32>(call32(ctx, kSceDisplay, kGetVcount, {}));
+        u32 calls = 1, v = from;
+        while (v == from && calls < 100'000) v = static_cast<u32>(call32(ctx, kSceDisplay, kGetVcount, {})), ++calls;
+        CHECK(v == ((from + 1) & 0xFFFF));  // (the next count: none skipped)
+        CHECK(calls <= 200);                // (a wait, not millions of reads)
+    }
+    // (reads further apart than a blank change each time, and never wait)
+    const u64 before = k.clock_ns();
+    u32 last = static_cast<u32>(call32(ctx, kSceDisplay, kGetVcount, {}));
+    for (int i = 0; i < 3; ++i) {
+        k.delay_thread(20'000, false);
+        const u32 v = static_cast<u32>(call32(ctx, kSceDisplay, kGetVcount, {}));
+        CHECK(v != last);
+        last = v;
+    }
+    CHECK(k.clock_ns() - before < 200'000'000);
+}
+
 TEST_CASE("gxm: user markers only within a scene or a command list; Razor's capture triggers without RenderDoc") {
     TestRuntime t;
     REQUIRE(t.rt.ok());
