@@ -2,7 +2,7 @@
 // - the application's state (SceAppMgrUser): in front, nothing of the system's over it, no system events;
 // - the power configuration (ScePower): taken, the host's power is its own;
 // - the network libraries' start (SceNetCtl, SceHttp, SceSsl), as on a console that is offline (SceNet: net.cpp);
-// - the development kit's debug LEDs (SceDebugLed): a retail console has none, so setting them does nothing;
+// - the development kit's debug LEDs (SceDebugLed): a retail console has none; what a game sets is logged (debug);
 // - the system's screenshots (SceScreenShot: the PS button and Start): the host has none of its own, so what a game
 //   sets for them (titles, an overlay picture, screenshots allowed or not) is checked and kept nowhere;
 // - the camera's shutter sound (SceShutterSound): not played;
@@ -71,7 +71,12 @@ i32 scePowerSetConfigurationMode(i32 mode) {
     return 0;
 }
 
-i32 sceKernelSetGPO(u32 /*leds*/) { return 0; }  // (games set them many times a frame: not logged)
+// (games set them many times a frame: a change logged, at debug level)
+i32 sceKernelSetGPO(u32 leds) {
+    static std::atomic<u32> last{0};
+    if (last.exchange(leds, std::memory_order_relaxed) != leds) nx::logd(logs::hle, "debug LEDs (GPO): 0x{:02x}", leds);
+    return 0;
+}
 u32 sceKernelGetGPI() { return 0; }                // (nor are there switches to read)
 
 // SceScreenShotParam: the photo's title, the game's title, a comment (UTF-8, any may be null), reserved (null).

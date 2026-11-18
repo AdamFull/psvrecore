@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "kernel_impl.hpp"
+#include "psvrecore/profile.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "psvrecore/recomp/support.hpp"
 #include "psvrecore/runtime/hle.hpp"
@@ -81,6 +82,9 @@ void Kernel::Impl::worker_loop(HostWorker* w) {
 
 void Kernel::Impl::run_thread(Thread* t) {
     set_current_thread(t);
+    // (its own lane in the profiler, named after it, whichever host thread runs it)
+    profile::Track* track = profile::acquire(t->name);
+    profile::enter(track);
     {
         Lock guard(lock);
         wait_for_cpu(t);
@@ -105,6 +109,8 @@ void Kernel::Impl::run_thread(Thread* t) {
         ended = true;
     }
     (void)ended;
+    profile::release(track);
+    profile::enter(nullptr);
     Lock guard(lock);
     finish_thread(t, status, delete_thread);
     set_current_thread(nullptr);

@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "kernel_impl.hpp"
+#include "psvrecore/profile.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "core/foundation/platform/os.h"
@@ -16,7 +17,43 @@ using namespace kernel;
 
 namespace {
 thread_local Thread* t_current = nullptr;
+
+#if PSVRECORE_TRACY
+// The profiler's zone for a wait, by what it waits for.
+const tracy::SourceLocationData* wait_location(WaitType type) {
+    PSV_PROFILE_LOCATION(kDelay, "wait: delay", 0x707070);
+    PSV_PROFILE_LOCATION(kThreadEnd, "wait: thread end", 0x8C6E4A);
+    PSV_PROFILE_LOCATION(kSignal, "wait: signal", 0x8C6E4A);
+    PSV_PROFILE_LOCATION(kEventFlag, "wait: event flag", 0xB0503C);
+    PSV_PROFILE_LOCATION(kSemaphore, "wait: semaphore", 0xB0503C);
+    PSV_PROFILE_LOCATION(kMutex, "wait: mutex", 0xC03030);
+    PSV_PROFILE_LOCATION(kRWLock, "wait: reader-writer lock", 0xC03030);
+    PSV_PROFILE_LOCATION(kCond, "wait: condition variable", 0xB0503C);
+    PSV_PROFILE_LOCATION(kEvent, "wait: event", 0xB0503C);
+    PSV_PROFILE_LOCATION(kMsgPipe, "wait: message pipe", 0xB0503C);
+    PSV_PROFILE_LOCATION(kLwMutex, "wait: lightweight mutex", 0xC03030);
+    PSV_PROFILE_LOCATION(kLwCond, "wait: lightweight condition variable", 0xB0503C);
+    PSV_PROFILE_LOCATION(kOther, "wait", 0x707070);
+    switch (type) {
+        case WaitType::Delay: return &kDelay;
+        case WaitType::ThreadEnd: return &kThreadEnd;
+        case WaitType::Signal: return &kSignal;
+        case WaitType::EventFlag: return &kEventFlag;
+        case WaitType::Semaphore: return &kSemaphore;
+        case WaitType::Mutex:
+        case WaitType::CondMutex: return &kMutex;
+        case WaitType::RWLock: return &kRWLock;
+        case WaitType::CondSignal: return &kCond;
+        case WaitType::Event: return &kEvent;
+        case WaitType::MsgPipe: return &kMsgPipe;
+        case WaitType::LwMutex:
+        case WaitType::LwCondMutex: return &kLwMutex;
+        case WaitType::LwCondSignal: return &kLwCond;
+        default: return &kOther;
+    }
 }
+#endif
+}  // namespace
 
 void set_current_thread(Thread* t) { t_current = t; }
 
@@ -143,9 +180,18 @@ void Kernel::Impl::dispatch() {
             break;  // (the queue changed: sort again)
         }
     }
+#if PSVRECORE_TRACY
+    i64 running = 0;
+    for (const Thread* c : cpus) running += c != nullptr;
+    PSV_PROFILE_PLOT("kernel: CPUs running a thread", running);
+    PSV_PROFILE_PLOT("kernel: threads ready without a CPU", static_cast<i64>(ready.size()));
+#endif
 }
 
 void Kernel::Impl::wait_for_cpu(Thread* t) {
+    if (t->cpu >= 0 || t->terminate) return;
+    // (ready, behind threads of higher priority or its own: a CPU handed over to it when one is free)
+    PSV_PROFILE_ZONE_COLOR("waiting for a CPU", 0xD0A020);
     while (t->cpu < 0 && !t->terminate) park(t);
 }
 
@@ -162,6 +208,13 @@ void Kernel::Impl::park(Thread* t, std::optional<u64> deadline_ns) {
 }
 
 i32 Kernel::Impl::block(Thread* t, WaitQueue* queue, std::optional<u64> deadline_ns, bool callbacks) {
+#if PSVRECORE_TRACY
+    profile::announce();
+    tracy::ScopedZone zone(wait_location(t->wait.type), -1, TracyIsConnected);
+    if (t->wait.object)
+        if (auto it = objects.find(t->wait.object); it != objects.end() && !it->second->name.empty())
+            zone.Text(it->second->name.data(), it->second->name.size());
+#endif
     t->state = ThreadState::Waiting;
     t->wait.queue = queue;
     t->wait.done = false;
@@ -307,6 +360,10 @@ void Kernel::checkpoint() {
 void Kernel::begin_blocking() {
     Thread* t = t_current;
     if (!t) return;
+#if PSVRECORE_TRACY
+    PSV_PROFILE_LOCATION(kBlocking, "blocked on the host", 0x5070A0);
+    profile::begin(&kBlocking);
+#endif
     Lock guard(impl_->lock);
     t->state = ThreadState::Waiting;
     t->wait = Wait{};
@@ -324,12 +381,18 @@ bool Kernel::lend_cpu() {
     impl_->release_cpu(t);
     t->lent_cpu = cpu;
     impl_->dispatch();
+#if PSVRECORE_TRACY
+    PSV_PROFILE_LOCATION(kLent, "CPU lent (host work)", 0x5090A0);
+    profile::begin(&kLent);
+#endif
     return true;
 }
 
 void Kernel::reclaim_cpu() {
     Thread* t = t_current;
     if (!t || t->lent_cpu < 0) return;
+    profile::pop();  // (lend_cpu's zone)
+    PSV_PROFILE_ZONE_COLOR("taking the CPU back", 0xD0A020);
     Lock guard(impl_->lock);
     const i32 cpu = t->lent_cpu;
     t->lent_cpu = -1;
@@ -361,6 +424,7 @@ void Kernel::reclaim_cpu() {
 void Kernel::end_blocking() {
     Thread* t = t_current;
     if (!t) return;
+    profile::pop();  // (begin_blocking's zone)
     Lock guard(impl_->lock);
     impl_->make_ready(t);
     impl_->wait_for_cpu(t);

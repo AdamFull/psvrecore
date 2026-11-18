@@ -67,5 +67,9 @@ void register_pvf();
 void register_mp4lib();
 void register_kernel_more();
 void register_commondialog();
+void register_debug();
+
+// printf-style formatting of a variadic call's guest arguments (libkernel.cpp).
+nx::string format_variadic(nx::string_view fmt, Variadic va);
 
 }  // namespace psvrecore::runtime::hle

@@ -11,6 +11,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/audiodec.cpp
     src/hle/codecengine.cpp
     src/hle/ctrl.cpp
+    src/hle/debug.cpp
     src/hle/fiber.cpp
     src/hle/fios2.cpp
     src/hle/ime.cpp

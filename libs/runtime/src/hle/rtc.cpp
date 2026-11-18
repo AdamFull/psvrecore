@@ -1,5 +1,4 @@
-// The real-time clock (SceRtcUser): ticks are microseconds since 0001-01-01 00:00:00 UTC. Also the debug library's
-// assertion handler (SceDbg).
+// The real-time clock (SceRtcUser): ticks are microseconds since 0001-01-01 00:00:00 UTC.
 
 #include <chrono>
 #include <cctype>
@@ -12,7 +11,7 @@ namespace psvrecore::runtime::hle {
 
 namespace {
 
-constexpr u32 kSceRtcUser = 0x6704D3C6, kSceRtc = 0x3503487E, kSceDbg = 0x623DF986;
+constexpr u32 kSceRtcUser = 0x6704D3C6, kSceRtc = 0x3503487E;
 
 // Days from 0001-01-01 to 1970-01-01 (proleptic Gregorian).
 constexpr i64 kUnixEpochDays = 719162;
@@ -509,11 +508,6 @@ const Function kRtcMore[] = {
 };
 const Function kRtcKernel[] = {HLE_FUNCTION(0x258BE8EC, sceRtcGetAccumulativeTime)};
 
-i32 sceDbgAssertionHandler(Ptr<const char> file, i32 line, i32 /*unknown*/, Ptr<const char> component, Ptr<const char> message) {
-    nx::loge(logs::hle, "guest assertion failed: {}:{} [{}] {}", str(file, 256), line, str(component, 64), str(message, 512));
-    return err::kOk;
-}
-
 const Function kRtc[] = {
     HLE_FUNCTION(0x811313B3, sceRtcGetTickResolution),
     HLE_FUNCTION(0x23F79274, sceRtcGetCurrentTick),
@@ -532,17 +526,12 @@ const Function kRtc[] = {
     HLE_FUNCTION(0x742250A9, sceRtcFormatRFC3339LocalTime),
 };
 
-const Function kDbg[] = {
-    HLE_FUNCTION(0x1AF3678B, sceDbgAssertionHandler),
-};
-
 }  // namespace
 
 void register_rtc() {
     register_library({"SceRtcUser", kSceRtcUser, kRtc});
     register_library({"SceRtcUser", kSceRtcUser, kRtcMore});
     register_library({"SceRtc", kSceRtc, kRtcKernel});
-    register_library({"SceDbg", kSceDbg, kDbg});
 }
 
 }  // namespace psvrecore::runtime::hle

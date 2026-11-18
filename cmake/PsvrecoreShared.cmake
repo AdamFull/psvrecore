@@ -44,7 +44,7 @@ if(TARGET mimalloc-static)
         target_compile_definitions(mimalloc-static PRIVATE MI_SHARED_LIB MI_SHARED_LIB_EXPORT)
     endif()
 endif()
-if(PSVRECORE_PROFILER AND TARGET TracyClient)
+if(PSVRECORE_TRACY AND TARGET TracyClient)
     list(APPEND _psvrecore_foundation TracyClient)
 endif()
 

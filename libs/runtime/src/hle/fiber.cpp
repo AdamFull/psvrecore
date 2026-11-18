@@ -8,9 +8,11 @@
 // own. Everything stays on the thread's OS thread: the kernel's current thread is the same throughout.
 
 #include <array>
+#include <atomic>
 #include <cstring>
 
 #include "hle_common.hpp"
+#include "psvrecore/profile.hpp"
 #include "core/foundation/containers/hash_map.h"
 #include "core/foundation/fibers/context.h"
 #include "core/foundation/fibers/stack.h"
@@ -33,6 +35,8 @@ struct Fiber {
     nx::fiber::Context host;
     bool started = false, running = false;
     PsvContext regs{};  // (its guest registers while it is not running)
+    profile::Track* track = nullptr;  // (its lane in the profiler)
+    ~Fiber() { profile::release(track); }
 };
 
 // What a thread knows of its fibers: its own host context and registers while a fiber runs, and which one runs.
@@ -41,6 +45,7 @@ struct ThreadFibers {
     PsvContext regs{};
     PsvContext* ctx = nullptr;  // (the thread's register context, which every fiber of it runs in)
     Fiber* current = nullptr;
+    profile::Track* track = nullptr;  // (the thread's own lane in the profiler, while a fiber runs)
 };
 
 // What one side hands the other on a switch: the fiber resumed (to start it), and the value.
@@ -82,6 +87,9 @@ u32 resume(ThreadFibers& t, Fiber* to, u32 value) {
     Fiber* from = t.current;
     PsvContext* ctx = t.ctx;
     (from ? from->regs : t.regs) = *ctx;
+    // (the profiler follows: what runs next is in its own lane)
+    if (!from) t.track = profile::current();
+    profile::enter(to ? to->track : t.track);
     if (from) from->running = false;
     if (to) to->running = true;
     t.current = to;
@@ -132,6 +140,7 @@ i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initia
     auto f = nx::make_unique<Fiber>();
     f->guest = fiber.address;
     f->name = name ? str(name, 31) : nx::string();
+    if constexpr (profile::kEnabled) f->track = profile::acquire(f->name.empty() ? nx::string_view("fiber") : f->name);
     f->entry = entry, f->arg_on_initialize = arg_on_initialize, f->context = context, f->context_size = context_size;
     f->stack = *stack;
     std::memset(fiber.get(), 0, 128);
@@ -257,8 +266,16 @@ i32 sceFiberRenameSelf(PsvContext* ctx, Ptr<const char> name) {
 // The context memory's use is not measured (sceFiberGetInfo's margin stays 0); profiler markers are not recorded.
 i32 sceFiberStartContextSizeCheck(u32 /*flags*/) { return 0; }
 i32 sceFiberStopContextSizeCheck() { return 0; }
-i32 sceFiberPushUserMarkerWithHud(Ptr<const char> /*name*/, u32 /*color*/, u32 /*flags*/) { return 0; }
-i32 sceFiberPopUserMarkerWithHud() { return 0; }
+// The fiber's markers: zones on its lane in the profiler (nothing without one; docs/PROFILING.md).
+i32 sceFiberPushUserMarkerWithHud(Ptr<const char> name, u32 color, u32 /*flags*/) {
+    if constexpr (profile::kEnabled) profile::push(str(name, 256), profile::rgb_of_abgr(color));
+    (void)name, (void)color;
+    return 0;
+}
+i32 sceFiberPopUserMarkerWithHud() {
+    profile::pop();
+    return 0;
+}
 
 // SceFiberInfo (128 bytes): the entry, its argument, the context memory and its size, the name (32 bytes), and the
 // context's unused margin (not measured: 0).
@@ -304,29 +321,22 @@ const Function kFiber[] = {
     HLE_FUNCTION(0x4EC01F9C, sceFiberPopUserMarkerWithHud),
 };
 
-// libult's hooks into the system's user-level object manager, its debugger support and the Razor profiler: nothing
-// registers or captures here. The profiler's capture flag pointer is null (libult then writes no packets).
+// libult's hooks into the system's user-level object manager and its debugger support: accepted, nothing registers.
+// (Its Razor profiler packets are ScePerf's, debug.cpp.)
 i32 _sceUlobjMgrRegisterLibultProtocolRevision(u32 /*revision*/) { return 0; }
-i32 ulobj_dbg_ignored() { return 0; }
-i32 _sceRazorCpuWriteFiberUltPkt() { return 0; }
+i32 ulobj_dbg_ignored() {
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true)) nx::logd(logs::hle, "SceUlobjDbg: libult's debugger hooks accepted (no debugger)");
+    return 0;
+}
 
-constexpr u32 kSceUlobjMgr = 0xDB18BB68, kSceUlobjDbg = 0x49F67FCF, kScePerf = 0x447F047D;
+constexpr u32 kSceUlobjMgr = 0xDB18BB68, kSceUlobjDbg = 0x49F67FCF;
 const Function kUlobjMgr[] = {
     HLE_FUNCTION(0x50F2F2AA, _sceUlobjMgrRegisterLibultProtocolRevision),
 };
 const Function kUlobjDbg[] = {
     Function{0xD7F0F610, "(SceUlobjDbg 0xD7F0F610)", &entry<&ulobj_dbg_ignored>},
     Function{0xF9C0F5DA, "(SceUlobjDbg 0xF9C0F5DA)", &entry<&ulobj_dbg_ignored>},
-};
-const Function kPerf[] = {
-    HLE_FUNCTION(0x409D966A, _sceRazorCpuWriteFiberUltPkt),
-};
-const Variable kPerfVariables[] = {
-    // (the pointer, then the flag it points to: libult reads the flag through it unconditionally)
-    {0x936A5F31, "_pLibPerfCaptureFlagPtr", 8, [](u8* host, u32 guest) {
-         const u32 words[2] = {guest + 4, 0};
-         std::memcpy(host, words, sizeof words);
-     }},
 };
 
 }  // namespace
@@ -342,7 +352,6 @@ void register_fiber() {
     register_library({"SceFiber", kSceFiber, kFiber});
     register_library({"SceUlobjMgr", kSceUlobjMgr, kUlobjMgr});
     register_library({"SceUlobjDbg", kSceUlobjDbg, kUlobjDbg});
-    register_library({"ScePerf", kScePerf, kPerf, kPerfVariables});
 }
 
 }  // namespace psvrecore::runtime::hle

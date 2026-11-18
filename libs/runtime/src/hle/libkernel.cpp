@@ -477,6 +477,12 @@ void register_system_libraries() {
     register_mp4lib();
     register_kernel_more();
     register_commondialog();
+    register_debug();
+}
+
+nx::string format_variadic(nx::string_view fmt, Variadic va) {
+    FormatArgs args{&va, 0};
+    return format(fmt, args);
 }
 
 }  // namespace psvrecore::runtime::hle

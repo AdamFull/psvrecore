@@ -25,7 +25,12 @@ else()
 endif()
 option(PSVRECORE_BUILD_TOOLS "Build host-side tools" ${_psvrecore_host_default})
 option(PSVRECORE_BUILD_TESTS "Build unit tests (no game data or SDK files required)" ${_psvrecore_host_default})
-option(PSVRECORE_PROFILER "Build Tracy into nx-foundation and compile its profiler zones" OFF)
+# Tracy (nx-foundation's copy of its client): the runtime's zones, plots and frame marks, the guest's own CPU and GPU
+# markers and the renderer's GPU zones (docs/PROFILING.md). Off, every hook compiles to nothing.
+option(PSVRECORE_TRACY "Build Tracy's client in and compile the profiler's hooks" OFF)
+if(PSVRECORE_PROFILER)  # (its earlier name)
+    set(PSVRECORE_TRACY ON CACHE BOOL "" FORCE)
+endif()
 # The runtime as one shared library (psvrecore.dll, libpsvrecore.so.<ABI version>) that each game's executable links,
 # or (off) static libraries linked into the game. Static on Android, where each APK carries its runtime anyway. The
 # tests and tools link the static libraries either way.
@@ -51,8 +56,8 @@ include(PsvrecorePackage)
 # provides it. Its own third-party code is in submodules too (git submodule update --init --recursive).
 if(NOT TARGET nx::foundation)
     set(NX_FOUNDATION_TESTS OFF CACHE BOOL "" FORCE)
-    set(NX_FOUNDATION_TRACY ${PSVRECORE_PROFILER} CACHE BOOL "" FORCE)
-    set(NX_ENABLE_PROFILER ${PSVRECORE_PROFILER} CACHE BOOL "" FORCE)
+    set(NX_FOUNDATION_TRACY ${PSVRECORE_TRACY} CACHE BOOL "" FORCE)
+    set(NX_ENABLE_PROFILER ${PSVRECORE_TRACY} CACHE BOOL "" FORCE)
     # Games are shared libraries on Android (libmain.so, loaded by the Java activity with dlopen), where mimalloc's
     # default initial-exec thread-local storage fails to load.
     if(ANDROID)

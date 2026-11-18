@@ -884,3 +884,78 @@ TEST_CASE("system gesture: the primitive touch events themselves, by count and a
     CHECK(psv_ld16(events + 12) == 100);
     CHECK(psv_ld16(events + 14) == 200);
 }
+
+TEST_CASE("perf, Razor HUD, dbg, debug LEDs: markers nest, the time base is the kernel's clock, counters read 0") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kScePerf = 0x447F047D, kSceRazorHud = 0x250371C2, kSceDbg = 0x623DF986, kSceDebugLed = 0xAE004C0A;
+    constexpr i32 kPerfInvalid = static_cast<i32>(0x80580000u);
+    // CPU markers: pushed and popped (zones in Tracy, nested; one popped too many is nothing); no profiler here.
+    constexpr u32 kPush = 0xC3DE4C0A, kPushHud = 0x5CDC09EA, kPop = 0xDC3224C3, kIsCapturing = 0x8DA87B35;
+    CHECK(call32(ctx, kScePerf, kPush, {guest_string("frame")}) == 0);
+    CHECK(call32(ctx, kScePerf, kPushHud, {guest_string("update"), 0x8000ff00u, 0}) == 0);
+    CHECK(call32(ctx, kScePerf, kPushHud, {0, 0x800000ffu, 1}) == 0);  // (no label)
+    for (int i = 0; i < 4; ++i) CHECK(call32(ctx, kScePerf, kPop, {}) == 0);
+    CHECK(call32(ctx, kScePerf, 0xDAB63FC3 /*StartCapture*/, {}) == 0);
+    CHECK(call32(ctx, kScePerf, kIsCapturing, {}) == 0);
+    CHECK(call32(ctx, kScePerf, 0x9C2C05C2 /*StopCapture*/, {}) == 0);
+    CHECK(call32(ctx, kScePerf, 0x4F1385E3 /*Sync*/, {}) == 0);
+    // The fibers' markers, the same.
+    CHECK(call32(ctx, kSceFiber, 0x9C414B09 /*PushUserMarkerWithHud*/, {guest_string("job"), 0x80ffffffu, 0}) == 0);
+    CHECK(call32(ctx, kSceFiber, 0x4EC01F9C /*PopUserMarkerWithHud*/, {}) == 0);
+
+    // The time base: the kernel's clock in nanoseconds, 1000 ticks a microsecond.
+    constexpr u32 kTimebase = 0xBD9615E5, kFrequency = 0x78EA4FFB;
+    CHECK(call32(ctx, kScePerf, kFrequency, {}) == 1000);
+    const u64 a = call(ctx, kScePerf, kTimebase, {});
+    t.rt.kernel().delay_thread(2000, false);
+    const u64 b = call(ctx, kScePerf, kTimebase, {});
+    CHECK(b - a >= 2'000'000);
+    CHECK(b <= t.rt.kernel().clock_ns());
+
+    // The ARM performance monitor: accepted, every counter 0; a counter that does not exist refused.
+    constexpr u32 kReset = 0x35151735, kSelect = 0x63CBEA8B, kStart = 0xC9D969D5, kStop = 0xD1A40F54,
+                  kGet = 0x6132A497, kSet = 0x12F6C708, kIncrement = 0x4264B4E7;
+    const u32 value = scratch(4);
+    psv_st32(value, 77);
+    CHECK(call32(ctx, kScePerf, kReset, {0}) == 0);
+    CHECK(call32(ctx, kScePerf, kSelect, {0, 5, 0x03}) == 0);
+    CHECK(call32(ctx, kScePerf, kSelect, {0, 6, 0x03}) == kPerfInvalid);
+    CHECK(call32(ctx, kScePerf, kStart, {0}) == 0);
+    CHECK(call32(ctx, kScePerf, kIncrement, {0x3F}) == 0);
+    CHECK(call32(ctx, kScePerf, kStop, {0}) == 0);
+    CHECK(call32(ctx, kScePerf, kGet, {0, 31, value}) == 0);
+    CHECK(psv_ld32(value) == 0);
+    CHECK(call32(ctx, kScePerf, kGet, {0, 7, value}) == kPerfInvalid);
+    CHECK(call32(ctx, kScePerf, kSet, {0, 2, 100}) == 0);
+
+    // Razor's trace buffers: taken, and read back empty.
+    constexpr u32 kStartTrace = 0xAED36A40, kStopTrace = 0x4B47E144, kGetTrace = 0x0DE231D4;
+    const u32 buffer = scratch(4096), out = scratch(4);
+    CHECK(call32(ctx, kScePerf, kStartTrace, {0, 4096}) == kPerfInvalid);
+    CHECK(call32(ctx, kScePerf, kStartTrace, {buffer, 4096}) == 0);
+    CHECK(call32(ctx, kScePerf, kGetTrace, {out}) == 0);
+    CHECK(psv_ld32(out) == buffer);
+    CHECK(call32(ctx, kScePerf, kStopTrace, {}) == 0);
+
+    // The HUD: no performance mode; the rest accepted.
+    CHECK(call32(ctx, kSceRazorHud, 0xE3709B44 /*sceRazorGpuPerfGetMode*/, {}) == 1);
+    CHECK(call32(ctx, kSceRazorHud, 0x77F2F606 /*sceRazorHudSetDisplayEnabled*/, {1}) == 0);
+    CHECK(call32(ctx, kSceRazorHud, 0xB46382FC /*sceRazorGpuLiveStart*/, {}) == 0);
+
+    // libdbg: the game's messages to the log, formatted with their arguments (file, line, level or stop, component,
+    // format, then the format's arguments on the stack).
+    constexpr u32 kLog = 0x6605AB19, kAssert = 0x1AF3678B, kMinimum = 0x941622FA;
+    const u32 file = guest_string("main.c"), component = guest_string("test");
+    CHECK(call32(ctx, kSceDbg, kMinimum, {2}) == 0);
+    CHECK(call32(ctx, kSceDbg, kLog, {file, 12, 3, component, guest_string("%d frames, %s"), 30, guest_string("ok")}) == 0);
+    CHECK(call32(ctx, kSceDbg, kLog, {file, 13, 0, component, guest_string("dropped below the minimum")}) == 0);
+    CHECK(call32(ctx, kSceDbg, kAssert, {file, 14, 0, component, guest_string("x == %d"), 4}) == 0);
+    CHECK(call32(ctx, kSceDbg, 0xED4A00BA /*SetBreakOnErrorState*/, {1}) == 0);
+    CHECK(call32(ctx, kSceDbg, 0x3DEAECD3 /*SetBreakOnWarningState*/, {1}) == 0);
+    CHECK(call32(ctx, kSceDbg, kMinimum, {0}) == 0);
+
+    // The development kit's LEDs: set (and logged when they change).
+    CHECK(call32(ctx, kSceDebugLed, 0x78E702D3 /*sceKernelSetGPO*/, {0x05}) == 0);
+    CHECK(call32(ctx, kSceDebugLed, 0x78E702D3, {0x05}) == 0);
+}
