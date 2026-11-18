@@ -13,6 +13,7 @@ using namespace kernel;
 namespace {
 
 constexpr u32 kMaxSyncObjects = 2048;
+constexpr u64 kFiosSchedulerPollNs = 100'000'000;  // (wait_cond: libfios2's schedulers, woken this often at least)
 
 constexpr u32 kEvfOr = 0x1, kEvfClearAll = 0x2, kEvfClearPattern = 0x4;
 
@@ -479,9 +480,24 @@ i32 Kernel::wait_cond(Uid uid, Timeout timeout, bool callbacks, ObjectClass cls)
     Lock guard(impl_->lock);
     const bool lw = cls == ObjectClass::LwCond;
     const ObjectClass mutex_cls = lw ? ObjectClass::LwMutex : ObjectClass::Mutex;
-    const auto deadline = impl_->deadline(timeout);
+    auto deadline = impl_->deadline(timeout);
     Cond* c = impl_->get<Cond>(uid, cls);
     if (!c) return unknown_cond(cls);
+    // libfios2 (the SDK's file library, which games link) can lose a wakeup of its I/O schedulers. A scheduler
+    // takes an op from its queue and runs it unlocked; when the op answers busy (a PSARC chunk whose decompression it
+    // just started), it locks again, puts the op back and counts it among the busy ones at the head of its queue,
+    // which it does not look at again until something wakes it ("kicks" it: the count back to 0, the condition
+    // signalled). The decompression ending in that window kicks a scheduler that is not waiting yet: the count goes
+    // to 0 and back to 1, the op is ready but never looked at, and the scheduler sleeps on its condition with no
+    // timeout, with every reader of the files waiting on it (the game frozen in a loading screen). Rare on the
+    // console; much less so here, where the decompressing thread runs on another host core at once. Its loop takes
+    // any wakeup as a cue to look again (and, finding only busy ops, looks at all of them after a 50 ms timed wait),
+    // so a wait on its schedulers' condition with no timeout ends now and then as if signalled.
+    bool poll = false;
+    if (!deadline && lw && c->name == "SceFiosSchedulerWakeup") {
+        poll = true;
+        deadline = impl_->now_ns() + kFiosSchedulerPollNs;
+    }
     Thread* self = current();
     if (!self) return err::kIllegalContext;
     const Uid mutex_uid = c->mutex;
@@ -498,6 +514,7 @@ i32 Kernel::wait_cond(Uid uid, Timeout timeout, bool callbacks, ObjectClass cls)
     c->waiters.add(self);
     i32 r = impl_->block(self, &c->waiters, deadline, false);
     (void)callbacks;  // (callbacks run once the mutex is held again, below)
+    if (poll && r == err::kWaitTimeout) r = err::kOk;  // (a spurious wakeup, as above)
 
     // Take the mutex back, whatever ended the wait (the guest expects to own it on return).
     for (;;) {

@@ -272,6 +272,13 @@
   `PSVRECORE_THREADS` lists where each guest thread is. Deterministic scheduling (`PSVRECORE_DETERMINISTIC=1`) is for
   tests: one host thread runs every guest thread, so a thread that spins until another goes on never ends, and host
   threads (the display's, audio) do not follow its clock.
+- **libfios2's schedulers are woken every 100 ms.** The SDK's file library loses a wakeup of its I/O schedulers when
+  a PSARC chunk's decompression ends while the scheduler that started it has not put it back in its queue yet: the
+  chunk is ready but counted among the busy ones, and every reader of the game's files waits for good (WipEout 2048
+  froze in its menus on an AYN Odin 3, often within a few minutes; the analysis is in the kernel's
+  `wait_cond`). A wait on a condition named `SceFiosSchedulerWakeup` with no timeout therefore ends after 100 ms as
+  if signalled, and the scheduler looks at its queue again. It works around the library, recognised by that name:
+  another library with the same flaw would need its own.
 - **Memory budgets are fixed defaults.** Main memory 256 MiB and CDRAM 128 MiB for memory blocks, set in
   `Runtime::Config`. The console's figures for a game are not reproduced exactly.
 - **Run on Windows and Android.** The POSIX host layer (faults, files, decommit) runs on Android arm64 (the SDK
