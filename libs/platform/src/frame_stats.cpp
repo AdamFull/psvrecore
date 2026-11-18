@@ -55,6 +55,8 @@ FrameStats::FrameStats() {
     if (const char* v = std::getenv("PSVRECORE_FRAME_TIMES"); v && *v) {
         times_file_ = std::fopen(v, "w");
         if (!times_file_) nx::logw(logs::display, "PSVRECORE_FRAME_TIMES: cannot write {}", v);
+        // (a line at a time: a process stopped from outside, as an Android app is, keeps every frame written)
+        else std::setvbuf(times_file_, nullptr, _IOLBF, 1024);
     }
 }
 
