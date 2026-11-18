@@ -337,6 +337,10 @@ public:
     i32 delete_thread(Uid uid);
     i32 wait_thread_end(Uid uid, i32* status, kernel::Timeout timeout, bool callbacks);
     i32 delay_thread(u32 microseconds, bool callbacks);
+    // The calling thread waits until the kernel's clock (clock_ns) reaches `at`, without its CPU, as a thread waiting
+    // for a device does on the console (audio output, the display's blanks, input sampling): a kernel wait, not a
+    // host sleep. A host thread that runs no guest thread sleeps. Throws ThreadExit on shutdown.
+    void wait_until(u64 at);
     i32 change_priority(Uid uid, i32 priority);
     i32 change_affinity(Uid uid, i32 mask);
     i32 get_affinity(Uid uid);

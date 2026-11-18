@@ -64,6 +64,24 @@ game's (`sceKernelWaitSema` about 2.7-3.3 ms a call, 0.13-0.16 million calls).
 
 Kept: the native backend is no worse within noise.
 
+## Where a guest thread blocks in host code
+
+Every place a guest thread can wait goes through the kernel, so that it gives up its CPU meanwhile and, with fibers,
+leaves its CPU's worker free (audit of 2026-11-18, `runtime/src`, `gxm/src`, `platform/src`):
+
+| Where | What it waits for | How |
+|---|---|---|
+| Kernel objects, `sceKernelDelayThread`, thread ends, signals, callbacks | other guest threads, time | the kernel's own waits (`Impl::block`) |
+| `sceAudioOutOutput` (its block's start), sceDisplayWaitVblankStart* (`wait_vblanks`), `sceCtrlRead*` / `sceTouchRead` (the next blank's sample), `sceNgsSystemLock` (another holder's unlock, looked for every 200 us) | the kernel's clock | `Kernel::wait_until`: a kernel wait with a deadline (were host sleeps in a blocking scope; the audio one spun its last half millisecond) |
+| File I/O (`sceIo*`, through libfios2 too), save data and AppUtil, module loading, SceAvPlayer's reads | the host's files | `Kernel::Blocking` |
+| The display queue (`sceGxmDisplayQueueAddEntry` for room, `sceGxmDisplayQueueFinish`), the vblank thread's end | the display queue's and vblank threads (adopted host threads) | `Kernel::Blocking` |
+| A scene's end (`sceGxmEndScene`: rendering, its fragment sync object, the renderer's thread), `sceGxmFinish`, notifications, the renderer's lock | the GPU, the renderer's threads | `Kernel::Lending` (the scene's rendering) and `Kernel::Blocking` (the waits inside it, `CpuGivenUp`, `TargetsHeld`) |
+| H.264 decoding (`sceVideodecDecode`) | host work | `Kernel::Lending` |
+| Host mutexes of the HLE layer (audio ports, NGS, the GXM queue) | another thread's short critical section | taken as is: held for microseconds, never across a kernel wait |
+
+Not bound to an OS thread: the audio device's SDL streams (thread-safe, put from any thread), the Vulkan command pools
+(one per frame slot under the renderer's lock), SDL's window and events (the frontend's main thread only).
+
 ## Fibers (`PSVRECORE_GUEST_FIBERS`)
 
 The fiber backend (guest threads as fibers on one host worker per console CPU) is the next step; its column above

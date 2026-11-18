@@ -776,8 +776,7 @@ i32 sceNgsSystemLock(u32 handle) {
                 return 0;
             }
         }
-        Kernel::Blocking blocking(kernel());
-        nx::this_thread::sleep_for(std::chrono::microseconds(200));
+        kernel().wait_until(kernel().clock_ns() + 200'000);  // (the holder's unlock looked for again: a kernel wait)
     }
 }
 

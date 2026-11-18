@@ -61,17 +61,11 @@ Audio& audio() {
 
 u64 now() { return kernel().clock_ns(); }
 
-// Waits (giving up the guest CPU) until the clock reaches `t`: a sleep, then a short spin for the last half
-// millisecond (host sleeps are coarse).
+// Waits (giving up the guest CPU) until the clock reaches `t`: a kernel wait, as the console's driver makes the thread
+// wait.
 void wait_until(u64 t) {
     if (now() >= t) return;
-    Kernel::Blocking blocking(kernel());
-    while (true) {
-        const u64 n = now();
-        if (n >= t) break;
-        if (t - n > 700'000) nx::this_thread::sleep_for(std::chrono::nanoseconds(t - n - 500'000));
-        else std::this_thread::yield();
-    }
+    kernel().wait_until(t);
 }
 
 bool valid_freq(u32 type, i32 freq) {

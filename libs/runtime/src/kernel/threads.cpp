@@ -281,6 +281,26 @@ i32 Kernel::delay_thread(u32 microseconds, bool callbacks) {
     }
 }
 
+void Kernel::wait_until(u64 at) {
+    Lock guard(impl_->lock);
+    const u64 deadline = impl_->start_ns + at;
+    Thread* self = current();
+    if (!self) {
+        while (impl_->now_ns() < deadline && !impl_->shutting_down) {
+            const u64 left = deadline - impl_->now_ns();
+            impl_->lock.unlock();
+            nx::this_thread::sleep_for(std::chrono::nanoseconds(left));
+            impl_->lock.lock();
+        }
+        return;
+    }
+    while (impl_->now_ns() < deadline) {
+        self->wait = Wait{};
+        self->wait.type = WaitType::Delay;
+        (void)impl_->block(self, nullptr, deadline, false);  // (the deadline, or shutdown: ThreadExit)
+    }
+}
+
 i32 Kernel::change_priority(Uid uid, i32 priority) {
     Lock guard(impl_->lock);
     Thread* t = impl_->thread(uid);

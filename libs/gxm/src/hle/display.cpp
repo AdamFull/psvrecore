@@ -80,14 +80,7 @@ void wait_vblanks(u32 count, bool callbacks) {
     const u64 now = now_ns();
     const u64 target = vcount_at(now) + count;
     const u64 at = static_cast<u64>(std::ceil(static_cast<f64>(target) * period_ns()));
-    {
-        runtime::Kernel::Blocking blocking(runtime::runtime().kernel());
-        while (true) {
-            const u64 t = now_ns();
-            if (t >= at) break;
-            nx::this_thread::sleep_for(std::chrono::nanoseconds(at - t));
-        }
-    }
+    runtime::runtime().kernel().wait_until(at);  // (a kernel wait, without the CPU)
     latch();
     if (callbacks) runtime::runtime().kernel().check_callbacks();
 }

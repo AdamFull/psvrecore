@@ -39,11 +39,7 @@ public:
         update(make);
         if (newest_ <= read_) {
             const u64 next = runtime().vblank_ns(static_cast<u64>(read_ + 1));
-            Kernel::Blocking blocking(kernel());
-            while (kernel().clock_ns() < next) {
-                const u64 t = kernel().clock_ns();
-                nx::this_thread::sleep_for(std::chrono::nanoseconds(next > t ? next - t : 0));
-            }
+            kernel().wait_until(next);  // (a kernel wait, without the CPU)
         }
         update(make);
         const u32 pending = static_cast<u32>(nx::min<i64>(newest_ - read_, kSize));
