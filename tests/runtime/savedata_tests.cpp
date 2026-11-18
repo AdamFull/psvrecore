@@ -486,3 +486,15 @@ TEST_CASE("apputil: without add-ons addcont0: is an empty device; without it, no
         CHECK(call32(ctx, kSceAppUtil, kDrmOpen, {addcont_id("ADDCONTDLC00001"), 0}) == kNotMounted);
     }
 }
+
+TEST_CASE("host: directories made below the deepest one that is there, and again without harm") {
+    TempDir d;
+    const nx::string deep = d.path + "/data/user/00/savedata/PCSF00007";
+    REQUIRE(host::make_directories(deep));
+    CHECK(nx::fs::status(nx::fs::path_view(deep)) == nx::fs::file_type::directory);
+    CHECK(host::make_directories(deep));  // (there already)
+    CHECK(host::make_directories(d.path + "/data/user/00/safemem/"));  // (a trailing slash)
+    // A file in the way: not a directory.
+    REQUIRE(nx::fs::file_write_text(nx::fs::path_view(d.path + "/file"), "x"));
+    CHECK_FALSE(host::make_directories(d.path + "/file/below"));
+}

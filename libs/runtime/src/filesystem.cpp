@@ -11,6 +11,41 @@
 
 namespace psvrecore::runtime {
 
+namespace host {
+
+bool make_directories(nx::string_view path) {
+    nx::string p(path);
+    for (char& c : p)
+        if (c == '\\') c = '/';
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    auto is_directory = [](const nx::string& q) { return nx::fs::status(nx::fs::path_view(q)) == nx::fs::file_type::directory; };
+    if (p.empty() || is_directory(p)) return !p.empty();
+    // (the deepest folder that is there, then each one below it made in turn)
+    usize from = p.size();
+    while (true) {
+        const usize slash = p.view().rfind('/', from - 1);
+        if (slash == nx::string_view::npos || slash == 0) {
+            from = 0;
+            break;
+        }
+        if (is_directory(nx::string(p.view().substr(0, slash)))) {
+            from = slash;
+            break;
+        }
+        from = slash;
+    }
+    for (usize i = from + 1; i <= p.size(); ++i) {
+        if (i < p.size() && p[i] != '/') continue;
+        const nx::string part(p.view().substr(0, i));
+        if (part.empty() || part.back() == ':' || is_directory(part)) continue;  // (a drive: C:)
+        const FileError e = make_directory(part.view());
+        if (e != FileError::None && !(e == FileError::Exists && is_directory(part))) return false;
+    }
+    return is_directory(p);
+}
+
+}  // namespace host
+
 namespace {
 
 char lower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; }

@@ -73,7 +73,7 @@ i32 to_guest(host::FileError e) { return e == host::FileError::NoSpace ? SaveDat
 }  // namespace
 
 SaveData::SaveData(nx::string root) : root_(std::move(root)) {
-    if (!nx::fs::create_directories(nx::fs::path_view(host("sce_sys")))) {
+    if (!host::make_directories(host("sce_sys"))) {
         nx::loge(logs::io, "save data: cannot make the folder '{}'", root_);
         return;
     }
@@ -163,7 +163,7 @@ bool SaveData::write_slots(nx::string_view host_path, const bool* used, const Sl
 }
 
 i32 SaveData::store_slots() {
-    if (!nx::fs::create_directories(nx::fs::path_view(host(kStaging)))) return err::kIo;
+    if (!host::make_directories(host(kStaging))) return err::kIo;
     const nx::string staged = nx::string(kStaging) + "/slots";
     if (!write_slots(host(staged), used_, params_)) return err::kIo;
     nx::vector<nx::string> ops;
@@ -270,7 +270,7 @@ bool SaveData::apply(nx::string_view list) {
         const nx::string_view op = line.substr(0, space);
         const nx::string_view args = space == nx::string_view::npos ? nx::string_view{} : line.substr(space + 1);
         if (op == "dir") {
-            ok &= static_cast<bool>(nx::fs::create_directories(nx::fs::path_view(host(args))));
+            ok &= static_cast<bool>(host::make_directories(host(args)));
         } else if (op == "move") {
             const usize split = args.find(' ');
             const nx::string from = host(args.substr(0, split)), to = host(args.substr(split + 1));
@@ -278,7 +278,7 @@ bool SaveData::apply(nx::string_view list) {
             if (!is_file(from)) continue;
             const nx::string parent = parent_of(to);
             if (!parent.empty() && !is_directory(parent))
-                ok &= static_cast<bool>(nx::fs::create_directories(nx::fs::path_view(parent)));
+                ok &= static_cast<bool>(host::make_directories(parent));
             ok &= host::rename(from, to) == host::FileError::None;
         } else if (op == "remove") {
             const nx::string path = host(args);
@@ -389,7 +389,7 @@ i32 SaveData::save(std::span<const SaveItem> items, const SlotUpdate* slot, u32*
         if (r == kNoSpaceFs && required_kib) *required_kib = static_cast<u32>(nx::max<i64>(delta, 1));
         return r;
     };
-    if (!nx::fs::create_directories(nx::fs::path_view(host(kStaging)))) return err::kIo;
+    if (!host::make_directories(host(kStaging))) return err::kIo;
     nx::vector<nx::string> ops;
     for (const auto& d : new_dirs) ops.push_back("dir " + d);
     for (usize i = 0; i < files.size(); ++i) {
@@ -457,7 +457,7 @@ i32 SaveData::remove(std::span<const nx::string> paths, const SlotUpdate* slot) 
     nx::vector<nx::string> ops;
     for (const auto& p : paths) ops.push_back("remove " + p);
     if (slot) {
-        if (!nx::fs::create_directories(nx::fs::path_view(host(kStaging)))) return err::kIo;
+        if (!host::make_directories(host(kStaging))) return err::kIo;
         const nx::string staged = nx::string(kStaging) + "/slots";
         if (!write_slots(host(staged), slot_used, slot_params)) return err::kIo;
         ops.push_back("move " + staged + " " + kSlotFile);

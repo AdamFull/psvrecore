@@ -6,6 +6,7 @@
 
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/log.hpp"
+#include "psvrecore/runtime/host.hpp"
 #include "core/foundation/core/sha256.h"
 #include "core/foundation/platform/filesystem.h"
 #include "core/foundation/strings/format.h"
@@ -75,7 +76,7 @@ void ShaderCache::open(const nx::string& folder) {
     nx::scoped_lock<nx::mutex> held(lock_);
     folder_ = folder;
     if (folder.empty()) return;
-    (void)nx::fs::create_directories(nx::fs::path_view(folder));
+    (void)runtime::host::make_directories(folder);
     const nx::string path = folder + "/shaders.bin";
     const Header want = header();
     // What is there, if a file this translator wrote.

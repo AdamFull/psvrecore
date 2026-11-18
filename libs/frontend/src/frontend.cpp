@@ -525,7 +525,7 @@ int run_game(const Game& game, int argc, char** argv) {
     // not be allowed to read)
     if (settings->game_folder.empty() && !user.empty()) {
         settings->game_folder = join(user, "game");
-        (void)nx::fs::create_directories(nx::fs::path_view(settings->game_folder));
+        (void)runtime::host::make_directories(settings->game_folder);
     }
 #endif
     const Settings& s = *settings;
@@ -550,7 +550,7 @@ int run_game(const Game& game, int argc, char** argv) {
     const nx::string save = join(data, nx::format("user/00/savedata/{}", game.title_id));
     const nx::string safe = join(data, "user/00/safemem");
     for (const nx::string& folder : {save, safe}) {
-        if (!nx::fs::create_directories(nx::fs::path_view(folder)))
+        if (!runtime::host::make_directories(folder))
             return fail(nx::format("{} cannot be made", folder), cl.hidden);
     }
     nx::vector<ScriptItem> script_items;

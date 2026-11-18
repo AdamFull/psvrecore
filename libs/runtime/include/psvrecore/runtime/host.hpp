@@ -105,6 +105,10 @@ private:
 
 // Directories and files by name.
 FileError make_directory(nx::string_view path);  // one level
+// A directory and the ones above it that are missing; true if it is there after. Only what is missing is made: on
+// Android an application may not make (or even be told it may not make) "/storage", above its own folders, so a walk
+// that makes every level from the root fails there (nx::fs::create_directories does).
+bool make_directories(nx::string_view path);
 FileError remove_directory(nx::string_view path);  // must be empty
 FileError remove_file(nx::string_view path);
 FileError rename(nx::string_view from, nx::string_view to);
