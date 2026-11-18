@@ -2,10 +2,11 @@
 
 // The guest's audio ports played on the host's audio device (SDL3): one audio stream per port, all bound to one
 // device that mixes them. The runtime paces the ports (each block arrives as the one before it starts), so a port's
-// stream holds about a block. The device's clock is not the kernel's: one running slower gathers sound in the
-// stream, so a stream holding more than a quarter of `max_latency_ms` is played up to 0.5% faster until it holds
-// less (a pitch change too small to hear); one that has gathered more than `max_latency_ms` all the same (a stall)
-// drops what it holds, so sound never falls behind the game.
+// stream would hold less than a block: a stream found empty (a new port, or one the device drained) gets kCushionMs
+// of silence first, which it then keeps. The device's clock is not the kernel's: one running slower gathers sound
+// in the stream, so a stream holding more than a quarter of `max_latency_ms` is played up to 0.5% faster until it
+// holds less (a pitch change too small to hear); one that has gathered more than `max_latency_ms` all the same (a
+// stall) drops what it holds, so sound never falls behind the game.
 
 #include <memory>
 
@@ -24,6 +25,8 @@ public:
         u32 rate = 48000;  // the device's (the ports' own rates are converted)
         u32 max_latency_ms = 200;
     };
+    // The lead a port's stream is given over the device when it is empty (a quarter of max_latency_ms at most).
+    static constexpr u32 kCushionMs = 32;
 
     // Opens the default playback device (initializing SDL's audio).
     static Result<nx::unique_ptr<AudioDevice>> open(const Options& options);
@@ -54,6 +57,7 @@ private:
     u32 device_ = 0;
     Options options_;
     nx::flat_hash_map<u32, Port> ports_;
+    nx::vector<u8> silence_;
 };
 
 }  // namespace psvrecore::platform

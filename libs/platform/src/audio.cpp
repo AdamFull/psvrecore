@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 
+
 #include "psvrecore/log.hpp"
 #include "core/foundation/strings/format.h"
 
@@ -65,6 +66,16 @@ void AudioDevice::play(const runtime::AudioBlock& block) {
         const f32 target = static_cast<f32>(options_.max_latency_ms) / 4;
         const f32 ratio = 1.0f + nx::clamp((p.queued_ms - target) / target * 0.005f, 0.0f, 0.005f);
         if (ratio != p.ratio && SDL_SetAudioStreamFrequencyRatio(p.stream, ratio)) p.ratio = ratio;
+    }
+    // (a stream with nothing left, a new one or one the device drained: silence first, kCushionMs of it, below the
+    // trimming's target. The guest hands its blocks over on the kernel's clock as the ones before finish, so without
+    // it the device held less than a block: a guest thread or the device's callback a few milliseconds late made a
+    // gap, heard as choppy sound: WipEout 2048 on a Pixel 8a, 1-6 times in 10 s in its menus.)
+    if (queued == 0 && bytes_per_ms) {
+        const u64 cushion_ms = nx::min<u64>(kCushionMs, options_.max_latency_ms / 4);
+        const u64 frame = u64{block.channels} * 2;
+        silence_.assign(static_cast<usize>(cushion_ms * bytes_per_ms / frame * frame), 0);
+        SDL_PutAudioStreamData(p.stream, silence_.data(), static_cast<int>(silence_.size()));
     }
     SDL_PutAudioStreamData(p.stream, block.samples.data(), static_cast<int>(block.samples.size_bytes()));
 }
