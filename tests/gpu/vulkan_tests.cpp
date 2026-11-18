@@ -3,6 +3,7 @@
 // layer is on when installed, and its errors fail the tests. Shaders are built with gxm's SPIR-V builder.
 // PSVRECORE_TEST_GPU=<index> picks the device (by default a discrete GPU).
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include "nxtest.h"
 #include "psvrecore/gxm/half_check.hpp"
 #include "psvrecore/gxm/spirv.hpp"
+#include "psvrecore/gxm/target_texture.hpp"
 #include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/vulkan/frames.hpp"
 #include "psvrecore/vulkan/pipelines.hpp"
@@ -617,5 +619,152 @@ TEST_CASE("vulkan gpu: the device's conversion to half precision checked against
     CHECK(c.conversion == (c.differ ? gxm::HalfConversion::Integer
                            : c.nans_differ ? gxm::HalfConversion::DeviceNaN : gxm::HalfConversion::Device));
     std::printf("half precision: %s\n", gxm::half_conversion_name(c.conversion));
+    check_no_validation_errors(*g);
+}
+
+namespace {
+
+// An image's texels (one aspect) put in, and the rows the renderer copies for a conversion taken out again (rows
+// `step` apart from `first`, w texels each), on the device.
+nx::vector<u32> through_image(Device& d, VkFormat format, VkImageAspectFlags aspect, u32 width, u32 height,
+                              std::span<const u32> texels, u32 texel_words, u32 w, u32 h, u32 step, u32 first) {
+    ImageDesc desc;
+    desc.format = format;
+    desc.width = width, desc.height = height;
+    desc.usage = (aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                                      : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    Image image = value_or_throw(create_image(d, desc));
+    Buffer in = value_or_throw(create_host_buffer(d, texels.size_bytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT));
+    std::memcpy(in.mapped, texels.data(), texels.size_bytes());
+    flush(d, in);
+    const usize out_words = usize{w} * h * texel_words;
+    Buffer out = value_or_throw(create_host_buffer(d, out_words * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT));
+    OneShot shot(d);
+    VkCommandBuffer cmd = value_or_throw(shot.begin());
+    transition(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkBufferImageCopy up{0, 0, 0, {aspect, 0, 0, 1}, {0, 0, 0}, {width, height, 1}};
+    vkCmdCopyBufferToImage(cmd, in.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &up);
+    transition(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    nx::vector<VkBufferImageCopy> rows;
+    for (u32 r = 0; r < h; ++r)
+        rows.push_back({VkDeviceSize{r} * w * texel_words * 4, 0, 0, {aspect, 0, 0, 1},
+                        {0, static_cast<i32>(r * step + first), 0}, {w, 1, 1}});
+    vkCmdCopyImageToBuffer(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, static_cast<u32>(rows.size()),
+                           rows.data());
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    REQUIRE(shot.submit_and_wait());
+    invalidate(d, out);
+    const u32* p = static_cast<const u32*>(out.mapped);
+    nx::vector<u32> got(p, p + out_words);
+    destroy_buffer(d, in);
+    destroy_buffer(d, out);
+    destroy_image(d, image);
+    return got;
+}
+
+}  // namespace
+
+TEST_CASE("vulkan gpu: render targets' textures made by a compute shader as the decoder makes them from guest memory") {
+    auto g = open(false);
+    Device& d = *g->device;
+    gxm::TargetConverter c;
+    REQUIRE(gxm::create_target_converter(d, c));
+    // (the start-up check: every source, swizzles, tiles, backgrounds, a scale's middle samples)
+    const gxm::TargetCheck check = gxm::check_target_conversion(d, c);
+    if (!check.ok) std::fprintf(stderr, "target textures: %s\n", check.what.c_str());
+    CHECK(check.ok);
+    std::printf("target textures: checked in %.0f ms\n", check.ms);
+
+    // The textures WipEout 2048's races read, at their size, through the device's images: a 960 x 544 surface's
+    // depth (at the internal resolution s: its middle samples) stored into a surface of 1920 samples a row and read
+    // as 1728 x 960 F32M (the rest from guest memory); its HDR colour read as an 832 x 480 U2F10F10F10 part of it; a
+    // D16 256 x 256 tiled shadow map read as U16.
+    u32 seed = 777;
+    auto next = [&] { return seed = seed * 1103515245u + 12345u; };
+    const VkFormat depth_format = d.caps().depth_stencil_format;
+    const bool d32 = depth_format == VK_FORMAT_D32_SFLOAT || depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    struct Case {
+        gxm::TargetSource source;
+        u32 format, type, surface_w, surface_h, scale, stride, tex_w, tex_h;
+    };
+    const Case cases[] = {
+        {gxm::TargetSource::Depth32, 0x13000000u, gxm::texture_type::kLinearStrided, 960, 544, 1, 1920, 1728, 960},
+        {gxm::TargetSource::Depth32, 0x13000000u, gxm::texture_type::kLinearStrided, 960, 544, 2, 1920, 1728, 960},
+        {gxm::TargetSource::Depth16, 0x09000000u, gxm::texture_type::kTiled, 256, 256, 2, 256, 256, 256},
+        {gxm::TargetSource::U2F10F10F10, 0x9A000000u, gxm::texture_type::kLinearStrided, 960, 544, 1, 960, 832, 480},
+    };
+    for (const Case& cs : cases) {
+        const bool depth = cs.source != gxm::TargetSource::U2F10F10F10;
+        if (depth && !d32) continue;  // (the renderer makes none from D24 images)
+        const u32 s = cs.scale, iw = cs.surface_w * s, ih = cs.surface_h * s;
+        const u32 tw_words = gxm::target_source_words(cs.source);
+        nx::vector<u32> texels(usize{iw} * ih * tw_words);
+        for (u32& t : texels) {
+            const u32 r = next();
+            t = depth ? std::bit_cast<u32>(static_cast<f32>(r >> 8) / 16777216.0f) : r;
+        }
+        gxm::TextureInfo info;
+        info.base_format = cs.format, info.type = cs.type, info.width = cs.tex_w, info.height = cs.tex_h, info.levels = 1;
+        const u32 bytes = cs.source == gxm::TargetSource::Depth16 ? 2 : 4;
+        const bool tiled = cs.type == gxm::texture_type::kTiled;
+        info.stride = tiled ? 0 : cs.stride * bytes;
+        const auto dec = gxm::target_decode(info, cs.source);
+        REQUIRE(dec.has_value());
+        const u32 aw = nx::min(cs.tex_w, cs.surface_w), ah = nx::min(cs.tex_h, cs.surface_h);
+        gxm::TargetTextureConstants k;
+        k.width = cs.tex_w, k.height = cs.tex_h, k.a_width = aw, k.a_height = ah;
+        k.src_pitch = aw * s, k.src_step = s, k.src_first = s / 2;
+        k.source = static_cast<u32>(cs.source);
+        k.kind = dec->kind, k.mask = dec->mask, k.select = dec->select, k.alpha_low = dec->alpha_low;
+        gxm::target_packing(k);
+        k.bg_tiled = tiled, k.bg_pitch = tiled ? (cs.tex_w + 31) / 32 : cs.stride, k.bg_bits = bytes * 8;
+        // (the image's rows the renderer copies, through the device)
+        const nx::vector<u32> image =
+            depth ? through_image(d, depth_format, VK_IMAGE_ASPECT_DEPTH_BIT, iw, ih, texels, 1, aw * s, ah, s, s / 2)
+                  : through_image(d, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, iw, ih, texels, 2, aw, ah, 1, 0);
+        // (guest memory as the write-back leaves it: noise, the surface's samples (the middle ones at a scale) over it)
+        const u32 size = gxm::texture_size(info);
+        nx::vector<u8> guest(size + 8);
+        for (u8& v : guest) v = static_cast<u8>(next() >> 24);
+        for (u32 y = 0; y < cs.surface_h; ++y)
+            for (u32 x = 0; x < cs.surface_w; ++x) {
+                const u64 index = tiled ? ((u64{y / 32} * k.bg_pitch + x / 32) * 1024 + (y % 32) * 32 + x % 32)
+                                        : u64{y} * cs.stride + x;
+                if (index * bytes + bytes > size) continue;
+                const u32* t = texels.data() + (usize{y * s + s / 2} * iw + x * s + s / 2) * tw_words;
+                if (cs.source == gxm::TargetSource::Depth16) {
+                    const u16 v = gxm::depth16_of(std::bit_cast<f32>(t[0]));
+                    std::memcpy(guest.data() + index * 2, &v, 2);
+                } else if (cs.source == gxm::TargetSource::Depth32) {
+                    std::memcpy(guest.data() + index * 4, t, 4);
+                } else {
+                    const u16 h[4] = {static_cast<u16>(t[0]), static_cast<u16>(t[0] >> 16), static_cast<u16>(t[1]),
+                                      static_cast<u16>(t[1] >> 16)};
+                    const u32 v = gxm::pack_u2f10f10f10(h);
+                    std::memcpy(guest.data() + index * 4, &v, 4);
+                }
+            }
+        const auto cpu = value_or_throw(gxm::read_texels(info, [&](u32 address, void* out, u32 n) {
+            if (u64{address} + n > guest.size()) return false;
+            std::memcpy(out, guest.data() + address, n);
+            return true;
+        }, false, true));
+        k.out = static_cast<u32>((image.size() + 3) & ~usize{3});
+        const auto gpu = value_or_throw(gxm::run_target_conversion(d, c, k, image, std::span<const u8>(guest.data(), size)));
+        REQUIRE(cpu.data.size() == gpu.size() * 4);
+        usize differ = 0, first = 0;
+        const u8* gb = reinterpret_cast<const u8*>(gpu.data());
+        for (usize i = 0; i < cpu.data.size(); ++i)
+            if (gb[i] != cpu.data[i] && differ++ == 0) first = i;
+        if (differ)
+            std::fprintf(stderr, "target texture format %08x at scale %u: %zu bytes differ, the first at texel %zu\n",
+                         cs.format, s, differ, first / cpu.bytes);
+        CHECK(differ == 0);
+    }
+    gxm::destroy_target_converter(d, c);
     check_no_validation_errors(*g);
 }

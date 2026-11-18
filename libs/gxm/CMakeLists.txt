@@ -2,6 +2,7 @@
 add_library(psvrecore_gxm STATIC
     src/half_check.cpp
     src/spirv.cpp
+    src/target_texture.cpp
     src/texture.cpp
     src/translate.cpp
 )

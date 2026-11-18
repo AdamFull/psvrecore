@@ -11,6 +11,9 @@
 //
 // - Textures are decoded on the CPU (gxm/texture.hpp) into RGBA images, cached by their control words and a hash
 //   of their data; units a program declares but the draw leaves unset read a white texel.
+// - A texture over a surface the GPU drew (a render target sampled later) is made from the surface's image on the GPU
+//   instead: copied (8-bit colour surfaces: texture_from_target) or converted by a compute shader to the bytes the
+//   decoder would make of guest memory (HDR colour, depth: converted_texture, gxm/target_texture.hpp).
 //
 // - Depth and stencil: an image per scene, cleared to the surface's background values; a surface in force load
 //   or force store mode is loaded from guest memory at the start or stored back at the end (linear or tiled,
@@ -38,6 +41,7 @@
 #include "psvrecore/gxm/surface.hpp"
 #include "psvrecore/gxm/texture.hpp"
 #include "psvrecore/gxm/half_check.hpp"
+#include "psvrecore/gxm/target_texture.hpp"
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/io/file.hpp"
 #include "psvrecore/log.hpp"
@@ -102,22 +106,8 @@ bool color_format(u32 gxm, ColorFormat& out) {
     }
 }
 
-// An unsigned 10-bit float is a half's exponent and top five mantissa bits (the same bias). To one: rounded to
-// nearest (ties to even); negative values are 0, large ones the largest finite value; infinity and NaN kept.
-u32 half_to_f10(u16 h) {
-    if (h & 0x8000) return 0;
-    if ((h & 0x7C00) == 0x7C00) return (h & 0x3FF) ? 0x3FF : 0x3E0;
-    const u32 r = (u32{h} + 0xF + ((h >> 5) & 1)) >> 5;
-    return nx::min<u32>(r, 0x3DF);
-}
+// An unsigned 10-bit float (a half's exponent and top five mantissa bits) as a half.
 u16 f10_to_half(u32 v) { return static_cast<u16>((v & 0x3FF) << 5); }
-// A half's value (finite; infinity and NaN as large values).
-f32 half_value(u16 h) {
-    const u32 e = (h >> 10) & 0x1F, m = h & 0x3FF;
-    const f32 v = e ? std::ldexp(static_cast<f32>(m | 0x400), static_cast<i32>(e) - 25) : std::ldexp(static_cast<f32>(m), -24);
-    return (h & 0x8000) ? -v : v;
-}
-
 // A surface's pixels from guest memory into its image's (`packing`), and back: `count` pixels.
 void unpack_pixels(Packing packing, const u8* guest, u8* image, usize count) {
     if (packing == Packing::U2F10F10F10) {
@@ -132,13 +122,15 @@ void unpack_pixels(Packing packing, const u8* guest, u8* image, usize count) {
 }
 void pack_pixels(Packing packing, const u8* image, u8* guest, usize count) {
     if (packing == Packing::U2F10F10F10) {
-        for (usize i = 0; i < count; ++i) {
-            u16 h[4];
-            std::memcpy(h, image + i * 8, 8);
-            const f32 a = nx::clamp(half_value(h[3]), 0.0f, 1.0f);
-            const u32 a2 = static_cast<u32>(a * 3.0f + 0.5f);
-            const u32 v = half_to_f10(h[0]) | half_to_f10(h[1]) << 10 | half_to_f10(h[2]) << 20 | a2 << 30;
-            std::memcpy(guest + i * 4, &v, 4);
+        // (as the GPU's textures from such a surface pack; a row at a time, aligned)
+        constexpr usize kRun = 1024;
+        u16 h[kRun * 4];
+        u32 v[kRun];
+        for (usize i = 0; i < count; i += kRun) {
+            const usize n = nx::min(kRun, count - i);
+            std::memcpy(h, image + i * 8, n * 8);
+            pack_u2f10f10f10(h, v, n);
+            std::memcpy(guest + i * 4, v, n * 4);
         }
     }
 }
@@ -358,7 +350,7 @@ void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32
                                        : std::bit_cast<u32>(z) | (mask_in_stencil(l) ? u32{stencil[at] & 1u} << 31 : mask);
                 std::memcpy(memory().host(s.depth_data + i * 4), &w, 4);
             } else if (l.depth_bytes == 2) {
-                const u16 h = static_cast<u16>(std::lround(z * 65535.0f));
+                const u16 h = depth16_of(z);
                 std::memcpy(memory().host(s.depth_data + i * 2), &h, 2);
             }
             if (l.stencil) *memory().host(s.stencil_data + i) = stencil[at];
@@ -414,6 +406,14 @@ struct DepthTarget {
     nx::vector<u8> written;
     u32 stencil_address = 0;  // (a kept one's: its key has the stencil's address too)
     u64 used = 0;             // (a kept one's: the scene it was last used in)
+    u64 generation = 0;       // (a kept one's: +1 each time a scene's store of it is written back)
+    // (a kept one's, for textures made on the GPU from it that read past what the scenes store (converted_texture):
+    // guest memory's bytes from its address as they were, on the CPU and in `background` once uploaded; `version` +1
+    // each time they are taken again)
+    nx::vector<u8> background_bytes;
+    vk::DeviceBuffer background{};
+    bool background_uploaded = false;
+    u64 background_version = 0;
 };
 
 struct CachedTexture {
@@ -484,6 +484,34 @@ struct Renderer {
         u32 strip_x = 0, strip_w = 0;
     };
     nx::vector<TargetCopy> target_copies;
+    // Textures made on the GPU from a surface's image by a conversion (converted_texture: target_texture.hpp), recorded
+    // with the copies: the image's region copied into a work buffer, the shader run, its texels copied into the
+    // texture. `depth`: a kept depth image (its middle samples at a scale: rows `step` apart from `first`), else the
+    // colour surface's image (its scaled one at a scale). A background to upload first: its staging buffer.
+    struct TargetConversion {
+        u64 key = 0;
+        Target* color = nullptr;
+        DepthTarget* depth = nullptr;
+        u32 x = 0, y = 0, w = 0, h = 0;  // (the image's texels copied: rows of w; depth at a scale: rows y * step + first)
+        u32 step = 1, first = 0;
+        TargetTextureConstants k{};
+        vk::DeviceBuffer work{};
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        vk::Buffer background_staging{};
+        vk::DeviceBuffer retired_background{};  // (a smaller one this replaced: earlier scenes may read it)
+        // (PSVRECORE_TARGET_TEXTURES=verify: the decoder's texels from guest memory, and the GPU's read back)
+        // A texture made from the image of a surface a pending scene draws (`pending`): what guest memory holds once
+        // that scene is written back, decoded when this one is done.
+        nx::vector<u8> expected;
+        vk::Buffer verify{};
+        bool pending = false;
+        usize verify_bytes = 0;
+        TextureInfo info{};
+    };
+    nx::vector<TargetConversion> target_conversions;
+    TargetConverter converter;  // (not ready: such textures are read back and decoded)
+    nx::hash_map<u64, std::optional<TargetDecode>> target_decodes;  // (by format, swizzle and source)
+    nx::vector<vk::DeviceBuffer> free_work;  // (the conversions' work buffers, for the next)
     // New textures' texels (texture_for), uploaded by the scene's commands before its draws: not waited for, as a
     // copy submitted alone would be (behind the scenes the GPU still has). Their buffers go when the scene is done.
     // A YUV420 texture (a movie's frame) is converted by the commands too (yuv_set: the staging buffer holds the
@@ -537,6 +565,7 @@ struct Renderer {
         DepthTarget* kept_depth = nullptr;  // (the kept depth image it drew with, and whether it stores it)
         bool stores_kept_depth = false;
         DepthTarget* depth_sources[2] = {};  // (the kept images it copies its depth and stencil from)
+        nx::vector<DepthTarget*> converted_from;  // (kept images its textures were made from)
         nx::unique_ptr<vk::OneShot> shot;
         nx::vector<std::pair<u32, u32>> writes;  // (address, bytes)
         Target* target = nullptr;
@@ -587,6 +616,24 @@ struct Renderer {
     tracy::VkCtx* gpu_zones = nullptr;  // (Tracy's GPU zones: the scenes' and the game's markers; null: none)
 #endif
 };
+
+// The conversion of render targets' images into textures (target_texture.hpp), checked on the device against the
+// texture decoder: unless PSVRECORE_TARGET_TEXTURES=0, or the device's results differ.
+void make_target_converter(Renderer& r) {
+    if (const char* v = std::getenv("PSVRECORE_TARGET_TEXTURES"); v && *v == '0') return;
+    if (auto made = create_target_converter(*r.device, r.converter); !made) {
+        nx::logw(logs::gpu, "{}: render targets read as textures are decoded on the CPU", made.error().message);
+        return;
+    }
+    const TargetCheck check = check_target_conversion(*r.device, r.converter);
+    if (!check.ok) {
+        nx::logw(logs::gpu, "target textures: the device's conversion differs from the decoder's ({}): render targets read "
+                 "as textures are decoded on the CPU", check.what);
+        destroy_target_converter(*r.device, r.converter);
+        return;
+    }
+    nx::logi(logs::gpu, "target textures: made on the GPU (the conversion checked in {:.0f} ms)", check.ms);
+}
 
 // The YUV420 conversion's pipeline (yuv420_shader): unless PSVRECORE_YUV_CPU is set, or the device has none.
 void make_yuv_pipeline(Renderer& r) {
@@ -1026,6 +1073,7 @@ bool ensure(Renderer& r) {
     li.pPushConstantRanges = &push;
     vkCreatePipelineLayout(d.device(), &li, nullptr, &r.layout);
     make_yuv_pipeline(r);
+    make_target_converter(r);
     vk::ImageDesc wd;
     wd.width = wd.height = 1;
     if (auto img = vk::create_image(d, wd)) {
@@ -1834,7 +1882,10 @@ DepthTarget* kept_depth_for(Renderer& r, const DepthStencilSurface& s, u32 width
             bool drawing = false;
             for (const Renderer::Pending& p : r.pending)
                 drawing |= p.kept_depth == r.kept_depths[i].get() || p.depth_sources[0] == r.kept_depths[i].get() ||
-                           p.depth_sources[1] == r.kept_depths[i].get();
+                           p.depth_sources[1] == r.kept_depths[i].get() ||
+                           std::find(p.converted_from.begin(), p.converted_from.end(), r.kept_depths[i].get()) !=
+                               p.converted_from.end();
+            for (const Renderer::TargetConversion& c : r.target_conversions) drawing |= c.depth == r.kept_depths[i].get();
             if (!drawing && (oldest == r.kept_depths.size() || r.kept_depths[i]->used < r.kept_depths[oldest]->used))
                 oldest = i;
         }
@@ -1842,6 +1893,7 @@ DepthTarget* kept_depth_for(Renderer& r, const DepthStencilSurface& s, u32 width
         DepthTarget& t = *r.kept_depths[oldest];
         r.passes->forget(t.image.view);
         vk::destroy_image(*r.device, t.image);
+        if (t.background.buffer) vk::destroy_buffer(*r.device, t.background);
         r.kept_depths.erase(r.kept_depths.begin() + static_cast<std::ptrdiff_t>(oldest));
     }
     vk::ImageDesc dd;
@@ -1992,6 +2044,7 @@ struct SceneProfile {
 
     u64 unchanged = 0, write_faults = 0;  // (textures found unwritten; writes to watched pages, by the process)
     u64 ahead = 0;  // (new textures whose texels were decoded ahead)
+    u64 converted = 0, converted_bg = 0;  // (textures made on the GPU from surfaces' images; backgrounds taken)
     u64 from_targets = 0, lookups = 0, hashed = 0, hash_ns = 0, misses = 0, miss_ns = 0, miss_bytes = 0, decode_ns = 0, create_ns = 0, upload_ns = 0;
     u64 at = 0;
     u32 part = 0, scenes = 0;
@@ -2071,9 +2124,10 @@ struct SceneProfile {
             std::fprintf(stderr, " GPU: %.2f ms before the pass, %.2f the pass, %.2f after it a scene;",
                          static_cast<f64>(gpu_before_ns) / 1e6 / gpu_measured, static_cast<f64>(gpu_pass_ns) / 1e6 / gpu_measured,
                          static_cast<f64>(gpu_after_ns) / 1e6 / gpu_measured);
-        std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene;",
+        std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene (%.2f converted, %.3f backgrounds);",
                      static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
-                     static_cast<f64>(from_targets) / scenes);
+                     static_cast<f64>(from_targets + converted) / scenes, static_cast<f64>(converted) / scenes,
+                     static_cast<f64>(converted_bg) / scenes);
         std::fprintf(stderr,
                      " textures: %.1f lookups, %.1f unwritten, %.1f hashed (%.2f ms), %.1f writes to watched pages, %.2f "
                      "new (%.0f KiB, %.2f ms: decoded %.2f, made %.2f, uploaded %.2f) a scene\n",
@@ -2232,12 +2286,340 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
     return nullptr;
 }
 
+// ---- Textures converted on the GPU from a surface's image -------------------------------------------------------
+
+bool read_guest_memory(u32 address, void* out, u32 bytes) {
+    if (!memory().valid(address, bytes)) return false;
+    std::memcpy(out, memory().host(address), bytes);
+    return true;
+}
+
+// The shader's decode of a texture's format and swizzle from an image of `source` (target_decode, probed once).
+const std::optional<TargetDecode>& decode_for(Renderer& r, const TextureInfo& info, TargetSource source) {
+    const u64 key = u64{info.base_format} ^ (u64{info.swizzle} << 32) ^ (u64{static_cast<u32>(source)} << 40) ^
+                    (u64{info.gamma} << 48) ^ (u64{info.levels} << 52);
+    auto it = r.target_decodes.find(key);
+    if (it == r.target_decodes.end()) it = r.target_decodes.emplace(key, target_decode(info, source)).first;
+    return it->second;
+}
+
+// A device buffer for a conversion's work (one given back, no more than four times as large, else a new one).
+Result<vk::DeviceBuffer> take_work(Renderer& r, VkDeviceSize bytes) {
+    usize best = r.free_work.size();
+    for (usize i = 0; i < r.free_work.size(); ++i) {
+        const VkDeviceSize s = r.free_work[i].size;
+        if (s >= bytes && s <= bytes * 4 && (best == r.free_work.size() || s < r.free_work[best].size)) best = i;
+    }
+    if (best < r.free_work.size()) {
+        const vk::DeviceBuffer b = r.free_work[best];
+        r.free_work.erase(r.free_work.begin() + static_cast<std::ptrdiff_t>(best));
+        return b;
+    }
+    return vk::create_device_buffer(*r.device, std::bit_ceil(nx::max<VkDeviceSize>(bytes, 65536)),
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+}
+void give_work(Renderer& r, vk::DeviceBuffer& b) {
+    if (!b.buffer) return;
+    r.free_work.push_back(b);
+    b = {};
+    VkDeviceSize total = 0;
+    for (const vk::DeviceBuffer& f : r.free_work) total += f.size;
+    while (total > (96ull << 20) && !r.free_work.empty()) {
+        total -= r.free_work.front().size;
+        vk::destroy_buffer(*r.device, r.free_work.front());
+        r.free_work.erase(r.free_work.begin());
+    }
+}
+
+// A conversion's buffers and set given back (once the scene that recorded it is done, or it was not recorded).
+void release_conversion(Renderer& r, Renderer::TargetConversion& c) {
+    give_work(r, c.work);
+    free_target_converter_set(*r.device, r.converter, c.set);
+    c.set = VK_NULL_HANDLE;
+    give_host_buffer(r, c.background_staging);
+    give_host_buffer(r, c.verify);
+    if (c.retired_background.buffer) vk::destroy_buffer(*r.device, c.retired_background);
+}
+
+// PSVRECORE_TARGET_TEXTURES=verify: each texture made on the GPU from a surface's image compared, once its scene is
+// done, with what the decoder makes of guest memory when it was made (not at an internal resolution above 1, where
+// a colour surface's texture is made at that resolution). Differences are logged.
+bool verify_conversions() {
+    static const bool on = [] {
+        const char* v = std::getenv("PSVRECORE_TARGET_TEXTURES");
+        return v && std::strcmp(v, "verify") == 0;
+    }();
+    return on;
+}
+void verified_conversion(Renderer::TargetConversion& c, vk::Device& d, const Target* drawn) {
+    static u64 checked = 0, differed = 0;
+    if (!c.verify.buffer) return;
+    if (c.pending) {
+        // (unless this scene drew over that surface since)
+        if (c.color == drawn) return;
+        auto texels = read_texels(c.info, read_guest_memory, false, true);
+        if (!texels || texels->data.size() != c.verify_bytes) return;
+        c.expected = std::move(texels->data);
+    }
+    if (c.expected.empty()) return;
+    vk::invalidate(d, c.verify);
+    const u8* got = static_cast<const u8*>(c.verify.mapped);
+    ++checked;
+    if (std::memcmp(got, c.expected.data(), c.expected.size()) != 0) {
+        usize at = 0, bytes = 0;
+        while (got[at] == c.expected[at]) ++at;
+        for (usize i = 0; i < c.expected.size(); ++i) bytes += got[i] != c.expected[i];
+        ++differed;
+        const usize texel = at / 8 * 8;
+        u64 g = 0, e = 0;
+        std::memcpy(&g, got + texel, nx::min<usize>(8, c.expected.size() - texel));
+        std::memcpy(&e, c.expected.data() + texel, nx::min<usize>(8, c.expected.size() - texel));
+        nx::logw(logs::gpu, "target textures: a texture {} x {} from a {} surface differs from the decoder's at byte {} "
+                 "({} bytes; the GPU's {:016x}, the decoder's {:016x}) ({} of {} differed){}", c.k.width, c.k.height,
+                 c.depth ? "depth" : "colour", at, bytes, g, e, differed, checked,
+                 c.pending ? " (made from a pending scene's image)" : "");
+    } else if (checked % 500 == 0) {
+        nx::logi(logs::gpu, "target textures: {} checked against the decoder, {} differed", checked, differed);
+    }
+}
+
+// The texture made: its image (the one these words showed before, of this size and format, when no draw of this
+// scene samples it), the conversion queued for the scene's commands.
+CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u64 words_key, const TargetDecode& dec,
+                                Renderer::TargetConversion conv) {
+    TargetTextureConstants& k = conv.k;
+    k.kind = dec.kind, k.mask = dec.mask, k.select = dec.select, k.alpha_low = dec.alpha_low ? 1 : 0;
+    target_packing(k);
+    vk::ImageDesc d;
+    d.format = dec.single ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+    d.width = k.width, d.height = k.height;
+    if (dec.single) {
+        constexpr VkComponentSwizzle of[3] = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
+        d.components = {of[dec.rgba_of[0]], of[dec.rgba_of[1]], of[dec.rgba_of[2]], of[dec.rgba_of[3]]};
+    }
+    // (the work buffer: the image's texels, then the texels made, 16-byte aligned)
+    const u32 src_words = conv.w * conv.h * target_source_words(static_cast<TargetSource>(k.source));
+    k.src = 0;
+    k.out = (src_words + 3) & ~3u;
+    const VkDeviceSize work_bytes = (VkDeviceSize{k.out} + VkDeviceSize{k.width} * k.height * target_out_words(dec)) * 4;
+    auto work = take_work(r, work_bytes);
+    if (!work) return nullptr;
+    conv.work = *work;
+    DepthTarget* bg = k.a_width < k.width || k.a_height < k.height ? conv.depth : nullptr;
+    const bool upload = bg && !bg->background_uploaded;
+    if (upload) {
+        // (guest memory's bytes, uploaded by the scene's commands; into a larger buffer when they grew)
+        const VkDeviceSize bytes = (bg->background_bytes.size() + 3) & ~VkDeviceSize{3};
+        auto staging = take_host_buffer(r, bytes);
+        if (!staging) {
+            give_work(r, conv.work);
+            return nullptr;
+        }
+        conv.background_staging = *staging;
+        if (bg->background.size < bytes) {
+            auto b = vk::create_device_buffer(*r.device, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            if (!b) {
+                release_conversion(r, conv);
+                return nullptr;
+            }
+            conv.retired_background = bg->background;
+            bg->background = *b;
+        }
+        std::memcpy(conv.background_staging.mapped, bg->background_bytes.data(), bg->background_bytes.size());
+        vk::flush(*r.device, conv.background_staging);
+    }
+    conv.set = target_converter_set(*r.device, r.converter, conv.work.buffer, work_bytes,
+                                    bg ? bg->background.buffer : VK_NULL_HANDLE, bg ? bg->background.size : 0);
+    CachedTexture c;
+    bool reused = false;
+    if (conv.set) {
+        if (auto was = r.by_words.find(words_key); was != r.by_words.end()) {
+            auto old = r.textures.find(was->second);
+            if (old != r.textures.end() && old->second.used != r.scenes) {
+                const vk::ImageDesc& od = old->second.image.desc;
+                if (od.format == d.format && od.width == d.width && od.height == d.height && od.mips == 1 &&
+                    od.layers == 1 && !od.cube && std::memcmp(&od.components, &d.components, sizeof d.components) == 0) {
+                    c = old->second;
+                    r.textures.erase(old);
+                    reused = true;
+                }
+            }
+        }
+        if (!reused) {
+            if (auto image = vk::create_image(*r.device, d)) {
+                c.image = *image;
+                c.sampler = texture_sampler(r, info, d.format, 1);
+                c.bytes = u64{d.width} * d.height * vk::texel_size(d.format);
+                r.texture_bytes += c.bytes;
+            }
+        }
+    }
+    if (!c.image.image) {
+        // (the old, smaller background stays the surface's until a conversion uploads a new one)
+        if (conv.retired_background.buffer) std::swap(conv.retired_background, bg->background);
+        release_conversion(r, conv);
+        return nullptr;
+    }
+    if (upload) bg->background_uploaded = true;
+    if (verify_conversions() && (conv.depth || conv.color->scale <= 1 || !conv.color->scaled.image)) {
+        auto texels = read_texels(info, read_guest_memory, false, true);
+        auto readback = texels ? take_host_buffer(r, texels->data.size()) : Result<vk::Buffer>(failure("verify"));
+        if (texels && readback && texels->data.size() == usize{k.width} * k.height * target_out_words(dec) * 4) {
+            if (!conv.pending) conv.expected = std::move(texels->data);
+            conv.verify = *readback;
+            conv.verify_bytes = usize{k.width} * k.height * target_out_words(dec) * 4;
+            conv.info = info;
+        } else if (readback) {
+            give_host_buffer(r, *readback);
+        }
+    }
+    conv.key = key;
+    r.target_conversions.push_back(conv);
+    c.used = r.scenes;
+    r.by_words[words_key] = key;
+    if (g_profile.on) ++g_profile.converted, g_profile.converted_bg += upload;
+    return &r.textures.emplace(key, c).first->second;
+}
+
+// A texture that reads a surface the GPU drew, in a format whose texels the shader makes from its image
+// (target_texture.hpp): an HDR colour surface (U2F10F10F10, read as such), a depth surface a scene stores (DF32,
+// DF32M read as F32 or F32M; D16 as U16). Made from the image while guest memory still holds what was written back
+// from it (and, for a texture that reads past what the scenes store, what it held when it was taken as the
+// background): keyed by the surface's generation, not hashed, decoded and uploaded.
+//
+// A colour surface: the texture inside it (its address in it, the same layout: rows of the same stride, or tiles of
+// as many a row from a tile row), at the internal resolution when it is drawn at one. A depth surface: at its
+// address, in its layout, its kept image's samples (at a scale, the middle samples guest memory gets) and the
+// background past them. `only`: that colour surface, which a pending scene draws (not compared).
+CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words_key, u64* key, Target* only = nullptr) {
+    if (!r.converter.ready() || info.levels != 1 || !info.address || info.gamma) return nullptr;
+    const u32 code = ((info.base_format >> 24) & 0x1F) | ((info.base_format >> 31) << 7);
+    const bool hdr = code == 0x9A, d16 = code == 0x09, d32 = code == 0x12 || code == 0x13;
+    if (!hdr && !d16 && !d32) return nullptr;
+    const bool linear = info.type == texture_type::kLinear || info.type == texture_type::kLinearStrided;
+    const bool tiled = info.type == texture_type::kTiled;
+    if (!linear && !tiled) return nullptr;
+    const u32 tw = info.width, th = info.height;
+    auto mix = [&](const void* p, u64 generation, u64 extra) {
+        return (words_key * 0x9E3779B97F4A7C15ull) ^ (reinterpret_cast<u64>(p) * 0xC2B2AE3D27D4EB4Full) ^
+               (generation * 0x165667B19E3779F9ull) ^ (extra * 0x27D4EB2F165667C5ull) ^ 0x636F6E7665727465ull;
+    };
+    auto cached = [&]() -> CachedTexture* {
+        auto it = r.textures.find(*key);
+        if (it == r.textures.end()) return nullptr;
+        it->second.used = r.scenes;
+        return &it->second;
+    };
+    if (hdr) {
+        for (auto& t : r.targets) {
+            if (only && t.get() != only) continue;
+            ColorFormat cf;
+            if (!color_format(t->format, cf) || cf.packing != Packing::U2F10F10F10) continue;
+            if (info.address < t->address || info.address - t->address >= t->layout.span()) continue;
+            const u32 delta = info.address - t->address;
+            const SurfaceLayout& l = t->layout;
+            const u32 tile_row = (l.stride + 31) / 32 * 1024 * 32 * 4;  // (bytes of a row of tiles)
+            u32 ox = 0, oy = 0;
+            if (linear && l.kind == SurfaceLayout::kLinear && info.stride == l.stride * 4 && delta % 4 == 0) {
+                oy = delta / (l.stride * 4), ox = delta % (l.stride * 4) / 4;
+            } else if (tiled && l.kind == SurfaceLayout::kTiled && (l.stride + 31) / 32 == (tw + 31) / 32 &&
+                       delta % tile_row == 0) {
+                oy = delta / tile_row * 32;
+            } else {
+                continue;
+            }
+            if (u64{ox} + tw > t->width || u64{oy} + th > t->height) continue;
+            if (!only) {
+                if (t->written.empty()) continue;
+                const Changes changes = surface_changes(*t);
+                if (changes.all || changes.pixels) continue;
+            }
+            const auto& dec = decode_for(r, info, TargetSource::U2F10F10F10);
+            if (!dec) return nullptr;
+            *key = mix(t.get(), t->generation, u64{ox} << 32 | oy);
+            if (CachedTexture* c = cached()) return c;
+            const u32 s = t->scale > 1 && t->scaled.image ? t->scale : 1;
+            Renderer::TargetConversion conv;
+            conv.color = t.get();
+            conv.pending = only != nullptr;
+            conv.x = ox * s, conv.y = oy * s, conv.w = tw * s, conv.h = th * s;
+            TargetTextureConstants& k = conv.k;
+            k.width = k.a_width = tw * s, k.height = k.a_height = th * s;
+            k.src_pitch = tw * s;
+            k.source = static_cast<u32>(TargetSource::U2F10F10F10);
+            return queue_conversion(r, info, *key, words_key, *dec, conv);
+        }
+        return nullptr;
+    }
+    if (only) return nullptr;
+    // (a D32 float image: a D24 one's values are converted on storing)
+    const VkFormat depth_format = r.device->caps().depth_stencil_format;
+    if (depth_format != VK_FORMAT_D32_SFLOAT && depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return nullptr;
+    for (auto& kt : r.kept_depths) {
+        DepthTarget* t = kt.get();
+        if (t->address != info.address || t->written.empty() || t->image.layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
+        DepthLayout l;
+        if (!depth_layout(t->control & 0x03FFF000u, l) || l.packed) continue;
+        if (d16 ? l.depth_bytes != 2 : (l.depth_bytes != 4 || (code == 0x12 && l.mask))) continue;
+        const u32 bytes = l.depth_bytes;
+        if (((t->control & kDsTiled) != 0) != tiled) continue;
+        if (linear ? info.stride != t->stride * 32 * bytes : (tw + 31) / 32 != t->stride) continue;
+        const u32 aw = nx::min(tw, t->width), ah = nx::min(th, t->height);
+        const bool past = aw < tw || ah < th;
+        if (past && !linear) continue;
+        bool drawing = false;  // (a pending scene drawing with it: its image is not what guest memory holds)
+        for (const Renderer::Pending& p : r.pending) drawing |= p.kept_depth == t;
+        if (drawing) continue;
+        DepthStencilSurface s{};
+        s.control = t->control, s.depth_data = t->address, s.stencil_data = t->stencil_address;
+        s.background_control = t->stride << 16;
+        if (!depth_contents_equal(depth_ranges(s, l, t->width, t->height), t->written)) continue;
+        const auto& dec = decode_for(r, info, d16 ? TargetSource::Depth16 : TargetSource::Depth32);
+        if (!dec) return nullptr;
+        if (past) {
+            // (guest memory past what the scenes store, row by row: as it was taken, else taken again)
+            const u32 size = texture_size(info);
+            if (!memory().valid(info.address, size)) return nullptr;
+            const u8* guest = memory().host(info.address);
+            const usize row = info.stride;
+            const u8* had = t->background_bytes.data();
+            bool same = t->background_bytes.size() == size;
+            for (u32 y = 0; same && y < ah; ++y) {
+                const usize from = y * row + usize{aw} * bytes, to = nx::min<usize>((y + 1) * row, size);
+                same = to <= from || std::memcmp(guest + from, had + from, to - from) == 0;
+            }
+            if (same && usize{ah} * row < size) same = std::memcmp(guest + ah * row, had + ah * row, size - ah * row) == 0;
+            if (!same) {
+                t->background_bytes.assign(guest, guest + size);
+                t->background_uploaded = false;
+                ++t->background_version;
+            }
+        }
+        *key = mix(t, t->generation, past ? t->background_version + 1 : 0);
+        if (CachedTexture* c = cached()) return c;
+        Renderer::TargetConversion conv;
+        conv.depth = t;
+        const u32 sc = t->scale;
+        conv.w = aw * sc, conv.h = ah;
+        conv.step = sc, conv.first = sc / 2;
+        TargetTextureConstants& k = conv.k;
+        k.width = tw, k.height = th, k.a_width = aw, k.a_height = ah;
+        k.src_pitch = aw * sc, k.src_step = sc, k.src_first = sc / 2;
+        k.source = static_cast<u32>(d16 ? TargetSource::Depth16 : TargetSource::Depth32);
+        k.bg_tiled = 0, k.bg_pitch = linear ? info.stride / bytes : 0, k.bg_bits = bytes * 8;
+        return queue_conversion(r, info, *key, words_key, *dec, conv);
+    }
+    return nullptr;
+}
+
 // A texture over the surface a pending scene draws: made from its image (the GPU runs the scenes in order), keyed
 // by the surface's generation (guest memory does not hold that scene's pixels yet).
 CachedTexture* texture_from_pending_target(Renderer& r, const TextureInfo& info, u64 words_key, u64* key) {
     for (const Renderer::Pending& p : r.pending) {
         Target* t = p.target;
         if (!t || t->address != info.address) continue;
+        if (CachedTexture* c = converted_texture(r, info, words_key, key, t)) return c;
         *key = (words_key * 0x9E3779B97F4A7C15ull) ^ (t->generation * 0xC2B2AE3D27D4EB4Full) ^ 0x70656E64696E67ull;
         if (auto it = r.textures.find(*key); it != r.textures.end()) {
             it->second.used = r.scenes;
@@ -2248,8 +2630,87 @@ CachedTexture* texture_from_pending_target(Renderer& r, const TextureInfo& info,
     return nullptr;
 }
 
+// The conversions converted_texture asked for: the backgrounds uploaded, the images' texels copied into the work
+// buffers, the shader run, its texels copied into the textures.
+void record_target_conversions(Renderer& r, VkCommandBuffer cmd) {
+    nx::vector<Renderer::TargetConversion*> live;
+    for (Renderer::TargetConversion& c : r.target_conversions)
+        if (r.textures.find(c.key) != r.textures.end()) live.push_back(&c);
+    if (live.empty()) return;
+    auto barrier = [&](VkPipelineStageFlags from, VkAccessFlags from_access, VkPipelineStageFlags to, VkAccessFlags to_access) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = from_access;
+        mb.dstAccessMask = to_access;
+        vkCmdPipelineBarrier(cmd, from, to, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    // (a background earlier scenes' conversions may still read, written over)
+    bool uploads = false;
+    for (Renderer::TargetConversion* c : live) uploads |= c->background_staging.buffer != VK_NULL_HANDLE;
+    if (uploads) barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    for (Renderer::TargetConversion* c : live) {
+        if (c->background_staging.buffer) {
+            const VkDeviceSize bytes = (c->depth->background_bytes.size() + 3) & ~VkDeviceSize{3};
+            const VkBufferCopy region{0, 0, bytes};
+            vkCmdCopyBuffer(cmd, c->background_staging.buffer, c->depth->background.buffer, 1, &region);
+        }
+        if (c->depth) {
+            vk::Image& from = c->depth->image;
+            const VkImageLayout was = from.layout;
+            vk::transition(cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            nx::vector<VkBufferImageCopy> rows;
+            if (c->step == 1) {
+                rows.push_back({0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {c->w, c->h, 1}});
+            } else {
+                // (the rows of middle samples, as the write-back takes them)
+                for (u32 y = 0; y < c->h; ++y)
+                    rows.push_back({VkDeviceSize{y} * c->w * 4, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+                                    {0, static_cast<i32>(y * c->step + c->first), 0}, {c->w, 1, 1}});
+            }
+            vkCmdCopyImageToBuffer(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->work.buffer,
+                                   static_cast<u32>(rows.size()), rows.data());
+            vk::transition(cmd, from, was);  // (as the scene's own use of it expects it)
+        } else {
+            vk::Image& from = c->color->scale > 1 && c->color->scaled.image ? c->color->scaled : c->color->image;
+            vk::transition(cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            const VkBufferImageCopy region{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                           {static_cast<i32>(c->x), static_cast<i32>(c->y), 0}, {c->w, c->h, 1}};
+            vkCmdCopyImageToBuffer(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->work.buffer, 1, &region);
+        }
+    }
+    barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
+    for (Renderer::TargetConversion* c : live) record_target_conversion(cmd, r.converter, c->set, c->k);
+    barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    for (Renderer::TargetConversion* c : live) {
+        vk::Image& to = r.textures.find(c->key)->second.image;
+        vk::transition(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        const VkBufferImageCopy region{VkDeviceSize{c->k.out} * 4, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                                       {c->k.width, c->k.height, 1}};
+        vkCmdCopyBufferToImage(cmd, c->work.buffer, to.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        if (c->verify.buffer) {
+            const VkBufferCopy back{VkDeviceSize{c->k.out} * 4, 0, c->verify_bytes};
+            vkCmdCopyBuffer(cmd, c->work.buffer, c->verify.buffer, 1, &back);  // (seen by the host after the scene's barrier)
+        }
+        vk::transition(cmd, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+}
+
 // The copies texture_from_target asked for, and the new textures' uploads, recorded before the scene's draws.
 void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
+    if (!r.target_copies.empty() || !r.target_conversions.empty()) {
+        // (a surface a pending scene draws, read here: its drawing (and its write-back's copy) before these copies.
+        // Its image may already be in TRANSFER_SRC, where a transition adds no barrier; the scenes are separate
+        // submissions, whose order alone does not order their commands)
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
     bool converted = false;
     for (Renderer::TextureUpload& u : r.texture_uploads) {
         if (!u.yuv_set || r.textures.find(u.key) == r.textures.end()) continue;
@@ -2296,6 +2757,7 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
         }
         vk::transition(cmd, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
+    record_target_conversions(r, cmd);
 }
 
 // The copies' buffers given back once the scene is done; `recorded` false (the scene ended before its commands):
@@ -2322,6 +2784,23 @@ void finish_target_copies(Renderer& r, bool recorded) {
         }
     }
     r.target_copies.clear();
+    // (conversions not recorded: a recorded scene's go with its finish)
+    for (Renderer::TargetConversion& c : r.target_conversions) {
+        if (c.background_staging.buffer) c.depth->background_uploaded = false;
+        if (c.retired_background.buffer) {
+            // (the larger background never written: the one earlier scenes read stays)
+            vk::destroy_buffer(*r.device, c.depth->background);
+            c.depth->background = c.retired_background;
+            c.retired_background = {};
+        }
+        release_conversion(r, c);
+        if (auto it = r.textures.find(c.key); it != r.textures.end()) {
+            r.texture_bytes -= it->second.bytes;
+            retire_image(r, it->second.image);
+            r.textures.erase(it);
+        }
+    }
+    r.target_conversions.clear();
 }
 
 // A texture to decode (texture_for, collecting): decoded on several threads, then made (make_texture).
@@ -2334,11 +2813,6 @@ struct TextureMiss {
     bool ahead = false;  // (its texels decoded ahead: taken)
 };
 
-bool read_guest_memory(u32 address, void* out, u32 bytes) {
-    if (!memory().valid(address, bytes)) return false;
-    std::memcpy(out, memory().host(address), bytes);
-    return true;
-}
 
 CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 key, u64 words_key, Result<Texels>* given);
 
@@ -2367,6 +2841,11 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
             return c;
         }
         g_finish_why = 7, finish_pending(r, true);
+    }
+    // (a render target's texels made on the GPU, before anything is hashed)
+    if (u64 converted_key = 0; CachedTexture* c = converted_texture(r, info, wh.value(), &converted_key)) {
+        seen[wh.value()] = converted_key;
+        return c;
     }
     const u32 palette = info.palette && memory().valid(info.palette, 1024) ? info.palette : 0;
     auto writes = [&] { return memory().writes(info.address, size) + (palette ? memory().writes(palette, 1024) : 0); };
@@ -4530,13 +5009,16 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     pending.kept_depth = kept_depth;
     pending.stores_kept_depth = kept_depth && store_depth;
     pending.depth_sources[0] = aspect_from[0], pending.depth_sources[1] = aspect_from[1];
+    for (const Renderer::TargetConversion& c : r.target_conversions)
+        if (c.depth && std::find(pending.converted_from.begin(), pending.converted_from.end(), c.depth) == pending.converted_from.end())
+            pending.converted_from.push_back(c.depth);
     const bool stores_depth = store_depth && depth.image;
     pending.finish = [&r, &d, stamps, color = color != nullptr, readback, mem_buf, depth_buf, buffers = std::move(buffers),
                       layout, data = cs.data, width, height, bytes = cf.guest_bytes(), packing = cf.packing, target,
                       buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
                       stores_depth, ds, dl, unorm24, samples, depth_target, kept_depth, depth, pool, sets,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
-                      uploads = std::move(r.texture_uploads)](bool ok) mutable {
+                      uploads = std::move(r.texture_uploads), conversions = std::move(r.target_conversions)](bool ok) mutable {
         if (ok && stamps) {
             u64 ts[4] = {};
             if (vkGetQueryPoolResults(d.device(), stamps, 0, 4, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -4614,7 +5096,10 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 const auto now = depth_bytes(ds, width, height);
                 depth_target->written.assign(now.begin(), now.end());
             }
-            if (kept_depth) depth_contents(depth_ranges(ds, dl, width, height), kept_depth->written);
+            if (kept_depth) {
+                depth_contents(depth_ranges(ds, dl, width, height), kept_depth->written);
+                ++kept_depth->generation;
+            }
         }
         back_mark(2);
         // (the scene's notifications, now that guest memory holds what it drew)
@@ -4627,10 +5112,16 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         for (Renderer::TargetCopy& c : copies)
             if (c.strip.buffer) vk::destroy_buffer(d, c.strip);
         for (Renderer::TextureUpload& u : uploads) give_upload(r, u);
+        for (Renderer::TargetConversion& c : conversions) {
+            if (!ok && c.background_staging.buffer) c.depth->background_uploaded = false;
+            if (ok) verified_conversion(c, d, target);
+            release_conversion(r, c);
+        }
         back_mark(3);
     };
     r.target_copies.clear();  // (moved into the scene's finish: the guard finds none)
     r.texture_uploads.clear();
+    r.target_conversions.clear();
     if (auto submitted = shot->submit(); !submitted) {
         nx::loge(logs::gpu, "scene: {}", submitted.error().message);
         finish_pending(r, true);

@@ -8,6 +8,7 @@
 
 #include "nxtest.h"
 #include "psvrecore/gxm/surface.hpp"
+#include "psvrecore/gxm/target_texture.hpp"
 #include "psvrecore/gxm/texture.hpp"
 
 using namespace psvrecore;
@@ -42,6 +43,25 @@ bool near(const u8* got, const u8 want[3]) {
 }
 
 }  // namespace
+
+TEST_CASE("gxm surfaces: U2F10F10F10 packed a pixel at a time and many at a time to the same words") {
+    // (every half in each channel, with the others varied)
+    nx::vector<u16> halves(65536 * 4);
+    for (u32 v = 0; v < 65536; ++v) {
+        halves[v * 4 + 0] = static_cast<u16>(v);
+        halves[v * 4 + 1] = static_cast<u16>(v * 7919u);
+        halves[v * 4 + 2] = static_cast<u16>(v ^ 0x5A5Au);
+        halves[v * 4 + 3] = static_cast<u16>(v);
+    }
+    nx::vector<u32> many(65536);
+    gxm::pack_u2f10f10f10(halves.data(), many.data(), many.size());
+    usize differ = 0;
+    for (u32 v = 0; v < 65536; ++v) differ += many[v] != gxm::pack_u2f10f10f10(halves.data() + v * 4);
+    CHECK(differ == 0);
+    // (an alpha of 1: both of its bits)
+    const u16 a[4] = {0, 0, 0, 0x3C00};
+    CHECK((gxm::pack_u2f10f10f10(a) >> 30) == 3);
+}
 
 TEST_CASE("gxm textures: YUV420 in two planes (YVU: U then V in memory), BT.709 through CSC1") {
     // A 16x4 image (each plane's rows are rounded up to 8 texels: none here): Y a ramp, a U/V pair per 2x2 block.
