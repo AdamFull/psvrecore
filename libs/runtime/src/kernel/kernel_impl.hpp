@@ -59,6 +59,9 @@ struct Kernel::Impl {
 
     // How guest threads run on the host (kernel/backend.hpp).
     kernel::BackendHost backend_host();
+    // (deterministic) The kernel's clock is its own, moved on by the backend and by each kernel call.
+    bool deterministic = false;
+    std::atomic<u64> virtual_ns{0};
 
     // ---- objects
     Uid new_uid();

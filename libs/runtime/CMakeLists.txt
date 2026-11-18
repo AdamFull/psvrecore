@@ -41,6 +41,7 @@ add_library(psvrecore_runtime STATIC
     src/hle/touch.cpp
     src/hle/videodec.cpp
     src/hle/voice.cpp
+    src/kernel/backend_fibers.cpp
     src/kernel/backend_native.cpp
     src/kernel/scheduler.cpp
     src/kernel/sync.cpp
@@ -64,6 +65,9 @@ else()
     target_sources(psvrecore_runtime PRIVATE src/host_posix.cpp)
 endif()
 add_library(psvrecore::runtime ALIAS psvrecore_runtime)
+if(PSVRECORE_GUEST_FIBERS)
+    target_compile_definitions(psvrecore_runtime PUBLIC PSVRECORE_GUEST_FIBERS=1)
+endif()
 target_include_directories(psvrecore_runtime PUBLIC include)
 target_link_libraries(psvrecore_runtime PUBLIC psvrecore::recomp_support psvrecore::analysis)
 

@@ -31,6 +31,11 @@ option(PSVRECORE_TRACY "Build Tracy's client in and compile the profiler's hooks
 if(PSVRECORE_PROFILER)  # (its earlier name)
     set(PSVRECORE_TRACY ON CACHE BOOL "" FORCE)
 endif()
+# Guest threads as fibers on one host worker per console CPU (libs/runtime/src/kernel/backend_fibers.cpp,
+# docs/THREAD_BACKENDS.md) instead of an OS thread each: an experiment. PSVRECORE_GUEST_THREADS=native picks the
+# native backend in such a build, and PSVRECORE_DETERMINISTIC=1 (or Kernel::Config::deterministic) the deterministic
+# scheduling that only fibers give.
+option(PSVRECORE_GUEST_FIBERS "Run guest threads as fibers on one host worker per console CPU" OFF)
 # The runtime as one shared library (psvrecore.dll, libpsvrecore.so.<ABI version>) that each game's executable links,
 # or (off) static libraries linked into the game. Static on Android, where each APK carries its runtime anyway. The
 # tests and tools link the static libraries either way.

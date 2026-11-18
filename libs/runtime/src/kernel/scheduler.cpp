@@ -102,7 +102,24 @@ Kernel::Impl::Impl(Kernel& k, GuestMemory& m, const Config& c) : kernel(k), memo
     cpus.assign(config.cpu_count, nullptr);
     start_ns = nx::os::ticks_ns();
     if (const char* v = std::getenv("PSVRECORE_THREAD_STATS"); v && *v && *v != '0') thread_stats = true;
+    const char* determinism = std::getenv("PSVRECORE_DETERMINISTIC");
+    const bool wants_determinism = config.deterministic || (determinism && *determinism && *determinism != '0');
+#if PSVRECORE_GUEST_FIBERS
+    const char* which = std::getenv("PSVRECORE_GUEST_THREADS");
+    if (which && nx::string_view(which) == "native") {
+        if (wants_determinism) nx::logw(logs::kernel, "deterministic scheduling needs the fiber backend: not with native threads");
+        backend = make_native_backend(backend_host());
+    } else {
+        deterministic = wants_determinism;
+        if (deterministic) virtual_ns.store(start_ns, std::memory_order_relaxed);
+        backend = make_fiber_backend(backend_host(), deterministic);
+    }
+#else
+    if (wants_determinism)
+        nx::logw(logs::kernel, "deterministic scheduling needs a build with PSVRECORE_GUEST_FIBERS: not in this one");
     backend = make_native_backend(backend_host());
+#endif
+    nx::logd(logs::kernel, "guest threads: {}", backend->name());
 }
 
 BackendHost Kernel::Impl::backend_host() {
@@ -116,6 +133,7 @@ BackendHost Kernel::Impl::backend_host() {
     h.name_of = [](const Thread* t) { return t->name.c_str(); };
     h.set_current = [](Thread* t) { set_current_thread(t); };
     h.enter_lane = [](Thread* t) { profile::enter(t ? t->track : nullptr); };
+    h.clock = deterministic ? &virtual_ns : nullptr;
     return h;
 }
 
@@ -131,6 +149,7 @@ Thread* Kernel::Impl::thread(Uid uid) {
 }
 
 u64 Kernel::Impl::now_ns() const {
+    if (deterministic) return virtual_ns.load(std::memory_order_acquire);
     const u64 at = suspended_at.load(std::memory_order_acquire);
     return (at ? at : nx::os::ticks_ns()) - paused_ns.load(std::memory_order_acquire);
 }
@@ -373,6 +392,12 @@ NX_NO_INLINE Thread* Kernel::current() { return t_current; }
 
 void Kernel::checkpoint() {
     Thread* t = t_current;
+    if (impl_->deterministic && t) {
+        // (a microsecond a kernel call, and the next CPU's holder runs now)
+        Lock guard(impl_->lock);
+        impl_->virtual_ns.fetch_add(1000, std::memory_order_acq_rel);
+        impl_->backend->yield(t);
+    }
     if (!t || !(t->lost_cpu.load(std::memory_order_acquire) || t->terminate)) return;
     Lock guard(impl_->lock);
     if (t->terminate) throw ThreadExit{err::kWaitCancel};
@@ -463,6 +488,8 @@ void Kernel::end_blocking() {
     impl_->wait_for_cpu(t);
     if (t->terminate) throw ThreadExit{err::kWaitCancel};
 }
+
+const char* Kernel::backend_name() const { return impl_->backend->name(); }
 
 u64 Kernel::process_time() const { return clock_ns() / 1000; }
 u64 Kernel::clock_ns() const { return impl_->now_ns() - impl_->start_ns; }

@@ -126,7 +126,10 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     The thread backend (`src/kernel/backend.hpp`) is the boundary: start a thread, park the calling one, wake one,
     give one a CPU, host work that may block, the end of a run. The kernel's objects and its scheduler use only that.
     The native backend makes an OS thread for each start, named after the guest thread, and ends it with the run
-    (nothing is reused); the fiber backend ([THREAD_BACKENDS.md](THREAD_BACKENDS.md)) is an option.
+    (nothing is reused); the fiber backend ([THREAD_BACKENDS.md](THREAD_BACKENDS.md), `PSVRECORE_GUEST_FIBERS`) is
+    an option: each guest thread a fiber, run by one host worker per CPU while it holds that CPU and by helper
+    threads while it has none (the kernel's work after a wake, host work that blocks), with a deterministic mode
+    for tests.
   - The kernel hands CPUs out as the console's scheduler does:
     - fixed priorities, FIFO among equal ones;
     - no time slicing;

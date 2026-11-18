@@ -257,6 +257,35 @@ TEST_CASE("kernel: a thread preempted while it runs that waits before its next k
     CHECK(g_log.joined() == "w2+ w1- w2-");
 }
 
+TEST_CASE("kernel: a thread spinning in guest code after losing its CPU sees what the thread that took it does") {
+    // One CPU. The spinner loops without kernel calls until a flag is set; the setter, of a higher priority, takes
+    // the CPU when its delay ends and sets it. The spinner stops only at its next kernel call, so until then both run
+    // (with fibers too: the setter does not wait for the spinner's host thread).
+    TestRuntime t(1, 100);
+    static std::atomic<u32> flag{0}, seen{0};
+    flag = 0;
+    seen = 0;
+    GuestCode code;
+    const u32 setter = code.add([](PsvContext* ctx, uint32_t) {
+        delay(ctx, 5000);
+        flag = 1;
+    });
+    const u32 spinner = code.add([](PsvContext*, uint32_t) {
+        const u64 give_up = nx::os::ticks_ns() + 3'000'000'000ull;
+        while (!flag.load() && nx::os::ticks_ns() < give_up) {
+        }
+        seen = flag.load();
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    const i32 a = create_thread(ctx, "setter", setter, 120), b = create_thread(ctx, "spinner", spinner, 160);
+    start_thread(ctx, a);
+    start_thread(ctx, b);
+    wait_end(ctx, b);
+    wait_end(ctx, a);
+    CHECK(seen.load() == 1);
+}
+
 TEST_CASE("kernel: three CPUs run three threads at once, never four") {
     TestRuntime t(3, 100);
     static std::atomic<u32> running{0}, most{0}, arrived{0};
@@ -659,6 +688,31 @@ TEST_CASE("kernel: shutting down ends threads blocked in the kernel") {
     CHECK(nx::os::ticks_ns() - before < 1'500'000'000ull);  // (well before the shutdown's give-up time)
 }
 
+TEST_CASE("kernel: delays end soon after their deadline (how late, printed)") {
+    TestRuntime t(kernel::kUserCpuCount, 100);
+    static std::atomic<u64> late_ns{0}, worst_ns{0};
+    late_ns = 0;
+    worst_ns = 0;
+    GuestCode code;
+    const u32 entry = code.add([](PsvContext* ctx, uint32_t) {
+        for (int i = 0; i < 200; ++i) {
+            const u64 from = nx::os::ticks_ns();
+            delay(ctx, 1000);
+            const u64 took = nx::os::ticks_ns() - from;
+            CHECK(took >= 1'000'000);
+            late_ns += took - 1'000'000;
+            worst_ns = nx::max(worst_ns.load(), took - 1'000'000);
+        }
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    const i32 uid = create_thread(ctx, "sleeper", entry, 120);
+    start_thread(ctx, uid);
+    wait_end(ctx, uid);
+    std::printf("kernel: 200 delays of 1 ms, each late by %.0f us on average, %.0f us at worst\n",
+                static_cast<f64>(late_ns.load()) / 200e3, static_cast<f64>(worst_ns.load()) / 1e3);
+}
+
 TEST_CASE("kernel: a thread started again and again runs each time (the rate printed: what a start costs)") {
     TestRuntime t(kernel::kUserCpuCount, 100);
     static std::atomic<u32> ran{0};
@@ -990,3 +1044,61 @@ TEST_CASE("kernel more: atomics, C helpers, events polled, pulsed and cancelled,
     CHECK(g_stack_seen <= stack + 0x1000);
     CHECK(g_stack_seen > stack);
 }
+
+#if PSVRECORE_GUEST_FIBERS
+namespace {
+i32 g_det_sema = 0, g_det_mutex = 0;
+u32 g_det_worker = 0;
+
+// Six threads of three priorities on three CPUs: each logs a step under a mutex, signals or waits for a semaphore
+// (three give, three take) and sleeps a little, four times; a root thread starts them and waits for their ends.
+nx::string deterministic_run() {
+    Runtime::Config c;
+    c.kernel.cpu_count = kernel::kUserCpuCount;
+    c.kernel.deterministic = true;
+    Runtime rt(c);
+    if (!rt.ok()) return "(no runtime)";
+    if (std::string_view(rt.kernel().backend_name()) != "fibers (deterministic)") return rt.kernel().backend_name();
+    g_log.events.clear();
+    GuestCode code;
+    g_det_worker = code.add([](PsvContext* ctx, uint32_t) {
+        const u32 id = psv_ld32(ctx->r[1]);
+        for (u32 i = 0; i < 4; ++i) {
+            call32(ctx, kSceLibKernel, kLockMutex, {u(g_det_mutex), 1, 0});
+            g_log.add(nx::format("{}{}", static_cast<char>('a' + id), i));
+            call32(ctx, kSceThreadmgr, kUnlockMutex, {u(g_det_mutex), 1});
+            if (id % 2) call32(ctx, kSceThreadmgr, kSignalSema, {u(g_det_sema), 1});
+            else call32(ctx, kSceLibKernel, kWaitSema, {u(g_det_sema), 1, 0});
+            call32(ctx, kSceThreadmgr, kDelayThread, {100 + 37 * id});
+        }
+    });
+    const u32 root = code.add([](PsvContext* ctx, uint32_t) {
+        g_det_sema = call32(ctx, kSceLibKernel, kCreateSema, {guest_string("det"), 0, 0, 16, 0});
+        g_det_mutex = call32(ctx, kSceLibKernel, kCreateMutex, {guest_string("det"), 0, 0, 0});
+        const u32 block = scratch(4);
+        i32 uids[6];
+        for (u32 id = 0; id < 6; ++id) {
+            uids[id] = create_thread(ctx, "det", g_det_worker, 120 + id % 3);
+            psv_st32(block, id);
+            start_thread(ctx, uids[id], 4, block);
+        }
+        for (i32 uid : uids) wait_end(ctx, uid);
+        g_log.add("end");
+    });
+    code.install();
+    Kernel& k = rt.kernel();
+    const Uid r = k.create_thread("root", root, 110, 0x4000, 0, 0);
+    k.start_thread(r, 0, 0);
+    i32 status = 0;
+    k.wait_thread_end(r, &status, kernel::Timeout{}, false);
+    return g_log.joined();
+}
+}  // namespace
+
+TEST_CASE("kernel: deterministic scheduling (fibers) runs threads in the same order run after run") {
+    const nx::string first = deterministic_run();
+    CHECK(first.size() > 6 * 4 * 3);  // (every step logged, and the end)
+    CHECK(first.view().ends_with("end"));
+    for (int i = 0; i < 4; ++i) CHECK(deterministic_run() == first);
+}
+#endif

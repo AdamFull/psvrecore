@@ -264,6 +264,14 @@
   Now a start takes 0.1-0.9 ms (a median of 0.34 ms in P4D) and costs no frame time, and each start makes an OS
   thread of its own ([THREAD_BACKENDS.md](THREAD_BACKENDS.md)). Timed waits (delays, timeouts) end within a
   millisecond of their deadline.
+- **Fiber backend (`PSVRECORE_GUEST_FIBERS`, off by default) is an experiment.** It runs the kernel tests, the SDK
+  test programs and P4D ([THREAD_BACKENDS.md](THREAD_BACKENDS.md)); it has not run WipEout 2048 or DIVA F 2nd
+  through a race or a song, nor run on a phone. A thread that loops without kernel calls holds its host worker. While
+  a preempted thread runs on to its next kernel call, its CPU's new holder runs on a helper thread, so more than three
+  host threads may run guest code then, as with native threads. Debuggers show the workers and helpers:
+  `PSVRECORE_THREADS` lists where each guest thread is. Deterministic scheduling (`PSVRECORE_DETERMINISTIC=1`) is for
+  tests: one host thread runs every guest thread, so a thread that spins until another goes on never ends, and host
+  threads (the display's, audio) do not follow its clock.
 - **Memory budgets are fixed defaults.** Main memory 256 MiB and CDRAM 128 MiB for memory blocks, set in
   `Runtime::Config`. The console's figures for a game are not reproduced exactly.
 - **Run on Windows and Android.** The POSIX host layer (faults, files, decommit) runs on Android arm64 (the SDK

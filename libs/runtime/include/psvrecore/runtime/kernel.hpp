@@ -283,6 +283,10 @@ public:
     struct Config {
         u32 cpu_count = kernel::kUserCpuCount;
         Region stack_region{0xE0000000u, 0xF0000000u};  // thread stacks and TLS areas
+        // The same scheduling order run after run (tests; also PSVRECORE_DETERMINISTIC=1): one host worker runs
+        // every CPU in turn, switching at each kernel call, and the kernel's clock is its own (a microsecond a kernel
+        // call; when nothing can run, the next deadline). Fiber builds only (PSVRECORE_GUEST_FIBERS).
+        bool deterministic = false;
     };
 
     Kernel(GuestMemory& memory, const Config& config);
@@ -476,6 +480,8 @@ public:
         u64 held_ns, ready_ns;
     };
     nx::vector<CpuUse> cpu_use();
+    // The thread backend in use ("native", "fibers", "fibers (deterministic)").
+    const char* backend_name() const;
     // (PSVRECORE_THREAD_STATS=1) The threads started so far and how long each took to run, to the log; also at
     // shutdown.
     void log_thread_stats();
