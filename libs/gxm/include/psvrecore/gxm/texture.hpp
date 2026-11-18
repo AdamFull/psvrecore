@@ -60,6 +60,10 @@ struct Texels {
     // 1-3: BC1-BC3 blocks as they are (native_bc), each level's 4x4 blocks in rows (8 or 16 bytes each); 0: texels
     u32 bc = 0;
     u32 width = 0, height = 0, levels = 1, faces = 1;
+    // F32 and F32M without gamma, read with `single_float`: one float a texel (bytes 4, as R32F), RGBA from it as
+    // `rgba_of` says (0: the float, 1: 0, 2: 1), for an image view to put it there: a quarter of RGBA32F's bytes.
+    bool single = false;
+    u8 rgba_of[4] = {};
     nx::vector<u8> data;  // face 0's levels, then face 1's, ...: each level width x height of its own, rows packed
 };
 
@@ -68,10 +72,12 @@ using ReadGuest = nx::function_ref<bool(u32 address, void* out, u32 size)>;
 // Reads and decodes a texture's texels. Fails on formats and layouts not implemented yet.
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read);
 // With `native_bc` (a device that samples BC1-BC3): those formats' blocks as they are (Texels::bc), not decoded.
-Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool native_bc);
+// With `single_float`: F32 and F32M textures one float a texel (Texels::single).
+Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool native_bc, bool single_float = false);
 namespace detail {
 // (`reference`: without the fast paths that give the same texels, for the tests to compare them with)
-Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool reference, bool native_bc = false);
+Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool reference, bool native_bc = false,
+                           bool single_float = false);
 }  // namespace detail
 
 // YUV420 textures (two planes or three), for a GPU to convert as read_texels does, to the same bytes: the planes as

@@ -335,7 +335,7 @@ constexpr u8 kPvrtcPalette[4][4][4] = {
     {{4, 5, 5, 5}, {6, 6, 5, 5}, {6, 6, 5, 5}, {6, 6, 6, 5}},
 };
 
-// A level's texels (RGBA in [0, 1]) from its blocks (bx x by, in rows).
+// A level's texels (8-bit RGBA, as integers in [0, 255]) from its blocks (bx x by, in rows).
 template <class Put>
 void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32 height, bool second, Put&& put) {
     nx::vector<PvrtcColours> colours(blocks.size());
@@ -382,9 +382,8 @@ void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
                     for (u32 k = 0; k < 4; ++k) out[k] = ((8 - w) * c[0][k] + w * c[1][k] + 64) / 128;
                 }
             }
-            f32 rgba[4];
-            for (u32 k = 0; k < 4; ++k) rgba[k] = static_cast<f32>(nx::clamp(out[k], 0, 255)) / 255.0f;
-            put(x, y, rgba);
+            for (u32 k = 0; k < 4; ++k) out[k] = nx::clamp(out[k], 0, 255);
+            put(x, y, out);
         }
     }
 }
@@ -824,11 +823,11 @@ void set_yuv_profile(u32 csc, u32 profile) {
 }
 
 Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) { return detail::read_texels(t, read, false); }
-Result<Texels> read_texels(const TextureInfo& t, ReadGuest read, bool native_bc) {
-    return detail::read_texels(t, read, false, native_bc);
+Result<Texels> read_texels(const TextureInfo& t, ReadGuest read, bool native_bc, bool single_float) {
+    return detail::read_texels(t, read, false, native_bc, single_float);
 }
 
-Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool reference, bool native_bc) {
+Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool reference, bool native_bc, bool single_float) {
     const u32 code = code_of(t.base_format);
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
@@ -870,7 +869,8 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
         if (components(code, t.swizzle, 0, c, n, w)) wide |= w;
     }
     const bool full = code == kF32 || code == kF32M || code == kF32F32;
-    out.bytes = full ? 16 : wide ? 8 : 4;
+    const bool single = single_float && !reference && t.gamma == 0 && (code == kF32 || code == kF32M);
+    out.bytes = single ? 4 : full ? 16 : wide ? 8 : 4;
     const u32 out_bytes = out.bytes;
     // 8-bit unsigned components without gamma: where each output byte comes from (a component's byte, or -1 for 0
     // and -256 for 255), found by putting markers through the swizzle.
@@ -881,6 +881,33 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
         f32 m[4];
         swizzle(marks, bits / 8, t.swizzle, m);
         for (u32 k = 0; k < 4; ++k) byte_of[k] = m[k] >= 10 ? static_cast<i32>(m[k]) - 10 : m[k] >= 1 ? -256 : -1;
+    }
+    // F32, F32M and U2F10F10F10 without gamma (a render target's depth or HDR colour read as a texture, often each
+    // frame): each output component a component's value or a constant, found by putting markers through the swizzle,
+    // and written as the general path writes it (F32: the float's bits, F32M's without the mask bit; U2F10F10F10:
+    // halves from tables of what the general path makes of each 10-bit float and 2-bit alpha), a texel at a time.
+    const bool floats32 = !reference && t.gamma == 0 && (code == kF32 || code == kF32M || code == kU2F10F10F10);
+    i32 float_of[4] = {};
+    f32 float_const[4] = {};
+    nx::vector<u16> f10_halves;
+    u16 alpha_halves[4] = {}, const_halves[4] = {};
+    if (floats32) {
+        const u32 count = code == kU2F10F10F10 ? 4 : 1;
+        const f32 marks[4] = {10, 11, 12, 13};
+        f32 m[4];
+        swizzle(marks, count, t.swizzle, m);
+        for (u32 k = 0; k < 4; ++k) {
+            float_of[k] = m[k] >= 10 ? static_cast<i32>(m[k]) - 10 : -1;
+            float_const[k] = m[k] >= 10 ? 0.0f : m[k];
+            const_halves[k] = float_to_half(float_const[k]);
+            out.rgba_of[k] = static_cast<u8>(float_of[k] >= 0 ? 0 : float_const[k] == 0.0f ? 1 : 2);
+        }
+        out.single = single;
+        if (code == kU2F10F10F10) {
+            f10_halves.resize(1024);
+            for (u32 i = 0; i < 1024; ++i) f10_halves[i] = float_to_half(half_to_float(static_cast<u16>(i << 5)));
+            for (u32 i = 0; i < 4; ++i) alpha_halves[i] = float_to_half(unorm(i, 2));
+        }
     }
     usize total = 0;
     for (const Level& l : levels) total += usize{l.width} * l.height * out_bytes;
@@ -944,9 +971,18 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                             const u8* block = base + index * 8;
                             if (block + 8 <= raw.data() + raw.size()) std::memcpy(&blocks[usize{y} * bx + x], block, 8);
                         }
-                    decode_pvrtc4(blocks, bx, by, lv.width, lv.height, code == kPVRTII4, [&](u32 x, u32 y, const f32* rgba) {
-                        f32 v[4] = {rgba[0], rgba[1], rgba[2], rgba[3]};
-                        put(dst + (usize{y} * lv.width + x) * out_bytes, v);
+                    // (8-bit texels without gamma: the bytes as they are, as put() rounds n / 255 back to n)
+                    const bool pvrtc_bytes = !reference && out_bytes == 4 && t.gamma == 0;
+                    decode_pvrtc4(blocks, bx, by, lv.width, lv.height, code == kPVRTII4, [&](u32 x, u32 y, const i32* c) {
+                        u8* o = dst + (usize{y} * lv.width + x) * out_bytes;
+                        if (pvrtc_bytes) {
+                            o[0] = static_cast<u8>(c[0]), o[1] = static_cast<u8>(c[1]), o[2] = static_cast<u8>(c[2]);
+                            o[3] = static_cast<u8>(c[3]);
+                            return;
+                        }
+                        f32 v[4];
+                        for (u32 k = 0; k < 4; ++k) v[k] = static_cast<f32>(c[k]) / 255.0f;
+                        put(o, v);
                     });
                     at += usize{lv.width} * lv.height * out_bytes;
                     continue;
@@ -1067,6 +1103,56 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                     } else {
                         const u64 row_bit = u64{y} * row * 8;
                         for (u32 x = 0; x < lv.width; ++x) put_texel(out_row + x, row_bit + u64{x} * bits);
+                    }
+                }
+            } else if (floats32) {
+                const u32 row = lv.offset == 0 && is_linear(t.type) ? t.stride : ((lv.width + 7) & ~7u) * 4;
+                const u32 tiles_w = (lv.width + 31) / 32;
+                const u8* end = raw.data() + raw.size();
+                const SwizzleTables sw(is_swizzled(t.type) ? lv.width : 0, is_swizzled(t.type) ? lv.height : 0, pw, ph);
+                // (each texel's word, as the general path reads it: one whose 8 bytes from it are past the data left 0)
+                auto each = [&](auto&& texel) {
+                    for (u32 y = 0; y < lv.height; ++y) {
+                        u8* out_row = dst + usize{y} * lv.width * out_bytes;
+                        for (u32 x = 0; x < lv.width; ++x) {
+                            u64 offset;
+                            if (is_swizzled(t.type)) offset = (sw.xs[x] + sw.ys[y]) * 4;
+                            else if (t.type == texture_type::kTiled)
+                                offset = ((u64{y / 32} * tiles_w + x / 32) * 1024 + (y % 32) * 32 + (x % 32)) * 4;
+                            else offset = u64{y} * row + u64{x} * 4;
+                            const u8* p = base + offset;
+                            if (p + 8 > end) continue;
+                            u32 v;
+                            std::memcpy(&v, p, 4);
+                            texel(out_row + usize{x} * out_bytes, v);
+                        }
+                    }
+                };
+                if (code == kU2F10F10F10) {
+                    const bool alpha_low = t.swizzle == 2 || t.swizzle == 3 || t.swizzle == 6 || t.swizzle == 7;
+                    const u32 at = alpha_low ? 2 : 0;
+                    const u16* f10 = f10_halves.data();
+                    each([&](u8* o, u32 v) {
+                        u16 c[4] = {f10[(v >> at) & 0x3FF], f10[(v >> (at + 10)) & 0x3FF], f10[(v >> (at + 20)) & 0x3FF],
+                                    alpha_halves[alpha_low ? v & 3 : v >> 30]};
+                        u16 h[4];
+                        for (u32 k = 0; k < 4; ++k) h[k] = float_of[k] >= 0 ? c[float_of[k]] : const_halves[k];
+                        std::memcpy(o, h, 8);
+                    });
+                } else {
+                    const u32 mask = code == kF32M ? 0x7FFFFFFFu : 0xFFFFFFFFu;
+                    if (single) {
+                        each([&](u8* o, u32 v) {
+                            const u32 w = v & mask;
+                            std::memcpy(o, &w, 4);
+                        });
+                    } else {
+                    each([&](u8* o, u32 v) {
+                        const f32 f = std::bit_cast<f32>(v & mask);
+                        f32 c[4];
+                        for (u32 k = 0; k < 4; ++k) c[k] = float_of[k] >= 0 ? f : float_const[k];
+                        std::memcpy(o, c, 16);
+                    });
                     }
                 }
             } else {

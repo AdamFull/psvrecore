@@ -16,6 +16,7 @@ struct ImageDesc {
     bool cube = false;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkComponentMapping components{};  // (the view's: identity unless given)
 };
 
 struct Image {

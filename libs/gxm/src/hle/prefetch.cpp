@@ -95,7 +95,7 @@ void decode(Prefetcher& p, u32 words_at) {
         std::memcpy(out, memory().host(address), bytes);
         return true;
     };
-    Result<Texels> texels = read_texels(info, read, p.native_bc);
+    Result<Texels> texels = read_texels(info, read, p.native_bc, true);
     if (!texels || texels->data.empty()) return;
     // (written while it was decoded: not kept, the renderer decodes it)
     if (texture_contents(info, size, palette) != before) {

@@ -1,6 +1,7 @@
 // GXM texture decoding: YUV textures (planar 4:2:0 in two or three planes, interleaved 4:2:2) through their colour
 // space conversions; colour surfaces' layouts as textures read them.
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -201,7 +202,7 @@ TEST_CASE("gxm textures: 8-bit components in every swizzle come out as their byt
     CHECK(texel(0x0C000000, 7) == 0xFF443322u);  // BGR1
 }
 
-TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted, blocks, 8-bit, each layout)") {
+TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted, blocks, PVRTC, 8-bit, 32-bit floats, each layout)") {
     Memory m;
     m.bytes.resize(1u << 21);
     u32 seed = 12345;
@@ -211,7 +212,8 @@ TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted
         u32 base_format, bits;
     };
     const Format formats[] = {{0x94000000, 4}, {0x95000000, 8}, {0x85000000, 4}, {0x86000000, 8}, {0x87000000, 8}, {0x0C000000, 32},
-                              {0x00000000, 8}, {0x07000000, 16}, {0x98000000, 24}};
+                              {0x00000000, 8}, {0x07000000, 16}, {0x98000000, 24}, {0x12000000, 32}, {0x13000000, 32},
+                              {0x9A000000, 32}, {0x81000000, 4}, {0x83000000, 4}};
     const u32 types[] = {texture_type::kSwizzled, texture_type::kLinear, texture_type::kLinearStrided, texture_type::kTiled};
     const u32 sizes[][2] = {{37, 23}, {64, 64}, {128, 32}, {16, 256}, {1, 1}};
     u32 compared = 0;
@@ -220,7 +222,8 @@ TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted
             for (const auto& size : sizes)
                 for (u32 swizzle = 0; swizzle < 8; ++swizzle)
                     for (u32 levels = 1; levels <= (type == texture_type::kSwizzled ? 3u : 1u); levels += 2) {
-                        const bool block = f.base_format >= 0x85000000 && f.base_format <= 0x87000000;
+                        const bool block = (f.base_format >= 0x85000000 && f.base_format <= 0x87000000) ||
+                                           f.base_format == 0x81000000 || f.base_format == 0x83000000;
                         if (block && (type == texture_type::kTiled || swizzle > 0)) continue;
                         if (type == texture_type::kLinearStrided && block) continue;
                         TextureInfo t;
@@ -249,6 +252,47 @@ TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted
                         ++compared;
                     }
     CHECK(compared > 300);
+}
+
+TEST_CASE("gxm textures: F32 and F32M one float a texel give the general path's RGBA through rgba_of") {
+    Memory m;
+    m.bytes.resize(1u << 20);
+    u32 seed = 4242;
+    for (u8& b : m.bytes) b = static_cast<u8>((seed = seed * 1103515245u + 12345u) >> 16);
+    auto read = [&](u32 address, void* out, u32 size) { return m.read(address, out, size); };
+    u32 compared = 0;
+    for (u32 format : {0x12000000u, 0x13000000u})
+        for (u32 type : {texture_type::kSwizzled, texture_type::kLinearStrided, texture_type::kTiled})
+            for (u32 swizzle = 0; swizzle < 8; ++swizzle) {
+                TextureInfo t;
+                t.base_format = format;
+                t.swizzle = swizzle;
+                t.type = type;
+                t.width = 37, t.height = 23;
+                t.address = 0x1000;
+                t.stride = ((t.width + 7) & ~7u) * 4 + (type == texture_type::kLinearStrided ? 16 : 0);
+                auto single = read_texels(t, read, false, true);
+                auto reference = detail::read_texels(t, read, true);
+                REQUIRE(single);
+                REQUIRE(reference);
+                REQUIRE(single->single);
+                REQUIRE(single->bytes == 4);
+                REQUIRE(reference->bytes == 16);
+                REQUIRE(single->data.size() * 4 == reference->data.size());
+                bool same = true;
+                for (usize i = 0; i < single->data.size() / 4; ++i)
+                    for (u32 k = 0; k < 4; ++k) {
+                        u32 want, got;
+                        std::memcpy(&want, reference->data.data() + i * 16 + k * 4, 4);
+                        const u8 of = single->rgba_of[k];
+                        if (of == 0) std::memcpy(&got, single->data.data() + i * 4, 4);
+                        else got = std::bit_cast<u32>(of == 1 ? 0.0f : 1.0f);
+                        same &= want == got;
+                    }
+                CHECK(same);
+                ++compared;
+            }
+    CHECK(compared == 48);
 }
 
 TEST_CASE("gxm textures: BC blocks kept for the device are the texture's blocks in rows") {

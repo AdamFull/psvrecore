@@ -96,6 +96,7 @@ Result<Image> create_image(Device& device, const ImageDesc& desc) {
     view.image = im.image;
     view.viewType = desc.cube ? VK_IMAGE_VIEW_TYPE_CUBE : desc.layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     view.format = desc.format;
+    view.components = desc.components;
     view.subresourceRange = {im.aspect, 0, desc.mips, 0, desc.layers};
     if (r = vkCreateImageView(device.device(), &view, nullptr, &im.view); r != VK_SUCCESS) {
         vmaDestroyImage(device.allocator(), im.image, im.allocation);

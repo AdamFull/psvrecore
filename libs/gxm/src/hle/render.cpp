@@ -2443,7 +2443,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     } else if (yuv) {
         texels->width = yuv->width, texels->height = yuv->height;
     } else {
-        texels = read_texels(info, read_guest, r.device->caps().texture_bc);
+        texels = read_texels(info, read_guest, r.device->caps().texture_bc, true);
     }
     if (!texels) {
         nx::logw(logs::gxm, "{} (format 0x{:08x}, type {})", texels.error().message, info.base_format, info.type);
@@ -2454,6 +2454,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     d.format = texels->bc == 1   ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
                : texels->bc == 2 ? VK_FORMAT_BC2_UNORM_BLOCK
                : texels->bc == 3 ? VK_FORMAT_BC3_UNORM_BLOCK
+               : texels->single      ? VK_FORMAT_R32_SFLOAT
                : texels->bytes == 16 ? VK_FORMAT_R32G32B32A32_SFLOAT
                : texels->bytes == 8 ? VK_FORMAT_R16G16B16A16_SFLOAT
                                     : VK_FORMAT_R8G8B8A8_UNORM;
@@ -2462,6 +2463,11 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     d.mips = texels->levels;
     d.layers = texels->faces;
     d.cube = texels->faces == 6;
+    if (texels->single) {
+        // (the float where the swizzle puts it, the constants elsewhere)
+        constexpr VkComponentSwizzle of[3] = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
+        d.components = {of[texels->rgba_of[0]], of[texels->rgba_of[1]], of[texels->rgba_of[2]], of[texels->rgba_of[3]]};
+    }
     const u64 decoded_at = g_profile.on ? nx::os::ticks_ns() : 0;
     if (g_profile.on) g_profile.decode_ns += decoded_at - miss_start, miss_time.decoded = decoded_at;
     // (the texels' upload, or the planes' conversion: decoded here when no set is free for it)
@@ -2470,7 +2476,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
             auto queued = queue_yuv420(r, key, *yuv);
             if (!queued) return nx::err(queued.error());
             if (*queued) return {};
-            auto decoded = read_texels(info, read_guest, r.device->caps().texture_bc);
+            auto decoded = read_texels(info, read_guest, r.device->caps().texture_bc, true);
             if (!decoded) return nx::err(decoded.error());
             *texels = std::move(*decoded);
         }
@@ -2483,6 +2489,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
         if (old != r.textures.end() && old->second.used != r.scenes) {
             const vk::ImageDesc& od = old->second.image.desc;
             if (od.format == d.format && od.width == d.width && od.height == d.height && od.mips == d.mips &&
+                std::memcmp(&od.components, &d.components, sizeof d.components) == 0 &&
                 od.layers == d.layers && od.cube == d.cube) {
                 CachedTexture c = old->second;
                 r.textures.erase(old);
@@ -4092,7 +4099,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 const usize k = order[i];
                 const u64 from = g_profile.on ? nx::os::ticks_ns() : 0;
                 const TextureInfo& info = misses[k].info;
-                misses[k].texels = read_texels(info, read_guest_memory, bc);
+                misses[k].texels = read_texels(info, read_guest_memory, bc, true);
                 // (one that took a while to decode: which)
                 if (const u64 took = g_profile.on ? nx::os::ticks_ns() - from : 0; took >= 1'000'000)
                     std::fprintf(stderr, "gxm profile: a slow decode, %.1f ms: format %08x type %u gamma %u, %u x %u, %u levels, "
