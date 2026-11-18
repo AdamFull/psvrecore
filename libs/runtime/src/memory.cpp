@@ -247,25 +247,36 @@ bool GuestMemory::valid(u32 address, u32 size, bool write) const {
 
 // ---- Write watching -------------------------------------------------------------------------------------------
 
-void GuestMemory::open_page(Watches& w, u64 page) {
-    u8 expected = 1;
-    if (w.state[page].compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
-        nx::vmem::protect(base_ + (page << host_shift_), usize{1} << host_shift_, host_protection(Access::ReadWrite));
-        w.count[page].fetch_add(1, std::memory_order_acq_rel);
-        w.state[page].store(0, std::memory_order_release);
-        return;
-    }
-    // (another thread opening it: once it has, the page is writable)
-    while (w.state[page].load(std::memory_order_acquire) == 2) std::this_thread::yield();
-}
-
+// The watched pages of a range opened (made writable, counted), each run of them with one protection change: a
+// page at a time, a renderer's write-back of a few megabytes made a thousand or more mprotect calls, each splitting
+// the mapping under the process's mmap lock (the game's other threads waiting on it for their own faults).
 void GuestMemory::unwatch(u64 begin, u64 end) {
     Watches* w = watches_owner_.get();
     if (!w || end <= begin) return;
-    for (u64 p = begin >> host_shift_; p < ((end + (u64{1} << host_shift_) - 1) >> host_shift_) && p < (kGuestSpace >> host_shift_); ++p) {
-        open_page(*w, p);
+    const u64 last = std::min((end + (u64{1} << host_shift_) - 1) >> host_shift_, kGuestSpace >> host_shift_);
+    u64 run = ~0ull;  // (the first page of the run being opened: each marked 2, as the fault handler marks one)
+    auto open_run = [&](u64 to) {
+        if (run == ~0ull) return;
+        nx::vmem::protect(base_ + (run << host_shift_), static_cast<usize>((to - run) << host_shift_),
+                          host_protection(Access::ReadWrite));
+        for (u64 p = run; p < to; ++p) {
+            w->count[p].fetch_add(1, std::memory_order_acq_rel);
+            w->state[p].store(0, std::memory_order_release);
+        }
+        run = ~0ull;
+    };
+    for (u64 p = begin >> host_shift_; p < last; ++p) {
+        u8 expected = 1;
+        if (w->state[p].compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
+            if (run == ~0ull) run = p;
+        } else {
+            open_run(p);
+            // (another thread opening it: once it has, the page is writable)
+            while (w->state[p].load(std::memory_order_acquire) == 2) std::this_thread::yield();
+        }
         w->count[p].fetch_add(1, std::memory_order_acq_rel);
     }
+    open_run(last);
 }
 
 bool GuestMemory::watch_writes(u32 address, u32 size) {

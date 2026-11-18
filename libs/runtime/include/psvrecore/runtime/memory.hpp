@@ -133,7 +133,6 @@ private:
     std::atomic<Watches*> watches_{nullptr};
     u32 host_shift_ = 12;  // (log2 of the host's page size)
     std::atomic<u64> write_faults_{0};
-    void open_page(Watches& w, u64 page);  // (a watched page's protection back to read/write, counted)
     void unwatch(u64 begin, u64 end);       // (under lock_: pages whose protection is set or that go back)
     nx::map<u32, Block> blocks_;  // by base
     nx::vector<Region> reserved_ranges_;

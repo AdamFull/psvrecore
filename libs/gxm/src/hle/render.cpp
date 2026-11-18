@@ -382,6 +382,46 @@ void scatter(const SurfaceLayout& l, u32 address, const u8* in) {
         }
 }
 
+// A range of guest memory a scene's write-back wrote, watched for writes since (GuestMemory::watch_writes): while
+// its pages' write counts are what they were once watched, guest memory holds what was written back, without
+// comparing it with a copy (`written`). Writes the counts do not see: one by the game during the write-back itself
+// (between the pages being opened for it and watched again). PSVRECORE_WRITE_WATCH=0: compared as before;
+// =verify: compared too, a difference the watch did not see logged.
+struct WrittenWatch {
+    u32 address = 0, size = 0;
+    u64 writes = 0;
+    bool armed = false;
+};
+u32 write_watch_mode() {  // (0 off, 1 on, 2 verify)
+    static const u32 mode = [] {
+        const char* v = std::getenv("PSVRECORE_WRITE_WATCH");
+        if (v && *v == '0') return 0u;
+        if (v && std::strcmp(v, "verify") == 0) return 2u;
+        return 1u;
+    }();
+    return mode;
+}
+// Watched from now (before guest memory there is read or relied on: a write after this is counted).
+void watch_range(WrittenWatch& w, u32 address, u32 size) {
+    w.address = address, w.size = size;
+    w.armed = write_watch_mode() && size && memory().watch_writes(address, size);
+    w.writes = w.armed ? memory().writes(address, size) : 0;
+}
+// Nothing has written [address, address + size) since it was watched (the same range).
+std::atomic<u64> g_watch_seen{0}, g_watch_compared{0};  // (PSVRECORE_GXM_PROFILE: answered by the watch, compared)
+bool unwritten(const WrittenWatch& w, u32 address, u32 size) {
+    const bool yes = w.armed && w.address == address && w.size == size && memory().writes(address, size) == w.writes;
+    (yes ? g_watch_seen : g_watch_compared).fetch_add(1, std::memory_order_relaxed);
+    return yes;
+}
+// (PSVRECORE_WRITE_WATCH=verify: a range the watch found unwritten, which a comparison found changed)
+void unseen_write(const char* what, u32 address, u32 size) {
+    static u32 reported = 0;
+    if (reported++ < 20)
+        nx::logw(logs::gpu, "write watching: {} at 0x{:08x} ({} bytes) changed without a write being seen", what, address,
+                 size);
+}
+
 struct Target {
     u32 address = 0, format = 0, width = 0, height = 0;
     SurfaceLayout layout;
@@ -392,6 +432,7 @@ struct Target {
     // The surface's bytes as last written back. While guest memory still holds them, `image` (and `scaled`) is the
     // surface and is not loaded again; once anything else wrote there, it is loaded from guest memory.
     nx::vector<u8> written;
+    WrittenWatch watch;  // (the surface's span, once written back)
     u64 generation = 0;  // (a scene drawing it submitted: +1)
 };
 
@@ -407,6 +448,8 @@ struct DepthTarget {
     u32 stencil_address = 0;  // (a kept one's: its key has the stencil's address too)
     u64 used = 0;             // (a kept one's: the scene it was last used in)
     u64 generation = 0;       // (a kept one's: +1 each time a scene's store of it is written back)
+    WrittenWatch watch[2];    // (its depth's bytes and its stencil's, once stored: `written`)
+    WrittenWatch background_watch;  // (background_bytes' range, once compared or taken)
     // (a kept one's, for textures made on the GPU from it that read past what the scenes store (converted_texture):
     // guest memory's bytes from its address as they were, on the CPU and in `background` once uploaded; `version` +1
     // each time they are taken again)
@@ -633,6 +676,41 @@ void make_target_converter(Renderer& r) {
         return;
     }
     nx::logi(logs::gpu, "target textures: made on the GPU (the conversion checked in {:.0f} ms)", check.ms);
+}
+
+// A write-back of the renderer's into guest memory (`ranges`, `write`): their watched pages opened at once (one call,
+// not a fault for each page), and the watches of other surfaces sharing a page with them, not their bytes (and those
+// in `exempt`, whose bytes it may write: a depth surface's background), watched again after it when nothing else
+// had written there. (WipEout 2048's HDR colour surface ends on the page its depth surface starts on.)
+struct GuestRange {
+    u32 address = 0, size = 0;
+};
+template <typename F>
+void write_back(Renderer& r, std::initializer_list<GuestRange> ranges, const WrittenWatch* exempt, F&& write) {
+    if (!write_watch_mode()) {
+        write();
+        return;
+    }
+    constexpr u64 kGranule = 1ull << 16;  // (as large as any host's page: pages shared are a subset)
+    nx::vector<WrittenWatch*> keep;
+    auto consider = [&](WrittenWatch& w) {
+        if (!w.armed || !unwritten(w, w.address, w.size)) return;
+        bool page = false, bytes = false;
+        for (const GuestRange& g : ranges) {
+            if (!g.size) continue;
+            const u64 a0 = g.address, a1 = u64{g.address} + g.size, w0 = w.address, w1 = u64{w.address} + w.size;
+            page |= a0 / kGranule <= (w1 - 1) / kGranule && w0 / kGranule <= (a1 - 1) / kGranule;
+            bytes |= a0 < w1 && w0 < a1;
+        }
+        if (page && (!bytes || &w == exempt)) keep.push_back(&w);
+    };
+    for (auto& t : r.targets) consider(t->watch);
+    for (auto& t : r.kept_depths) consider(t->watch[0]), consider(t->watch[1]), consider(t->background_watch);
+    for (auto& t : r.depth_targets) consider(t->watch[0]);
+    for (const GuestRange& g : ranges)
+        if (g.size) memory().note_write(g.address, g.size);
+    write();
+    for (WrittenWatch* w : keep) watch_range(*w, w->address, w->size);
 }
 
 // The YUV420 conversion's pipeline (yuv420_shader): unless PSVRECORE_YUV_CPU is set, or the device has none.
@@ -1462,7 +1540,18 @@ struct Changes {
     usize pixels = 0;            // changed pixels
     bool all = false;
 };
+Changes compare_surface(const Target& t);
 Changes surface_changes(const Target& t) {
+    // (nothing written there since the write-back: its pages' write counts)
+    if (!t.written.empty() && unwritten(t.watch, t.address, static_cast<u32>(t.layout.span()))) {
+        if (write_watch_mode() != 2) return Changes{};
+        Changes c = compare_surface(t);
+        if (c.all || c.pixels) unseen_write("a colour surface", t.address, static_cast<u32>(t.layout.span()));
+        return c;
+    }
+    return compare_surface(t);
+}
+Changes compare_surface(const Target& t) {
     Changes c;
     const SurfaceLayout& l = t.layout;
     const u32 bytes = l.bytes;
@@ -1911,6 +2000,18 @@ DepthTarget* kept_depth_for(Renderer& r, const DepthStencilSurface& s, u32 width
     return r.kept_depths.back().get();
 }
 
+// Whether guest memory holds what was last stored from a kept depth image (`written`, its depth's bytes then its
+// stencil's): watched, else compared.
+bool kept_holds(const DepthTarget& t, const DepthRanges& g) {
+    if (t.written.empty() || t.written.size() != usize{g.depth_bytes} + g.stencil_bytes) return false;
+    const bool watched = (!g.depth_bytes || unwritten(t.watch[0], g.depth, g.depth_bytes)) &&
+                         (!g.stencil_bytes || unwritten(t.watch[1], g.stencil, g.stencil_bytes));
+    if (watched && write_watch_mode() != 2) return true;
+    const bool equal = depth_contents_equal(g, t.written);
+    if (watched && !equal) unseen_write("a depth surface", g.depth ? g.depth : g.stencil, g.depth_bytes + g.stencil_bytes);
+    return equal;
+}
+
 // Whether a kept depth image holds what the pending scenes leave in its surface's memory: the latest of them to write
 // there (or to draw with the image) stored it from the image. 1: it does; 0: it does not (a scene drew with the image
 // without storing it, or wrote there otherwise); -1: no pending scene writes there.
@@ -1953,8 +2054,11 @@ DepthTarget* kept_aspect(Renderer& r, const DepthStencilSurface& s, const DepthR
         if (pending != -1) continue;
         // (what was stored: its depth's bytes, then its stencil's)
         const usize offset = stencil ? usize{depth_samples(s, width, height)} * tl.depth_bytes : 0;
-        if (t->written.size() >= offset + bytes && std::memcmp(memory().host(at), t->written.data() + offset, bytes) == 0)
-            return t.get();
+        if (t->written.size() < offset + bytes) continue;
+        const bool watched = unwritten(t->watch[stencil ? 1 : 0], at, bytes);
+        if (watched && write_watch_mode() != 2) return t.get();
+        if (std::memcmp(memory().host(at), t->written.data() + offset, bytes) == 0) return t.get();
+        if (watched) unseen_write("a depth surface's aspect", at, bytes);
     }
     return nullptr;
 }
@@ -1980,6 +2084,18 @@ bool texels_as_depth(const TextureInfo& info) {
     return c[0] == probe && c[1] == 0.0f && c[2] == 0.0f && c[3] == 1.0f;
 }
 
+// Whether guest memory holds the depth a depth-only scene last stored from its image (`written`): watched, else
+// compared.
+bool depth_target_holds(const DepthTarget& t) {
+    const u32 n = static_cast<u32>(t.written.size());
+    if (!n || !memory().valid(t.address, n)) return false;
+    const bool watched = unwritten(t.watch[0], t.address, n);
+    if (watched && write_watch_mode() != 2) return true;
+    const bool equal = std::memcmp(memory().host(t.address), t.written.data(), n) == 0;
+    if (watched && !equal) unseen_write("a stored depth surface", t.address, n);
+    return equal;
+}
+
 // A texture that reads a depth surface stored at the internal resolution: its kept image's depth, when the texture
 // is that surface (address, size, tiled or rows as it was stored), guest memory still holds what was stored, and it
 // is not this scene's depth.
@@ -1995,9 +2111,7 @@ DepthTarget* scaled_depth_texture(Renderer& r, const TextureInfo& info, const De
                         info.stride != t->stride * 32 * 4)
             return nullptr;
         if (!texels_as_depth(info)) return nullptr;
-        if (!memory().valid(t->address, static_cast<u32>(t->written.size())) ||
-            std::memcmp(memory().host(t->address), t->written.data(), t->written.size()) != 0)
-            return nullptr;
+        if (!depth_target_holds(*t)) return nullptr;
         return t.get();
     }
     return nullptr;
@@ -2124,6 +2238,8 @@ struct SceneProfile {
             std::fprintf(stderr, " GPU: %.2f ms before the pass, %.2f the pass, %.2f after it a scene;",
                          static_cast<f64>(gpu_before_ns) / 1e6 / gpu_measured, static_cast<f64>(gpu_pass_ns) / 1e6 / gpu_measured,
                          static_cast<f64>(gpu_after_ns) / 1e6 / gpu_measured);
+        std::fprintf(stderr, " surfaces written back found unchanged: %.2f by watching, %.2f compared a scene;",
+                     static_cast<f64>(g_watch_seen.exchange(0)) / scenes, static_cast<f64>(g_watch_compared.exchange(0)) / scenes);
         std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene (%.2f converted, %.3f backgrounds);",
                      static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
                      static_cast<f64>(from_targets + converted) / scenes, static_cast<f64>(converted) / scenes,
@@ -2574,7 +2690,7 @@ CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words
         DepthStencilSurface s{};
         s.control = t->control, s.depth_data = t->address, s.stencil_data = t->stencil_address;
         s.background_control = t->stride << 16;
-        if (!depth_contents_equal(depth_ranges(s, l, t->width, t->height), t->written)) continue;
+        if (!kept_holds(*t, depth_ranges(s, l, t->width, t->height))) continue;
         const auto& dec = decode_for(r, info, d16 ? TargetSource::Depth16 : TargetSource::Depth32);
         if (!dec) return nullptr;
         if (past) {
@@ -2585,11 +2701,19 @@ CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words
             const usize row = info.stride;
             const u8* had = t->background_bytes.data();
             bool same = t->background_bytes.size() == size;
-            for (u32 y = 0; same && y < ah; ++y) {
-                const usize from = y * row + usize{aw} * bytes, to = nx::min<usize>((y + 1) * row, size);
-                same = to <= from || std::memcmp(guest + from, had + from, to - from) == 0;
+            // (watched: nothing written there since it was compared or taken, but the stores of this surface, which
+            // write_back lets keep the watch)
+            const bool watched = same && unwritten(t->background_watch, info.address, size);
+            if (!watched || write_watch_mode() == 2) {
+                watch_range(t->background_watch, info.address, size);  // (before it is compared or taken)
+                for (u32 y = 0; same && y < ah; ++y) {
+                    const usize from = y * row + usize{aw} * bytes, to = nx::min<usize>((y + 1) * row, size);
+                    same = to <= from || std::memcmp(guest + from, had + from, to - from) == 0;
+                }
+                if (same && usize{ah} * row < size)
+                    same = std::memcmp(guest + ah * row, had + ah * row, size - ah * row) == 0;
+                if (watched && !same) unseen_write("a depth texture's background", info.address, size);
             }
-            if (same && usize{ah} * row < size) same = std::memcmp(guest + ah * row, had + ah * row, size - ah * row) == 0;
             if (!same) {
                 t->background_bytes.assign(guest, guest + size);
                 t->background_uploaded = false;
@@ -3974,7 +4098,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         kept_depth = kept_depth_for(r, ds, width, height, scale, (ds.control & kDsForceStore) != 0);
     if (kept_depth && (ds.control & kDsForceLoad)) {
         const int pending = pending_kept_depth(r, kept_depth, ranges);
-        depth_kept = pending == 1 || (pending == -1 && depth_contents_equal(ranges, kept_depth->written));
+        depth_kept = pending == 1 || (pending == -1 && kept_holds(*kept_depth, ranges));
     }
     // (else each aspect from a kept image of another surface over the same memory, copied on the GPU)
     DepthTarget* aspect_from[2] = {};  // (the depth, the stencil)
@@ -3998,9 +4122,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             depth_target = depth_target_for(r, ds, l, width, height, s);
             if (depth_target) {
                 scale = s;
-                const auto now = depth_bytes(ds, width, height);
-                depth_kept = depth_target->written.size() == now.size() &&
-                             std::memcmp(now.data(), depth_target->written.data(), now.size()) == 0;
+                depth_kept = depth_target->written.size() == depth_bytes(ds, width, height).size() &&
+                             depth_target_holds(*depth_target);
             }
         }
     }
@@ -5046,13 +5169,18 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             const u8* src = static_cast<const u8*>(readback->mapped);
             nx::vector<u8> packed;
             if (packing != Packing::None) {
+                packed.swap(target->written);  // (its memory, packed into: `written` again once written back)
                 packed.resize(usize{width} * height * bytes);
                 pack_pixels(packing, src, packed.data(), usize{width} * height);
                 src = packed.data();
             }
-            scatter(layout, data, src);
+            const u32 span = static_cast<u32>(layout.span());
+            write_back(r, {{data, span}}, nullptr, [&] { scatter(layout, data, src); });
             // (what guest memory holds now, to know whether the image (or the scaled one) is still the surface)
-            target->written.assign(src, src + usize{width} * height * bytes);
+            // (a packed surface's bytes are a vector of their own already: kept, not copied)
+            if (packing != Packing::None) target->written = std::move(packed);
+            else target->written.assign(src, src + usize{width} * height * bytes);
+            watch_range(target->watch, data, span);
         } else if (!ok && target) {
             target->written.clear();  // (the image may hold what guest memory does not)
         }
@@ -5084,20 +5212,27 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (ok && stores_depth) {
             vk::invalidate(d, *depth_buf);
             const u8* src = static_cast<const u8*>(depth_buf->mapped);
-            if (scale > 1) {
-                const nx::vector<u8> down = scale_down_samples(src, width, height, scale);
-                write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(down.data()),
-                                    down.data() + usize{width} * height * 4);
-            } else {
-                write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src), src + samples * 4);
-            }
+            const DepthRanges g = depth_ranges(ds, dl, width, height);
+            write_back(r, {{g.depth, g.depth_bytes}, {g.stencil, g.stencil_bytes}},
+                       kept_depth ? &kept_depth->background_watch : nullptr, [&] {
+                if (scale > 1) {
+                    const nx::vector<u8> down = scale_down_samples(src, width, height, scale);
+                    write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(down.data()),
+                                        down.data() + usize{width} * height * 4);
+                } else {
+                    write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src), src + samples * 4);
+                }
+            });
             // (what guest memory holds now, to know whether the kept depth image is still the surface)
             if (depth_target) {
                 const auto now = depth_bytes(ds, width, height);
                 depth_target->written.assign(now.begin(), now.end());
+                watch_range(depth_target->watch[0], ds.depth_data, static_cast<u32>(now.size()));
             }
             if (kept_depth) {
-                depth_contents(depth_ranges(ds, dl, width, height), kept_depth->written);
+                depth_contents(g, kept_depth->written);
+                watch_range(kept_depth->watch[0], g.depth, g.depth_bytes);
+                watch_range(kept_depth->watch[1], g.stencil, g.stencil_bytes);
                 ++kept_depth->generation;
             }
         }
