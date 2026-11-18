@@ -162,6 +162,74 @@ public:
     }
 };
 
+// PSVRECORE_AUDIO_RECORD=<folder>: what each audio port plays, as it is queued, to <folder>/audio_port<N>.wav (16-bit
+// PCM, the port's rate and channels), passed on to the speaker as well. The files are written as the blocks come
+// and their sizes set at the end (a program stopped from outside leaves them 0: the samples are there all the same).
+class AudioRecorder : public runtime::AudioSink {
+public:
+    AudioRecorder(nx::string folder, runtime::AudioSink* next) : folder_(std::move(folder)), next_(next) {}
+    ~AudioRecorder() override {
+        nx::scoped_lock<nx::mutex> held(lock_);
+        for (auto& [port, t] : tracks_) {
+            if (!t.file) continue;
+            const u32 data = static_cast<u32>(nx::min<u64>(t.bytes, 0xFFFFFFFFull - 36));
+            std::fseek(t.file, 4, SEEK_SET);
+            u32 riff = 36 + data;
+            std::fwrite(&riff, 4, 1, t.file);
+            std::fseek(t.file, 40, SEEK_SET);
+            std::fwrite(&data, 4, 1, t.file);
+            std::fclose(t.file);
+        }
+    }
+    void play(const runtime::AudioBlock& b) override {
+        if (next_) next_->play(b);
+        nx::scoped_lock<nx::mutex> held(lock_);
+        Track& t = tracks_[b.port];
+        if (!t.file && !t.failed) {
+            const nx::string path = nx::format("{}/audio_port{}.wav", folder_, b.port);
+            t.file = std::fopen(path.c_str(), "wb");
+            if (!t.file) {
+                t.failed = true;
+                nx::logw(logs::frontend, "PSVRECORE_AUDIO_RECORD: cannot write {}", path);
+                return;
+            }
+            auto u32le = [&](u32 v) { std::fwrite(&v, 4, 1, t.file); };
+            auto u16le = [&](u16 v) { std::fwrite(&v, 2, 1, t.file); };
+            std::fwrite("RIFF", 1, 4, t.file);
+            u32le(0);
+            std::fwrite("WAVEfmt ", 1, 8, t.file);
+            u32le(16);
+            u16le(1);  // (PCM)
+            u16le(static_cast<u16>(b.channels));
+            u32le(b.rate);
+            u32le(b.rate * b.channels * 2);
+            u16le(static_cast<u16>(b.channels * 2));
+            u16le(16);
+            std::fwrite("data", 1, 4, t.file);
+            u32le(0);
+            nx::logi(logs::frontend, "PSVRECORE_AUDIO_RECORD: port {} ({} Hz, {} channels) to {}", b.port, b.rate,
+                     b.channels, path);
+        }
+        if (!t.file) return;
+        std::fwrite(b.samples.data(), 2, b.samples.size(), t.file);
+        t.bytes += b.samples.size() * 2;
+    }
+    void port_released(u32 port) override {
+        if (next_) next_->port_released(port);
+    }
+
+private:
+    struct Track {
+        std::FILE* file = nullptr;
+        u64 bytes = 0;
+        bool failed = false;
+    };
+    nx::string folder_;
+    runtime::AudioSink* next_;
+    nx::mutex lock_;
+    nx::hash_map<u32, Track> tracks_;
+};
+
 // The application sent to the background and brought back (Android): the game suspended, its sound paused and the
 // window's surface let go, all before the system takes the window. From the activity's pause and resume (on the
 // system's thread, before the surface goes), and from SDL's events as well (which reach SDL's thread only after).
@@ -673,6 +741,11 @@ int run_game(const Game& game, int argc, char** argv) {
     config.files.mounts.push_back({"ux0", data, true});
     config.files.mounts.push_back({"savedata0", save, false});  // (read-only to sceIo; save data is written by SceAppUtil)
     config.audio = speaker.get();
+    nx::unique_ptr<AudioRecorder> recorder;
+    if (const char* v = std::getenv("PSVRECORE_AUDIO_RECORD"); v && *v) {
+        recorder = nx::make_unique<AudioRecorder>(nx::string(v), speaker.get());
+        config.audio = recorder.get();
+    }
     config.system.language = s.language;
     config.system.user_name = s.user_name;
     config.system.date_format = s.date_format;
