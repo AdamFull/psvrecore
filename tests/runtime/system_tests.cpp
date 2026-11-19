@@ -326,6 +326,11 @@ TEST_CASE("apputil, power, LiveArea, game update, photo export: the host's answe
     CHECK(u(call32(ctx, kSceAppUtil, 0x9651B941 /*PhotoUmount*/, {})) == 0x80100604u);
     CHECK(u(call32(ctx, kSceAppUtil, 0xF19D0423 /*LaunchWebBrowser*/, {out})) == 0x80100605u);
     CHECK(u(call32(ctx, kSceAppUtil, 0x85FA94EE /*StoreBrowse*/, {out})) == 0x80100605u);
+    // (the SKU flag: a licensed, full copy; any other parameter is refused)
+    psv_st32(out, 0);
+    CHECK(call32(ctx, kSceAppUtil, 0xCD7FD67A /*AppParamGetInt*/, {0, out}) == 0);
+    CHECK(psv_ld32(out) == 3);
+    CHECK(u(call32(ctx, kSceAppUtil, 0xCD7FD67A /*AppParamGetInt*/, {1, out})) == 0x80100600u);
 
     CHECK(call32(ctx, kScePower, 0xD3075926 /*IsLowBattery*/, {}) == 0);
     CHECK(call32(ctx, kScePower, 0x87440F5E /*IsPowerOnline*/, {}) == 1);

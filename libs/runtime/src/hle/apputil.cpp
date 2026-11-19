@@ -475,11 +475,13 @@ i32 sceAppUtilSystemParamGetString(u32 id, Ptr<char> buf, u32 size) {
     return 0;
 }
 
-// The SKU flag: none (an application sold one way).
+// The SKU flag: full (3), as a licensed copy of the game gets it; 1 would be a trial, 0 an application without a
+// licence's. Games sold with a trial in the same package (Lumines: Electronic Symphony) are the full game only when
+// it is 3.
 i32 sceAppUtilAppParamGetInt(u32 id, Ptr<i32> value) {
     if (!apputil().initialized) return kNotInitialized;
     if (id != 0 || !value || !writable(value.address, 4)) return kParameter;
-    *value = 0;
+    *value = 3;
     return 0;
 }
 
