@@ -71,7 +71,8 @@ struct BlendRead {
 
 std::optional<BlendRead> find_blend_read(const usse::Gxp& gxp, std::span<const Decoded> program) {
     using B = ColorReadBlend;
-    if (!gxp.native_color || !gxp.frag_color || gxp.output_type != usse::ParameterType::U8) return std::nullopt;
+    if (!gxp.native_color || !gxp.frag_color || gxp.output_type != usse::ParameterType::U8 || gxp.output_register)
+        return std::nullopt;
     auto is_colour = [](const Operand& o) {
         return o.bank == Bank::Output && o.number == 0 && !o.indexed && !o.negate && !o.absolute && o.lanes &&
                o.swizzle[0] == Comp::X && o.swizzle[1] == Comp::Y && o.swizzle[2] == Comp::Z && o.swizzle[3] == Comp::W;
@@ -1890,6 +1891,7 @@ void Translator::fragment_epilogue() {
     // attributes: checked in the shader compiler's programs)
     BankVar& bank = gxp_.native_color ? out_ : pa_;
     auto p = [&](u32 r) {
+        r += gxp_.output_register;  // (where the program leaves its colour)
         bank.used = nx::max(bank.used, r + 1);
         return load(tu_, chain(tp_fu_, bank.var, {u(r)}));
     };

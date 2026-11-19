@@ -23,7 +23,8 @@ namespace psvrecore::usse {
 // component count (8-11), container (12-15), semantic (16-23, attributes only), semantic index (24-27) and cube
 // sampler flag (28); the array size; the resource index.
 // The varyings block: word 2 is, for a vertex program, the mask of primary registers holding attributes read in
-// their declared format; for a fragment program, the output type (bits 16-19) and component count (24-27). A
+// their declared format; for a fragment program, the output type (bits 16-19), component count (24-27) and the
+// register the colour is left in (bits 0-7: Lumines' text program ends with it in pa4, its others in pa0). A
 // vertex program's outputs are flags in word 4 (position 12, fog 9, color0 11, color1 10, point size 8, clip
 // planes 0-7) and one 3-bit group per texture coordinate in word 5 (non-zero when written); word 7 holds the
 // primary register of the vertex index (bits 0-15) and of the instance index (16-31), read where the flags say. A fragment program's
@@ -158,6 +159,7 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
         const u32 format = r.le<u32>(varyings + 0x08);
         g.output_type = static_cast<ParameterType>((format >> 16) & 0xF);
         g.output_components = static_cast<u8>((format >> 24) & 0xF);
+        g.output_register = static_cast<u8>(format & 0xFF);
         const u32 count = r.le<u32>(varyings + 0x0C) & 0xFFFF;
         if (!r.contains(varyings + 0x14, usize{count} * 16)) return failure("GXP fragment inputs outside the file");
         u32 offset = 0;

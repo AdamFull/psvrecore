@@ -142,7 +142,7 @@ Result<void> run_vertex(const Draw& d, const Machine& setup, u32 index, Vertex& 
 // The fragment program's colour: its output register's lanes in the type it declares (as the hardware converts it
 // to the output format; the attachment then quantizes), lanes it does not have 0, 0, 0, 1.
 void output_color(const usse::Gxp& g, const Machine& m, f32 rgba[4]) {
-    const u32* bank = g.native_color ? m.output : m.primary;
+    const u32* bank = (g.native_color ? m.output : m.primary) + g.output_register;
     f32 lane[4] = {0, 0, 0, 1};
     auto half = [&](u32 w, u32 k) { return usse::from_half(static_cast<u16>(k ? w >> 16 : w)); };
     switch (g.output_type) {

@@ -231,6 +231,14 @@ TEST_CASE("usse: GXP container") {
     REQUIRE(p->inputs.size() == 1);
     CHECK(p->inputs[0].interpolated == varying::kColor0);
     CHECK(p->inputs[0].sampled == varying::kTexCoord0);
+    CHECK(p->output_register == 0);
+    // (a program that leaves its colour in pa4: Lumines' text)
+    g.put32(0xA0 + 0x08, 0x04010004);
+    const auto p4 = parse_gxp(g.data);
+    REQUIRE(p4);
+    CHECK(p4->output_register == 4);
+    CHECK(p4->output_type == ParameterType::F16);
+    CHECK(p4->output_components == 4);
     g.data[5] = 6;
     CHECK(!gxp_valid(g.data));
     g.data[0] = 'X';

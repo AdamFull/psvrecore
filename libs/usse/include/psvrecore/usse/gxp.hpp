@@ -122,6 +122,9 @@ struct Gxp {
     // The fragment program's output register format (fragment programs only).
     ParameterType output_type = ParameterType::F32;
     u8 output_components = 0;
+    // The register the colour is left in (the primary attributes', or the output registers' with __nativecolor):
+    // usually 0, but the compiler may leave it elsewhere (a program that writes pa4 and ends).
+    u8 output_register = 0;
     nx::vector<Parameter> parameters;
     nx::vector<Container> containers;
     nx::vector<Literal> literals;
