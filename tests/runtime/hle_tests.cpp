@@ -236,6 +236,39 @@ TEST_CASE("sysmem: memory blocks by type, size rules, lookup and freeing") {
     CHECK(call32(ctx, kSceSysmem, kFree, {u(uid)}) == err::kUnknownUid);
 }
 
+TEST_CASE("sysmem: physically contiguous blocks have an area of their own beside main memory's budget") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kAlloc = 0xB9D5EBDE, kFree = 0xA91E15EE, kFreeSize = 0x87CC580B;
+    constexpr u32 kUserRw = 0x0C20D060, kPhycont = 0x0C80D060;
+    constexpr u32 kMiB = 0x100000;
+    const u32 name = guest_string("block"), info = scratch(16);
+    auto free_sizes = [&](u32* main, u32* phycont) {
+        psv_st32(info, 16);
+        REQUIRE(call32(ctx, kSceSysmem, kFreeSize, {info}) == 0);
+        *main = psv_ld32(info + 4);
+        *phycont = psv_ld32(info + 12);
+    };
+    u32 main = 0, phy = 0;
+    free_sizes(&main, &phy);
+    CHECK(phy == 26 * kMiB);
+    // The main budget taken whole, then the 26 MiB area still there.
+    const i32 all = call32(ctx, kSceSysmem, kAlloc, {name, kUserRw, main, 0});
+    REQUIRE(all > 0);
+    const i32 area = call32(ctx, kSceSysmem, kAlloc, {name, kPhycont, 26 * kMiB, 0});
+    CHECK(area > 0);
+    free_sizes(&main, &phy);
+    CHECK(main == 0);
+    CHECK(phy == 0);
+    CHECK(call32(ctx, kSceSysmem, kAlloc, {name, kPhycont, kMiB, 0}) == err::kNoFreePhysicalPage);
+    // Past the area, phycont blocks come from the main budget.
+    CHECK(call32(ctx, kSceSysmem, kFree, {u(all)}) == 0);
+    CHECK(call32(ctx, kSceSysmem, kAlloc, {name, kPhycont, kMiB, 0}) > 0);
+    free_sizes(&main, &phy);
+    CHECK(phy == 0);
+    CHECK(main == 0x10000000u - kMiB);
+}
+
 TEST_CASE("files: open, write, read, seek, stat and directories on a mounted folder") {
     TempDir dir;
     TestRuntime t;

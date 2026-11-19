@@ -52,6 +52,26 @@ bool rules_for(u32 type, TypeRules* out) {
 
 constexpr i32 kNoFreeCdram = err::code(0x80024309);  // SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE_CDRAM
 
+// Physically contiguous main memory is an area of its own on the console, 26 MiB for the game, beside the budget for
+// main memory's other blocks: Uncharted: Golden Abyss sizes its heap from the free main memory, then takes 26 MiB
+// of the physically contiguous kind. Phycont blocks past that area are charged to the main budget (as all of them
+// were before), so nothing that fitted then is refused now.
+constexpr u64 kPhycontArea = 26ull * kMiB;
+constexpr u32 kPhycontTypes[] = {kUserMainPhycontRw, kUserMainPhycontNcRw};
+bool phycont(u32 type) { return type == kUserMainPhycontRw || type == kUserMainPhycontNcRw; }
+
+// Main memory in use: the blocks charged to its budget (the others, and phycont blocks past the area), and the
+// phycont blocks.
+struct MainUse {
+    u64 charged = 0, phycont = 0;
+};
+MainUse main_use(u32 adding_type = 0, u32 adding = 0) {
+    const u64 all = memory().mapped_bytes(BlockKind::MemBlock, layout::kUserMemory) + adding;
+    const u64 phy = memory().mapped_bytes(BlockKind::MemBlock, layout::kUserMemory, kPhycontTypes) +
+                    (phycont(adding_type) ? adding : 0);
+    return {all - phy + (phy > kPhycontArea ? phy - kPhycontArea : 0), phy};
+}
+
 i32 sceKernelAllocMemBlock(Ptr<const char> name, u32 type, u32 size, Ptr<AllocOpt> opt) {
     if (!name) return err::kInvalidArgument;
     TypeRules rules{};
@@ -70,7 +90,9 @@ i32 sceKernelAllocMemBlock(Ptr<const char> name, u32 type, u32 size, Ptr<AllocOp
     const Region region = rules.cdram ? layout::kCdram : layout::kUserMemory;
     const u64 budget = rules.cdram ? rt.config().cdram_budget : rt.config().user_memory_budget;
     const i32 no_memory = rules.cdram ? kNoFreeCdram : err::kNoFreePhysicalPage;
-    if (rt.memory().mapped_bytes(BlockKind::MemBlock, region) + size > budget) return no_memory;
+    if (rules.cdram ? rt.memory().mapped_bytes(BlockKind::MemBlock, region) + size > budget
+                    : main_use(type, size).charged > budget)
+        return no_memory;
     const u32 uid = 0x40050001u + 2 * g_next_block.fetch_add(1);
     const nx::string block_name = str(name, 31);
     const u32 base = rt.memory().map_anywhere(region, size, alignment, Access::ReadWrite, BlockKind::MemBlock, block_name,
@@ -133,13 +155,14 @@ i32 sceKernelGetMemBlockInfoByRange(u32 address, u32 size, Ptr<MemBlockInfo> out
 i32 sceKernelGetFreeMemorySize(Ptr<FreeMemorySizeInfo> out) {
     if (!writable(out.address, 16)) return err::kIllegalAddress;
     const Runtime& rt = runtime();
-    const u64 main_used = memory().mapped_bytes(BlockKind::MemBlock, layout::kUserMemory);
+    const MainUse used = main_use();
     const u64 cdram_used = memory().mapped_bytes(BlockKind::MemBlock, layout::kCdram);
     FreeMemorySizeInfo info{};
     info.size = out->size;
-    info.main = static_cast<u32>(main_used >= rt.config().user_memory_budget ? 0 : rt.config().user_memory_budget - main_used);
+    info.main = static_cast<u32>(used.charged >= rt.config().user_memory_budget ? 0
+                                                                                 : rt.config().user_memory_budget - used.charged);
     info.cdram = static_cast<u32>(cdram_used >= rt.config().cdram_budget ? 0 : rt.config().cdram_budget - cdram_used);
-    info.phycont = info.main;
+    info.phycont = static_cast<u32>(used.phycont >= kPhycontArea ? 0 : kPhycontArea - used.phycont);
     std::memcpy(out.get(), &info, std::min<u32>(info.size ? info.size : sizeof info, sizeof info));
     return err::kOk;
 }

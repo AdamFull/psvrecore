@@ -90,6 +90,8 @@ public:
     // Bytes mapped in blocks of a kind (that lie in `region`, if given).
     u64 mapped_bytes(BlockKind kind) const;
     u64 mapped_bytes(BlockKind kind, const Region& region) const;
+    // (and of those, the ones mapped with one of these types: map_anywhere's `type`)
+    u64 mapped_bytes(BlockKind kind, const Region& region, std::span<const u32> types) const;
 
     // True if [address, address + size) lies in mapped blocks (with write access if `write`).
     PSVRECORE_API bool valid(u32 address, u32 size, bool write = false) const;

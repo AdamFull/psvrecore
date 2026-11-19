@@ -223,6 +223,16 @@ u64 GuestMemory::mapped_bytes(BlockKind kind, const Region& region) const {
     return total;
 }
 
+u64 GuestMemory::mapped_bytes(BlockKind kind, const Region& region, std::span<const u32> types) const {
+    nx::scoped_lock<nx::mutex> guard(lock_);
+    u64 total = 0;
+    for (const auto& [base, block] : blocks_)
+        if (block.kind == kind && base >= region.begin && base < region.end &&
+            std::find(types.begin(), types.end(), block.type) != types.end())
+            total += block.size;
+    return total;
+}
+
 bool GuestMemory::valid(u32 address, u32 size, bool write) const {
     if (size == 0) return true;
     if (pages_) {
