@@ -244,8 +244,10 @@ void sceGxmSetBackVisibilityTestOp(u32 context, u32 op) {
     with(context, [&](Context& c) { c.state.visibility_set[1] = op == 0x40000; });
 }
 
+// A null base takes the buffer away (the scenes begun after it count nothing): Gravity Rush does so at start-up and
+// stops on any error, so the console accepts it; only a null context is refused.
 i32 sceGxmSetVisibilityBuffer(u32 context, u32 base, u32 stride) {
-    if (!context || !base) return err::kInvalidPointer;
+    if (!context) return err::kInvalidPointer;
     if ((base | stride) & 15) return err::kInvalidAlignment;
     nx::scoped_lock<nx::mutex> held(state().lock);
     Context* c = context_of(context);
