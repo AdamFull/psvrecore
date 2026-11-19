@@ -216,7 +216,16 @@ usize run_corpus(const FuzzBlock* blocks, u32 count, int states, const char* wha
                 const u32 w = rng.u32v();
                 std::memcpy(&initial[i], &w, std::min<usize>(4, kMemory - i));
             }
-            const PsvContext start = state(rng);
+            PsvContext start_state = state(rng);
+#if defined(__aarch64__)
+            // An exclusive access or a swap at an address that is not aligned faults on the console (an alignment
+            // fault) and on an arm64 host, whose atomic instructions fault likewise (SIGBUS); x64 does it quietly.
+            // So on arm64 such a block's base registers are aligned: every core register, as any may be the base.
+            if (const nx::string text = disassembly(block);
+                text.find("ldrex") != nx::string::npos || text.find("strex") != nx::string::npos || text.find("swp") != nx::string::npos)
+                for (int r = 0; r < 15; ++r) start_state.r[r] &= ~7u;
+#endif
+            const PsvContext start = start_state;
 
             // Generated code.
             PsvContext g = start;
