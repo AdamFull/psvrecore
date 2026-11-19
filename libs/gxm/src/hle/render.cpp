@@ -75,6 +75,7 @@ runtime::GuestMemory& memory() { return runtime::runtime().memory(); }
 enum class Packing : u8 {
     None,
     U2F10F10F10,  // (A in the top 2 bits, then B, G and R as unsigned 10-bit floats from bit 20, 10 and 0) as F16x4
+    U8U8U8,       // (three bytes, R first: no 24-bit attachments) as U8x4, A 1
 };
 
 struct ColorFormat {
@@ -82,7 +83,9 @@ struct ColorFormat {
     u32 bytes = 0;  // per pixel in the image
     u8 swizzle[4] = {0, 1, 2, 3};  // (FragmentShader::swizzle)
     Packing packing = Packing::None;
-    u32 guest_bytes() const { return packing == Packing::None ? bytes : 4; }  // per pixel in guest memory
+    u32 guest_bytes() const {  // per pixel in guest memory
+        return packing == Packing::None ? bytes : packing == Packing::U8U8U8 ? 3 : 4;
+    }
 };
 
 // The image format whose memory layout is the surface's (or that holds it: `packing`), and the order the output
@@ -103,6 +106,10 @@ bool color_format(u32 gxm, ColorFormat& out) {
         // (U2U10U10U10_ABGR: A in the top two bits, then B, G and R from bit 20, 10 and 0, as Vulkan's packed format,
         // which every device can draw into and blend)
         case 0x60800000u: out = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, {0, 1, 2, 3}}; return true;
+        case 0x40800000u: out = {VK_FORMAT_R16_UNORM, 2, {0, 4, 4, 5}}; return true;           // U16_R
+        case 0x10000000u:  // U8U8U8_BGR (LittleBigPlanet)
+            out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {0, 1, 2, 3}, Packing::U8U8U8};
+            return true;
         case 0x41000000u:  // U2F10F10F10_ABGR
             out = {VK_FORMAT_R16G16B16A16_SFLOAT, 8, {0, 1, 2, 3}, Packing::U2F10F10F10};
             return true;
@@ -114,6 +121,12 @@ bool color_format(u32 gxm, ColorFormat& out) {
 u16 f10_to_half(u32 v) { return static_cast<u16>((v & 0x3FF) << 5); }
 // A surface's pixels from guest memory into its image's (`packing`), and back: `count` pixels.
 void unpack_pixels(Packing packing, const u8* guest, u8* image, usize count) {
+    if (packing == Packing::U8U8U8) {
+        for (usize i = 0; i < count; ++i) {
+            image[i * 4] = guest[i * 3], image[i * 4 + 1] = guest[i * 3 + 1], image[i * 4 + 2] = guest[i * 3 + 2];
+            image[i * 4 + 3] = 0xFF;
+        }
+    }
     if (packing == Packing::U2F10F10F10) {
         static const u16 kAlpha[4] = {0x0000, 0x3555, 0x3955, 0x3C00};  // (0, 1/3, 2/3, 1)
         for (usize i = 0; i < count; ++i) {
@@ -125,6 +138,10 @@ void unpack_pixels(Packing packing, const u8* guest, u8* image, usize count) {
     }
 }
 void pack_pixels(Packing packing, const u8* image, u8* guest, usize count) {
+    if (packing == Packing::U8U8U8) {
+        for (usize i = 0; i < count; ++i)
+            guest[i * 3] = image[i * 4], guest[i * 3 + 1] = image[i * 4 + 1], guest[i * 3 + 2] = image[i * 4 + 2];
+    }
     if (packing == Packing::U2F10F10F10) {
         // (as the GPU's textures from such a surface pack; a row at a time, aligned)
         constexpr usize kRun = 1024;
