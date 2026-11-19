@@ -3379,6 +3379,14 @@ const Trace& trace() {
     return t;
 }
 
+// (PSVRECORE_GXM_TRACE_PROGRAMS=<folder>: a traced program's GXP written there, for psvusse)
+void write_traced_program(const Program* p) {
+    const char* folder = std::getenv("PSVRECORE_GXM_TRACE_PROGRAMS");
+    if (!folder || !*folder || !p || !p->gxp.size || !memory().valid(p->gxp_address, p->gxp.size)) return;
+    const nx::string path = nx::format("{}/{:08x}.gxp", folder, p->gxp_address);
+    (void)io::write_file(nx::fs::path_view(path), {memory().host(p->gxp_address), p->gxp.size});
+}
+
 void trace_scene(u64 number, const Scene& scene) {
     const ColorSurface& cs = scene.color;
     const DepthStencilSurface& ds = scene.depth;
@@ -3393,6 +3401,8 @@ void trace_scene(u64 number, const Scene& scene) {
             if (!w.words[0] && !w.words[1] && !w.words[2] && !w.words[3]) continue;
             const TextureInfo t = decode_texture(w.words);
             textures += nx::format(" t{}=0x{:08x}:{:08x}/type {}/{}x{}", u, t.address, t.base_format, t.type, t.width, t.height);
+            if (t.levels > 1 || t.swizzle || t.gamma)
+                textures += nx::format("/levels {} swizzle {} gamma {}", t.levels, t.swizzle, t.gamma);
         }
         nx::logi(logs::gxm, "trace:   draw {}: vertex 0x{:08x} fragment 0x{:08x} (blend {}, mask update {}), primitive {}, "
                  "{} indices x {}{}", i, d.vertex ? d.vertex->guest : 0, d.fragment ? d.fragment->guest : 0,
@@ -3420,14 +3430,19 @@ void trace_scene(u64 number, const Scene& scene) {
                                            static_cast<u32>(p.category), static_cast<u32>(p.type), p.components, p.array_size,
                                            p.resource, p.container);
             nx::logi(logs::gxm, "trace:     its uniforms:{}", uniforms);
-            // (PSVRECORE_GXM_TRACE_PROGRAMS=<folder>: the program's GXP written there, for psvusse)
-            if (const char* folder = std::getenv("PSVRECORE_GXM_TRACE_PROGRAMS"); folder && *folder) {
-                for (const Program* p : {d.vertex->program, d.fragment ? d.fragment->program : nullptr}) {
-                    if (!p || !p->gxp.size || !memory().valid(p->gxp_address, p->gxp.size)) continue;
-                    const nx::string path = nx::format("{}/{:08x}.gxp", folder, p->gxp_address);
-                    (void)io::write_file(nx::fs::path_view(path), {memory().host(p->gxp_address), p->gxp.size});
-                }
-            }
+            write_traced_program(d.vertex->program);
+        }
+        // (each fragment program the first time it is seen, whichever vertex program it is drawn with: a vertex program
+        // is often drawn with several)
+        static nx::hash_map<u32, bool> described_fragments;
+        if (d.fragment && d.fragment->program && described_fragments.emplace(d.fragment->guest, true).second) {
+            const BlendInfo& b = d.fragment->blend;
+            nx::logi(logs::gxm, "trace:     fragment program 0x{:08x} (GXP at 0x{:08x}), output format 0x{:08x}, blend {}: "
+                     "mask 0x{:x}, colour func {} src {} dst {}, alpha func {} src {} dst {}", d.fragment->guest,
+                     d.fragment->program->gxp_address, d.fragment->output_format, d.fragment->blend_enabled,
+                     b.color_mask, b.color_func(), b.color_src(), b.color_dst(), b.alpha_func(), b.alpha_src(),
+                     b.alpha_dst());
+            write_traced_program(d.fragment->program);
         }
     }
 }
