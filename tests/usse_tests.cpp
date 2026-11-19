@@ -72,6 +72,8 @@ TEST_CASE("usse: moves, packs and tests") {
     CHECK(one(0x4809C91110038080ull) == "cmp.ge.f32 p0, r2.y, {0}");
     CHECK(one(0x488C0A81000A2240ull) == "cmp.gt.u8 p0, r4.x, r0.x");
     CHECK(one(0x78408A80C0338080ull) == "cmp.gt.f32 r2.x, sa2.xyzw, r0.xyzw");
+    // an indexed source whose second half is the next pair at the same index: one vec4
+    CHECK(one(0x40430DBC0FB9B770ull) == "mov.f32 i1.xyzw, sa[index1 * 2 + 14].xyzw");
 }
 
 TEST_CASE("usse: bitwise, fixed point, integer") {
@@ -82,6 +84,9 @@ TEST_CASE("usse: bitwise, fixed point, integer") {
     CHECK(one(0x9080118008C02340ull ^ (1ull << 35)) ==
           "add.fx10 r6.x, r0.x * r6.x, min(r6.www,1.0 - r0.www) * r0.x");
     CHECK(one(0xC880080009122046ull) == "mad.sat.fx10 r8.xyzw, r0.xyzw, r6.xyzw, r8.xyzw");
+    // family 19: as family 25 (a native-colour program blending into the colour it read)
+    CHECK(one(0x988000057000004Bull) == "mad.u8 o0.xyzw, o0.xyzw, sa11.xyzw, pa0.xyzw");
+    CHECK(one(0x9880000570000018ull) == "mad.u8 o0.xyzw, o0.xyzw, sa24.xyzw, pa0.xyzw");
     CHECK(one(0xA8820882B001440Dull) == "mad.i32 pa0.x, r5.lo16, 0x8.lo16, sa13.x");
     CHECK(one(0xA0010900E0A10601ull) == "mad.i16 r5.xy, r4.xy, sa12, 0x1.lo8");
     CHECK(one(0xD0820006B1041011ull) == "mad.u32.s0 pa8.x, pa16.x, 0x20, sa17.x");
