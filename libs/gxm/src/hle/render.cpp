@@ -94,6 +94,7 @@ bool color_format(u32 gxm, ColorFormat& out) {
         case 0x00200000u: out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {3, 2, 1, 0}}; return true;      // U8U8U8U8_RGBA
         case 0x00300000u: out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {3, 0, 1, 2}}; return true;      // U8U8U8U8_BGRA
         case 0x01000000u: out = {VK_FORMAT_R16G16B16A16_SFLOAT, 8, {0, 1, 2, 3}}; return true;  // F16x4 ABGR
+        case 0x01100000u: out = {VK_FORMAT_R16G16B16A16_SFLOAT, 8, {2, 1, 0, 3}}; return true;  // F16x4 ARGB
         case 0x00800000u: out = {VK_FORMAT_R16G16_SFLOAT, 4, {0, 1, 4, 5}}; return true;       // F16F16_GR
         case 0x10800000u: out = {VK_FORMAT_R32_SFLOAT, 4, {0, 4, 4, 5}}; return true;          // F32_R
         case 0x80800000u: out = {VK_FORMAT_R8_UNORM, 1, {0, 4, 4, 5}}; return true;            // U8_R
