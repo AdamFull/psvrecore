@@ -628,7 +628,41 @@ TEST_CASE("kernel: each thread has its own TLS area") {
     CHECK(mine != 0);
     CHECK(other_tls != 0);
     CHECK(mine != other_tls);
-    CHECK(mine == ctx->tpidruro + 12);
+    CHECK(mine == ctx->tpidruro - kernel::kTlsSlotsSize + 12);  // (the slots are below the thread pointer)
+}
+
+TEST_CASE("kernel: each thread's TLS block starts as a copy of the process's TLS image") {
+    TestRuntime t;
+    // (the image: 12 initial bytes, 0x18 in memory)
+    const u32 image = scratch(16);
+    const u32 words[3] = {0x81958938u, 0xFFFFFFFFu, 0x12345678u};
+    std::memcpy(t.rt.memory().host(image), words, sizeof words);
+    t.rt.kernel().set_tls_image(image, 12, 0x18);
+    GuestCode code;
+    static u32 seen[6];
+    static u32 slot;
+    const u32 entry = code.add([](PsvContext* ctx, uint32_t) {
+        for (u32 i = 0; i < 6; ++i) seen[i] = psv_ld32(ctx->tpidruro + 4 * i);
+        psv_st32(ctx->tpidruro, 7);  // (its own copy)
+        slot = static_cast<u32>(call(ctx, kSceLibKernel, kGetTlsAddr, {0}));
+        if (slot) psv_st32(slot, 9);
+    });
+    code.install();
+    PsvContext* ctx = t.ctx();
+    for (int run = 0; run < 2; ++run) {
+        const i32 uid = create_thread(ctx, "tls image", entry, 100);
+        std::memset(seen, 0, sizeof seen);
+        start_thread(ctx, uid);
+        wait_end(ctx, uid);
+        CHECK(seen[0] == 0x81958938u);
+        CHECK(seen[1] == 0xFFFFFFFFu);
+        CHECK(seen[2] == 0x12345678u);
+        CHECK(seen[3] == 0);
+        CHECK(seen[4] == 0);
+        CHECK(seen[5] == 0);
+        CHECK(slot != 0);
+    }
+    CHECK(psv_ld32(image) == 0x81958938u);  // (the image itself is left as it is)
 }
 
 TEST_CASE("kernel: sceKernelExitThread ends a thread from inside nested guest calls") {

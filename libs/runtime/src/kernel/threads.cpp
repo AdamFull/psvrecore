@@ -149,8 +149,8 @@ Uid Kernel::create_thread(nx::string_view name, u32 entry, i32 priority, u32 sta
     t->stack = memory_.map_anywhere(impl_->config.stack_region, stack_size, GuestMemory::kPageSize, Access::ReadWrite,
                                     BlockKind::Stack, name);
     if (!t->stack) return err::kNoMemory;
-    t->tls = memory_.map_anywhere(impl_->config.stack_region, kTlsSize, GuestMemory::kPageSize, Access::ReadWrite,
-                                  BlockKind::ThreadLocal, name);
+    t->tls = memory_.map_anywhere(impl_->config.stack_region, impl_->tls_area_size, GuestMemory::kPageSize,
+                                  Access::ReadWrite, BlockKind::ThreadLocal, name);
     if (!t->tls) {
         memory_.unmap(t->stack);
         return err::kNoMemory;
@@ -183,9 +183,8 @@ i32 Kernel::start_thread(Uid uid, u32 arg_size, u32 arg_block) {
     t->ctx.r[1] = argp;
     t->ctx.r[13] = sp & ~7u;
     t->ctx.r[14] = hle::kHostReturn;
-    t->ctx.tpidruro = t->tls;
+    t->ctx.tpidruro = impl_->init_tls(t->tls);
     t->ctx.thread = t;
-    std::memset(memory_.host(t->tls), 0, kTlsSize);
     t->priority = t->init_priority;
     t->affinity = t->init_affinity;
     t->exit_status = err::kNotDormant;
@@ -426,8 +425,30 @@ i32 Kernel::wait_signal(Timeout timeout) {
 
 u32 Kernel::tls_address(u32 key) {
     Thread* t = current();
-    if (!t || !t->tls || key >= kTlsSize / 4) return 0;
+    if (!t || !t->tls || key >= kTlsSlotsSize / 4) return 0;
     return t->tls + 4 * key;
+}
+
+void Kernel::set_tls_image(u32 address, u32 file_size, u32 memory_size) {
+    Lock guard(impl_->lock);
+    if (file_size > memory_size || (file_size && !memory_.valid(address, file_size))) {
+        nx::logw(logs::kernel, "TLS image 0x{:08x} (0x{:x} of 0x{:x} bytes) is not in memory: left out", address,
+                 file_size, memory_size);
+        return;
+    }
+    impl_->tls_image = address;
+    impl_->tls_file_size = file_size;
+    impl_->tls_memory_size = memory_size;
+    const u32 page = GuestMemory::kPageSize;
+    impl_->tls_area_size = nx::max(kTlsSize, (kTlsSlotsSize + memory_size + page - 1) / page * page);
+    nx::logd(logs::kernel, "TLS image 0x{:08x}: 0x{:x} bytes, 0x{:x} in memory", address, file_size, memory_size);
+}
+
+u32 Kernel::Impl::init_tls(u32 tls) {
+    std::memset(memory.host(tls), 0, tls_area_size);
+    const u32 tp = tls + kTlsSlotsSize;
+    if (tls_file_size) std::memcpy(memory.host(tp), memory.host(tls_image), tls_file_size);
+    return tp;
 }
 
 nx::vector<Kernel::CpuUse> Kernel::cpu_use() {

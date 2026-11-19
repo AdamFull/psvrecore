@@ -76,7 +76,11 @@ inline constexpr u32 kCpuMaskShift = 16;
 inline constexpr u32 kUserCpuCount = 3;
 inline constexpr i32 kAllUserCpus = 0x7 << kCpuMaskShift;
 inline constexpr u32 kStackSizeMin = 0x1000, kStackSizeMax = 0x2000000, kMainStackSize = 0x40000;
-inline constexpr u32 kTlsSize = 0x1000;  // per thread: the thread's TLS slots (sceKernelGetTLSAddr) and more
+// A thread's TLS area: its TLS slots (sceKernelGetTLSAddr), then from its thread pointer (TPIDRURO) the process's
+// TLS block, a copy of the main executable's TLS image (module_info's TLS: the initial bytes, then zeros). At least
+// kTlsSize; more when the image needs it.
+inline constexpr u32 kTlsSize = 0x1000;
+inline constexpr u32 kTlsSlotsSize = 0x800;  // the slots, below the thread pointer
 
 // Wait queue order.
 inline constexpr u32 kAttrThreadPriority = 0x2000;  // SCE_KERNEL_ATTR_TH_PRIO (otherwise FIFO)
@@ -364,6 +368,9 @@ public:
     i32 wait_signal(kernel::Timeout timeout);
     // The TLS slot `key` of the calling thread (0 if it has none).
     u32 tls_address(u32 key);
+    // The process's TLS image (the main executable's module_info: `file_size` initial bytes at `address`, then zeros
+    // up to `memory_size`), copied to each thread's thread pointer as it starts. Set before the first thread.
+    void set_tls_image(u32 address, u32 file_size, u32 memory_size);
 
     // ---- semaphores
     Uid create_semaphore(nx::string_view name, u32 attr, i32 init, i32 max);

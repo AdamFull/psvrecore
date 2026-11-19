@@ -224,6 +224,9 @@ Result<i32> Loader::boot(const BootOptions& options) {
     if (!main_uid) return nx::err(main_uid.error());
     const LoadedModule* main = find(*main_uid);
     runtime_.process_param = main->process_param;
+    // (its TLS image: every thread's TLS block starts as a copy, the threads of the modules' module_start too)
+    if (const auto& info = main->image.module().info; info.tls_memory_size)
+        runtime_.kernel().set_tls_image(info.tls_start, info.tls_file_size, info.tls_memory_size);
 
     for (const auto& path : options.modules) {
         auto uid = load_guest(path);

@@ -35,6 +35,12 @@ struct Kernel::Impl {
     u32 thread_count = 0;
     u32 sync_count = 0;
 
+    // The process's TLS image (Kernel::set_tls_image), and each thread's TLS area's size for it.
+    u32 tls_image = 0, tls_file_size = 0, tls_memory_size = 0;
+    u32 tls_area_size = kernel::kTlsSize;
+    // A thread's TLS area as it starts: the slots zeroed, the TLS block a fresh copy of the image. Its thread pointer.
+    u32 init_tls(u32 tls);
+
     nx::vector<kernel::Thread*> cpus;   // the thread each CPU runs
     nx::vector<kernel::Thread*> ready;  // ready threads without a CPU
     i64 back_order = 0, front_order = 0;

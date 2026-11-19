@@ -127,13 +127,13 @@ Result<Module> parse(const elf::File& file) {
     const u32 export_top = image.u32_at(a + 36), export_end = image.u32_at(a + 40);
     const u32 import_top = image.u32_at(a + 44), import_end = image.u32_at(a + 48);
     info.module_nid = image.u32_at(a + 52);
-    info.tls_start = image.u32_at(a + 56);
+    const auto range = [&](u32 offset) { return offset ? base + offset : 0; };
+    info.tls_start = range(image.u32_at(a + 56));  // (an offset too: the TLS image is in the module's segments)
     info.tls_file_size = image.u32_at(a + 60);
     info.tls_memory_size = image.u32_at(a + 64);
     const u32 start = image.u32_at(a + 68), stop = image.u32_at(a + 72);
     info.module_start = start == kNoEntry ? 0 : base + start;
     info.module_stop = stop == kNoEntry ? 0 : base + stop;
-    const auto range = [&](u32 offset) { return offset ? base + offset : 0; };
     info.exidx_start = range(image.u32_at(a + 76));
     info.exidx_end = range(image.u32_at(a + 80));
     info.extab_start = range(image.u32_at(a + 84));
