@@ -3671,6 +3671,16 @@ void write_traced_program(const Program* p) {
     (void)io::write_file(nx::fs::path_view(path), {memory().host(p->gxp_address), p->gxp.size});
 }
 
+// A program whose translation failed: which one (its GXP's address), and its GXP written to
+// PSVRECORE_GXM_TRACE_PROGRAMS's folder when that is set, traced or not (for psvusse).
+Result<nx::vector<u32>> failed_noted(const Program* p, Result<nx::vector<u32>> spirv) {
+    if (!spirv && p) {
+        nx::logw(logs::gxm, "program at 0x{:08x} (GXP 0x{:08x}) not translated", p->guest, p->gxp_address);
+        write_traced_program(p);
+    }
+    return spirv;
+}
+
 void trace_scene(u64 number, const Scene& scene) {
     const ColorSurface& cs = scene.color;
     const DepthStencilSurface& ds = scene.depth;
@@ -4023,7 +4033,7 @@ void prepare_shaders(Renderer& r, std::span<const Draw> draws, const ColorFormat
     for (usize i = 0; i < tasks.size(); ++i) {
         Task& t = tasks[i];
         const VkShaderModule m = module_for(r, t.key, [&]() -> Result<nx::vector<u32>> {
-            if (!t.error.empty()) return failure(t.error);
+            if (!t.error.empty()) return failed_noted(t.program, failure(t.error));
             return std::move(t.words);
         });
         if (m && t.kind == Kind::Secondary) computes.push_back({i, m});
@@ -4684,7 +4694,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (auto it = r.quick_modules.find(vq); it != r.quick_modules.end()) {
             vmod = it->second;
         } else {
-            vmod = module_for(r, vertex_key(vp, vs), [&] { return translate_vertex(vp.gxp, vp.primary, vs); });
+            vmod = module_for(r, vertex_key(vp, vs), [&] { return failed_noted(&vp, translate_vertex(vp.gxp, vp.primary, vs)); });
             if (vmod) r.quick_modules[vq] = vmod;
         }
         const FragmentShader fs = fragment_shader_of(dr, cf, color != nullptr);
@@ -4696,7 +4706,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             fmod = module_for(r, fragment_key(fp, fs, inline_secondary), [&] {
                 const std::span<const usse::Decoded> secondary =
                     inline_secondary ? std::span<const usse::Decoded>(fp.secondary) : std::span<const usse::Decoded>{};
-                return translate_fragment(fp.gxp, fp.primary, fs, secondary);
+                return failed_noted(&fp, translate_fragment(fp.gxp, fp.primary, fs, secondary));
             });
             if (fmod) r.quick_modules[fq] = fmod;
         }
