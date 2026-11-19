@@ -481,7 +481,9 @@ const Function kNearUtilMore[] = {
     FAIL(0x773ABEA9, "sceNearGetDiscoveredGiftInfo", kNearNotRetrieved),
     FAIL(0xEFE6F060, "sceNearGetDiscoveredGiftSender", kNearNotRetrieved),
     FAIL(0xA64D9D38, "sceNearGetDiscoveredGiftStatus", kNearNotRetrieved),
-    FAIL(0xDE6F0859, "sceNearGetDiscoveredGifts", kNearNotRetrieved),
+    // (none discovered: its result is the number of gifts, which games use as a count; Uncharted: Golden Abyss's
+    // near thread looped over 0x8010491E of them and ran off its array)
+    DONE(0xDE6F0859, "sceNearGetDiscoveredGifts"),
     FAIL(0xDB8BAC35, "sceNearGetGift", kNearNotRetrieved),
     FAIL(0xD393578E, "sceNearGetLastNeighborFoundDateTime", kNearNotRetrieved),
     FAIL(0xAEF3022A, "sceNearGetMyStatus", kNearNotRetrieved),
