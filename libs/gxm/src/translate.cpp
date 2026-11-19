@@ -1779,7 +1779,10 @@ void Translator::fragment_prologue() {
             return cast(tu_, un(SpvOpConvertFToS, ti_, ext(tf_, GLSLstd450RoundEven, {fmul(c, f(255.0f))})));
         };
         switch (gxp_.output_type) {
+            // (an S8 output's register holds the surface's bytes too: its 8-bit lanes read as the U8 one's, which the
+            // program's byte arithmetic, `mad.u8` on o0, takes as they are)
             case usse::ParameterType::U8:
+            case usse::ParameterType::S8:
                 o(0, bor(bor(unorm8(lane[0]), shl(unorm8(lane[1]), u(8))), bor(shl(unorm8(lane[2]), u(16)), shl(unorm8(lane[3]), u(24)))));
                 break;
             case usse::ParameterType::F16:
@@ -1881,7 +1884,8 @@ void Translator::fragment_epilogue() {
         switch (gxp_.output_type) {
             case usse::ParameterType::F32: format = gxp_.output_components <= 1 ? 8 : 7; break;
             case usse::ParameterType::U8: format = 1; break;
-            case usse::ParameterType::S8: format = 2; break;
+            // (a native colour's bytes are the surface's as they are: an 8-bit surface is a UNORM image here)
+            case usse::ParameterType::S8: format = gxp_.native_color ? 1 : 2; break;
             case usse::ParameterType::U16: format = 3; break;
             case usse::ParameterType::S16: format = 4; break;
             default: format = gxp_.output_components <= 2 ? 6 : 5; break;  // F16
