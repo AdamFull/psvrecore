@@ -231,8 +231,8 @@ bool load_store(Emitter& e, const Instruction& in) {
                 }
             }
             const nx::string a = e.address(in, m, nullptr);
-            if (in.op == Op::Vldr) e.line(nx::format("{} = psv_ld{}({});", vreg(r), dbl ? 64 : 32, a));
-            else e.line(nx::format("psv_st{}({}, {});", dbl ? 64 : 32, a, vreg(r)));
+            if (in.op == Op::Vldr) e.line(nx::format("{} = psv_mld{}(mb, {});", vreg(r), dbl ? 64 : 32, a));
+            else e.line(nx::format("psv_mst{}(mb, {}, {});", dbl ? 64 : 32, a, vreg(r)));
             return true;
         }
         case Op::Vldmia: case Op::Vldmdb: case Op::Vstmia: case Op::Vstmdb: case Op::Vpush: case Op::Vpop: {
@@ -252,8 +252,8 @@ bool load_store(Emitter& e, const Instruction& in) {
                 const u32 r = list.reg + i;
                 const nx::string reg = dbl ? nx::format("ctx->vfp.d[{}]", r) : nx::format("ctx->vfp.s[{}]", r);
                 const u32 offset = (dbl ? 8 : 4) * i;
-                if (load) e.line(nx::format("{} = psv_ld{}({} + {}u);", reg, dbl ? 64 : 32, at, offset));
-                else e.line(nx::format("psv_st{}({} + {}u, {});", dbl ? 64 : 32, at, offset, reg));
+                if (load) e.line(nx::format("{} = psv_mld{}(mb, {} + {}u);", reg, dbl ? 64 : 32, at, offset));
+                else e.line(nx::format("psv_mst{}(mb, {} + {}u, {});", dbl ? 64 : 32, at, offset, reg));
             }
             if (writeback) e.line(nx::format("{} = {} {} {}u;", R(rn), base, increment ? "+" : "-", bytes));
             return true;

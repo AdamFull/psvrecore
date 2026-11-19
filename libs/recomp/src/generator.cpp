@@ -155,24 +155,58 @@ void Emitter::write(const Instruction& in, u32 r, nx::string_view value, PcWrite
     else branch_to_value(in, value);
 }
 
-void Emitter::branch_to_value(const Instruction& in, nx::string_view target) {
-    const nx::string t = temp("target");
-    line(nx::format("const uint32_t {} = {};", t, target));
-    if (auto table = fn_.tables.find(in.address); table != fn_.tables.end()) {
-        ++stats_.jump_tables;
-        // (the table is in read-only memory: its targets are known, so the jump is a switch on the target)
-        line(nx::format("switch ({}) {{", t));
-        nx::flat_hash_set<u32> seen;
-        for (u32 target : table->second.targets) {
-            if (!seen.insert(target).second) continue;
-            const bool tail = target != fn_.entry && program_.function_at(target) != nullptr;
-            if (tail) line(nx::format("case {}: {}(ctx, ret); return;", hex(target), function_name(target)));
-            else line(nx::format("case {}: goto {};", hex(target), label_name(target)));
-        }
-        line(nx::format("default: psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
-        line("}");
+void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& table, nx::string_view target) {
+    ++stats_.jump_tables;
+    const auto& targets = table.targets;
+    const u32 n = static_cast<u32>(targets.size());
+    if (n == 0) {  // (a bound of no entries: every index is outside the table)
+        line(nx::format("psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
         return;
     }
+    // A switch on the index. Each entry the table branch reads (tbb, tbh, ldr pc) must be in read-only memory the
+    // loader does not patch, so that it holds at run time what it holds now; and with the table's address in a
+    // register (ldr pc, [rB, rI, lsl #2]), the register must hold that address.
+    u32 entry_size = 0;
+    if (in.op == Op::Tbb) entry_size = 1;
+    else if (in.op == Op::Tbh) entry_size = 2;
+    else if (in.op == Op::Ldr) entry_size = 4;
+    bool constant = true;
+    for (u32 i = 0; entry_size && constant && i < n; ++i) {
+        u32 value;
+        constant = constant_load(table.table + i * entry_size, entry_size, value);
+    }
+    const nx::string index = temp("index");
+    if (!constant) line(nx::format("uint32_t {} = 0xFFFFFFFFu;", index));
+    else if (table.base_reg != 0xFF)
+        line(nx::format("uint32_t {} = {} == {} ? {} : 0xFFFFFFFFu;", index, R(table.base_reg), hex(table.table), read(in, table.index_reg)));
+    else line(nx::format("uint32_t {} = {};", index, read(in, table.index_reg)));
+    // Any other index (or table): the target the instruction computes, if it is one of the table's (the entry of the
+    // first index that has it), as the guest's branch would go there; else a trap.
+    const nx::string list = temp("targets");
+    line(nx::format("if ({} >= {}u) {{", index, n));
+    nx::string values;
+    for (u32 i = 0; i < n; ++i) values += (i % 8 == 0 ? "\n                " : " ") + hex(targets[i]) + ",";
+    line(nx::format("    static const uint32_t {}[{}] = {{{}\n            }};", list, n, values));
+    line(nx::format("    {} = psv_table_find({}, {}u, {});", index, list, n, target));
+    line(nx::format("    if ({} >= {}u) {{", index, n));
+    line(nx::format("        psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
+    line("    }");
+    line("}");
+    line(nx::format("switch ({}) {{", index));
+    for (u32 i = 0; i < n; ++i) {
+        const u32 target_code = targets[i];
+        const bool tail = target_code != fn_.entry && program_.function_at(target_code) != nullptr;
+        if (tail) line(nx::format("case {}u: {}(ctx, ret); return;", i, function_name(target_code)));
+        else line(nx::format("case {}u: goto {};", i, label_name(target_code)));
+    }
+    line("default: __builtin_unreachable();");  // (the index is below n here)
+    line("}");
+}
+
+void Emitter::branch_to_value(const Instruction& in, nx::string_view target) {
+    if (auto table = fn_.tables.find(in.address); table != fn_.tables.end()) return table_branch(in, table->second, target);
+    const nx::string t = temp("target");
+    line(nx::format("const uint32_t {} = {};", t, target));
     ++stats_.indirect_jumps;
     line(nx::format("if ({} == ret) return;", t));
     line(nx::format("psv_jump(ctx, {}, ret, {});", t, hex(in.address)));
@@ -296,8 +330,11 @@ nx::string Emitter::function() {
         else out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n", hex(next));
     }
     ++stats_.functions;
-    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n    PsvFlags fl;\n    PSV_FL_IN(fl);\n",
-                      function_name(fn_.entry)) +
+    // The guest memory base, read once (see guest.h: psv_membase never changes while guest code runs, but every guest
+    // store could change it as far as the compiler knows).
+    const bool memory = out.find("(mb,") != nx::string::npos;
+    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl;\n    PSV_FL_IN(fl);\n",
+                      function_name(fn_.entry), memory ? "    uint8_t* const mb = psv_membase;\n" : "") +
            localize_flags(out) + "}\n";
 }
 

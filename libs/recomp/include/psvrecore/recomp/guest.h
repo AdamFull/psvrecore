@@ -136,14 +136,21 @@ typedef struct PsvModuleCode {
 
 /* ---- Guest memory ---------------------------------------------------------------------------------------------- */
 
-/* The host address of guest address 0: the runtime reserves the whole 32-bit guest space there. */
+/* The host address of guest address 0: the runtime reserves the whole 32-bit guest space there. Set before any guest
+ * code runs and never changed while it runs. */
 extern PSVRECORE_API uint8_t* psv_membase;
 
+/* The accessors below come in two forms: psv_m<op>(mb, ...) takes the base, psv_<op>(...) reads psv_membase. A
+ * generated function reads the base once, at entry (`uint8_t* const mb = psv_membase;`), and uses the first form:
+ * generated code is compiled without strict aliasing, so to the compiler every guest store might change the global and
+ * the base would be loaded again after each one (through the import table on Windows, the GOT on Android). The second
+ * form is for the runtime's own code. */
 #ifdef PSV_ADDRESS_MASK /* (tests: every access folded into a small buffer) */
-#define PSV_HOST(a) (psv_membase + ((uint32_t)(a) & (uint32_t)PSV_ADDRESS_MASK))
+#define PSV_HOST_AT(mb, a) ((mb) + ((uint32_t)(a) & (uint32_t)PSV_ADDRESS_MASK))
 #else
-#define PSV_HOST(a) (psv_membase + (uint32_t)(a))
+#define PSV_HOST_AT(mb, a) ((mb) + (uint32_t)(a))
 #endif
+#define PSV_HOST(a) PSV_HOST_AT(psv_membase, a)
 
 /* Every access is a relaxed atomic one: other guest threads may read or write the same memory at the same time, and
  * a plain C access would let the compiler keep a value in a register across a loop or merge stores, which the guest
@@ -151,75 +158,80 @@ extern PSVRECORE_API uint8_t* psv_membase;
  * barriers (dmb) become fences, and on a host weaker than x86 relaxed accesses order no more than ARMv7's do.
  * Unaligned guest accesses stay unaligned host accesses (allowed for ordinary loads and stores on x86-64 and arm64),
  * and like the guest's they are not single-copy atomic. */
-#define PSV_LOAD(type, a) __atomic_load_n((type*)PSV_HOST(a), __ATOMIC_RELAXED)
-#define PSV_STORE(type, a, v) __atomic_store_n((type*)PSV_HOST(a), (type)(v), __ATOMIC_RELAXED)
+#define PSV_LOAD_AT(mb, type, a) __atomic_load_n((type*)PSV_HOST_AT(mb, a), __ATOMIC_RELAXED)
+#define PSV_STORE_AT(mb, type, a, v) __atomic_store_n((type*)PSV_HOST_AT(mb, a), (type)(v), __ATOMIC_RELAXED)
+#define PSV_LOAD(type, a) PSV_LOAD_AT(psv_membase, type, a)
+#define PSV_STORE(type, a, v) PSV_STORE_AT(psv_membase, type, a, v)
 
-PSV_INLINE uint32_t psv_ld8(uint32_t a) { return PSV_LOAD(uint8_t, a); }
-PSV_INLINE uint32_t psv_ld16(uint32_t a) { return PSV_LOAD(uint16_t, a); }
-PSV_INLINE uint32_t psv_ld32(uint32_t a) { return PSV_LOAD(uint32_t, a); }
+PSV_INLINE uint32_t psv_mld8(uint8_t* mb, uint32_t a) { return PSV_LOAD_AT(mb, uint8_t, a); }
+PSV_INLINE uint32_t psv_mld16(uint8_t* mb, uint32_t a) { return PSV_LOAD_AT(mb, uint16_t, a); }
+PSV_INLINE uint32_t psv_mld32(uint8_t* mb, uint32_t a) { return PSV_LOAD_AT(mb, uint32_t, a); }
 #ifdef PSV_ADDRESS_MASK /* (two word accesses, each folded, as the interpreter makes them) */
-PSV_INLINE uint64_t psv_ld64(uint32_t a) { return psv_ld32(a) | ((uint64_t)psv_ld32(a + 4) << 32); }
+PSV_INLINE uint64_t psv_mld64(uint8_t* mb, uint32_t a) { return psv_mld32(mb, a) | ((uint64_t)psv_mld32(mb, a + 4) << 32); }
 #else
-PSV_INLINE uint64_t psv_ld64(uint32_t a) { return PSV_LOAD(uint64_t, a); }
+PSV_INLINE uint64_t psv_mld64(uint8_t* mb, uint32_t a) { return PSV_LOAD_AT(mb, uint64_t, a); }
 #endif
-PSV_INLINE uint32_t psv_lds8(uint32_t a) { return (uint32_t)(int32_t)(int8_t)PSV_LOAD(uint8_t, a); }
-PSV_INLINE uint32_t psv_lds16(uint32_t a) { return (uint32_t)(int32_t)(int16_t)PSV_LOAD(uint16_t, a); }
-PSV_INLINE void psv_st8(uint32_t a, uint32_t v) { PSV_STORE(uint8_t, a, v); }
-PSV_INLINE void psv_st16(uint32_t a, uint32_t v) { PSV_STORE(uint16_t, a, v); }
-PSV_INLINE void psv_st32(uint32_t a, uint32_t v) { PSV_STORE(uint32_t, a, v); }
+PSV_INLINE uint32_t psv_mlds8(uint8_t* mb, uint32_t a) { return (uint32_t)(int32_t)(int8_t)PSV_LOAD_AT(mb, uint8_t, a); }
+PSV_INLINE uint32_t psv_mlds16(uint8_t* mb, uint32_t a) { return (uint32_t)(int32_t)(int16_t)PSV_LOAD_AT(mb, uint16_t, a); }
+PSV_INLINE void psv_mst8(uint8_t* mb, uint32_t a, uint32_t v) { PSV_STORE_AT(mb, uint8_t, a, v); }
+PSV_INLINE void psv_mst16(uint8_t* mb, uint32_t a, uint32_t v) { PSV_STORE_AT(mb, uint16_t, a, v); }
+PSV_INLINE void psv_mst32(uint8_t* mb, uint32_t a, uint32_t v) { PSV_STORE_AT(mb, uint32_t, a, v); }
 #ifdef PSV_ADDRESS_MASK
-PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { psv_st32(a, (uint32_t)v); psv_st32(a + 4, (uint32_t)(v >> 32)); }
+PSV_INLINE void psv_mst64(uint8_t* mb, uint32_t a, uint64_t v) { psv_mst32(mb, a, (uint32_t)v); psv_mst32(mb, a + 4, (uint32_t)(v >> 32)); }
 #else
-PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { PSV_STORE(uint64_t, a, v); }
+PSV_INLINE void psv_mst64(uint8_t* mb, uint32_t a, uint64_t v) { PSV_STORE_AT(mb, uint64_t, a, v); }
 #endif
 /* A D register's 8 bytes in order, at any alignment: VLD1/VST1's elements of `ebytes` each (each element single-copy
  * atomic as the console's are, which one 8-byte host access keeps when they are aligned). */
 #ifdef PSV_ADDRESS_MASK /* (element by element, each folded, as the interpreter makes them) */
-PSV_INLINE uint64_t psv_ld64u(uint32_t a, uint32_t ebytes) {
+PSV_INLINE uint64_t psv_mld64u(uint8_t* mb, uint32_t a, uint32_t ebytes) {
     uint64_t v = 0;
     for (uint32_t i = 0; i < 8; i += ebytes) {
-        const uint64_t e = ebytes == 1 ? psv_ld8(a + i) : ebytes == 2 ? psv_ld16(a + i) : ebytes == 4 ? psv_ld32(a + i) : psv_ld64(a + i);
+        const uint64_t e = ebytes == 1   ? psv_mld8(mb, a + i)
+                           : ebytes == 2 ? psv_mld16(mb, a + i)
+                           : ebytes == 4 ? psv_mld32(mb, a + i)
+                                         : psv_mld64(mb, a + i);
         v |= e << (8 * i);
     }
     return v;
 }
-PSV_INLINE void psv_st64u(uint32_t a, uint64_t v, uint32_t ebytes) {
+PSV_INLINE void psv_mst64u(uint8_t* mb, uint32_t a, uint64_t v, uint32_t ebytes) {
     for (uint32_t i = 0; i < 8; i += ebytes) {
         const uint64_t e = v >> (8 * i);
-        if (ebytes == 1) psv_st8(a + i, (uint32_t)e & 0xFFu);
-        else if (ebytes == 2) psv_st16(a + i, (uint32_t)e & 0xFFFFu);
-        else if (ebytes == 4) psv_st32(a + i, (uint32_t)e);
-        else psv_st64(a + i, e);
+        if (ebytes == 1) psv_mst8(mb, a + i, (uint32_t)e & 0xFFu);
+        else if (ebytes == 2) psv_mst16(mb, a + i, (uint32_t)e & 0xFFFFu);
+        else if (ebytes == 4) psv_mst32(mb, a + i, (uint32_t)e);
+        else psv_mst64(mb, a + i, e);
     }
 }
 #else
-PSV_INLINE uint64_t psv_ld64u(uint32_t a, uint32_t ebytes) { (void)ebytes; return PSV_LOAD(uint64_t, a); }
-PSV_INLINE void psv_st64u(uint32_t a, uint64_t v, uint32_t ebytes) { (void)ebytes; PSV_STORE(uint64_t, a, v); }
+PSV_INLINE uint64_t psv_mld64u(uint8_t* mb, uint32_t a, uint32_t ebytes) { (void)ebytes; return PSV_LOAD_AT(mb, uint64_t, a); }
+PSV_INLINE void psv_mst64u(uint8_t* mb, uint32_t a, uint64_t v, uint32_t ebytes) { (void)ebytes; PSV_STORE_AT(mb, uint64_t, a, v); }
 #endif
 
 /* Exclusive loads and stores. A store succeeds (returns 0) when the monitor holds this address and the memory still
  * holds the value the exclusive load saw; it is then written atomically. (A value changed and changed back in
  * between goes unnoticed, where the hardware would fail the store.) */
-PSV_INLINE uint32_t psv_ldrex(PsvContext* PSV_RESTRICT ctx, uint32_t a, uint32_t size) {
+PSV_INLINE uint32_t psv_mldrex(uint8_t* mb, PsvContext* PSV_RESTRICT ctx, uint32_t a, uint32_t size) {
     uint64_t v;
     switch (size) {
-        case 1: v = __atomic_load_n((uint8_t*)PSV_HOST(a), __ATOMIC_SEQ_CST); break;
-        case 2: v = __atomic_load_n((uint16_t*)PSV_HOST(a), __ATOMIC_SEQ_CST); break;
-        default: v = __atomic_load_n((uint32_t*)PSV_HOST(a), __ATOMIC_SEQ_CST); break;
+        case 1: v = __atomic_load_n((uint8_t*)PSV_HOST_AT(mb, a), __ATOMIC_SEQ_CST); break;
+        case 2: v = __atomic_load_n((uint16_t*)PSV_HOST_AT(mb, a), __ATOMIC_SEQ_CST); break;
+        default: v = __atomic_load_n((uint32_t*)PSV_HOST_AT(mb, a), __ATOMIC_SEQ_CST); break;
     }
     ctx->excl_address = a;
     ctx->excl_size = size;
     ctx->excl_value = v;
     return (uint32_t)v;
 }
-PSV_INLINE uint64_t psv_ldrexd(PsvContext* PSV_RESTRICT ctx, uint32_t a) {
-    const uint64_t v = __atomic_load_n((uint64_t*)PSV_HOST(a), __ATOMIC_SEQ_CST);
+PSV_INLINE uint64_t psv_mldrexd(uint8_t* mb, PsvContext* PSV_RESTRICT ctx, uint32_t a) {
+    const uint64_t v = __atomic_load_n((uint64_t*)PSV_HOST_AT(mb, a), __ATOMIC_SEQ_CST);
     ctx->excl_address = a;
     ctx->excl_size = 8;
     ctx->excl_value = v;
     return v;
 }
-PSV_INLINE uint32_t psv_strex(PsvContext* PSV_RESTRICT ctx, uint32_t a, uint64_t value, uint32_t size) {
+PSV_INLINE uint32_t psv_mstrex(uint8_t* mb, PsvContext* PSV_RESTRICT ctx, uint32_t a, uint64_t value, uint32_t size) {
     if (ctx->excl_size != size || ctx->excl_address != a) {
         ctx->excl_size = 0;
         return 1;
@@ -229,32 +241,61 @@ PSV_INLINE uint32_t psv_strex(PsvContext* PSV_RESTRICT ctx, uint32_t a, uint64_t
     switch (size) {
         case 1: {
             uint8_t expected = (uint8_t)ctx->excl_value;
-            ok = __atomic_compare_exchange_n((uint8_t*)PSV_HOST(a), &expected, (uint8_t)value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            ok = __atomic_compare_exchange_n((uint8_t*)PSV_HOST_AT(mb, a), &expected, (uint8_t)value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
             break;
         }
         case 2: {
             uint16_t expected = (uint16_t)ctx->excl_value;
-            ok = __atomic_compare_exchange_n((uint16_t*)PSV_HOST(a), &expected, (uint16_t)value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            ok = __atomic_compare_exchange_n((uint16_t*)PSV_HOST_AT(mb, a), &expected, (uint16_t)value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
             break;
         }
         case 4: {
             uint32_t expected = (uint32_t)ctx->excl_value;
-            ok = __atomic_compare_exchange_n((uint32_t*)PSV_HOST(a), &expected, (uint32_t)value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            ok = __atomic_compare_exchange_n((uint32_t*)PSV_HOST_AT(mb, a), &expected, (uint32_t)value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
             break;
         }
         default: {
             uint64_t expected = ctx->excl_value;
-            ok = __atomic_compare_exchange_n((uint64_t*)PSV_HOST(a), &expected, value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            ok = __atomic_compare_exchange_n((uint64_t*)PSV_HOST_AT(mb, a), &expected, value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
             break;
         }
     }
     return ok ? 0u : 1u;
 }
-PSV_INLINE uint32_t psv_swp(uint32_t a, uint32_t value, uint32_t size) {
-    if (size == 1) return __atomic_exchange_n((uint8_t*)PSV_HOST(a), (uint8_t)value, __ATOMIC_SEQ_CST);
-    return __atomic_exchange_n((uint32_t*)PSV_HOST(a), value, __ATOMIC_SEQ_CST);
+PSV_INLINE uint32_t psv_mswp(uint8_t* mb, uint32_t a, uint32_t value, uint32_t size) {
+    if (size == 1) return __atomic_exchange_n((uint8_t*)PSV_HOST_AT(mb, a), (uint8_t)value, __ATOMIC_SEQ_CST);
+    return __atomic_exchange_n((uint32_t*)PSV_HOST_AT(mb, a), value, __ATOMIC_SEQ_CST);
 }
+
+/* The same through psv_membase (the runtime's code, and code generated before the base was a local). */
+PSV_INLINE uint32_t psv_ld8(uint32_t a) { return psv_mld8(psv_membase, a); }
+PSV_INLINE uint32_t psv_ld16(uint32_t a) { return psv_mld16(psv_membase, a); }
+PSV_INLINE uint32_t psv_ld32(uint32_t a) { return psv_mld32(psv_membase, a); }
+PSV_INLINE uint64_t psv_ld64(uint32_t a) { return psv_mld64(psv_membase, a); }
+PSV_INLINE uint32_t psv_lds8(uint32_t a) { return psv_mlds8(psv_membase, a); }
+PSV_INLINE uint32_t psv_lds16(uint32_t a) { return psv_mlds16(psv_membase, a); }
+PSV_INLINE void psv_st8(uint32_t a, uint32_t v) { psv_mst8(psv_membase, a, v); }
+PSV_INLINE void psv_st16(uint32_t a, uint32_t v) { psv_mst16(psv_membase, a, v); }
+PSV_INLINE void psv_st32(uint32_t a, uint32_t v) { psv_mst32(psv_membase, a, v); }
+PSV_INLINE void psv_st64(uint32_t a, uint64_t v) { psv_mst64(psv_membase, a, v); }
+PSV_INLINE uint64_t psv_ld64u(uint32_t a, uint32_t ebytes) { return psv_mld64u(psv_membase, a, ebytes); }
+PSV_INLINE void psv_st64u(uint32_t a, uint64_t v, uint32_t ebytes) { psv_mst64u(psv_membase, a, v, ebytes); }
+PSV_INLINE uint32_t psv_ldrex(PsvContext* PSV_RESTRICT ctx, uint32_t a, uint32_t size) { return psv_mldrex(psv_membase, ctx, a, size); }
+PSV_INLINE uint64_t psv_ldrexd(PsvContext* PSV_RESTRICT ctx, uint32_t a) { return psv_mldrexd(psv_membase, ctx, a); }
+PSV_INLINE uint32_t psv_strex(PsvContext* PSV_RESTRICT ctx, uint32_t a, uint64_t value, uint32_t size) {
+    return psv_mstrex(psv_membase, ctx, a, value, size);
+}
+PSV_INLINE uint32_t psv_swp(uint32_t a, uint32_t value, uint32_t size) { return psv_mswp(psv_membase, a, value, size); }
 PSV_INLINE void psv_barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+
+/* A table branch's index for a target address: the first entry of the table's targets (n of them) that is `target`,
+ * or n. Generated code switches on the index register; for an index outside the table, this finds where the entry the
+ * guest reads there leads, when that is one of the table's targets. */
+static inline __attribute__((noinline, cold)) uint32_t psv_table_find(const uint32_t* targets, uint32_t n, uint32_t target) {
+    uint32_t i = 0;
+    while (i < n && targets[i] != target) ++i;
+    return i;
+}
 
 /* ---- Integer helpers ------------------------------------------------------------------------------------------ */
 

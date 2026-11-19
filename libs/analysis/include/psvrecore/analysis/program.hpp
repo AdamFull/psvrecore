@@ -38,6 +38,9 @@ struct JumpTable {
     u32 site = 0;             // the branch instruction
     u32 table = 0;            // the first entry
     u8 index_reg = 0;
+    // ldr pc, [rB, rI, lsl #2] after adr rB, table (or add/sub rB, pc, #K): rB, which holds `table` at the branch
+    // when the instruction before it runs into it. 0xFF: the table's address is the PC's (tbb, tbh, ldr pc, [pc, ..]).
+    u8 base_reg = 0xFF;
     bool bounded = false;     // the entry count comes from a bounds check on the index (else: inferred)
     nx::vector<u32> targets;  // code addresses, by index
 };

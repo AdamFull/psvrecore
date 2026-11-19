@@ -423,8 +423,8 @@ bool branches(Emitter& e, const Instruction& in) {
             const auto& m = in.operands[0];
             const nx::string index = e.temp("index");
             e.line(nx::format("const uint32_t {} = {};", index, e.read(in, m.reg2)));
-            const nx::string entry = in.op == Op::Tbb ? nx::format("psv_ld8({} + {})", e.read(in, m.reg), index)
-                                                      : nx::format("psv_ld16({} + ({} << 1))", e.read(in, m.reg), index);
+            const nx::string entry = in.op == Op::Tbb ? nx::format("psv_mld8(mb, {} + {})", e.read(in, m.reg), index)
+                                                      : nx::format("psv_mld16(mb, {} + ({} << 1))", e.read(in, m.reg), index);
             e.branch_to_value(in, nx::format("({} + 2u * {}) | 1u", hex(analysis::pc_value(in)), entry));
             return true;
         }

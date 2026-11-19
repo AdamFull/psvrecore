@@ -177,6 +177,38 @@ TEST_CASE("analysis: a table branch bounded on its own index is unchanged") {
     CHECK(errors(p) == 0u);
 }
 
+TEST_CASE("analysis: a table of addresses whose address is put in a register just before the branch") {
+    // cmp r7, #3; bhi out; adr r8, #4; ldr.w pc, [r8, r7, lsl #2]; four words (the cases, at +0x20..+0x26), then
+    // `bx lr`s. (SNC's form; WipEout 2048's executable has it.)
+    const auto image = thumb_image({0x2F03, 0xD80B, 0xF20F, 0x0804, 0xF858, 0xF027, 0x0021, 0x8100, 0x0023, 0x8100,
+                                    0x0025, 0x8100, 0x0027, 0x8100});
+    analysis::Options options;
+    options.extra_entries = {kBase | 1u};
+    options.use_exidx = false;
+    const auto p = analysis::analyze(image, options);
+    const auto* t = table_at(p, kBase + 0x08);
+    REQUIRE(t != nullptr);
+    CHECK(t->bounded);
+    CHECK(t->base_reg == 8);
+    CHECK(t->index_reg == 7);
+    CHECK(t->table == kBase + 0x0C);
+    REQUIRE(t->targets.size() == 4u);
+    for (u32 i = 0; i < 4; ++i) CHECK(t->targets[i] == ((kBase + 0x20 + 2 * i) | 1u));
+    CHECK(errors(p) == 0u);
+}
+
+TEST_CASE("analysis: a table address in a register that something else writes before the branch is not followed") {
+    // cmp r7, #3; bhi out; adr r8, #8; mov r8, r1; ldr.w pc, [r8, r7, lsl #2]: r8 is not the table's address.
+    const auto image = thumb_image({0x2F03, 0xD80D, 0xF20F, 0x0808, 0x4688, 0xF858, 0xF027, 0x0000, 0x0021, 0x8100,
+                                    0x0023, 0x8100, 0x0025, 0x8100, 0x0027, 0x8100});
+    analysis::Options options;
+    options.extra_entries = {kBase | 1u};
+    options.use_exidx = false;
+    const auto p = analysis::analyze(image, options);
+    CHECK(p.functions.contains(kBase | 1u));
+    CHECK(table_at(p, kBase + 0x0A) == nullptr);
+}
+
 TEST_CASE("analysis: a table branch reached only by a branch that checks its index") {
     // cmp r2, #3; bls tbb; bx lr; (bx lr); tbb [pc, r2]: 4 entries, two zero bytes, then the cases. Read up to its
     // first target instead, the zero bytes would be two more entries (branches into the table).

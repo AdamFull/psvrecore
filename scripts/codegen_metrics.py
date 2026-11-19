@@ -203,7 +203,8 @@ def cmake_generated_flags():
                 flags.append(tok)
         return flags
 
-    return options(branches[0]), options(branches[1].split("endif()")[0])
+    # (the else branch whole: its nested if()s hold options for some hosts, arm64 among them)
+    return options(branches[0]), options(branches[1])
 
 
 def vs_environment():
@@ -254,7 +255,7 @@ class Target:
         self.key = hashlib.sha256(" ".join(flags).encode()).hexdigest()[:16]
 
 
-def make_targets(names, debug_info):
+def make_targets(names, debug_info, extra_x64=(), extra_arm64=()):
     msvc_flags, gnu_flags = cmake_generated_flags()
     includes = [ROOT / "libs" / "recomp" / "include", ROOT / "libs" / "core" / "include"]
     targets, notes = [], []
@@ -267,7 +268,7 @@ def make_targets(names, debug_info):
         else:
             flags = ["/nologo", "-DPSVRECORE_SHARED", "/DWIN32", "/D_WINDOWS", "/O2", "/Ob1", "/DNDEBUG", "-MD"]
             flags += ["-Zi"] if debug_info else []
-            flags += msvc_flags + ["/utf-8"] + [f"-I{p}" for p in includes]
+            flags += msvc_flags + list(extra_x64) + ["/utf-8"] + [f"-I{p}" for p in includes]
 
             def cmd(src, obj, moddir, flags=flags, clang_cl=clang_cl):
                 return [clang_cl, *flags, f"-I{moddir}", "-c", f"/Fo{obj}", "--", str(src)]
@@ -287,7 +288,7 @@ def make_targets(names, debug_info):
                      "-ffunction-sections", "-funwind-tables", "-fstack-protector-strong", "-no-canonical-prefixes",
                      "-D_FORTIFY_SOURCE=2", "-Wformat", "-Werror=format-security", "-O2", "-DNDEBUG", "-fPIC"]
             flags += ["-g"] if debug_info else []
-            flags += gnu_flags + ["-pthread"] + [f"-I{p}" for p in includes]
+            flags += gnu_flags + list(extra_arm64) + ["-pthread"] + [f"-I{p}" for p in includes]
 
             def cmd(src, obj, moddir, flags=flags, clang=clang):
                 return [str(clang), *flags, f"-I{moddir}", "-c", "-o", str(obj), str(src)]
@@ -451,9 +452,16 @@ def main():
     ap.add_argument("--only-function-files", action="store_true", help="compile only the files holding the named functions")
     ap.add_argument("--objects-x64", help="use the objects of an existing build (searched by name) instead of compiling")
     ap.add_argument("--objects-arm64", help="the same for arm64")
+    ap.add_argument("--binary-arm64", help="a linked ELF binary (a shared library with its symbol table) holding the "
+                    "code instead of objects: for link-time optimization, which leaves no per-file objects (functions "
+                    "it inlined everywhere have no symbol left; their guest instructions count where they went)")
     ap.add_argument("--work", help="where objects are compiled (default: build/codegen-metrics/<tree name>)")
     ap.add_argument("--jobs", type=int, default=max(1, min(os.cpu_count() or 4, 12)), help="parallel compiles")
     ap.add_argument("--debug-info", action="store_true", help="compile with the builds' debug information (-g, -Zi)")
+    ap.add_argument("--flags-x64", action="append", default=[], metavar="FLAG",
+                    help="another compiler option for x64 (clang-cl syntax; repeatable; give it as --flags-x64=/clang:-march=x86-64-v3)")
+    ap.add_argument("--flags-arm64", action="append", default=[], metavar="FLAG",
+                    help="another compiler option for arm64 (repeatable; e.g. --flags-arm64=-march=armv8.2-a)")
     ap.add_argument("--json", help="write the results here")
     ap.add_argument("--all-functions", action="store_true", help="every function's numbers in the JSON")
     ap.add_argument("--compare", help="an earlier run's JSON to compare with")
@@ -515,11 +523,29 @@ def main():
     in_scope = {(mod, src.name) for mod, _, src in files}
 
     # Host side.
-    targets, notes = make_targets(names, args.debug_info)
+    targets, notes = make_targets(names, args.debug_info, args.flags_x64, args.flags_arm64)
     for n in notes:
         print(f"note: {n}")
     helpers = {}
     for target in targets:
+        binary = getattr(args, f"binary_{target.name}", None)
+        if binary:
+            by_name = defaultdict(list)
+            for key, r in functions.items():
+                if (r["module"], r["file"]) in in_scope:
+                    by_name[key.split(":", 1)[1]].append(key)
+            hi = hb = 0
+            for sym, (n, b) in disassemble(target, Path(binary)).items():
+                keys = by_name.get(sym, [])
+                if len(keys) == 1:
+                    functions[keys[0]][target.name] = [n, b]
+                elif not sym.startswith("f_"):
+                    hi += n
+                    hb += b
+            helpers[target.name] = {"host_instructions": hi, "host_bytes": hb}
+            gone = sum(1 for k, r in functions.items() if (r["module"], r["file"]) in in_scope and target.name not in r)
+            print(f"{target.name}: {binary}: {gone} functions have no symbol in it (inlined, or not linked)")
+            continue
         given = getattr(args, f"objects_{target.name}")
         objects = []
         if given:

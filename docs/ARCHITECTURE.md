@@ -88,12 +88,18 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
   - Touching anything else faults. A fault handler reports the guest address and the guest thread that touched it.
   - Generated code accesses guest memory with relaxed atomic loads and stores. Plain C accesses would let the C
     compiler keep a value across a guest spin loop. On x86-64 and arm64 they compile to ordinary moves.
+  - The base (`psv_membase`) is set before guest code runs and never changes. Each generated function reads it once,
+    into a local (`uint8_t* const mb`), and passes it to the accessors (`psv_mld32(mb, a)`...): read from the global
+    at each access, the C compiler would load it again after every guest store (generated code has no strict
+    aliasing). The runtime's own code uses the accessors that read the global (`psv_ld32(a)`...).
 - **Analysis.** Function starts come from the module's exports, the exception index table and call targets.
   - Discovery repeats until the set of functions and the set of functions that never return stop changing. The
     second set starts from imports known by name never to return (`abort`, `exit`, the C++ throw helpers and
     others).
   - Jump tables are read from their bounds checks. When a table has no bounds check, it is taken to end at the
-    first code after it.
+    first code after it. Tables of halfwords and bytes after TBB/TBH, of addresses after `ldr pc, [pc, rX, lsl #2]`
+    or at the address `adr rB` puts in a register just before `ldr pc, [rB, rX, lsl #2]`, and ARM's branch tables
+    after `add pc, pc, rX, lsl #2`.
   - Each imported variable's reference table lists the places that need its address. Those places are resolved at
     load time, never at generation time.
 - **Generated code** (`recomp/guest.h` is the contract between the generator, the runtime and the tests).
@@ -102,7 +108,15 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
   - A call sets LR and calls the C function. A return is an indirect branch whose target equals `ret`. A tail call
     passes its own `ret` on.
   - Other indirect branches look the target up among the registered modules' functions. An unknown target stops
-    with a diagnostic. Jump tables become `switch` statements.
+    with a diagnostic. Jump tables become `switch` statements on the index register (the tables are in read-only
+    memory the loader does not patch, so each index's target is known). An index outside the table goes where the
+    entry the guest reads there leads, if that is one of the table's targets, and traps otherwise.
+  - Generated code is compiled with its own options (`psvrecore_generated_code` in
+    `cmake/PsvrecoreCompilerOptions.cmake`): wrapping arithmetic, no strict aliasing, no floating-point contraction,
+    unwind tables; no stack protector; its symbols hidden (ELF) and bound inside the shared
+    library (`-Bsymbolic` on Android), so calls between generated functions are direct; inline atomics on arm64;
+    full inlining (`/Ob2`) with clang-cl; line tables only as debug information. Options for the instruction set,
+    ThinLTO and debug information are in [BUILDING.md](BUILDING.md#options).
   - Registers and flags live in the context, and the C compiler keeps them in host registers where it can.
   - IT blocks become per-instruction conditions.
   - Loads from read-only data are folded into constants, except words the loader patches.

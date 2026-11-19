@@ -144,6 +144,9 @@ Instruction Analyzer::decode_at(u32 address, Mode mode, arm::ItState& it, bool& 
     return arm::decode_thumb(hw1, hw2, address, it);
 }
 
+// An immediate operand: Thumb's, or ARM's modified immediate (its value in `imm`).
+static bool immediate(const arm::Operand& o) { return o.kind == OperandKind::Imm || o.kind == OperandKind::ModImm; }
+
 // A register copied into another, unconditionally: mov rd, rm, or add/sub rd, rm, #0 (which SNC uses as its move).
 static bool register_copy(const Instruction& in, u8& dst, u8& src) {
     if (in.cond != arm::Cond::Al || in.operands[0].kind != OperandKind::Reg) return false;
@@ -152,7 +155,7 @@ static bool register_copy(const Instruction& in, u8& dst, u8& src) {
         return dst != arm::kPc && src != arm::kPc;
     }
     if ((in.op == Op::Add || in.op == Op::Sub) && in.operand_count == 3 && in.operands[1].kind == OperandKind::Reg &&
-        in.operands[2].kind == OperandKind::Imm && in.operands[2].imm == 0) {
+        immediate(in.operands[2]) && in.operands[2].imm == 0) {
         dst = in.operands[0].reg, src = in.operands[1].reg;
         return dst != arm::kPc && src != arm::kPc;
     }
@@ -169,13 +172,38 @@ bool constant_before(const Code& code, Iterator it, u8 reg, u32& value) {
         const Flow f = flow_of(in);
         if (in.operand_count >= 1 && in.operands[0].kind == OperandKind::Reg && in.operands[0].reg == reg) {
             if ((in.op == Op::Mov || in.op == Op::Movw) && in.operand_count == 2 && in.cond == arm::Cond::Al &&
-                in.operands[1].kind == OperandKind::Imm) {
+                immediate(in.operands[1])) {
                 value = in.operands[1].imm;
                 return true;
             }
             return false;  // (written otherwise, or only read: not followed)
         }
         if (f.kind != FlowKind::Next) return false;
+    }
+    return false;
+}
+
+// The address a table branch's base register holds: the instruction right before it (which runs into it) puts a
+// table's address there, unconditionally and without setting flags: Thumb's adr rB, #K, or ARM's add/sub rB, pc, #K.
+// Nothing else is followed. (Another path could reach the branch with another value in rB; the generated code checks
+// the register before it uses the table, see Emitter::table_branch.)
+template <class Code>
+bool table_address_before(const Code& code, const Instruction& site, u8 reg, u32& address) {
+    auto at = code.find(site.address);
+    if (at == code.end() || at == code.begin()) return false;
+    const Instruction& in = std::prev(at)->second;
+    if (in.address + in.size != site.address || in.cond != arm::Cond::Al || (in.flags & arm::kSetsFlags) ||
+        in.operand_count < 2 || in.operands[0].kind != OperandKind::Reg || in.operands[0].reg != reg)
+        return false;
+    if (in.op == Op::Adr && in.operand_count == 2 && in.operands[1].kind == OperandKind::Imm) {
+        address = (pc_value(in) & ~3u) + in.operands[1].imm;
+        return true;
+    }
+    if ((in.op == Op::Add || in.op == Op::Sub) && in.mode == Mode::Arm && in.operand_count == 3 &&
+        in.operands[1].kind == OperandKind::Reg && in.operands[1].reg == arm::kPc &&
+        immediate(in.operands[2])) {
+        address = in.op == Op::Add ? pc_value(in) + in.operands[2].imm : pc_value(in) - in.operands[2].imm;
+        return true;
     }
     return false;
 }
@@ -249,7 +277,7 @@ u32 Analyzer::bound_before(const Traversal& t, nx::map<u32, Instruction>::const_
             const arm::Operand& src = in.operand_count == 2 ? in.operands[0] : in.operands[1];
             const arm::Operand& k = in.operand_count == 2 ? in.operands[1] : in.operands[2];
             if ((in.operand_count == 2 || in.operand_count == 3) && src.kind == OperandKind::Reg && src.reg != arm::kPc &&
-                src.reg != arm::kSp && k.kind == OperandKind::Imm) {
+                src.reg != arm::kSp && immediate(k)) {
                 reg = src.reg;
                 bias = k.imm;
                 biased = true;
@@ -259,7 +287,7 @@ u32 Analyzer::bound_before(const Traversal& t, nx::map<u32, Instruction>::const_
         if (in.op == Op::Cmp && in.operands[0].kind == OperandKind::Reg && in.operands[0].reg == reg) {
             u32 n = 0;
             bool known = false;
-            if (in.operands[1].kind == OperandKind::Imm) n = in.operands[1].imm, known = true;
+            if (immediate(in.operands[1])) n = in.operands[1].imm, known = true;
             else if (in.operands[1].kind == OperandKind::Reg) known = constant_before(t.code, it, in.operands[1].reg, n);
             if (known) {
                 if (!guard_seen) return 0;
@@ -304,13 +332,21 @@ bool Analyzer::jump_table(Traversal& t, const Instruction& in, JumpTable& out, b
         }
         return !out.targets.empty();
     }
-    // ldr pc, [pc, rX, lsl #2] (a table of addresses after the instruction, ARM or Thumb)
+    // ldr pc, [pc, rX, lsl #2] (a table of addresses after the instruction, ARM or Thumb), or ldr pc, [rB, rX, lsl #2]
+    // right after adr rB, table (clang's ARM switches; SNC's Thumb ones: adr r8, #4; ldr.w pc, [r8, r7, lsl #2])
     if (in.op == Op::Ldr && in.operands[1].kind == OperandKind::Mem) {
         const auto& m = in.operands[1];
-        if (m.reg != arm::kPc || !(m.flags & arm::kMemIndexReg) || m.shift != arm::ShiftType::Lsl || m.amount != 2 ||
+        if (!(m.flags & arm::kMemIndexReg) || m.shift != arm::ShiftType::Lsl || m.amount != 2 ||
             (m.flags & arm::kMemSubtract) || !(m.flags & arm::kMemPre) || (m.flags & arm::kMemWriteBack))
             return false;
-        out.table = (pc_value(in)) & ~3u;
+        if (m.reg == arm::kPc) {
+            out.table = (pc_value(in)) & ~3u;
+        } else {
+            u32 address;
+            if (m.reg == m.reg2 || m.reg == arm::kSp || !table_address_before(t.code, in, m.reg, address)) return false;
+            out.table = address;
+            out.base_reg = m.reg;
+        }
         out.index_reg = m.reg2;
         bool found;
         const u32 count = bound_for(t, in, m.reg2, found);

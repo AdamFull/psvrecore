@@ -232,12 +232,7 @@ struct KnownFailure {
     const char* reason;
 };
 constexpr KnownFailure kKnownFailures[] = {
-    // clang's ARM switch: `add r3, pc, #0; ldr pc, [r3, r0, lsl #2]`. Code discovery recognizes a table of addresses
-    // only as `ldr pc, [pc, rX, lsl #2]`, so this one is an indirect jump: the generated code stops with "branch to
-    // an address no recompiled function starts at" (no wrong result, but no run). Recognizing it changes discovery,
-    // and so the generated code of games that have it (WipEout 2048's eboot has the Thumb form, `adr r8, #4;
-    // ldr.w pc, [r8, r7, lsl #2]` at 0x81342720 after `cmp r7, #15; bhi`): not done in this change.
-    {"arm_switch", "jump table through a register loaded with the table's address (add rB, pc, #K; ldr pc, [rB, rI, lsl #2])"},
+    {nullptr, nullptr},  // (none at present)
 };
 
 const char* known_failure(const char* function) {

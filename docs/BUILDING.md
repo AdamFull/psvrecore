@@ -67,6 +67,9 @@ discrete GPU.
 | `PSVRECORE_FUZZ_SEED`, `PSVRECORE_FUZZ_BLOCKS` | `0x9E3779B97F4A7C15`, `2000` | Corpus of the generator-versus-interpreter test. A larger or different corpus, for example `scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000`, is a stress run |
 | `PSVRECORE_PROBES_DIR` | empty | Set by `scripts/probe_check.py` to build the probe runners from the code it generated. Leave it empty otherwise |
 | `PSVRECORE_PROGRAMS_DIR` | empty | The same for `scripts/program_check.py` and its program runners |
+| `PSVRECORE_GENERATED_CODE_ARCH`, `PSVRECORE_GENERATED_CODE_CPU` | empty | `-march` / `-mcpu` for generated code only (`psvrecore_generated_code`), e.g. `x86-64-v3` or `armv8.2-a`. Empty: the toolchain's baseline (x86-64, ARMv8.0). A build so made runs only on CPUs that have it. Measured in [CODEGEN_METRICS.md](CODEGEN_METRICS.md) |
+| `PSVRECORE_GENERATED_CODE_LTO` | OFF | ThinLTO across generated code (clang, with lld or lld-link): inlining between generated files at link time, for a longer link. Measured in [CODEGEN_METRICS.md](CODEGEN_METRICS.md) |
+| `PSVRECORE_GENERATED_CODE_DEBUG` | `lines` | Debug information of generated code in builds that have it: `lines` (function names and line tables: debuggers' and profilers' symbols, simpleperf's and Tracy's `f_<address>`, under a third of the size of full debug information), `full` (types and variables too), `none` |
 
 ## The shared runtime library
 

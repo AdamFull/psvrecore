@@ -52,11 +52,11 @@ constexpr Access kSingle[] = {
 };
 
 const char* load_fn(u32 size, bool sign) {
-    if (size == 4) return "psv_ld32";
-    if (size == 2) return sign ? "psv_lds16" : "psv_ld16";
-    return sign ? "psv_lds8" : "psv_ld8";
+    if (size == 4) return "psv_mld32";
+    if (size == 2) return sign ? "psv_mlds16" : "psv_mld16";
+    return sign ? "psv_mlds8" : "psv_mld8";
 }
-const char* store_fn(u32 size) { return size == 4 ? "psv_st32" : size == 2 ? "psv_st16" : "psv_st8"; }
+const char* store_fn(u32 size) { return size == 4 ? "psv_mst32" : size == 2 ? "psv_mst16" : "psv_mst8"; }
 
 bool single(Emitter& e, const Instruction& in) {
     const Access* acc = nullptr;
@@ -81,13 +81,18 @@ bool single(Emitter& e, const Instruction& in) {
     const nx::string value = acc->load ? nx::string() : e.temp("value");
     if (!acc->load) e.line(nx::format("const uint32_t {} = {};", value, e.read(in, rt)));
     const nx::string a = e.address(in, m, &writeback);
+    if (acc->load && rt == arm::kPc && writeback.empty() && e.fn().tables.contains(in.address)) {
+        // (a table branch: the entry is read only for an index outside the table, see Emitter::table_branch)
+        e.branch_to_value(in, nx::format("{}(mb, {})", load_fn(acc->size, acc->sign), a));
+        return true;
+    }
     if (acc->load) {
         const nx::string v = e.temp("v");
-        e.line(nx::format("const uint32_t {} = {}({});", v, load_fn(acc->size, acc->sign), a));
+        e.line(nx::format("const uint32_t {} = {}(mb, {});", v, load_fn(acc->size, acc->sign), a));
         if (!writeback.empty()) e.line(writeback);
         e.write(in, rt, v);
     } else {
-        e.line(nx::format("{}({}, {});", store_fn(acc->size), a, value));
+        e.line(nx::format("{}(mb, {}, {});", store_fn(acc->size), a, value));
         if (!writeback.empty()) e.line(writeback);
     }
     return true;
@@ -112,8 +117,8 @@ bool dual(Emitter& e, const Instruction& in) {
         }
         const nx::string a = e.address(in, m, &writeback);
         const nx::string lo = e.temp("lo"), hi = e.temp("hi");
-        e.line(nx::format("const uint32_t {} = psv_ld32({});", lo, a));
-        e.line(nx::format("const uint32_t {} = psv_ld32({} + 4u);", hi, a));
+        e.line(nx::format("const uint32_t {} = psv_mld32(mb, {});", lo, a));
+        e.line(nx::format("const uint32_t {} = psv_mld32(mb, {} + 4u);", hi, a));
         if (!writeback.empty()) e.line(writeback);
         e.write(in, rt, lo);
         e.write(in, rt2, hi);
@@ -122,8 +127,8 @@ bool dual(Emitter& e, const Instruction& in) {
         e.line(nx::format("const uint32_t {} = {};", lo, e.read(in, rt)));
         e.line(nx::format("const uint32_t {} = {};", hi, e.read(in, rt2)));
         const nx::string a = e.address(in, m, &writeback);
-        e.line(nx::format("psv_st32({}, {});", a, lo));
-        e.line(nx::format("psv_st32({} + 4u, {});", a, hi));
+        e.line(nx::format("psv_mst32(mb, {}, {});", a, lo));
+        e.line(nx::format("psv_mst32(mb, {} + 4u, {});", a, hi));
         if (!writeback.empty()) e.line(writeback);
     }
     return true;
@@ -172,7 +177,7 @@ bool multiple(Emitter& e, const Instruction& in) {
         for (u32 r = 0; r < 16; ++r) {
             if (!(list & (1u << r))) continue;
             const nx::string v = e.temp("v");
-            e.line(nx::format("const uint32_t {} = psv_ld32({} + {}u);", v, first, 4 * index++));
+            e.line(nx::format("const uint32_t {} = psv_mld32(mb, {} + {}u);", v, first, 4 * index++));
             loaded.emplace_back(r, v);
         }
         if (writeback) e.line(nx::format("{} = {};", R(rn), final_base));
@@ -181,7 +186,7 @@ bool multiple(Emitter& e, const Instruction& in) {
         for (u32 r = 0; r < 16; ++r) {
             if (!(list & (1u << r))) continue;
             // (the base register, when stored, has its original value)
-            e.line(nx::format("psv_st32({} + {}u, {});", first, 4 * index++, r == rn ? base : e.read(in, r)));
+            e.line(nx::format("psv_mst32(mb, {} + {}u, {});", first, 4 * index++, r == rn ? base : e.read(in, r)));
         }
         if (writeback) e.line(nx::format("{} = {};", R(rn), final_base));
     }
@@ -196,13 +201,13 @@ bool exclusive(Emitter& e, const Instruction& in) {
         case Op::Ldrexh: {
             const u32 size = in.op == Op::Ldrex ? 4 : in.op == Op::Ldrexh ? 2 : 1;
             const nx::string a = e.address(in, in.operands[1], nullptr);
-            e.write(in, in.operands[0].reg, nx::format("psv_ldrex(ctx, {}, {})", a, size));
+            e.write(in, in.operands[0].reg, nx::format("psv_mldrex(mb, ctx, {}, {})", a, size));
             return true;
         }
         case Op::Ldrexd: {
             const nx::string a = e.address(in, in.operands[2], nullptr);
             const nx::string v = e.temp("v");
-            e.line(nx::format("const uint64_t {} = psv_ldrexd(ctx, {});", v, a));
+            e.line(nx::format("const uint64_t {} = psv_mldrexd(mb, ctx, {});", v, a));
             e.write(in, in.operands[0].reg, nx::format("(uint32_t){}", v));
             e.write(in, in.operands[1].reg, nx::format("(uint32_t)({} >> 32)", v));
             return true;
@@ -214,7 +219,7 @@ bool exclusive(Emitter& e, const Instruction& in) {
             const nx::string v = e.temp("value");
             e.line(nx::format("const uint32_t {} = {};", v, e.read(in, in.operands[1].reg)));
             const nx::string a = e.address(in, in.operands[2], nullptr);
-            e.write(in, in.operands[0].reg, nx::format("psv_strex(ctx, {}, {}, {})", a, v, size));
+            e.write(in, in.operands[0].reg, nx::format("psv_mstrex(mb, ctx, {}, {}, {})", a, v, size));
             return true;
         }
         case Op::Strexd: {
@@ -222,7 +227,7 @@ bool exclusive(Emitter& e, const Instruction& in) {
             e.line(nx::format("const uint64_t {} = (uint64_t){} | ((uint64_t){} << 32);", v, e.read(in, in.operands[1].reg),
                               e.read(in, in.operands[2].reg)));
             const nx::string a = e.address(in, in.operands[3], nullptr);
-            e.write(in, in.operands[0].reg, nx::format("psv_strex(ctx, {}, {}, 8)", a, v));
+            e.write(in, in.operands[0].reg, nx::format("psv_mstrex(mb, ctx, {}, {}, 8)", a, v));
             return true;
         }
         case Op::Swp:
@@ -230,7 +235,7 @@ bool exclusive(Emitter& e, const Instruction& in) {
             const nx::string v = e.temp("value");
             e.line(nx::format("const uint32_t {} = {};", v, e.read(in, in.operands[1].reg)));
             const nx::string a = e.address(in, in.operands[2], nullptr);
-            e.write(in, in.operands[0].reg, nx::format("psv_swp({}, {}, {})", a, v, in.op == Op::Swp ? 4 : 1));
+            e.write(in, in.operands[0].reg, nx::format("psv_mswp(mb, {}, {}, {})", a, v, in.op == Op::Swp ? 4 : 1));
             return true;
         }
         default: return false;

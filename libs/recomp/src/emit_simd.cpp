@@ -349,8 +349,8 @@ bool memory(Emitter& e, const Instruction& in) {
     const u32 ebytes = esize_of(in.dt) / 8, esize = 8 * ebytes;
     const nx::string base = e.temp("base");
     e.line(nx::format("const uint32_t {} = {};", base, e.read(in, m.reg)));
-    const auto load_fn = [&] { return ebytes == 1 ? "psv_ld8" : ebytes == 2 ? "psv_ld16" : ebytes == 4 ? "psv_ld32" : "psv_ld64"; };
-    const auto store_fn = [&] { return ebytes == 1 ? "psv_st8" : ebytes == 2 ? "psv_st16" : ebytes == 4 ? "psv_st32" : "psv_st64"; };
+    const auto load_fn = [&] { return ebytes == 1 ? "psv_mld8" : ebytes == 2 ? "psv_mld16" : ebytes == 4 ? "psv_mld32" : "psv_mld64"; };
+    const auto store_fn = [&] { return ebytes == 1 ? "psv_mst8" : ebytes == 2 ? "psv_mst16" : ebytes == 4 ? "psv_mst32" : "psv_mst64"; };
     const auto lane = [&](u32 reg, u32 index) {
         // (an element of D register reg as an lvalue of its size)
         if (ebytes == 1) return nx::format("ctx->vfp.b[{}]", reg * 8 + index);
@@ -371,8 +371,8 @@ bool memory(Emitter& e, const Instruction& in) {
         // once, each element still read or written whole, as the console's accesses are)
         if (n == 1) {
             for (u32 r = 0; r < regs; ++r, offset += 8) {
-                if (load) e.line(nx::format("ctx->vfp.d[{}] = psv_ld64u({} + {}u, {}u);", list.reg + r, base, offset, ebytes));
-                else e.line(nx::format("psv_st64u({} + {}u, ctx->vfp.d[{}], {}u);", base, offset, list.reg + r, ebytes));
+                if (load) e.line(nx::format("ctx->vfp.d[{}] = psv_mld64u(mb, {} + {}u, {}u);", list.reg + r, base, offset, ebytes));
+                else e.line(nx::format("psv_mst64u(mb, {} + {}u, ctx->vfp.d[{}], {}u);", base, offset, list.reg + r, ebytes));
             }
             regs = 0;
         }
@@ -380,8 +380,8 @@ bool memory(Emitter& e, const Instruction& in) {
             for (u32 el = 0; el < elements; ++el)
                 for (u32 i = 0; i < n; ++i) {
                     const u32 reg = list.reg + i * inc + r;
-                    if (load) e.line(nx::format("{} = {}{}({} + {}u);", lane(reg, el), cast, load_fn(), base, offset));
-                    else e.line(nx::format("{}({} + {}u, {});", store_fn(), base, offset, lane(reg, el)));
+                    if (load) e.line(nx::format("{} = {}{}(mb, {} + {}u);", lane(reg, el), cast, load_fn(), base, offset));
+                    else e.line(nx::format("{}(mb, {} + {}u, {});", store_fn(), base, offset, lane(reg, el)));
                     offset += ebytes;
                 }
         size = 8 * list.count;
@@ -392,7 +392,7 @@ bool memory(Emitter& e, const Instruction& in) {
             const u32 reg = list.reg + i * list.amount;
             const u32 offset = n == 1 ? 0 : i * ebytes;
             const nx::string v = e.temp("v");
-            e.line(nx::format("const uint64_t {} = (uint64_t){}({} + {}u);", v, load_fn(), base, offset));
+            e.line(nx::format("const uint64_t {} = (uint64_t){}(mb, {} + {}u);", v, load_fn(), base, offset));
             nx::string all = v;
             if (esize == 8) all = nx::format("{} * 0x0101010101010101ull", v);
             else if (esize == 16) all = nx::format("{} * 0x0001000100010001ull", v);
@@ -404,8 +404,8 @@ bool memory(Emitter& e, const Instruction& in) {
     } else {  // one lane
         for (u32 i = 0; i < n; ++i) {
             const u32 reg = list.reg + i * list.amount;
-            if (load) e.line(nx::format("{} = {}{}({} + {}u);", lane(reg, list.index), cast, load_fn(), base, i * ebytes));
-            else e.line(nx::format("{}({} + {}u, {});", store_fn(), base, i * ebytes, lane(reg, list.index)));
+            if (load) e.line(nx::format("{} = {}{}(mb, {} + {}u);", lane(reg, list.index), cast, load_fn(), base, i * ebytes));
+            else e.line(nx::format("{}(mb, {} + {}u, {});", store_fn(), base, i * ebytes, lane(reg, list.index)));
         }
         size = n * ebytes;
     }

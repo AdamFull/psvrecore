@@ -52,8 +52,11 @@ public:
     // Writes a core register; a write to the PC is a branch. `kind`: how the PC write treats bit 0 (see branch_to_value).
     enum class PcWrite { Interworking, Branch };
     void write(const Instruction& in, u32 r, nx::string_view value, PcWrite kind = PcWrite::Interworking);
-    // A branch to a computed code address (the instruction's jump table if it has one).
+    // A branch to a computed code address (the instruction's jump table if it has one). `target` is an expression,
+    // evaluated once; a table branch evaluates it only for an index outside its table (it may read guest memory).
     void branch_to_value(const Instruction& in, nx::string_view target);
+    // A table branch: a switch on the index register (see analysis::JumpTable).
+    void table_branch(const Instruction& in, const analysis::JumpTable& table, nx::string_view target);
     // A branch to a known code address: a goto, or a tail call.
     void branch_to(const Instruction& in, u32 target_code);
     // A call: LR = the return address, then the function, the import or the runtime's lookup.
