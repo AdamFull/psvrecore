@@ -1,7 +1,8 @@
 // psvrecomp — the static recompiler: finds the code of a Vita module (SELF or ELF) and translates it to C.
 //
 //   psvrecomp analyze <module>                  what code discovery finds: functions, table branches, diagnostics
-//   psvrecomp generate <module> <dir> --name N  the module's code as C (see recomp/generator.hpp)
+//   psvrecomp generate <module> <dir> --name N  the module's code as C (see recomp/generator.hpp);
+//                                               --instructions-per-file N sets the size of each .c file
 
 #include <algorithm>
 #include <cstdio>
@@ -134,8 +135,9 @@ bool valid_identifier(nx::string_view name) {
 }
 
 Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const nx::string& name, const nx::vector<u32>& bases,
-                          analysis::Options options, const nids::Database& db) {
+                          analysis::Options options, const nids::Database& db, u32 instructions_per_file) {
     if (!valid_identifier(name)) return failure(nx::format("--name '{}' is not a C identifier", name));
+    if (instructions_per_file == 0) return failure("--instructions-per-file must be at least 1");
     auto image = analysis::Image::load(nx::fs::path_view(path), bases);
     if (!image) return nx::err(image.error());
     options.noreturn_imports = noreturn_imports(*image, db);
@@ -144,6 +146,7 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     for (const auto& d : program.diagnostics) errors += d.severity == analysis::Severity::Error;
     recomp::Options gen;
     gen.name = name;
+    gen.instructions_per_file = instructions_per_file;
     const auto output = recomp::generate(program, gen);
     const nx::fs::path_view dir(out_dir);
     if (auto made = nx::fs::create_directories(dir); !made)
@@ -173,6 +176,7 @@ int main(int argc, char** argv) {
     nx::vector<nx::string> entries_text, dbs;
     bool no_default_db = false;
     bool list_functions = false, list_diagnostics = false, no_exidx = false;
+    u32 instructions_per_file = recomp::Options{}.instructions_per_file;
     nx::cli::Parser cli("psvrecomp", "Finds the code of a Vita module and translates it to C.");
     cli.command("analyze", "code discovery: functions, table branches, diagnostics")
         .positional("file", file, "SELF or ELF module")
@@ -190,6 +194,8 @@ int main(int argc, char** argv) {
         .option("base", bases_text, "guest address of each loadable segment, comma-separated", {.value_name = "ADDRESSES"})
         .option_many("entry", entries_text, "an extra function entry (code address, bit 0 for Thumb); repeatable", {.value_name = "ADDRESS"})
         .flag("no-exidx", no_exidx, "do not take function starts from the exception index table")
+        .option("instructions-per-file", instructions_per_file,
+                "start a new .c file once a file holds this many guest instructions (default 20000)", {.value_name = "N"})
         .option_many("db", dbs, "NID database (.yml, .tsv, or a directory of them); repeatable", {.value_name = "PATH"})
         .flag("no-default-db", no_default_db, "do not load vita-headers' database");
     nx::string command;
@@ -213,7 +219,7 @@ int main(int argc, char** argv) {
         for (const auto& path : dbs)
             if (auto loaded = db.load(path); !loaded) return loaded;
         if (command == "analyze") return cmd_analyze(file, *bases, options, db, list_functions, list_diagnostics);
-        if (command == "generate") return cmd_generate(file, out_dir, name, *bases, options, db);
+        if (command == "generate") return cmd_generate(file, out_dir, name, *bases, options, db, instructions_per_file);
         return failure(nx::format("unknown command '{}'", command));
     };
     if (const auto done = run(); !done) {

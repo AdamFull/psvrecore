@@ -115,8 +115,13 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
   generator, and shares only the decoder and the context layout. It has its own integer soft float. Two kinds of
   test compare generated code against it:
   - random blocks run on both from the same state (in CI);
+  - whole functions of a synthetic corpus (`tests/codegen`: loops, calls, returns, tables, flags across calls, VFP,
+    NEON) run on both from random states, through the production memory path and through folded memory (in CI);
   - SDK-built C programs, recompiled and compared with the same source built for the host (`scripts/probe_check.py`,
     local).
+- **Generated-code size** is measured by `scripts/codegen_metrics.py` (host instructions and bytes per guest
+  instruction, x64 and arm64, on the synthetic corpus and on a game's tree); a change to the generator reports it
+  before and after against the baseline in [CODEGEN_METRICS.md](CODEGEN_METRICS.md).
 - **Runtime tests.**
   - Unit tests call the system library functions as recompiled code does, from stand-in guest functions (in CI).
   - Whole SDK-built programs (start-up code, libc, threads, files, memory) are recompiled and booted from an

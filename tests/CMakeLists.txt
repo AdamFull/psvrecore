@@ -46,6 +46,44 @@ psvrecore_target_defaults(psvrecore_tests)
 
 add_test(NAME psvrecore_tests COMMAND psvrecore_tests)
 
+# The generator's synthetic corpus (codegen/: compiled and hand-written ARM code, checked in as corpus_data.inc by
+# scripts/codegen_corpus.py), translated at build time: whole functions run against the interpreter, through the
+# production memory path (psvrecore_codegen_tests) and through folded memory (psvrecore_codegen_masked_tests).
+# scripts/codegen_metrics.py measures the same code (corpusgen writes it with the default file size there).
+add_executable(corpusgen codegen/corpusgen.cpp)
+target_include_directories(corpusgen PRIVATE codegen)
+target_link_libraries(corpusgen PRIVATE psvrecore::recomp)
+psvrecore_target_defaults(corpusgen)
+set(_corpus_dir "${CMAKE_CURRENT_BINARY_DIR}/codegen")
+set(_corpus_modules calls control integer integer_arm neon vfp)  # (one per file in codegen/corpus)
+set(_corpus_sources "${_corpus_dir}/corpus_modules.c")
+set(_corpus_includes "")
+foreach(_m IN LISTS _corpus_modules)
+    list(APPEND _corpus_sources "${_corpus_dir}/syn_${_m}/syn_${_m}_code_0.c" "${_corpus_dir}/syn_${_m}/syn_${_m}_module.c")
+    list(APPEND _corpus_includes "${_corpus_dir}/syn_${_m}")
+endforeach()
+add_custom_command(
+    OUTPUT ${_corpus_sources}
+    COMMAND corpusgen "${_corpus_dir}" 0xFFFFFFFF
+    DEPENDS corpusgen "${CMAKE_CURRENT_SOURCE_DIR}/codegen/corpus_data.inc"
+    COMMENT "Translating the code generator's synthetic corpus"
+    VERBATIM)
+add_library(psvrecore_codegen_code STATIC ${_corpus_sources})
+add_library(psvrecore_codegen_code_masked STATIC ${_corpus_sources})
+target_compile_definitions(psvrecore_codegen_code_masked PRIVATE PSV_ADDRESS_MASK=0x7FFFF)
+foreach(_config "" _masked)
+    target_include_directories(psvrecore_codegen_code${_config} PRIVATE ${_corpus_includes})
+    target_link_libraries(psvrecore_codegen_code${_config} PUBLIC psvrecore::recomp_support)
+    psvrecore_generated_code(psvrecore_codegen_code${_config})
+    add_executable(psvrecore_codegen${_config}_tests "${_nxtest_dir}/nxtest.cpp" codegen/codegen_tests.cpp)
+    target_include_directories(psvrecore_codegen${_config}_tests PRIVATE "${_nxtest_dir}" codegen)
+    target_link_libraries(psvrecore_codegen${_config}_tests PRIVATE psvrecore::interp psvrecore_codegen_code${_config} nx::foundation)
+    psvrecore_target_defaults(psvrecore_codegen${_config}_tests)
+    add_test(NAME psvrecore_codegen${_config}_tests COMMAND psvrecore_codegen${_config}_tests)
+    set_tests_properties(psvrecore_codegen${_config}_tests PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
+target_compile_definitions(psvrecore_codegen_masked_tests PRIVATE CODEGEN_TEST_MASK=0x7FFFF)
+
 # Same-source probes, built only by scripts/probe_check.py (they need the SDK and recompiled SDK code: local only).
 set(PSVRECORE_PROBES_DIR "" CACHE PATH "folder of SDK-built probes and their recompiled code (scripts/probe_check.py)")
 if(PSVRECORE_PROBES_DIR)

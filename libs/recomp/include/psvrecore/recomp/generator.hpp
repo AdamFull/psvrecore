@@ -20,7 +20,7 @@ namespace psvrecore::recomp {
 struct Options {
     nx::string name;                    // C identifier prefix of the module's tables (libc, eboot...)
     bool comments = true;               // each instruction's disassembly as a comment
-    u32 instructions_per_file = 20000;  // how much code each .c file gets
+    u32 instructions_per_file = 20000;  // how much code each .c file gets (psvrecomp --instructions-per-file)
 };
 
 struct GeneratedFile {

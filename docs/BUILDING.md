@@ -45,6 +45,11 @@ cmake --build --preset linux-x64-release
 ctest --preset linux-x64-release
 ```
 
+The generator's synthetic corpus (`psvrecore_codegen_tests`, `psvrecore_codegen_masked_tests`) is checked in as
+`tests/codegen/corpus_data.inc`. After changing a source in `tests/codegen/corpus/`, rebuild it with
+`python scripts/codegen_corpus.py` (LLVM's clang and ld.lld, or the NDK's); `--check` tells whether it is up to
+date. `scripts/codegen_metrics.py` measures the generated code ([CODEGEN_METRICS.md](CODEGEN_METRICS.md)).
+
 `psvrecore_gpu_tests` needs a Vulkan device and is skipped without one (CI machines). It turns the validation
 layer on when the Vulkan SDK's is installed. `PSVRECORE_TEST_GPU=<index>` picks the device; by default it is a
 discrete GPU.

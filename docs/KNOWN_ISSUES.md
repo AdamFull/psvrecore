@@ -222,6 +222,13 @@
 - **Some jump tables are sized by inference.** When a TBB/TBH or computed branch has no bounds check that analysis
   can read, the table is taken to end at the first code after it (79 of 677 tables in a 24 MB executable). A wrong
   size would show up as a trap on an unknown target, not as a wrong branch.
+- **A table of addresses reached through a register is not recognized.** Code discovery reads `ldr pc, [pc, rX,
+  lsl #2]` tables, but not the form that first puts the table's address in a register: `adr rB, table` (or `add rB,
+  pc, #K`) then `ldr pc, [rB, rX, lsl #2]`. That branch is translated as an indirect jump, and reaching it stops with
+  "branch to an address no recompiled function starts at". clang's ARM-mode switches use it (the synthetic corpus'
+  `arm_switch`, a known failure in `psvrecore_codegen_tests`), and so does one place in WipEout 2048's executable
+  (`adr r8, #4; ldr.w pc, [r8, r7, lsl #2]` at 0x81342720, bounded by `cmp r7, #15; bhi`). Recognizing it changes
+  the generated code of the games that have it, so it was left for a change of its own.
 - **A few system instructions are not translated.** In the 24 MB executable these are 3 `mcrr` and 3 `mrc p15`
   (coprocessor registers other than the thread ID registers). Each traps with a diagnostic.
 - **Imported variables need the SDK's reference-table format.** Analysis reads each imported variable's table of uses
