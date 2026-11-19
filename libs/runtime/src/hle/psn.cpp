@@ -34,7 +34,7 @@ constexpr i32 kManagerSignedOut = err::code(0x8055050A), kAuthSignedOut = err::c
               kNearNotRetrieved = err::code(0x8010491E), kActivitySignedOut = err::code(0x80552306);
 constexpr i32 kUtilInvalidArgument = err::code(0x80550601), kUtilNotMatch = err::code(0x80550609),
               kTrophyInvalidArgument = err::code(0x80551604), kTrophyIconNotFound = err::code(0x80551618),
-              kTrophyUnsupportedTrp = err::code(0x8055161B), kPartyInvalidArgument = err::code(0x80552504),
+              kPartyInvalidArgument = err::code(0x80552504),
               kWebApiInvalidArgument = err::code(0x80552902);
 
 std::atomic<i32> g_next_id{0x100};
@@ -511,9 +511,6 @@ const Function kNpPartyManual[] = {HLE_FUNCTION(0x9F99ADF7, sceNpPartyGetState)}
 const Function kNpWebApiManual[] = {HLE_FUNCTION(0x98CBE11F, sceNpWebApiUtilityParseNpId)};
 const Function kNpTrophyMore[] = {
     HLE_FUNCTION(0xD55C6F4C, sceNpTrophyAbortHandle),
-    FAIL(0xBA2B7F2A, "sceNpTrophyGetGameInfo", kTrophyUnsupportedTrp),
-    FAIL(0x087B0535, "sceNpTrophyGetGroupInfo", kTrophyUnsupportedTrp),
-    FAIL(0xA4ADDD91, "sceNpTrophyGetTrophyInfo", kTrophyUnsupportedTrp),
     FAIL(0xFE382529, "sceNpTrophyGetGameIcon", kTrophyIconNotFound),
     FAIL(0x1B8C3192, "sceNpTrophyGetGroupIcon", kTrophyIconNotFound),
     FAIL(0x94BAB8D0, "sceNpTrophyGetTrophyIcon", kTrophyIconNotFound),

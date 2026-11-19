@@ -7,6 +7,9 @@
 #include "nxtest.h"
 #include "psvrecore/runtime/dialogs.hpp"
 #include "runtime_support.hpp"
+#include "core/foundation/platform/filesystem.h"
+#include "core/foundation/platform/os.h"
+#include "core/foundation/strings/format.h"
 
 using namespace psvrecore;
 using namespace psvrecore::runtime;
@@ -323,6 +326,79 @@ TEST_CASE("psn: a trophy unlocked twice answers already unlocked") {
     const u32 platinum = scratch(4);
     REQUIRE(call32(ctx, kSceNpTrophy, kUnlock, {1, 1, 7, platinum}) == 0);
     CHECK(u(call32(ctx, kSceNpTrophy, kUnlock, {1, 1, 7, platinum})) == 0x8055160Fu);
+}
+
+TEST_CASE("psn: a trophy set's details come from the game's trophy pack when its TROP.SFM is plain") {
+    // (a folder with app0:sce_sys/trophy/NPWR00001_00/TROPHY.TRP: the pack's header, one entry, TROP.SFM)
+    nx::string base = "/tmp";
+    if (auto v = nx::os::environment_variable("TEMP")) base = *v;
+    else if (auto v2 = nx::os::environment_variable("TMPDIR")) base = *v2;
+    const nx::string dir = nx::format("{}/psvrecore_trophy_test_{}", base, nx::os::process_id());
+    const nx::string trophies = dir + "/sce_sys/trophy/NPWR00001_00";
+    (void)nx::fs::remove_all(nx::fs::path_view(dir));
+    REQUIRE(nx::fs::create_directories(nx::fs::path_view(trophies)).has_value());
+    const nx::string xml =
+        "<!--Sce-Np-Trophy-Signature: 00-->\n<trophyconf version=\"1.1\" platform=\"psp2\">\n"
+        " <title-name>A Game &amp; More</title-name>\n <title-detail>Its trophies</title-detail>\n"
+        " <group id=\"001\">\n  <name>Pack 1</name>\n  <detail>The first pack</detail>\n </group>\n"
+        " <trophy id=\"000\" hidden=\"no\" ttype=\"P\" pid=\"-1\"><name>All</name><detail>Every one</detail></trophy>\n"
+        " <trophy id=\"001\" hidden=\"yes\" ttype=\"B\" pid=\"000\"><name>First</name><detail>One</detail></trophy>\n"
+        " <trophy id=\"002\" hidden=\"no\" ttype=\"G\" pid=\"000\" gid=\"001\"><name>Packed</name><detail>Two</detail></trophy>\n"
+        "</trophyconf>\n";
+    nx::vector<u8> pack(0x80, 0);
+    auto put32 = [&](usize at, u32 v) {
+        for (int i = 0; i < 4; ++i) pack[at + i] = static_cast<u8>(v >> (24 - 8 * i));
+    };
+    put32(0, 0xDCA24D00u);
+    put32(4, 2);
+    put32(0x10, 1);     // (one entry)
+    put32(0x14, 0x40);  // (of 64 bytes)
+    std::memcpy(&pack[0x40], "TROP.SFM", 8);
+    put32(0x40 + 36, 0x80);                           // (its offset, u64)
+    put32(0x40 + 44, static_cast<u32>(xml.size()));  // (its size, u64)
+    pack.insert(pack.end(), xml.begin(), xml.end());
+    REQUIRE(nx::fs::file_write(nx::fs::path_view(trophies + "/TROPHY.TRP"), std::span<const u8>(pack)).has_value());
+
+    TestRuntime t;
+    t.rt.files().mount({"app0", dir, false});
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kSceNpTrophy = 0x4332C10D, kCreateContext = 0xC49FD33F, kGameInfo = 0xBA2B7F2A,
+                  kGroupInfo = 0x087B0535, kTrophyInfo = 0xA4ADDD91;
+    const u32 comm_id = scratch(12), context = scratch(4);
+    std::memset(t.rt.memory().host(comm_id), 0, 12);
+    std::memcpy(t.rt.memory().host(comm_id), "NPWR00001", 9);
+    REQUIRE(call32(ctx, kSceNpTrophy, kCreateContext, {context, comm_id, 0, 0, 0}) == 0);
+    const u32 c = psv_ld32(context);
+    const u32 details = scratch(0x1C + 1152), data = scratch(0x20);
+    REQUIRE(call32(ctx, kSceNpTrophy, kGameInfo, {c, 1, details, data}) == 0);
+    CHECK(psv_ld32(details + 4) == 1);   // (groups besides the base game)
+    CHECK(psv_ld32(details + 8) == 3);   // (trophies)
+    CHECK(psv_ld32(details + 12) == 1);  // (platinum)
+    CHECK(psv_ld32(details + 16) == 1);  // (gold)
+    CHECK(psv_ld32(details + 24) == 1);  // (bronze)
+    CHECK(nx::string(reinterpret_cast<const char*>(t.rt.memory().host(details + 0x1C))) == "A Game & More");
+    CHECK(psv_ld32(data + 4) == 0);  // (none unlocked)
+    REQUIRE(call32(ctx, kSceNpTrophy, kGroupInfo, {c, 1, 1, details, data}) == 0);
+    CHECK(psv_ld32(details + 8) == 1);
+    CHECK(nx::string(reinterpret_cast<const char*>(t.rt.memory().host(details + 0x1C))) == "Pack 1");
+    REQUIRE(call32(ctx, kSceNpTrophy, kGroupInfo, {c, 1, 0xFFFFFFFFu, details, data}) == 0);  // (the base game)
+    CHECK(psv_ld32(details + 8) == 2);
+    CHECK(u(call32(ctx, kSceNpTrophy, kGroupInfo, {c, 1, 5, details, data})) == 0x8055160Du);
+    REQUIRE(call32(ctx, kSceNpTrophy, kTrophyInfo, {c, 1, 1, details, data}) == 0);
+    CHECK(psv_ld32(details + 4) == 1);
+    CHECK(psv_ld32(details + 8) == 4);           // (bronze)
+    CHECK(psv_ld32(details + 12) == 0xFFFFFFFFu);  // (the base game)
+    CHECK(psv_ld32(details + 16) == 1);          // (hidden)
+    CHECK(nx::string(reinterpret_cast<const char*>(t.rt.memory().host(details + 0x14))) == "First");
+    CHECK(u(call32(ctx, kSceNpTrophy, kTrophyInfo, {c, 1, 9, details, data})) == 0x8055160Eu);
+    REQUIRE(call32(ctx, kSceNpTrophy, 0xB397AA24 /*sceNpTrophyUnlockTrophy*/, {c, 1, 2, scratch(4)}) == 0);
+    REQUIRE(call32(ctx, kSceNpTrophy, kTrophyInfo, {c, 1, 2, details, data}) == 0);
+    CHECK(psv_ld32(details + 12) == 1);  // (group 001)
+    CHECK(psv_ld32(data + 8) == 1);      // (unlocked)
+    REQUIRE(call32(ctx, kSceNpTrophy, kGameInfo, {c, 1, details, data}) == 0);
+    CHECK(psv_ld32(data + 4) == 1);
+    CHECK(psv_ld32(data + 0x18) == 33);  // (per cent)
+    (void)nx::fs::remove_all(nx::fs::path_view(dir));
 }
 
 TEST_CASE("dialogs: the PSN, store and photo dialogs open and the player backs out; aborts end a running dialog") {
