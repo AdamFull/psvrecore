@@ -390,6 +390,90 @@ void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
     }
 }
 
+// PVRTC 2bpp (PVRTC-I and -II): blocks of 8x4 texels, 64 bits each, the colours as in 4bpp (pvrtc_colours) and the
+// low word the modulation. M (bit 32) clear: a bit per texel (row by row), C0 or C1. M set: 2 bits for each texel
+// with (x ^ y) even (the others' values interpolated from their neighbours, which may be in the next blocks), the
+// weights 0, 3/8, 5/8, 1; bit 0 (the first texel's low bit) set picks the neighbours: bit 20 (the centre texel's
+// low bit) set, the ones above and below, else the ones to the left and right; clear, all four. Those two texels'
+// low bits are then their high bits again (bit 1 and bit 21). The colours are interpolated over the 8x4 square as in
+// 4bpp; a PVRTC-II block with H set takes P's colours as they are (as its 4bpp blocks with H and not M). No texel is
+// punched through in 2bpp.
+template <class Put>
+void decode_pvrtc2(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32 height, bool second, Put&& put) {
+    nx::vector<PvrtcColours> colours(blocks.size());
+    for (usize i = 0; i < blocks.size(); ++i) colours[i] = pvrtc_colours(blocks[i], second);
+    static constexpr i32 kWeight[4] = {0, 3, 5, 8};  // (eighths)
+    // Each block's mode (0 direct, 1 four neighbours, 2 left and right, 3 above and below) and its texels' stored
+    // weights (direct: 0 or 8; interpolated: the stored ones, -1 for the others).
+    struct Modulation {
+        u8 mode;
+        i8 w[4][8];
+    };
+    nx::vector<Modulation> mods(blocks.size());
+    for (usize i = 0; i < blocks.size(); ++i) {
+        u32 bits = static_cast<u32>(blocks[i]);
+        Modulation& m = mods[i];
+        if (!((blocks[i] >> 32) & 1)) {
+            m.mode = 0;
+            for (u32 y = 0; y < 4; ++y)
+                for (u32 x = 0; x < 8; ++x, bits >>= 1) m.w[y][x] = static_cast<i8>((bits & 1) ? 8 : 0);
+            continue;
+        }
+        m.mode = 1;
+        if (bits & 1) {
+            m.mode = (bits & (1u << 20)) ? 3 : 2;
+            bits = (bits & ~(1u << 20)) | ((bits >> 1) & (1u << 20));
+        }
+        bits = (bits & ~1u) | ((bits >> 1) & 1u);
+        for (u32 y = 0; y < 4; ++y)
+            for (u32 x = 0; x < 8; ++x) {
+                if ((x ^ y) & 1) {
+                    m.w[y][x] = -1;
+                    continue;
+                }
+                m.w[y][x] = static_cast<i8>(kWeight[bits & 3]);
+                bits >>= 2;
+            }
+    }
+    const u32 tw = bx * 8, th = by * 4;  // (the blocks' texels: neighbours wrap around them)
+    const auto stored = [&](u32 x, u32 y) -> i32 {
+        x %= tw, y %= th;
+        const i32 w = mods[usize{y / 4} * bx + x / 8].w[y % 4][x % 8];
+        return w < 0 ? 0 : w;
+    };
+    for (u32 y = 0; y < height; ++y) {
+        const u32 py = ((y + 4 * by - 2) / 4) % by, ry = (py + 1) % by, t = (y + 2) % 4;
+        for (u32 x = 0; x < width; ++x) {
+            const u32 px = ((x + 8 * bx - 4) / 8) % bx, qx = (px + 1) % bx, s = (x + 4) % 8;
+            const usize at = usize{y / 4} * bx + x / 8;
+            const Modulation& m = mods[at];
+            i32 w = m.w[y % 4][x % 8];
+            if (w < 0) {
+                const u32 l = x + tw - 1, r = x + 1, u = y + th - 1, d = y + 1;
+                w = m.mode == 2   ? (stored(l, y) + stored(r, y) + 1) / 2
+                    : m.mode == 3 ? (stored(x, u) + stored(x, d) + 1) / 2
+                                  : (stored(l, y) + stored(r, y) + stored(x, u) + stored(x, d) + 2) / 4;
+            }
+            const bool h = second && ((blocks[at] >> 47) & 1);
+            const PvrtcColours* corner[4] = {&colours[usize{py} * bx + px], &colours[usize{py} * bx + qx],
+                                             &colours[usize{ry} * bx + px], &colours[usize{ry} * bx + qx]};
+            // (C0 and C1 at this texel, times 32)
+            const i32 wp = static_cast<i32>((8 - s) * (4 - t)), wq = static_cast<i32>(s * (4 - t)),
+                      wr = static_cast<i32>((8 - s) * t), ws = static_cast<i32>(s * t);
+            i32 out[4];
+            for (u32 k = 0; k < 4; ++k) {
+                i32 c[2];
+                for (u32 j = 0; j < 2; ++j)
+                    c[j] = h ? 32 * corner[0]->c[j][k]
+                             : wp * corner[0]->c[j][k] + wq * corner[1]->c[j][k] + wr * corner[2]->c[j][k] +
+                                   ws * corner[3]->c[j][k];
+                out[k] = nx::clamp(((8 - w) * c[0] + w * c[1] + 128) / 256, 0, 255);
+            }
+            put(x, y, out);
+        }
+    }
+}
+
 // Swizzled addressing as two tables: swizzled_index(x, y, w, h) is a part from x's bits and a part from y's that do
 // not overlap, so the index of (x, y) is xs[x] + ys[y].
 struct SwizzleTables {
@@ -833,7 +917,6 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     const u32 code = code_of(t.base_format);
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
-    if (code == kPVRT2 || code == kPVRTII2) return failure("texture: PVRTC 2bpp formats not implemented");
     if (code >= kYUV420P2 && code <= kYUV422) return read_yuv(t, code, read);
     if (code >= kUBC4 && code <= kSBC5) return failure("texture: format not implemented");
     if (code == kX8S8S8U8 || (code == kX8U24 && t.swizzle != 0) || code == kU32 || code == kS32 ||
@@ -960,11 +1043,13 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
             const u32 pw = pow2_ceil(lv.width), ph = pow2_ceil(lv.height);
             u8* dst = out.data.data() + at;
             if (block_format(code)) {
-                // Blocks of 4x4 texels, in Morton order (swizzled layouts) or in rows of blocks.
-                const u32 bx = (lv.width + 3) / 4, by = (lv.height + 3) / 4;
-                if (code == kPVRT4 || code == kPVRTII4) {
+                // Blocks of 4x4 texels (PVRTC 2bpp: 8x4), in Morton order (swizzled layouts) or in rows of blocks.
+                const bool pvrtc2 = code == kPVRT2 || code == kPVRTII2;
+                const u32 bw = pvrtc2 ? 8 : 4;
+                const u32 bx = (lv.width + bw - 1) / bw, by = (lv.height + 3) / 4;
+                if (code == kPVRT4 || code == kPVRTII4 || pvrtc2) {
                     // (a texel needs the blocks around it: the level's blocks gathered first)
-                    const u32 pbx = nx::max(pw / 4, 1u), pby = nx::max(ph / 4, 1u);
+                    const u32 pbx = nx::max(pw / bw, 1u), pby = nx::max(ph / 4, 1u);
                     const SwizzleTables sw(is_swizzled(t.type) ? bx : 0, is_swizzled(t.type) ? by : 0, pbx, pby);
                     nx::vector<u64> blocks(usize{bx} * by, 0);
                     for (u32 y = 0; y < by; ++y)
@@ -975,7 +1060,7 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                         }
                     // (8-bit texels without gamma: the bytes as they are, as put() rounds n / 255 back to n)
                     const bool pvrtc_bytes = !reference && out_bytes == 4 && t.gamma == 0;
-                    decode_pvrtc4(blocks, bx, by, lv.width, lv.height, code == kPVRTII4, [&](u32 x, u32 y, const i32* c) {
+                    const auto texel = [&](u32 x, u32 y, const i32* c) {
                         u8* o = dst + (usize{y} * lv.width + x) * out_bytes;
                         if (pvrtc_bytes) {
                             o[0] = static_cast<u8>(c[0]), o[1] = static_cast<u8>(c[1]), o[2] = static_cast<u8>(c[2]);
@@ -985,7 +1070,9 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                         f32 v[4];
                         for (u32 k = 0; k < 4; ++k) v[k] = static_cast<f32>(c[k]) / 255.0f;
                         put(o, v);
-                    });
+                    };
+                    if (pvrtc2) decode_pvrtc2(blocks, bx, by, lv.width, lv.height, code == kPVRTII2, texel);
+                    else decode_pvrtc4(blocks, bx, by, lv.width, lv.height, code == kPVRTII4, texel);
                     at += usize{lv.width} * lv.height * out_bytes;
                     continue;
                 }

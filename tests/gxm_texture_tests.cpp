@@ -454,3 +454,45 @@ TEST_CASE("gxm textures: PVRTC 4bpp (I and II): the weights, punch-through, and 
     CHECK((texels(kPvrtcI, translucent | 0x8000u)[3] >> 24) == 0xEEu);
     CHECK((texels(kPvrtcI, translucent | 0x8000u)[0] >> 24) == 0xFFu);
 }
+
+TEST_CASE("gxm textures: PVRTC 2bpp: direct bits, and the stored texels' neighbours in each interpolation mode") {
+    // A 16 x 8 texture of four identical 8x4 blocks (every texel's four blocks the same), C0 black and C1 white,
+    // opaque: the first row's first texels.
+    auto texels = [](u32 base_format, u32 hi, u32 lo) {
+        Memory m;
+        const u64 block = (u64{hi} << 32) | lo;
+        m.bytes.resize(4 * 8);
+        for (u32 i = 0; i < 4; ++i) std::memcpy(m.bytes.data() + 8 * i, &block, 8);
+        TextureInfo t;
+        t.base_format = base_format;
+        t.type = texture_type::kSwizzled;
+        t.width = 16;
+        t.height = 8;
+        auto out = read_texels(t, [&](u32 address, void* o, u32 size) { return m.read(address, o, size); });
+        REQUIRE(out);
+        REQUIRE(out->bytes == 4);
+        nx::vector<u32> row(3);
+        std::memcpy(row.data(), out->data.data(), 12);
+        return row;
+    };
+    constexpr u32 kPvrtcII2 = 0x82000000, kPvrtcI2 = 0x80000000;
+    // (PVRTC-II: bit 63 both opaque; PVRTC-I: bit 63 C1's flag, bit 47 C0's)
+    const u32 opaque = 0x80000000u | (0x7FFFu << 16), opaque_i = opaque | 0x8000u;
+    // M clear: a bit a texel.
+    auto a = texels(kPvrtcII2, opaque, 0x2u);
+    CHECK(a[0] == 0xFF000000u);
+    CHECK(a[1] == 0xFFFFFFFFu);
+    CHECK(a[2] == 0xFF000000u);
+    CHECK(texels(kPvrtcI2, opaque_i, 0x2u)[1] == 0xFFFFFFFFu);
+    CHECK(texels(kPvrtcI2, opaque_i, 0x2u)[0] == 0xFF000000u);
+    // M set, bit 0 clear: the stored texels 2 bits each (texel 0 index 0, the others 3); texel 1 the mean of its four
+    // neighbours' weights (0, 1, 1, 1 -> 6/8: 191).
+    auto b = texels(kPvrtcII2, opaque | 1u, 0xFFFFFFFCu);
+    CHECK(b[0] == 0xFF000000u);
+    CHECK(b[1] == 0xFFBFBFBFu);
+    CHECK(b[2] == 0xFFFFFFFFu);
+    // Bit 0 set, bit 20 clear: left and right only (texel 0's index from bit 1: 0): 4/8.
+    CHECK(texels(kPvrtcII2, opaque | 1u, 0xFFEFFFFDu)[1] == 0xFF808080u);
+    // Bit 20 set: above and below only (both 1).
+    CHECK(texels(kPvrtcII2, opaque | 1u, 0xFFFFFFFDu)[1] == 0xFFFFFFFFu);
+}
