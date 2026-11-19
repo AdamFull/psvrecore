@@ -268,8 +268,11 @@ bool decode_fam8(const Word& w, nx::vector<Instruction>& out) {
         for (int i = 0; i < 4; ++i) uses_b |= ((on >> i) & 1) && l[i] >= 2;
         const bool gpi = skind == Kind::Temp && a >= 60;
         const bool plain = static_cast<u32>(skind) < 4 && bkind == skind;
+        // (an indexed pair: the same index, b the pair after a, in the same bank: the low four bits are the offset)
+        const bool indexed_next = (skind == Kind::Index1 || skind == Kind::Index2) && bkind == skind && b == a + 1 &&
+                                  (a & 15) != 15;
         Lanes lanes = lanes_identity(4, on);
-        if (gpi || !uses_b || (plain && b == a + 1)) {
+        if (gpi || !uses_b || (plain && b == a + 1) || indexed_next) {
             for (int i = 0; i < 4; ++i) lanes.comp[i] = static_cast<Comp>(l[i]);
             in.src[0] = operand(skind, a, lanes, view);
         } else if (plain && b == a) {
@@ -510,7 +513,9 @@ bool decode_sop(const Word& w, nx::vector<Instruction>& out) {
     return true;
 }
 
-// Family 25: fixed-point (fx10) or byte (u8) multiply-add on four lanes.
+// Families 25 and 19: fixed-point (fx10) or byte (u8) multiply-add on four lanes. The reference prints family 19 the
+// same, field for field (a fragment program's last instruction, blending its result into the colour it read from the
+// surface: `mad.u8 o0.xyzw, o0.xyzw, sa11.xyzw, pa0.xyzw`, Call of Duty: Black Ops Declassified's shadow masks).
 bool decode_mad25(const Word& w, nx::vector<Instruction>& out) {
     Instruction in;
     in.op = Op::FxMad;
@@ -669,6 +674,7 @@ bool decode_alu(const Word& w, ProgramKind, nx::vector<Instruction>& out) {
         case 18: return decode_sop(w, out);
         case 20:
         case 21: return decode_imad(w, family == 20, out);
+        case 19:
         case 25: return decode_mad25(w, out);
         case 26: return decode_imad26(w, out);
         case 28: return decode_tex(w, out);
