@@ -169,13 +169,18 @@ bool read_param(Ptr<SlotParam> p, SlotParam* out) {
 }
 
 // A data path the guest gave (inside savedata0:), or empty when it is not one.
-// (a backslash separates folders, as in the file system's paths: Uncharted: Golden Abyss saves
-// "slot_000/saves\\settings.bin")
+// (a backslash separates folders, as in the file system's paths, and separators in a row or at the end are one or
+// none: Uncharted: Golden Abyss saves "slot_000/saves\\settings.bin" and removes its folder as "slot_000//")
 nx::string data_path(Ptr<const char> p) {
     if (!p) return {};
-    nx::string s = str(p, SaveData::kPathMax + 1);
-    for (char& c : s)
+    const nx::string given = str(p, SaveData::kPathMax + 1);
+    nx::string s;
+    for (char c : given) {
         if (c == '\\') c = '/';
+        if (c == '/' && !s.empty() && s.back() == '/') continue;
+        s += c;
+    }
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
     return SaveData::valid_path(s) ? s : nx::string{};
 }
 
