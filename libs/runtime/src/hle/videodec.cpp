@@ -325,7 +325,7 @@ void register_videodec() {
         videodec().initialized = false;
         videodec().decoders.clear();
     }
-    register_library({"SceVideodecUser", kSceVideodecUser, kVideodec});
+    register_library({"SceVideodecUser", kSceVideodecUser, kVideodec, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

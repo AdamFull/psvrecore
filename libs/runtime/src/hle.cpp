@@ -9,6 +9,7 @@
 
 #include "psvrecore/log.hpp"
 #include "psvrecore/recomp/support.hpp"
+#include "psvrecore/runtime/float_env.hpp"
 #include "psvrecore/runtime/runtime.hpp"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/containers/hash_map.h"
@@ -23,6 +24,7 @@ namespace {
 struct Registered {
     const char* name;
     u32 nid;
+    bool host_float = false;  // (Library::host_float, from any source that registers some of it)
     nx::vector<Function> functions;
     nx::vector<Variable> variables;
     nx::vector<u32> variable_addresses;  // (allocated on first use)
@@ -133,6 +135,44 @@ constexpr std::array<PsvFunction, sizeof...(I)> counted_entries(std::integer_seq
 }
 constexpr auto kCountedEntries = counted_entries(std::make_integer_sequence<u32, kCountedSlots>{});
 
+// The imports of host_float libraries with native floating point: a trampoline per bound function that runs it in the
+// host's default floating-point environment (float_env.hpp). Only built so; elsewhere bind() returns the function.
+constexpr u32 kHostFloatSlots = kNativeFloat ? 1024 : 1;
+PsvFunction g_host_float[kHostFloatSlots];
+std::atomic<u32> g_host_float_used{0};
+template <u32 I>
+void host_float_entry(PsvContext* ctx, uint32_t ret) {
+    const HostFloatScope scope(ctx);
+    g_host_float[I](ctx, ret);
+}
+template <u32... I>
+constexpr std::array<PsvFunction, sizeof...(I)> host_float_entries(std::integer_sequence<u32, I...>) {
+    return {&host_float_entry<I>...};
+}
+constexpr auto kHostFloatEntries = host_float_entries(std::make_integer_sequence<u32, kHostFloatSlots>{});
+
+bool is_host_float(const Function& f) {
+    for (const auto& r : libraries())
+        if (r.host_float && &f >= r.functions.data() && &f < r.functions.data() + r.functions.size()) return true;
+    return false;
+}
+
+// (lock held) f's function in the host's environment, when it needs one.
+PsvFunction host_float_function(const Function& f) {
+    if (!kNativeFloat || !is_host_float(f)) return f.function;
+    const u32 used = g_host_float_used.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < used; ++i)
+        if (g_host_float[i] == f.function) return kHostFloatEntries[i];
+    if (used == kHostFloatSlots) {
+        nx::logw(logs::hle, "{}: more host_float imports than trampolines ({}): runs in the guest's floating-point mode", f.name,
+                 kHostFloatSlots);
+        return f.function;
+    }
+    g_host_float[used] = f.function;
+    g_host_float_used.store(used + 1, std::memory_order_release);
+    return kHostFloatEntries[used];
+}
+
 }  // namespace
 
 bool counting_calls() {
@@ -144,13 +184,15 @@ bool counting_calls() {
 }
 
 PsvFunction bind(const Function& f) {
-    if (!counting_calls() && !tracing_calls() && !logging_errors()) return f.function;
+    if (!counting_calls() && !tracing_calls() && !logging_errors() && !kNativeFloat) return f.function;
     nx::scoped_lock<nx::mutex> held(g_lock);
+    const PsvFunction function = host_float_function(f);
+    if (!counting_calls() && !tracing_calls() && !logging_errors()) return function;
     const u32 used = g_counted_used.load(std::memory_order_relaxed);
     for (u32 i = 0; i < used; ++i)
-        if (g_counted[i].function == f.function) return kCountedEntries[i];
-    if (used == kCountedSlots) return f.function;
-    g_counted[used].function = f.function;
+        if (g_counted[i].function == function) return kCountedEntries[i];
+    if (used == kCountedSlots) return function;
+    g_counted[used].function = function;
     g_counted[used].name = f.name;
     g_counted_used.store(used + 1, std::memory_order_release);
     return kCountedEntries[used];
@@ -239,9 +281,10 @@ void register_library(const Library& library) {
     for (auto& existing : libraries())
         if (existing.nid == library.nid) r = &existing;
     if (!r) {
-        libraries().push_back(Registered{library.name, library.nid, {}, {}, {}});
+        libraries().push_back(Registered{library.name, library.nid, false, {}, {}, {}});
         r = &libraries().back();
     }
+    r->host_float |= library.host_float;
     for (const auto& f : library.functions) {
         auto it = std::find_if(r->functions.begin(), r->functions.end(), [&](const Function& g) { return g.nid == f.nid; });
         if (it != r->functions.end()) *it = f;
@@ -300,7 +343,13 @@ u32 call_guest(PsvContext* ctx, u32 code, std::span<const u32> args) {
         ctx->r[13] = sp;
     }
     ctx->r[14] = kHostReturn;
+    // (native floating point: the guest's FPCR mirror in the callee, then what the caller had: a guest caller's mirror
+    // read again from the context, which a vmsr in the callee may have changed; float_env.hpp)
+    const FloatState caller = float_state();
+    enter_guest_float(ctx);
     f(ctx, kHostReturn);
+    if (caller.guest) enter_guest_float(ctx);
+    else set_float_state(caller);
     ctx->r[13] = saved_sp;
     return ctx->r[0];
 }

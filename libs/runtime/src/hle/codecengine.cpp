@@ -120,7 +120,7 @@ void register_codecengine() {
         nx::scoped_lock<nx::mutex> held(all.lock);
         all.by_uid.clear();
     }
-    register_library({"SceCodecEngineUser", kSceCodecEngineUser, kFunctions});
+    register_library({"SceCodecEngineUser", kSceCodecEngineUser, kFunctions, {}, true});
     register_library({"SceCodecEnginePerf", kSceCodecEnginePerf, kPerf});
 }
 

@@ -931,7 +931,7 @@ void register_json() {
         j.allocator = j.user_data = 0;
         j.null_value = j.null_string = j.null_array = j.null_object = j.null_number = j.empty_text = j.base_vtable = 0;
     }
-    register_library({"SceLibJson", kSceLibJson, kFunctions});
+    register_library({"SceLibJson", kSceLibJson, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

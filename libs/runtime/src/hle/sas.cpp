@@ -662,7 +662,7 @@ void register_sas() {
         s.initialized = false;
     }
     g_in_core = false;
-    register_library({"SceSas", kSceSas, kFunctions});
+    register_library({"SceSas", kSceSas, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

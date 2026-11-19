@@ -76,8 +76,15 @@
 #define PSVRECORE_ABI_CHECKS ", debug"
 #endif
 
+/* Generated code's floating point: the host's instructions under the runtime's FPCR mirror (runtime/float_env.hpp). */
+#if defined(PSVRECORE_NATIVE_FLOAT)
+#define PSVRECORE_ABI_FLOAT ", native float"
+#else
+#define PSVRECORE_ABI_FLOAT ""
+#endif
+
 /* What the game and psvrecore must agree on besides the version: "clang 22.1, MSVC 1944 STL 145, release". */
-#define PSVRECORE_BUILD_SIGNATURE PSVRECORE_ABI_COMPILER PSVRECORE_ABI_LIBRARY PSVRECORE_ABI_CHECKS
+#define PSVRECORE_BUILD_SIGNATURE PSVRECORE_ABI_COMPILER PSVRECORE_ABI_LIBRARY PSVRECORE_ABI_CHECKS PSVRECORE_ABI_FLOAT
 
 extern "C" {
 #endif

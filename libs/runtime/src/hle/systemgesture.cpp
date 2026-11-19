@@ -645,7 +645,7 @@ void register_systemgesture() {
         g.primitives.clear();
         g.recognizers.clear();
     }
-    register_library({"SceSystemGesture", kSceSystemGesture, kFunctions});
+    register_library({"SceSystemGesture", kSceSystemGesture, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

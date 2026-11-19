@@ -345,7 +345,7 @@ void register_audiodec() {
         a.decoders.clear();
         for (u32 i = 0; i < 4; ++i) a.limit[i] = a.used[i] = 0;
     }
-    register_library({"SceAudiodecUser", kSceAudiodecUser, kFunctions});
+    register_library({"SceAudiodecUser", kSceAudiodecUser, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

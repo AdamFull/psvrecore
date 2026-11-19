@@ -48,6 +48,14 @@ set(PSVRECORE_GENERATED_CODE_DEBUG "lines" CACHE STRING
 set_property(CACHE PSVRECORE_GENERATED_CODE_DEBUG PROPERTY STRINGS lines full none)
 option(PSVRECORE_GENERATED_CODE_CHECK_KEPT
     "generated code checks after each direct call that the registers it kept in locals are what the callee left" OFF)
+# arm64 only: generated code's floating point as the host's instructions (PSV_NATIVE_FLOAT in guest.h), the runtime
+# keeping the host's FPCR mirroring the guest's FPSCR (runtime/float_env.hpp). Not verified on a device yet: see
+# docs/BUILDING.md for the device test that checks it.
+option(PSVRECORE_GENERATED_CODE_NATIVE_FLOAT
+    "arm64: generated code's floating point as host instructions under an FPCR that mirrors the guest FPSCR (unverified on hardware)" OFF)
+if(PSVRECORE_GENERATED_CODE_NATIVE_FLOAT AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    message(FATAL_ERROR "PSVRECORE_GENERATED_CODE_NATIVE_FLOAT is for arm64 targets (this is ${CMAKE_SYSTEM_PROCESSOR})")
+endif()
 
 # The cache options above (each changes nothing when left at its default). Apart from psvrecore_generated_code so that
 # scripts/codegen_metrics.py, which reads that function's options, measures the defaults; it takes these as --flags-*.
@@ -78,6 +86,15 @@ function(_psvrecore_generated_code_options target)
     if(PSVRECORE_GENERATED_CODE_CHECK_KEPT)
         target_compile_definitions(${target} PRIVATE PSV_CHECK_KEPT_REGISTERS)
     endif()
+    # (and nothing assumed about how denormals compare: the FPCR's FZ decides at run time)
+    if(PSVRECORE_GENERATED_CODE_NATIVE_FLOAT)
+        target_compile_definitions(${target} PRIVATE PSV_NATIVE_FLOAT)
+        check_c_compiler_flag(-fdenormal-fp-math=dynamic _psvrecore_has_dynamic_denormals)
+        if(NOT _psvrecore_has_dynamic_denormals)
+            message(FATAL_ERROR "PSVRECORE_GENERATED_CODE_NATIVE_FLOAT needs clang's -fdenormal-fp-math=dynamic (clang 17 or newer)")
+        endif()
+        target_compile_options(${target} PRIVATE -fdenormal-fp-math=dynamic)
+    endif()
     if(PSVRECORE_GENERATED_CODE_LTO)
         if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
             message(FATAL_ERROR "PSVRECORE_GENERATED_CODE_LTO needs clang (and lld or lld-link)")
@@ -105,10 +122,11 @@ endfunction()
 function(psvrecore_generated_code target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /clang:-fwrapv /clang:-fno-strict-aliasing /clang:-ffp-contract=off
-                                                 /clang:-fno-fast-math /clang:-w /GS- $<$<CONFIG:RelWithDebInfo>:/Ob2>)
+                                                 /clang:-fno-fast-math /clang:-fno-math-errno /clang:-w /GS-
+                                                 $<$<CONFIG:RelWithDebInfo>:/Ob2>)
     else()
-        target_compile_options(${target} PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off -fno-fast-math -w
-                                                 -funwind-tables)
+        target_compile_options(${target} PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off -fno-fast-math -fno-math-errno
+                                                 -w -funwind-tables)
         target_compile_options(${target} PRIVATE -fno-stack-protector -fvisibility=hidden)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
             check_c_compiler_flag(-mno-outline-atomics _psvrecore_has_no_outline_atomics)

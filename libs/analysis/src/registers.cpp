@@ -602,6 +602,7 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out) const 
     const u32 entry_block = g.block_of[g.entry];
     at[entry_block] = init;
     RegSet ok = kPreservable;
+    bool lr_ok = true;  // (FunctionRegisters::returns_to_lr)
     // (the blocks inside a loop: a strongly connected component with a cycle)
     nx::vector<u8> in_loop;
     if (out && options_.keep == KeepPolicy::Loops) in_loop = loop_blocks(g);
@@ -628,14 +629,16 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out) const 
                 // (a return when the target is the LR the function was entered with, which is its return address
                 // when it was called directly; else a jump through the runtime, to code that may do anything)
                 ok &= pc == entry_value(arm::kLr) ? entry_values() : RegSet(0);
+                lr_ok &= pc == entry_value(arm::kLr);
                 break;
             case EdgeKind::TailCall: {
                 const u32 t = index(e.to);
                 ok &= t != kNoIndex && s.local[arm::kLr] == entry_value(arm::kLr) ? static_cast<RegSet>(entry_values() & fns_[t].preserved)
                                                                                  : RegSet(0);
+                lr_ok &= t != kNoIndex && s.local[arm::kLr] == entry_value(arm::kLr);
                 break;
             }
-            case EdgeKind::ImportTail: ok = 0; break;
+            case EdgeKind::ImportTail: ok = 0, lr_ok = false; break;
             default: break;
         }
     };
@@ -731,8 +734,10 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out) const 
     }
     if (out) {
         ok = kPreservable;
+        lr_ok = true;
         for (u32 b = 0; b < nb; ++b)
             if (at[b].reached) run_block(b, true);
+        out->returns_to_lr = lr_ok;
     }
     return ok;
 }

@@ -209,7 +209,7 @@ void register_motion() {
         nx::scoped_lock<nx::mutex> held(m.lock);
         m.sampling = false;
     }
-    register_library({"SceMotion", kSceMotion, kFunctions});
+    register_library({"SceMotion", kSceMotion, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

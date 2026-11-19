@@ -307,6 +307,7 @@ bool status(Emitter& e, const Instruction& in) {
 }  // namespace
 
 bool emit_vfp(Emitter& e, const Instruction& in) {
+    if (e.vfp_locals()) return emit_vfp_locals(e, in);
     if (status(e, in) || load_store(e, in)) return true;
     if (in.op == Op::Vmov && moves(e, in)) return true;
     if (!vfp_form(in)) return false;

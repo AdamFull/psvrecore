@@ -256,7 +256,7 @@ void register_audioout() {
     // (a new runtime starts with every port closed)
     Audio& a = audio();
     for (Port& p : a.ports) p = Port{};
-    register_library({"SceAudio", kSceAudio, kFunctions});
+    register_library({"SceAudio", kSceAudio, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

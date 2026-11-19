@@ -456,8 +456,8 @@ void register_jpegenc() {
         nx::scoped_lock<nx::mutex> held(all.lock);
         all.by_ctrl.clear();
     }
-    register_library({"SceJpegEncUser", kSceJpegEncUser, kFunctions});
-    register_library({"SceJpegUser", kSceJpegUser, kDecoder});
+    register_library({"SceJpegEncUser", kSceJpegEncUser, kFunctions, {}, true});
+    register_library({"SceJpegUser", kSceJpegUser, kDecoder, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

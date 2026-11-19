@@ -2,6 +2,7 @@
 # module loader, and the system libraries implemented on the host (HLE).
 add_library(psvrecore_runtime STATIC
     src/filesystem.cpp
+    src/float_env.cpp
     src/hle.cpp
     src/input.cpp
     src/hle/apputil.cpp
@@ -68,6 +69,11 @@ endif()
 add_library(psvrecore::runtime ALIAS psvrecore_runtime)
 if(PSVRECORE_GUEST_FIBERS)
     target_compile_definitions(psvrecore_runtime PUBLIC PSVRECORE_GUEST_FIBERS=1)
+endif()
+# (generated code with native floating point: the runtime keeps the host's FPCR mirroring the guest's FPSCR, see
+# runtime/float_env.hpp; the games' executables and the runtime must agree, so it is in the build signature)
+if(PSVRECORE_GENERATED_CODE_NATIVE_FLOAT)
+    target_compile_definitions(psvrecore_runtime PUBLIC PSVRECORE_NATIVE_FLOAT=1)
 endif()
 target_include_directories(psvrecore_runtime PUBLIC include)
 target_link_libraries(psvrecore_runtime PUBLIC psvrecore::recomp_support psvrecore::analysis)

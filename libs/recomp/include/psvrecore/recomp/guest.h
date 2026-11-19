@@ -19,6 +19,15 @@
 #include <string.h>
 
 #include "psvrecore/abi.h"
+/* (floating point in typed locals: the hosts' conversions to integers, below) */
+#if defined(PSV_NATIVE_FLOAT) && !defined(__aarch64__)
+#error "PSV_NATIVE_FLOAT: arm64 only (the host FPCR mirrors the guest's FPSCR)"
+#endif
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -839,10 +848,331 @@ PSV_INLINE uint32_t psv_f16_to_f32(uint32_t fpscr, uint32_t h) {
     return sign | ((exp - 15 + 127) << 23) | (man << 13);
 }
 
-/* VMSR FPSCR: settings this implementation does not support trap; the trap enables read as zero. */
-PSV_INLINE void psv_write_fpscr(PsvContext* PSV_RESTRICT ctx, uint32_t value, uint32_t pc) {
+/* ---- Floating point in typed locals -------------------------------------------------------------------------------
+ *
+ * Generated functions keep the S and D registers in locals of type float and double (ARCHITECTURE.md, "VFP
+ * registers"), and the FPSCR in two: `fpscr` (bits 27-0; its bits 31-28 are not used) and `fpnzcv` (bits 31-28, what
+ * vcmp writes). Moves, loads and stores copy bits: a float or double copy keeps every bit pattern, signalling NaNs
+ * and their payloads included (the host's moves, loads, stores and bitwise operations do not touch the value).
+ * The operations below give the VFP's results bit for bit:
+ *
+ * - By default: the host's operation, then the exact helpers above where it could differ. With FPSCR.FZ clear, the
+ *   host's IEEE operation in round to nearest gives the VFP's result whenever that is not a NaN (only the NaN rules
+ *   differ: the VFP's operand order, signalling NaNs first, its positive default NaN, DN): one check of the result.
+ *   With FZ set, an operand below the smallest normal or a result at or below it (tininess before rounding) also
+ *   takes the exact path; that check is out of line.
+ * - With PSV_NATIVE_FLOAT (arm64, the PSVRECORE_GENERATED_CODE_NATIVE_FLOAT build option): the host's instruction
+ *   alone. The runtime runs guest code with the FPCR's FZ and DN as the guest's FPSCR has them (psv_native_set_fpcr):
+ *   AArch64's flush-to-zero (inputs and results, tininess before rounding), default NaN and NaN propagation are
+ *   ARMv7's. The instructions are inline assembly, volatile: for C operators the compiler assumes the default
+ *   floating-point environment and may fold constants, move an operation across a write of the FPCR (a vmsr, a call)
+ *   or swap the operands of an addition (which picks the other NaN). Comparisons are C (the generated code is built
+ *   with -fdenormal-fp-math=dynamic there: no assumption about how denormals compare).
+ * - Conversions to integers (to nearest or toward zero, saturating, NaN to 0) are AArch64's FCVT[ZN][SU] on arm64
+ *   either way (the same results, whatever the FPCR); x86's conversion and a check of its out-of-range answer on x64.
+ *
+ * Rounding is always to nearest: a vmsr selecting another mode traps (PSV_FPSCR_UNSUPPORTED). The cumulative
+ * exception flags (IOC... IDC) are not computed: they keep what software wrote, as in the interpreter. */
+
+PSV_INLINE float psv_vlo32(double d) { return psv_f32((uint32_t)psv_b64(d)); }
+PSV_INLINE float psv_vhi32(double d) { return psv_f32((uint32_t)(psv_b64(d) >> 32)); }
+PSV_INLINE double psv_vpack64(float lo, float hi) { return psv_f64((uint64_t)psv_b32(lo) | ((uint64_t)psv_b32(hi) << 32)); }
+PSV_INLINE double psv_vsetlo64(double d, float lo) { return psv_f64((psv_b64(d) & 0xFFFFFFFF00000000ull) | psv_b32(lo)); }
+PSV_INLINE double psv_vsethi64(double d, float hi) { return psv_f64((psv_b64(d) & 0xFFFFFFFFull) | ((uint64_t)psv_b32(hi) << 32)); }
+/* FPAbs, FPNeg: the sign bit alone, NaNs included. */
+PSV_INLINE float psv_vabs32(float a) { return psv_f32(psv_b32(a) & 0x7FFFFFFFu); }
+PSV_INLINE float psv_vneg32(float a) { return psv_f32(psv_b32(a) ^ 0x80000000u); }
+PSV_INLINE double psv_vabs64(double a) { return psv_f64(psv_b64(a) & 0x7FFFFFFFFFFFFFFFull); }
+PSV_INLINE double psv_vneg64(double a) { return psv_f64(psv_b64(a) ^ 0x8000000000000000ull); }
+/* 2^k for k in [-32, 32], exactly. */
+PSV_INLINE float psv_vpow2f(int k) { return psv_f32((uint32_t)(127 + k) << 23); }
+PSV_INLINE double psv_vpow2(int k) { return psv_f64((uint64_t)(1023 + k) << 52); }
+
+/* Flush-to-zero mode: the host computes as the VFP does when no operand is a denormal and the result is not tiny
+ * (tininess before rounding: a result rounded to the smallest normal may be the VFP's zero). A value's key is its
+ * magnitude's bits less one, times two: below PSV_VTINY32 (PSV_VTINY64) for a denormal or the smallest normal, so one
+ * unsigned minimum over the operands' and the result's keys checks them all (an operand at the smallest normal takes
+ * the exact helper too, needlessly but exactly). Zeros, infinities and NaNs are not tiny (a NaN fails r == r). */
+#define PSV_VTINY32 0x00FFFFFFu
+#define PSV_VTINY64 0x001FFFFFFFFFFFFFull
+PSV_INLINE uint32_t psv_vkey32(float x) { return psv_b32(x) * 2u - 2u; }
+PSV_INLINE uint64_t psv_vkey64(double x) { return psv_b64(x) * 2u - 2u; }
+PSV_INLINE uint32_t psv_vmin32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+PSV_INLINE uint64_t psv_vmin64(uint64_t a, uint64_t b) { return a < b ? a : b; }
+PSV_INLINE int psv_vfz32(float x) { return psv_vkey32(x) >= PSV_VTINY32; }
+PSV_INLINE int psv_vfz64(double x) { return psv_vkey64(x) >= PSV_VTINY64; }
+PSV_INLINE int psv_vfz3_32(float a, float b, float r) {
+    return psv_vmin32(psv_vmin32(psv_vkey32(a), psv_vkey32(b)), psv_vkey32(r)) >= PSV_VTINY32;
+}
+PSV_INLINE int psv_vfz3_64(double a, double b, double r) {
+    return psv_vmin64(psv_vmin64(psv_vkey64(a), psv_vkey64(b)), psv_vkey64(r)) >= PSV_VTINY64;
+}
+
+/* (arm64) The FPCR's FZ (bit 24) and DN (bit 25) from the FPSCR's (the same bits); the rest of the FPCR as it is.
+ * The runtime's mirror (runtime/float_env.hpp) and, with PSV_NATIVE_FLOAT, vmsr. Elsewhere nothing. */
+#if defined(__aarch64__)
+PSV_INLINE void psv_native_set_fpcr(uint32_t fpscr) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    const uint64_t want = (fpcr & ~(uint64_t)PSV_FPSCR_STANDARD) | (fpscr & PSV_FPSCR_STANDARD);
+    if (want != fpcr) __asm__ volatile("msr fpcr, %0" : : "r"(want));
+}
+#else
+PSV_INLINE void psv_native_set_fpcr(uint32_t fpscr) { (void)fpscr; }
+#endif
+
+#ifdef PSV_NATIVE_FLOAT
+
+#define PSV_NATIVE2(name, T, insn, reg)                                                                              \
+    PSV_INLINE T name(uint32_t fpscr, T a, T b) {                                                                    \
+        T r;                                                                                                         \
+        (void)fpscr;                                                                                                 \
+        __asm__ volatile(insn " %" reg "0, %" reg "1, %" reg "2" : "=w"(r) : "w"(a), "w"(b));                        \
+        return r;                                                                                                    \
+    }
+#define PSV_NATIVE1(name, R, T, insn, rreg, treg)                                                                    \
+    PSV_INLINE R name(uint32_t fpscr, T a) {                                                                         \
+        R r;                                                                                                         \
+        (void)fpscr;                                                                                                 \
+        __asm__ volatile(insn " %" rreg "0, %" treg "1" : "=w"(r) : "w"(a));                                         \
+        return r;                                                                                                    \
+    }
+PSV_NATIVE2(psv_vadd32, float, "fadd", "s")
+PSV_NATIVE2(psv_vsub32, float, "fsub", "s")
+PSV_NATIVE2(psv_vmul32, float, "fmul", "s")
+PSV_NATIVE2(psv_vdiv32, float, "fdiv", "s")
+PSV_NATIVE2(psv_vnmul32, float, "fnmul", "s")
+PSV_NATIVE2(psv_vadd64, double, "fadd", "d")
+PSV_NATIVE2(psv_vsub64, double, "fsub", "d")
+PSV_NATIVE2(psv_vmul64, double, "fmul", "d")
+PSV_NATIVE2(psv_vdiv64, double, "fdiv", "d")
+PSV_NATIVE2(psv_vnmul64, double, "fnmul", "d")
+PSV_NATIVE1(psv_vsqrt32, float, float, "fsqrt", "s", "s")
+PSV_NATIVE1(psv_vsqrt64, double, double, "fsqrt", "d", "d")
+PSV_NATIVE1(psv_vcvt_f64_f32, double, float, "fcvt", "d", "s")
+PSV_NATIVE1(psv_vcvt_f32_f64, float, double, "fcvt", "s", "d")
+#undef PSV_NATIVE2
+#undef PSV_NATIVE1
+/* (the FPCR flushes compared denormals) */
+PSV_INLINE float psv_vflush32(uint32_t fpscr, float a) { (void)fpscr; return a; }
+PSV_INLINE double psv_vflush64(uint32_t fpscr, double a) { (void)fpscr; return a; }
+/* FCMP's NZCV is VFP's (less 1000, equal 0110, greater 0010, unordered 0011), in the same bits. */
+PSV_INLINE uint32_t psv_vcmp32(uint32_t fpscr, float a, float b) {
+    uint64_t nzcv;
+    (void)fpscr;
+    __asm__ volatile("fcmp %s1, %s2\n\tmrs %0, nzcv" : "=r"(nzcv) : "w"(a), "w"(b) : "cc");
+    return (uint32_t)nzcv;
+}
+PSV_INLINE uint32_t psv_vcmp64(uint32_t fpscr, double a, double b) {
+    uint64_t nzcv;
+    (void)fpscr;
+    __asm__ volatile("fcmp %d1, %d2\n\tmrs %0, nzcv" : "=r"(nzcv) : "w"(a), "w"(b) : "cc");
+    return (uint32_t)nzcv;
+}
+
+#else /* exact by check and fallback */
+
+/* The host's result where it is the VFP's: with FZ clear whenever it is not a NaN; with FZ set when the operands and
+ * the result are also not tiny (psv_vfz*; the check inline: in a loop a call would cost the spills of every
+ * floating-point value live across it). Else the exact helper, out of line. */
+#define PSV_VFP_OK(fpscr, r, fz_ok)                                                                                  \
+    (__builtin_expect(!((fpscr) & PSV_FPSCR_FZ), 1) ? __builtin_expect((r) == (r), 1) : ((r) == (r) && (fz_ok)))
+#define PSV_VFP_TYPED2(name, T, B, op, exact)                                                              \
+    PSV_COLD T name##_exact_typed(uint32_t fpscr, T a, T b) { return psv_f##B(exact(fpscr, psv_b##B(a), psv_b##B(b))); } \
+    PSV_INLINE T name(uint32_t fpscr, T a, T b) {                                                                    \
+        const T r = a op b;                                                                                          \
+        if (PSV_VFP_OK(fpscr, r, psv_vfz3_##B(a, b, r))) return r;                                                   \
+        return name##_exact_typed(fpscr, a, b);                                                                      \
+    }
+PSV_VFP_TYPED2(psv_vadd32, float, 32, +, psv_fadd32_exact)
+PSV_VFP_TYPED2(psv_vsub32, float, 32, -, psv_fsub32_exact)
+PSV_VFP_TYPED2(psv_vmul32, float, 32, *, psv_fmul32_exact)
+PSV_VFP_TYPED2(psv_vdiv32, float, 32, /, psv_fdiv32_exact)
+PSV_VFP_TYPED2(psv_vadd64, double, 64, +, psv_fadd64)
+PSV_VFP_TYPED2(psv_vsub64, double, 64, -, psv_fsub64)
+PSV_VFP_TYPED2(psv_vmul64, double, 64, *, psv_fmul64)
+PSV_VFP_TYPED2(psv_vdiv64, double, 64, /, psv_fdiv64)
+#undef PSV_VFP_TYPED2
+/* VNMUL: the product's sign flipped after rounding, a NaN's too. */
+PSV_INLINE float psv_vnmul32(uint32_t fpscr, float a, float b) { return psv_vneg32(psv_vmul32(fpscr, a, b)); }
+PSV_INLINE double psv_vnmul64(uint32_t fpscr, double a, double b) { return psv_vneg64(psv_vmul64(fpscr, a, b)); }
+
+/* The square root of a negative operand, or of a NaN, is a NaN (the exact helper's); of a denormal in FZ mode, a
+ * zero (a square root of a normal is never tiny). */
+PSV_COLD float psv_vsqrt32_exact_typed(uint32_t fpscr, float a) { return psv_f32(psv_fsqrt32(fpscr, psv_b32(a))); }
+PSV_INLINE float psv_vsqrt32(uint32_t fpscr, float a) {
+    const float r = __builtin_sqrtf(a);
+    if (PSV_VFP_OK(fpscr, r, psv_vfz32(a))) return r;
+    return psv_vsqrt32_exact_typed(fpscr, a);
+}
+PSV_COLD double psv_vsqrt64_exact_typed(uint32_t fpscr, double a) { return psv_f64(psv_fsqrt64(fpscr, psv_b64(a))); }
+PSV_INLINE double psv_vsqrt64(uint32_t fpscr, double a) {
+    const double r = __builtin_sqrt(a);
+    if (PSV_VFP_OK(fpscr, r, psv_vfz64(a))) return r;
+    return psv_vsqrt64_exact_typed(fpscr, a);
+}
+
+/* Precision conversions: the host's, exact for a widening; a narrowing rounds to nearest as the VFP does. A NaN
+ * (quietened, its payload's top kept, or the default NaN), and FZ's denormals, take the exact helper. A denormal
+ * double narrowed in FZ mode is a zero of its sign either way (the host's rounding gives the same zero). */
+PSV_COLD double psv_vcvt_f64_f32_exact(uint32_t fpscr, float a) { return psv_f64(psv_f32_to_f64(fpscr, psv_b32(a))); }
+PSV_INLINE double psv_vcvt_f64_f32(uint32_t fpscr, float a) {
+    const double r = (double)a;
+    if (PSV_VFP_OK(fpscr, r, psv_vfz32(a))) return r;
+    return psv_vcvt_f64_f32_exact(fpscr, a);
+}
+PSV_COLD float psv_vcvt_f32_f64_exact(uint32_t fpscr, double a) { return psv_f32(psv_f64_to_f32(fpscr, psv_b64(a))); }
+PSV_INLINE float psv_vcvt_f32_f64(uint32_t fpscr, double a) {
+    const float r = (float)a;
+    if (PSV_VFP_OK(fpscr, r, psv_vfz32(r))) return r;
+    return psv_vcvt_f32_f64_exact(fpscr, a);
+}
+
+/* Compares: FPSCR's NZCV (bits 31-28). The operands flushed in FZ mode first (psv_vflush*), then the host's ordered
+ * comparison, exact for every value. */
+PSV_INLINE float psv_vflush32(uint32_t fpscr, float a) {
+    return __builtin_expect((fpscr & PSV_FPSCR_FZ) != 0, 0) ? psv_f32(psv_flush32(fpscr, psv_b32(a))) : a;
+}
+PSV_INLINE double psv_vflush64(uint32_t fpscr, double a) {
+    return __builtin_expect((fpscr & PSV_FPSCR_FZ) != 0, 0) ? psv_f64(psv_flush64(fpscr, psv_b64(a))) : a;
+}
+
+#endif /* PSV_NATIVE_FLOAT */
+
+/* NZCV of two operands already flushed: less 1000, equal 0110, greater 0010, unordered 0011. (Generated code
+ * branching on the result compares the operands itself: ARCHITECTURE.md, "Compares".) */
+PSV_INLINE uint32_t psv_vnzcv32(float a, float b) { return a < b ? 0x80000000u : a == b ? 0x60000000u : a > b ? 0x20000000u : 0x30000000u; }
+PSV_INLINE uint32_t psv_vnzcv64(double a, double b) { return a < b ? 0x80000000u : a == b ? 0x60000000u : a > b ? 0x20000000u : 0x30000000u; }
+#ifndef PSV_NATIVE_FLOAT
+PSV_INLINE uint32_t psv_vcmp32(uint32_t fpscr, float a, float b) { return psv_vnzcv32(psv_vflush32(fpscr, a), psv_vflush32(fpscr, b)); }
+PSV_INLINE uint32_t psv_vcmp64(uint32_t fpscr, double a, double b) { return psv_vnzcv64(psv_vflush64(fpscr, a), psv_vflush64(fpscr, b)); }
+#endif
+
+/* To 32-bit integers: toward zero (vcvt) or to nearest (vcvtr), saturating, NaN to 0; a denormal gives 0 whether
+ * flushed or not, so FPSCR does not matter. */
+PSV_COLD uint32_t psv_vcvt_int32_cold(float a, int is_signed, int nearest) { return psv_f32_to_int(0, psv_b32(a), is_signed, nearest); }
+PSV_COLD uint32_t psv_vcvt_int64_cold(double a, int is_signed, int nearest) { return psv_f64_to_int(0, psv_b64(a), is_signed, nearest); }
+#if defined(__aarch64__)
+PSV_INLINE uint32_t psv_vcvt_s32_f32(uint32_t fpscr, float a) { (void)fpscr; return (uint32_t)vcvts_s32_f32(a); }
+PSV_INLINE uint32_t psv_vcvt_u32_f32(uint32_t fpscr, float a) { (void)fpscr; return vcvts_u32_f32(a); }
+PSV_INLINE uint32_t psv_vcvtr_s32_f32(uint32_t fpscr, float a) { (void)fpscr; return (uint32_t)vcvtns_s32_f32(a); }
+PSV_INLINE uint32_t psv_vcvtr_u32_f32(uint32_t fpscr, float a) { (void)fpscr; return vcvtns_u32_f32(a); }
+#define PSV_CVT64(name, insn)                                                                                        \
+    PSV_INLINE uint32_t name(uint32_t fpscr, double a) {                                                             \
+        uint32_t r;                                                                                                  \
+        (void)fpscr;                                                                                                 \
+        __asm__(insn " %w0, %d1" : "=r"(r) : "w"(a));                                                                \
+        return r;                                                                                                    \
+    }
+PSV_CVT64(psv_vcvt_s32_f64, "fcvtzs")
+PSV_CVT64(psv_vcvt_u32_f64, "fcvtzu")
+PSV_CVT64(psv_vcvtr_s32_f64, "fcvtns")
+PSV_CVT64(psv_vcvtr_u32_f64, "fcvtnu")
+#undef PSV_CVT64
+#elif defined(__x86_64__) || defined(_M_X64)
+/* (x86 gives 0x80000000 for a NaN or a value out of range, and 0x8000000000000000 from the 64-bit forms: those take
+ * the exact helper, as does -2^31 itself. vcvtr: MXCSR's rounding, to nearest as the host's code leaves it.) */
+PSV_INLINE uint32_t psv_vcvt_s32_f32(uint32_t fpscr, float a) {
+    const int r = _mm_cvttss_si32(_mm_set_ss(a));
+    (void)fpscr;
+    return __builtin_expect(r != (int)0x80000000u, 1) ? (uint32_t)r : psv_vcvt_int32_cold(a, 1, 0);
+}
+PSV_INLINE uint32_t psv_vcvtr_s32_f32(uint32_t fpscr, float a) {
+    const int r = _mm_cvtss_si32(_mm_set_ss(a));
+    (void)fpscr;
+    return __builtin_expect(r != (int)0x80000000u, 1) ? (uint32_t)r : psv_vcvt_int32_cold(a, 1, 1);
+}
+PSV_INLINE uint32_t psv_vcvt_u32_f32(uint32_t fpscr, float a) {
+    const long long r = _mm_cvttss_si64(_mm_set_ss(a));
+    (void)fpscr;
+    return __builtin_expect((unsigned long long)r <= 0xFFFFFFFFull, 1) ? (uint32_t)r : psv_vcvt_int32_cold(a, 0, 0);
+}
+PSV_INLINE uint32_t psv_vcvtr_u32_f32(uint32_t fpscr, float a) {
+    const long long r = _mm_cvtss_si64(_mm_set_ss(a));
+    (void)fpscr;
+    return __builtin_expect((unsigned long long)r <= 0xFFFFFFFFull, 1) ? (uint32_t)r : psv_vcvt_int32_cold(a, 0, 1);
+}
+PSV_INLINE uint32_t psv_vcvt_s32_f64(uint32_t fpscr, double a) {
+    const int r = _mm_cvttsd_si32(_mm_set_sd(a));
+    (void)fpscr;
+    return __builtin_expect(r != (int)0x80000000u, 1) ? (uint32_t)r : psv_vcvt_int64_cold(a, 1, 0);
+}
+PSV_INLINE uint32_t psv_vcvtr_s32_f64(uint32_t fpscr, double a) {
+    const int r = _mm_cvtsd_si32(_mm_set_sd(a));
+    (void)fpscr;
+    return __builtin_expect(r != (int)0x80000000u, 1) ? (uint32_t)r : psv_vcvt_int64_cold(a, 1, 1);
+}
+PSV_INLINE uint32_t psv_vcvt_u32_f64(uint32_t fpscr, double a) {
+    const long long r = _mm_cvttsd_si64(_mm_set_sd(a));
+    (void)fpscr;
+    return __builtin_expect((unsigned long long)r <= 0xFFFFFFFFull, 1) ? (uint32_t)r : psv_vcvt_int64_cold(a, 0, 0);
+}
+PSV_INLINE uint32_t psv_vcvtr_u32_f64(uint32_t fpscr, double a) {
+    const long long r = _mm_cvtsd_si64(_mm_set_sd(a));
+    (void)fpscr;
+    return __builtin_expect((unsigned long long)r <= 0xFFFFFFFFull, 1) ? (uint32_t)r : psv_vcvt_int64_cold(a, 0, 1);
+}
+#else
+PSV_INLINE uint32_t psv_vcvt_s32_f32(uint32_t fpscr, float a) { (void)fpscr; return psv_vcvt_int32_cold(a, 1, 0); }
+PSV_INLINE uint32_t psv_vcvtr_s32_f32(uint32_t fpscr, float a) { (void)fpscr; return psv_vcvt_int32_cold(a, 1, 1); }
+PSV_INLINE uint32_t psv_vcvt_u32_f32(uint32_t fpscr, float a) { (void)fpscr; return psv_vcvt_int32_cold(a, 0, 0); }
+PSV_INLINE uint32_t psv_vcvtr_u32_f32(uint32_t fpscr, float a) { (void)fpscr; return psv_vcvt_int32_cold(a, 0, 1); }
+PSV_INLINE uint32_t psv_vcvt_s32_f64(uint32_t fpscr, double a) { (void)fpscr; return psv_vcvt_int64_cold(a, 1, 0); }
+PSV_INLINE uint32_t psv_vcvtr_s32_f64(uint32_t fpscr, double a) { (void)fpscr; return psv_vcvt_int64_cold(a, 1, 1); }
+PSV_INLINE uint32_t psv_vcvt_u32_f64(uint32_t fpscr, double a) { (void)fpscr; return psv_vcvt_int64_cold(a, 0, 0); }
+PSV_INLINE uint32_t psv_vcvtr_u32_f64(uint32_t fpscr, double a) { (void)fpscr; return psv_vcvt_int64_cold(a, 0, 1); }
+#endif
+/* From 32-bit integers: rounded to nearest (exact to double). */
+PSV_INLINE float psv_vcvt_f32_s32(uint32_t x) { return (float)(int32_t)x; }
+PSV_INLINE float psv_vcvt_f32_u32(uint32_t x) { return (float)x; }
+PSV_INLINE double psv_vcvt_f64_s32(uint32_t x) { return (double)(int32_t)x; }
+PSV_INLINE double psv_vcvt_f64_u32(uint32_t x) { return (double)x; }
+
+/* Fixed point, `fraction` bits after the point (1-32), 16 or 32 bits. To fixed: the value scaled by 2^fraction is
+ * exact (or infinite, or below 1 in magnitude and truncated to 0 either way), then the conversion toward zero, then
+ * saturated to 16 bits and sign- or zero-extended. From fixed: the integer rounded to nearest, then scaled exactly
+ * (a nonzero result is at least 2^-32: never tiny), which is the VFP's single rounding. */
+PSV_INLINE uint32_t psv_vcvt_fixed_f32(uint32_t fpscr, float a, uint32_t bits, uint32_t fraction, int is_signed) {
+    const float scaled = a * psv_vpow2f((int)fraction);
+    if (is_signed) {
+        const int32_t v = (int32_t)psv_vcvt_s32_f32(fpscr, scaled);
+        return bits == 16 ? (uint32_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v) : (uint32_t)v;
+    }
+    const uint32_t v = psv_vcvt_u32_f32(fpscr, scaled);
+    return bits == 16 && v > 65535u ? 65535u : v;
+}
+PSV_INLINE uint32_t psv_vcvt_fixed_f64(uint32_t fpscr, double a, uint32_t bits, uint32_t fraction, int is_signed) {
+    const double scaled = a * psv_vpow2((int)fraction);
+    if (is_signed) {
+        const int32_t v = (int32_t)psv_vcvt_s32_f64(fpscr, scaled);
+        return bits == 16 ? (uint32_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v) : (uint32_t)v;
+    }
+    const uint32_t v = psv_vcvt_u32_f64(fpscr, scaled);
+    return bits == 16 && v > 65535u ? 65535u : v;
+}
+PSV_INLINE float psv_vcvt_f32_fixed(uint32_t fpscr, uint32_t x, uint32_t bits, uint32_t fraction, int is_signed) {
+    (void)fpscr;
+    const float v = bits == 16 ? (is_signed ? (float)(int16_t)x : (float)(uint16_t)x) : (is_signed ? (float)(int32_t)x : (float)x);
+    return v * psv_vpow2f(-(int)fraction);
+}
+PSV_INLINE double psv_vcvt_f64_fixed(uint32_t fpscr, uint32_t x, uint32_t bits, uint32_t fraction, int is_signed) {
+    (void)fpscr;
+    const double v = bits == 16 ? (is_signed ? (double)(int16_t)x : (double)(uint16_t)x) : (is_signed ? (double)(int32_t)x : (double)x);
+    return v * psv_vpow2(-(int)fraction);
+}
+
+/* VMSR FPSCR: settings this implementation does not support trap; the trap enables read as zero. psv_vmsr returns
+ * the new value for the function's locals; with native floating point the host's FPCR follows it. */
+PSV_INLINE uint32_t psv_vmsr(PsvContext* PSV_RESTRICT ctx, uint32_t value, uint32_t pc) {
     if (value & PSV_FPSCR_UNSUPPORTED) psv_trap(ctx, pc, PSV_TRAP_FPSCR);
-    ctx->fpscr = value & PSV_FPSCR_WRITABLE;
+    value &= PSV_FPSCR_WRITABLE;
+#ifdef PSV_NATIVE_FLOAT
+    psv_native_set_fpcr(value);
+#endif
+    return value;
+}
+PSV_INLINE void psv_write_fpscr(PsvContext* PSV_RESTRICT ctx, uint32_t value, uint32_t pc) {
+    ctx->fpscr = psv_vmsr(ctx, value, pc);
 }
 
 #include "psvrecore/recomp/guest_simd.h"

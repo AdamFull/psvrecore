@@ -588,3 +588,197 @@ back to back, Windows x64 release.
 - Persona 4 Dancing All Night, the fixed-time run (shots at 3-55 s), base then new: both reach the opening movie and
   are at the same scenes at 40 s and 55 s (a few frames apart, the 8 s shot identical), the same single gxm warning,
   no traps, 1658 / 1656 frames.
+
+## Floating-point registers in locals, typed operations
+
+Measured 2026-11-19 with the same compilers and options (the generated code's now with `-fno-math-errno`). The S and D
+registers and the FPSCR are typed locals of each function ([ARCHITECTURE.md](ARCHITECTURE.md), "VFP registers"); each
+operation is guest.h's typed one: on x64, and on arm64 by default, the host's operation with a check of its result and
+an exact fallback out of line; on arm64 with `PSVRECORE_GENERATED_CODE_NATIVE_FLOAT` the host's instruction alone
+(measured with `--flags-arm64=-DPSV_NATIVE_FLOAT --flags-arm64=-fdenormal-fp-math=dynamic`; the option is off by
+default and not yet verified on a device). "Before" is the generator at 75635f5 with its own flags. The corpus has a
+module more (`vfp_locals`, last in file order) and its data moved to 0x82050000, so the synthetic "before" is
+75635f5's corpusgen built on the new corpus, measured by 75635f5's script; WipEout's "before" is 75635f5's
+psvrecomp's tree. `docs/codegen_metrics_synthetic.json` now holds the x64 and default arm64 numbers of this change, the
+baseline for the next one.
+
+### Synthetic corpus
+
+| | Functions | Guest | x64 before | x64 after | | arm64 before | arm64 after | | arm64 native | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 175 | 2458 | 10.84 | 9.51 | -12.3% | 7.73 | 7.64 | -1.1% | 5.04 | -34.8% |
+| Module `syn_calls` | 31 | 377 | 5.30 | 5.34 | +0.7% | 4.25 | 4.25 | +0.1% | 4.25 | +0.1% |
+| Module `syn_control` | 16 | 134 | 7.01 | 7.01 | +0.0% | 5.27 | 5.27 | +0.0% | 5.27 | +0.0% |
+| Module `syn_flags` | 19 | 146 | 7.01 | 6.97 | -0.6% | 5.47 | 5.40 | -1.4% | 5.24 | -4.3% |
+| Module `syn_integer` | 18 | 605 | 4.38 | 4.38 | +0.0% | 2.75 | 2.75 | +0.0% | 2.75 | +0.0% |
+| Module `syn_integer_arm` | 6 | 151 | 5.36 | 5.34 | -0.3% | 3.38 | 3.38 | +0.0% | 3.38 | +0.0% |
+| Module `syn_neon` | 13 | 194 | 22.95 | 22.61 | -1.5% | 15.44 | 15.45 | +0.1% | 15.63 | +1.2% |
+| Module `syn_regs` | 44 | 291 | 8.49 | 8.49 | +0.0% | 7.16 | 7.14 | -0.2% | 7.17 | +0.1% |
+| Module `syn_vfp` | 12 | 264 | 21.40 | 14.18 | -33.7% | 14.50 | 12.87 | -11.2% | 2.58 | -82.2% |
+| Module `syn_vfp_locals` | 16 | 296 | 22.48 | 18.05 | -19.7% | 16.25 | 17.02 | +4.7% | 4.52 | -72.2% |
+| Class integer | 98 | 1074 | 5.02 | 5.02 | -0.0% | 3.77 | 3.77 | +0.0% | 3.77 | +0.0% |
+| Class vfp | 30 | 568 | 21.27 | 15.85 | -25.5% | 14.94 | 14.74 | -1.4% | 3.62 | -75.8% |
+| Class neon | 21 | 551 | 12.43 | 12.07 | -2.8% | 8.29 | 8.12 | -2.0% | 7.96 | -3.9% |
+| Class call-heavy | 26 | 265 | 8.77 | 8.76 | -0.1% | 7.17 | 7.17 | -0.1% | 7.17 | -0.1% |
+
+Out-of-line helpers: 1590 -> 3104 instructions (x64), 1286 -> 2322 (arm64), 849 (arm64 native): the typed
+operations' exact fallbacks. A static count weighs the fallbacks and the flush-to-zero checks like the fast path: each
+operation's check is inline in both modes (FZ clear: is the result a NaN; FZ set: also an operand or the result
+denormal or at the smallest normal, one unsigned minimum of three keys), and clang threads the FZ test through a
+function, so the code holds two copies of each run of operations, one per mode. Without the FZ checks inline (an
+earlier version: FZ handled in the out-of-line helper) the static numbers were lower (on the corpus of then, class vfp
+x64 -44.8%, arm64 -35.7%), but every operation in FZ mode became a call, and the float functions of the timing run
+took up to 2.3 times as long. VFP functions (x64 before / after, arm64 before / after / native, per guest instruction): `dot_f64` 35.4 ->
+16.5, 19.8 -> 14.2 / 3.6; `newton_f64` 34.7 -> 15.1, 23.1 -> 12.2 / 2.2; `mat2_f64` 39.1 -> 17.3, 25.1 -> 21.7 / 2.4;
+`saves_d8` 35.8 -> 10.3, 23.5 -> 9.8 / 3.5; `partial_d` 60.8 -> 28.3, 37.5 -> 23.3 / 4.0; `clamp_f32` 5.8 -> 4.9,
+4.2 -> 3.5 / 2.4; `cmp_loop` 13.4 -> 9.2, 4.7 -> 4.3 / 3.5. Single precision grows in static size where its fast
+path was already inline (`dot3_f32` 14.0 -> 14.7, 11.4 -> 14.8 / 2.4; `lerp_f32`, `div_abs_f32`, `arith_all` on
+arm64 89.5 from 56.9): the duplicated FZ copy.
+
+Per guest operation (`build/t5/ops`: a module of functions that each repeat one operation 8 times in a dependent
+chain, less an empty function; the compare rows less the same branch on an integer compare). First the static count
+(every path), then the fall-through path the compiler laid out as the likely one (FZ clear, no NaN: `hot_path.py`, from
+the entry with every conditional branch not taken; it includes each function's frame over 8 operations, about 2.5
+instructions per operation on x64):
+
+| Guest operation | x64 before | x64 after | arm64 before | arm64 after | arm64 native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vadd.f32 | 43.8 | 44.6 | 32.5 | 37.1 | 1.1 |
+| vmul.f32 | 43.8 | 44.6 | 32.5 | 37.1 | 1.1 |
+| vdiv.f32 | 43.8 | 44.6 | 32.5 | 37.1 | 1.1 |
+| vsqrt.f32 | 49.9 | 33.0 | 32.6 | 25.1 | 1.1 |
+| vmla.f32 | 77.2 | 87.4 | 54.6 | 77.0 | 2.2 |
+| vadd.f64 | 93.1 | 44.2 | 69.9 | 37.1 | 1.1 |
+| vmul.f64 | 110.8 | 44.2 | 82.0 | 37.1 | 1.1 |
+| vdiv.f64 | 123.0 | 44.2 | 91.0 | 37.1 | 1.1 |
+| vsqrt.f64 | 30.1 | 33.5 | 20.6 | 25.1 | 1.1 |
+| vmla.f64 | 221.0 | 86.6 | 151.6 | 77.0 | 2.2 |
+| vneg.f32 (with a vadd.f32, less the vadd) | 4.0 | 1.6 | 1.0 | 3.4 | 1.6 |
+| vcvt.s32.f32 + vcvt.f32.s32 | 30.5 | 17.8 | 22.2 | 2.5 | 2.5 |
+| vcvtr.s32.f32 + vcvt.f32.s32 | 30.5 | 17.8 | 22.2 | 2.5 | 2.5 |
+| vcvt.s32.f64 + vcvt.f64.s32 | 33.2 | 16.0 | 21.5 | 2.5 | 2.5 |
+| vcvt.f64.f32 + vcvt.f32.f64 | 73.8 | 62.5 | 55.0 | 54.2 | 2.5 |
+| vcmp.f32 + vmrs + b (less an integer cmp + b) | 33.6 | 14.1 | 27.2 | 20.1 | 5.1 |
+| vcmpe.f64 + vmrs + b (less an integer cmp + b) | 47.6 | 17.4 | 32.5 | 19.6 | 4.8 |
+
+Fall-through path:
+
+| Guest operation | x64 before | x64 after | arm64 before | arm64 after | arm64 native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vadd.f32 | 30.5 | 6.8 | 21.0 | 4.8 | 1.4 |
+| vmul.f32 | 30.5 | 6.8 | 21.0 | 4.8 | 1.4 |
+| vdiv.f32 | 30.5 | 6.8 | 21.0 | 4.8 | 1.4 |
+| vsqrt.f32 | 38.4 | 6.0 | 13.9 | 4.5 | 1.4 |
+| vmla.f32 | 57.6 | 12.1 | 41.2 | 8.4 | 2.5 |
+| vadd.f64 | 51.9 | 7.0 | 35.0 | 4.8 | 1.4 |
+| vmul.f64 | 62.8 | 7.0 | 35.0 | 4.8 | 1.4 |
+| vdiv.f64 | 79.9 | 7.0 | 44.6 | 4.8 | 1.4 |
+| vsqrt.f64 | 23.6 | 6.2 | 13.9 | 4.5 | 1.4 |
+| vmla.f64 | 77.4 | 12.1 | 69.4 | 8.4 | 2.5 |
+| vneg.f32 (with a vadd.f32, less the vadd) | 3.2 | 3.2 | 3.0 | 2.5 | 1.9 |
+| vcvt.s32.f32 + vcvt.f32.s32 | 26.8 | 8.5 | 21.2 | 2.5 | 2.5 |
+| vcvtr.s32.f32 + vcvt.f32.s32 | 26.8 | 8.5 | 21.2 | 2.5 | 2.5 |
+| vcvt.s32.f64 + vcvt.f64.s32 | 20.8 | 8.8 | 20.8 | 3.0 | 3.0 |
+| vcvt.f64.f32 + vcvt.f32.f64 | 47.5 | 10.5 | 37.5 | 8.8 | 3.0 |
+| vcmp.f32 + vmrs + b (less an integer cmp + b) | 64.4 | 9.1 | 47.0 | 7.9 | 1.0 |
+| vcmpe.f64 + vmrs + b (less an integer cmp + b) | 28.4 | 13.0 | 29.4 | 11.6 | 1.4 |
+
+On x64 the fast path of an addition is `movaps; addss; ucomiss; jp` (the copy is SSE's two-operand form), on arm64
+`fadd; fcmp; b.vs`, native `fadd` alone; before, each operation loaded its operands from the context, checked both
+exponents and the result's, and stored the result. Conversions to integers are one SSE conversion and a compare with
+0x80000000 on x64, one FCVTZS/FCVTNS on arm64 (its saturation and NaN-to-0 are VFP's) in both arm64 builds. vcmp +
+vmrs + branch is one ucomiss (fcmp) and branch; the remaining instructions in that row compute the FPSCR's NZCV, which
+stays in the context at the function's exit (KNOWN_ISSUES.md).
+
+What the code does in time (x64 only; `build/t4/bench2.py`, the corpus' functions run by the differential test's
+harness, both programs alternately, 6 rounds each, pinned to one logical CPU at high priority, twice on two CPUs). The
+machine was running other sessions' work (another program busy on two cores, four processes spinning a core each);
+integer functions, whose code did not change, moved by -2.5% to +3.8% between the programs, which is the noise here.
+Geometric means:
+
+| | Functions | CPU 2: before | after | | CPU 8: before | after | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| All | 126 | 42.93 ns | 41.97 ns | -2.2% | 42.96 ns | 39.72 ns | -7.5% |
+| Class integer | 55 | 26.45 | 27.45 | +3.8% | 26.44 | 25.84 | -2.3% |
+| Class call-heavy | 25 | 26.64 | 27.51 | +3.3% | 26.57 | 25.90 | -2.5% |
+| Class vfp | 26 | 98.90 | 79.93 | -19.2% | 99.33 | 76.33 | -23.1% |
+| Class neon | 20 | 99.76 | 99.03 | -0.7% | 100.07 | 94.55 | -5.5% |
+
+The float functions that gain most (both runs, after / before): `partial_d` 0.42-0.46, `cond_all` 0.43-0.47,
+`newton_f64` 0.48-0.50, `cvt_all` 0.47-0.51, `clamp_f32` 0.55-0.57, `convert_f32` 0.57, `vmsr_modes` 0.55-0.58,
+`neon_fixed` (NEON with VFP conversions) 0.47-0.48. Three are slower: `dot3_f32` 1.86-1.95, `length_f32` 1.50-1.56,
+`arith_all` 1.47-1.59. Their start states hold NaNs and infinities (the corpus' random memory words and "any"
+registers include special values), their sums become NaN early, and from then on every operation calls its
+out-of-line exact helper, which in a loop also costs the spills of the live float locals; 75635f5 handled NaN
+operands with the same kind of call but had nothing in registers to spill. The FZ checks were out of line in an
+earlier version of this change; with random FPSCRs half the start states have FZ set, and `mixed_neon`, `dot3_f32`,
+`arith_all`, `length_f32` and `lerp_f32` took 1.3-2.3 times as long: hence the inline checks.
+
+### WipEout 2048
+
+Regenerated with this generator into the game worktree's `generated/code` (the game build's code); "before" is
+75635f5's psvrecomp's tree (`build/wo-game-base`).
+
+| | Functions | Guest | x64 before | x64 after | | arm64 before | arm64 after | | arm64 native | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 16658 | 1479360 | 4.02 | 4.00 | -0.4% | 3.48 | 3.53 | +1.5% | 3.11 | -10.6% |
+| Module `wo_eboot` | 14792 | 1350786 | 3.99 | 4.03 | +1.0% | 3.47 | 3.56 | +2.5% | 3.15 | -9.4% |
+| Module `wo_libc` | 1201 | 65672 | 5.58 | 4.44 | -20.5% | 4.47 | 3.83 | -14.3% | 2.89 | -35.2% |
+| Module `wo_libfios2` | 520 | 39042 | 3.05 | 3.04 | -0.1% | 2.62 | 2.62 | -0.1% | 2.62 | -0.2% |
+| Module `wo_libult` | 145 | 23860 | 2.80 | 2.80 | +0.0% | 2.64 | 2.64 | +0.0% | 2.64 | +0.0% |
+| Class integer | 10290 | 757832 | 2.82 | 2.83 | +0.2% | 2.50 | 2.51 | +0.3% | 2.48 | -1.0% |
+| Class vfp | 1444 | 224442 | 5.86 | 5.61 | -4.2% | 5.01 | 5.21 | +4.1% | 3.00 | -40.0% |
+| Class neon | 663 | 122161 | 12.33 | 12.56 | +1.9% | 9.74 | 9.93 | +2.0% | 9.16 | -5.9% |
+| Class call-heavy | 4261 | 374925 | 2.62 | 2.63 | +0.0% | 2.50 | 2.51 | +0.1% | 2.49 | -0.8% |
+| `f_8311A9C8` (integer) | 1 | 383 | 3.52 | 3.52 | +0.0% | 2.42 | 2.42 | +0.0% | 2.42 | +0.0% |
+| `f_8128DB48` (neon) | 1 | 443 | 9.62 | 9.70 | +0.9% | 8.23 | 8.45 | +2.7% | 7.32 | -11.1% |
+| `f_813BAC40` (vfp) | 1 | 408 | 5.16 | 5.41 | +4.8% | 3.35 | 4.16 | +24.1% | 3.73 | +11.3% |
+| `f_812FC59A` (neon) | 1 | 1125 | 9.46 | 9.66 | +2.2% | 8.36 | 8.71 | +4.2% | 7.22 | -13.7% |
+| `f_812FC39E` (neon) | 1 | 117 | 43.20 | 43.48 | +0.6% | 32.67 | 32.40 | -0.8% | 33.29 | +1.9% |
+| `f_81276E14` (neon) | 1 | 112 | 20.08 | 20.48 | +2.0% | 14.96 | 14.80 | -1.1% | 14.71 | -1.7% |
+| `f_8127A712` (neon) | 1 | 123 | 16.52 | 17.41 | +5.4% | 12.16 | 12.41 | +2.1% | 10.98 | -9.8% |
+| `f_8118C300` (neon) | 1 | 716 | 14.77 | 14.82 | +0.4% | 12.63 | 12.09 | -4.3% | 11.45 | -9.3% |
+| `f_813C32DC` (integer) | 1 | 31 | 4.84 | 4.84 | +0.0% | 3.65 | 3.65 | +0.0% | 3.65 | +0.0% |
+| `f_812A7EDC` (neon) | 1 | 475 | 6.53 | 6.91 | +5.8% | 5.87 | 6.21 | +5.9% | 3.92 | -33.3% |
+
+Out-of-line helpers: 55500 -> 68062 instructions (x64), 44903 -> 53687 (arm64), 35843 (arm64 native). In static
+counts the whole program hardly moves on x64 (-0.4%) and grows on arm64 (+1.5%); libc's float code shrinks (-20.5%,
+-14.3%: its doubles had no fast path before), the executable's single-precision code grows on arm64 (class vfp +4.1%),
+where 75635f5's binary32 operations were already inline with a short check and each operation now has its FZ copy
+(above). Native floating point takes the VFP class to 3.00 instructions per guest instruction (-40%), the whole
+program -10.6%. The NEON class grows by 2% (the floating-point locals written to the context before an Advanced SIMD
+instruction that reads them and read back after it: 9174 such reloads in the executable). Of the hot ten, the NEON
+ones grow by up to 6% (`f_812A7EDC` +5.8% on x64, +5.9% on arm64, -33% native), and `f_813BAC40` (VFP) grows by 4.8%
+(x64) and 24% (arm64), 11% even native (not looked into: register pressure of the locals across its many helper calls
+is the likely cause).
+
+What psvrecomp reports (`vfp` lines):
+
+| Module | Functions with VFP locals | D registers as two floats / as a double | Read at entry | Store places | Reloads (after Advanced SIMD) | Calls keeping a live local | Trap stores | Fused vcmp + vmrs | Fused conditions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `wo_eboot` | 2482 | 8952 / 1995 | 11251 | 14058 | 15156 (9174) | 6160 | 76 | 3812 | 3692 |
+| `wo_libc` | 276 | 200 / 703 | 1042 | 1218 | 915 (411) | 561 | 1 | 595 | 595 |
+| `wo_libfios2` | 50 | 1 / 57 | 1 | 52 | 48 (0) | 2 | 0 | 0 | 0 |
+| `wo_libult` | 0 | | | | | | | | |
+
+Generated source: 243 MB before, 246 MB after. Context traffic in the generated C: `ctx->vfp` writes 75196 -> 61110,
+FPSCR references 38053 -> 17103. `psvrecomp --vfp-in-context` writes 75635f5's code byte for byte (WipEout's four
+modules compared).
+
+### Games
+
+Hidden runs (`--hidden`), each with its own data, settings and shots, the build of 75635f5's generator and this one
+back to back, Windows x64 release (the runtime and generated code of each built from its own tree).
+
+- WipEout 2048, the race script, three pairs: base then new, new then base (both with an earlier version of the typed
+  operations), and new then base with the final code. At the 199 s shot all six runs are on lap 1/3 in 8th place.
+  Race time and shield: base 1:47.71 / 89%, 1:46.80 / 90%, 1:47.41 / 89%; new 1:46.81 / 90%, 1:47.66 / 89%,
+  1:47.65 / 89% (frames drawn: base 11913, 11548, 11754; new 11677, 11887, 11892). The script's inputs come at fixed
+  wall-clock times, so a run that drew more or fewer frames meets them at another point of the track: both builds
+  give both outcomes, and the time follows the frames. The same four warnings in every run (system module 0x002d
+  twice, one untranslated GXP program), no traps. The machine was running other sessions' work (another program
+  busy on two cores, four processes spinning a core each), so these runs do not show a speed difference.
+- Persona 4 Dancing All Night, the fixed-time run (shots at 3-55 s), two pairs (base then new with the earlier
+  version, new then base with the final code): all four reach the opening movie and are at the same scenes at 40 s
+  and 55 s, a few frames apart (the 8 s shot identical in both pairs), the same single gxm warning (the mask bit of
+  DF32M_S8 surfaces), no traps; frames 1660 / 1657 and 1661 (new) / 1658 (base).

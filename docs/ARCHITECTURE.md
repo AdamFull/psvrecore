@@ -119,12 +119,17 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     ThinLTO and debug information are in [BUILDING.md](BUILDING.md#options).
   - The core registers live in locals of each function and are in the context only where code outside the
     function may read them (below, "Registers"). The condition flags live in a local of each function and are
-    computed only where an instruction reads them (below).
+    computed only where an instruction reads them (below). The floating-point registers and the FPSCR live in typed
+    locals (`float`, `double`) and are in the context only where code outside the function may read them (below,
+    "VFP registers").
   - IT blocks become per-instruction conditions.
   - Loads from read-only data are folded into constants, except words the loader patches.
   - Imports go through a per-module table the loader fills, and so do imported variables' addresses.
-  - Floating point is compiled without contraction (`-ffp-contract=off`, no fast math). Flush-to-zero, default NaN
-    and the ARM NaN rules are implemented explicitly, binary32 by way of binary64 with exact underflow detection.
+  - Floating point is compiled without contraction (`-ffp-contract=off`, no fast math, no errno). Each VFP operation
+    is the host's, checked where its result could differ from the VFP's (a NaN; with flush-to-zero, denormal operands
+    and results at the smallest normal), the rest by exact helpers that implement flush-to-zero, default NaN and the ARM
+    NaN rules explicitly, binary32 by way of binary64 with exact underflow detection; on arm64 with native floating
+    point the host's instruction alone (below, "VFP registers").
   - Advanced SIMD always uses its standard FP mode.
   - Exclusive loads and stores become a host compare-and-swap.
 - **Control-flow graph** (`analysis/cfg.hpp`). Each function's instructions as the generator translates their
@@ -278,6 +283,89 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     byte what the generator gave before: checked on WipEout 2048's four modules); `--no-callee-saved` keeps the
     locals and reads every live register back after every call (stage A alone), for chasing a suspected bug in a
     game.
+- **VFP registers** (`analysis/vfp.hpp`). The floating-point registers and the FPSCR are typed locals of each generated
+  function: d0-d15 as two `float` locals `s<2n>`, `s<2n+1>` or as one `double` `d<n>` (by how the function's
+  instructions access them: a word at a time at least as often as whole, two floats), d16-d31 as doubles, the FPSCR as
+  `fpscr` (bits 27-0) and `fpnzcv` (bits 31-28, what vcmp writes). A unit is one such local; an access to part of a
+  unit (an S register of a double-held register: `psv_vlo32`, `psv_vsetlo64`...; a whole D register of float-held
+  ones: `psv_vpack64`; a byte or halfword lane) reads the whole unit. Moves, loads and stores copy bits: a float or
+  double copy keeps every bit pattern, signalling NaNs and payloads included (no host operation that canonicalises
+  NaNs is involved; `tests/vfp_typed_tests.cpp` checks the moves, the corpus' `nan_moves` the whole path).
+  - What each instruction's translation reads and writes is recorded by the first translation (as for the core
+    registers), in words of the register file. A forward pass gives the units that may be dirty, a backward pass the
+    live ones: read by an instruction, or written to the context at a call, an Advanced SIMD instruction, an exit or a
+    trap, before being written. Every unit a store writes from its local is live there.
+  - **The contract.** Where control goes and what the context holds there:
+    - Function entry (every way in): the context holds every register and the FPSCR. The function reads into its
+      locals the units it reads before writing them; the others start at 0 and are never read before written.
+    - A direct call to a function G of the module: before it, the context holds every unit G may read or write (each
+      dirty one of them written); after it, the live units G may write are read back, the others stay in the caller's
+      locals. What G may read and write is its summary: the words and FPSCR parts its own instructions touch and its
+      callees' (direct calls and tail calls), the least fixed point over the module; everything when G calls an
+      import, calls or jumps through the runtime, makes svc, ends in an import's tail call, or when its returns are
+      not shown to go back to the LR it was entered with (`FunctionRegisters::returns_to_lr`: a return to another
+      address is a jump through the runtime to code that may do anything). No calling convention is assumed: a callee
+      that saves d8 with vpush and restores it with vpop still writes d8 (its caller reads d8 back); one that touches
+      no floating-point register (most integer helpers) leaves every local alone.
+    - Imports, indirect calls (`psv_call`), svc: before them the context holds every unit; after them every live unit
+      is read back.
+    - Advanced SIMD instructions (their guest_simd.h helpers work on the context's registers): before each, the dirty
+      units of the D registers it names (lists: more than it names, never fewer) and the FPSCR's rest (QC, AHP) are
+      written; after it, the live ones are read back. Their D registers stay in the context otherwise (task 6 makes
+      them vector locals).
+    - A return, a jump through the runtime, a tail call, an import's tail call, running into another function: every
+      dirty unit is written first. The context is exact when a function returns; the differential tests compare
+      d0-d31 and the FPSCR at every exit.
+    - A trap: the dirty units are written first (on the trapping path), as the core registers are.
+    - Host code that reads the context while generated code runs without calling it (the memory fault report, the
+      write watch): it prints the core registers; the floating-point registers there are as of the function's last
+      call, exit or trap.
+    - System libraries: the HLE adapter reads float arguments from s0-s15/d0-d7 and writes results to s0/d0 in an
+      exact context (an import call), after which every live unit is read back. Fibers save and restore the whole
+      context, FPSCR included, inside their imports.
+    - vmsr: the new FPSCR in both locals (`psv_vmsr`; a setting not implemented traps, with the dirty units written
+      first on that path); vmrs: from the locals.
+  - **Compares.** A vcmp/vcmpe and the vmrs APSR_nzcv after it in the same block (with no other compare, vmsr, vmrs
+    or call between) keep the compared operands in `fc32a/b` (`fc64a/b`), flushed in flush-to-zero mode
+    (`psv_vflush*`); the vmsr computes only the flags something reads after the conditions that follow it, and those
+    conditions (up to an instruction that writes or otherwise reads the flags, a call or the block's end) compare the
+    operands instead: each condition code is one ordered comparison or its negation (`gt`: `a > b`, `ls`: `a <= b`,
+    `lt`: `!(a >= b)`, `vs`: unordered...). `vcmp; vmrs; bgt` is one host compare and branch. The FPSCR's NZCV is still
+    computed (`psv_vnzcv*`) where something may read it (a vmrs to a core register, a call, an exit).
+  - **Exactness.** The operations are guest.h's typed ones (`psv_vadd32`, `psv_vcvt_s32_f64`...). On x64 (and arm64
+    by default) each is the host's operation and a check: with FPSCR.FZ clear the host's IEEE result in round to
+    nearest is the VFP's unless it is a NaN (the VFP's operand order, signalling NaNs first, its positive default NaN,
+    DN), so a NaN result takes the exact helper; with FZ set an inline check also sends denormal operands and results
+    at or below the smallest normal (tininess before rounding) there (one unsigned minimum over each value's
+    magnitude bits less one, times two; an operand at the smallest normal goes there too, needlessly but exactly).
+    Only the helpers are out of line; both checks are inline because a call in a loop costs the spills of every live
+    floating-point local, and clang threads the FZ test through a function (two copies of a run of operations, one
+    per mode). Conversions to integers use x86's conversion and take the exact helper for its out-of-range answer
+    (0x80000000), conversions from integers and fixed point are exact by construction (`guest.h` says why),
+    float/double conversions check like the arithmetic.
+    Multiply-accumulates stay two rounded operations (`-ffp-contract=off`), negation and absolute value are sign-bit
+    operations. Rounding is always to nearest (a vmsr selecting another mode traps), and the cumulative exception
+    flags are not computed, in the generated code and in the interpreter alike.
+  - **Native floating point (arm64, `PSVRECORE_GENERATED_CODE_NATIVE_FLOAT`, off by default, not yet verified on a
+    device).** `PSV_NATIVE_FLOAT`: each operation is the host's instruction (volatile inline assembly: `fadd`, `fmul`,
+    `fdiv`, `fsqrt`, `fnmul`, `fcvt`, `fcmp` + `mrs nzcv`; conversions to integers `fcvt[zn][su]`, which saturate and
+    give 0 for a NaN as VFP does), relying on the host's FPCR having the guest FPSCR's FZ and DN: AArch64's
+    flush-to-zero (inputs and results, tininess before rounding), default NaN (positive) and NaN propagation (first
+    signalling, then quiet, the first operand first) are ARMv7 VFP's. The assembly keeps the operand order (the
+    compiler would swap an addition's operands, which picks the other NaN), keeps constants from being folded under the
+    default environment, and keeps operations from moving across a write of the FPCR (a vmsr, a call). Comparisons are
+    C, and the generated code is built with `-fdenormal-fp-math=dynamic` (the compiler assumes nothing about how
+    denormals compare). The runtime keeps the mirror (`runtime/float_env.hpp`): set at a guest thread's start, by
+    `call_guest` (and back to what its caller had after), after a sceFiber switch (the resumed fiber's FPSCR), carried
+    by each guest fiber of the fiber backend across its host threads; vmsr updates it. HLE code runs in it, except the
+    imports of libraries registered `host_float` (`hle::Library`: JSON, NGS, SAS, the audio, video, JPEG and codec
+    engines, AvPlayer, PVF fonts, motion, system gestures, voice, SceLibKernel (printf's `%f`), SceAudio, SceGxm,
+    SceDisplay), which run in the host's default environment (`HostFloatScope`, a trampoline per bound function).
+    `tests/device` has the tests that check it on a device ([BUILDING.md](BUILDING.md#device-tests)).
+  - `psvrecomp --vfp-in-context` generates the code from before, every floating-point register and the FPSCR in the
+    context (byte for byte what the generator gave before: checked on WipEout 2048's four modules);
+    `--vfp-calls-conservative` keeps the locals and takes every call to read and write everything (no summaries), for
+    chasing a suspected bug in a game.
 - **Reference interpreter** (`interp`, tests only). It is written from the ARM ARM pseudocode, independently of the
   generator, and shares only the decoder and the context layout. It has its own integer soft float. Two kinds of
   test compare generated code against it:

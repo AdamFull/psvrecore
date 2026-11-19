@@ -735,7 +735,7 @@ void register_avplayer() {
         nx::scoped_lock<nx::mutex> held(ps.lock);
         ps.by_handle.clear();
     }
-    register_library({"SceAvPlayer", kSceAvPlayer, kFunctions});
+    register_library({"SceAvPlayer", kSceAvPlayer, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

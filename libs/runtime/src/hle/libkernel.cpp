@@ -436,7 +436,7 @@ const Variable kLibcParamVariables[] = {
 
 void register_libkernel() {
     register_library({"SceLibcParam", kSceLibcParam, {}, kLibcParamVariables});
-    register_library({"SceLibKernel", kSceLibKernel, kLibKernel, kLibKernelVariables});
+    register_library({"SceLibKernel", kSceLibKernel, kLibKernel, kLibKernelVariables, true});
     register_library({"SceLibRng", kSceLibRng, kLibRng});
 }
 

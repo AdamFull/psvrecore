@@ -13,6 +13,7 @@
 #include "psvrecore/analysis/flags.hpp"
 #include "psvrecore/analysis/program.hpp"
 #include "psvrecore/analysis/registers.hpp"
+#include "psvrecore/analysis/vfp.hpp"
 #include "core/foundation/containers/map.h"
 #include "core/foundation/core/foundation.h"
 #include "core/foundation/strings/utf8_string.h"
@@ -42,6 +43,11 @@ struct Options {
     // The stack pointer checked after calls to code outside the module's view where callers rely on it (psvrecomp
     // --no-sp-check: assumed, not checked; analysis::RegisterOptions::check_sp).
     bool check_sp = true;
+    // The floating-point registers and the FPSCR (analysis/vfp.hpp): in the context everywhere, translated as before
+    // they were locals (psvrecomp --vfp-in-context); every call taken to read and write all of them, no callee's
+    // summary used (psvrecomp --vfp-calls-conservative).
+    bool vfp_in_context = false;
+    bool vfp_calls_conservative = false;
 };
 
 struct GeneratedFile {
@@ -90,6 +96,23 @@ struct Stats {
     // analysis uses the translation's; a mismatch is a generator or model bug to look at), and the first few.
     usize register_effect_mismatches = 0;
     nx::vector<nx::string> register_notes;
+    // Floating-point registers in locals (analysis/vfp.hpp): functions with such locals; locals read from the context
+    // at entry; places (calls, Advanced SIMD instructions, exits) with locals written to the context before them, and
+    // with locals read back after them (calls, Advanced SIMD); traps that write them; calls after which a live local
+    // stays (the callee does not write it); Advanced SIMD instructions with locals written or read around them; D
+    // registers held as two floats, and as a double (counted per function); vcmp + vmrs APSR_nzcv pairs computed as one
+    // compare, and the conditions after them that compare its operands.
+    usize vfp_functions = 0;
+    usize vfp_entry_loads = 0;
+    usize vfp_stores = 0;
+    usize vfp_call_loads = 0;
+    usize vfp_trap_stores = 0;
+    usize vfp_calls_keeping = 0;
+    usize vfp_simd_syncs = 0;
+    usize vfp_s_held = 0;
+    usize vfp_d_held = 0;
+    usize vfp_fused_compares = 0;
+    usize vfp_fused_conditions = 0;
     // Instructions translated to a trap, by mnemonic (undefined, unimplemented, privileged...).
     nx::map<nx::string, usize> traps;
 };

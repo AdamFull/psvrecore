@@ -1,6 +1,6 @@
 {
  "tree": "synthetic corpus",
- "scope": "all 8 files",
+ "scope": "all 9 files",
  "targets": {
   "x64": {
    "compiler": "C:\\Program Files\\LLVM\\bin\\clang-cl.exe",
@@ -17,6 +17,7 @@
     "/clang:-fno-strict-aliasing",
     "/clang:-ffp-contract=off",
     "/clang:-fno-fast-math",
+    "/clang:-fno-math-errno",
     "/clang:-w",
     "/GS-",
     "/Ob2",
@@ -46,6 +47,7 @@
     "-fno-strict-aliasing",
     "-ffp-contract=off",
     "-fno-fast-math",
+    "-fno-math-errno",
     "-w",
     "-funwind-tables",
     "-fno-stack-protector",
@@ -58,29 +60,29 @@
   }
  },
  "overall": {
-  "functions": 158,
-  "guest": 2156,
+  "functions": 175,
+  "guest": 2458,
   "x64": {
-   "host_instructions": 19952,
-   "host_bytes": 77920,
-   "per_guest": 9.254,
-   "bytes_per_guest": 36.141
+   "host_instructions": 23368,
+   "host_bytes": 93127,
+   "per_guest": 9.507,
+   "bytes_per_guest": 37.887
   },
   "arm64": {
-   "host_instructions": 14147,
-   "host_bytes": 56588,
-   "per_guest": 6.562,
-   "bytes_per_guest": 26.247
+   "host_instructions": 18787,
+   "host_bytes": 75148,
+   "per_guest": 7.643,
+   "bytes_per_guest": 30.573
   }
  },
  "helpers": {
   "x64": {
-   "host_instructions": 1203,
-   "host_bytes": 4666
+   "host_instructions": 3104,
+   "host_bytes": 11992
   },
   "arm64": {
-   "host_instructions": 976,
-   "host_bytes": 3904
+   "host_instructions": 2322,
+   "host_bytes": 9288
   }
  },
  "modules": {
@@ -88,16 +90,16 @@
    "functions": 31,
    "guest": 377,
    "x64": {
-    "host_instructions": 1999,
-    "host_bytes": 7255,
-    "per_guest": 5.302,
-    "bytes_per_guest": 19.244
+    "host_instructions": 2012,
+    "host_bytes": 7328,
+    "per_guest": 5.337,
+    "bytes_per_guest": 19.438
    },
    "arm64": {
-    "host_instructions": 1602,
-    "host_bytes": 6408,
-    "per_guest": 4.249,
-    "bytes_per_guest": 16.997
+    "host_instructions": 1603,
+    "host_bytes": 6412,
+    "per_guest": 4.252,
+    "bytes_per_guest": 17.008
    }
   },
   "syn_control": {
@@ -120,16 +122,16 @@
    "functions": 19,
    "guest": 146,
    "x64": {
-    "host_instructions": 1024,
-    "host_bytes": 3303,
-    "per_guest": 7.014,
-    "bytes_per_guest": 22.623
+    "host_instructions": 1018,
+    "host_bytes": 3252,
+    "per_guest": 6.973,
+    "bytes_per_guest": 22.274
    },
    "arm64": {
-    "host_instructions": 799,
-    "host_bytes": 3196,
-    "per_guest": 5.473,
-    "bytes_per_guest": 21.89
+    "host_instructions": 788,
+    "host_bytes": 3152,
+    "per_guest": 5.397,
+    "bytes_per_guest": 21.589
    }
   },
   "syn_integer": {
@@ -152,9 +154,9 @@
    "functions": 6,
    "guest": 151,
    "x64": {
-    "host_instructions": 809,
+    "host_instructions": 807,
     "host_bytes": 2677,
-    "per_guest": 5.358,
+    "per_guest": 5.344,
     "bytes_per_guest": 17.728
    },
    "arm64": {
@@ -168,114 +170,130 @@
    "functions": 13,
    "guest": 194,
    "x64": {
-    "host_instructions": 4453,
-    "host_bytes": 19569,
-    "per_guest": 22.954,
-    "bytes_per_guest": 100.871
+    "host_instructions": 4387,
+    "host_bytes": 19240,
+    "per_guest": 22.613,
+    "bytes_per_guest": 99.175
    },
    "arm64": {
-    "host_instructions": 2995,
-    "host_bytes": 11980,
-    "per_guest": 15.438,
-    "bytes_per_guest": 61.753
+    "host_instructions": 2998,
+    "host_bytes": 11992,
+    "per_guest": 15.454,
+    "bytes_per_guest": 61.814
    }
   },
   "syn_regs": {
-   "functions": 43,
-   "guest": 285,
+   "functions": 44,
+   "guest": 291,
    "x64": {
-    "host_instructions": 2430,
-    "host_bytes": 8005,
-    "per_guest": 8.526,
-    "bytes_per_guest": 28.088
+    "host_instructions": 2471,
+    "host_bytes": 8143,
+    "per_guest": 8.491,
+    "bytes_per_guest": 27.983
    },
    "arm64": {
-    "host_instructions": 2042,
-    "host_bytes": 8168,
-    "per_guest": 7.165,
-    "bytes_per_guest": 28.66
+    "host_instructions": 2079,
+    "host_bytes": 8316,
+    "per_guest": 7.144,
+    "bytes_per_guest": 28.577
    }
   },
   "syn_vfp": {
    "functions": 12,
    "guest": 264,
    "x64": {
-    "host_instructions": 5650,
-    "host_bytes": 24631,
-    "per_guest": 21.402,
-    "bytes_per_guest": 93.299
+    "host_instructions": 3744,
+    "host_bytes": 16049,
+    "per_guest": 14.182,
+    "bytes_per_guest": 60.792
    },
    "arm64": {
-    "host_instructions": 3827,
-    "host_bytes": 15308,
-    "per_guest": 14.496,
-    "bytes_per_guest": 57.985
+    "host_instructions": 3398,
+    "host_bytes": 13592,
+    "per_guest": 12.871,
+    "bytes_per_guest": 51.485
+   }
+  },
+  "syn_vfp_locals": {
+   "functions": 16,
+   "guest": 296,
+   "x64": {
+    "host_instructions": 5342,
+    "host_bytes": 23958,
+    "per_guest": 18.047,
+    "bytes_per_guest": 80.939
+   },
+   "arm64": {
+    "host_instructions": 5039,
+    "host_bytes": 20156,
+    "per_guest": 17.024,
+    "bytes_per_guest": 68.095
    }
   }
  },
  "classes": {
   "integer": {
-   "functions": 97,
-   "guest": 1071,
+   "functions": 98,
+   "guest": 1074,
    "x64": {
-    "host_instructions": 5382,
-    "host_bytes": 17662,
-    "per_guest": 5.025,
-    "bytes_per_guest": 16.491
+    "host_instructions": 5393,
+    "host_bytes": 17705,
+    "per_guest": 5.021,
+    "bytes_per_guest": 16.485
    },
    "arm64": {
-    "host_instructions": 4032,
-    "host_bytes": 16128,
+    "host_instructions": 4044,
+    "host_bytes": 16176,
     "per_guest": 3.765,
-    "bytes_per_guest": 15.059
+    "bytes_per_guest": 15.061
    }
   },
   "vfp": {
-   "functions": 15,
-   "guest": 287,
+   "functions": 30,
+   "guest": 568,
    "x64": {
-    "host_instructions": 5837,
-    "host_bytes": 25322,
-    "per_guest": 20.338,
-    "bytes_per_guest": 88.23
+    "host_instructions": 9003,
+    "host_bytes": 39514,
+    "per_guest": 15.85,
+    "bytes_per_guest": 69.567
    },
    "arm64": {
-    "host_instructions": 3972,
-    "host_bytes": 15888,
-    "per_guest": 13.84,
-    "bytes_per_guest": 55.359
+    "host_instructions": 8371,
+    "host_bytes": 33484,
+    "per_guest": 14.738,
+    "bytes_per_guest": 58.951
    }
   },
   "neon": {
-   "functions": 20,
-   "guest": 533,
+   "functions": 21,
+   "guest": 551,
    "x64": {
-    "host_instructions": 6410,
-    "host_bytes": 27249,
-    "per_guest": 12.026,
-    "bytes_per_guest": 51.124
+    "host_instructions": 6652,
+    "host_bytes": 28227,
+    "per_guest": 12.073,
+    "bytes_per_guest": 51.229
    },
    "arm64": {
-    "host_instructions": 4242,
-    "host_bytes": 16968,
-    "per_guest": 7.959,
-    "bytes_per_guest": 31.835
+    "host_instructions": 4473,
+    "host_bytes": 17892,
+    "per_guest": 8.118,
+    "bytes_per_guest": 32.472
    }
   },
   "call-heavy": {
    "functions": 26,
    "guest": 265,
    "x64": {
-    "host_instructions": 2323,
-    "host_bytes": 7687,
-    "per_guest": 8.766,
-    "bytes_per_guest": 29.008
+    "host_instructions": 2320,
+    "host_bytes": 7681,
+    "per_guest": 8.755,
+    "bytes_per_guest": 28.985
    },
    "arm64": {
-    "host_instructions": 1901,
-    "host_bytes": 7604,
-    "per_guest": 7.174,
-    "bytes_per_guest": 28.694
+    "host_instructions": 1899,
+    "host_bytes": 7596,
+    "per_guest": 7.166,
+    "bytes_per_guest": 28.664
    }
   }
  },
@@ -620,16 +638,16 @@
    "functions": 1,
    "guest": 107,
    "x64": {
-    "host_instructions": 629,
-    "host_bytes": 2534,
-    "per_guest": 5.879,
-    "bytes_per_guest": 23.682
+    "host_instructions": 642,
+    "host_bytes": 2607,
+    "per_guest": 6.0,
+    "bytes_per_guest": 24.364
    },
    "arm64": {
-    "host_instructions": 494,
-    "host_bytes": 1976,
-    "per_guest": 4.617,
-    "bytes_per_guest": 18.467
+    "host_instructions": 495,
+    "host_bytes": 1980,
+    "per_guest": 4.626,
+    "bytes_per_guest": 18.505
    },
    "module": "syn_calls",
    "class": "neon",
@@ -1271,16 +1289,16 @@
    "functions": 1,
    "guest": 3,
    "x64": {
-    "host_instructions": 58,
-    "host_bytes": 253,
-    "per_guest": 19.333,
-    "bytes_per_guest": 84.333
+    "host_instructions": 53,
+    "host_bytes": 199,
+    "per_guest": 17.667,
+    "bytes_per_guest": 66.333
    },
    "arm64": {
-    "host_instructions": 46,
-    "host_bytes": 184,
-    "per_guest": 15.333,
-    "bytes_per_guest": 61.333
+    "host_instructions": 40,
+    "host_bytes": 160,
+    "per_guest": 13.333,
+    "bytes_per_guest": 53.333
    },
    "module": "syn_flags",
    "class": "vfp",
@@ -1292,16 +1310,16 @@
    "functions": 1,
    "guest": 13,
    "x64": {
-    "host_instructions": 94,
-    "host_bytes": 313,
-    "per_guest": 7.231,
-    "bytes_per_guest": 24.077
+    "host_instructions": 93,
+    "host_bytes": 316,
+    "per_guest": 7.154,
+    "bytes_per_guest": 24.308
    },
    "arm64": {
-    "host_instructions": 70,
-    "host_bytes": 280,
-    "per_guest": 5.385,
-    "bytes_per_guest": 21.538
+    "host_instructions": 65,
+    "host_bytes": 260,
+    "per_guest": 5.0,
+    "bytes_per_guest": 20.0
    },
    "module": "syn_flags",
    "class": "vfp",
@@ -2069,9 +2087,9 @@
    "functions": 1,
    "guest": 25,
    "x64": {
-    "host_instructions": 146,
+    "host_instructions": 144,
     "host_bytes": 515,
-    "per_guest": 5.84,
+    "per_guest": 5.76,
     "bytes_per_guest": 20.6
    },
    "arm64": {
@@ -2363,16 +2381,16 @@
    "functions": 1,
    "guest": 21,
    "x64": {
-    "host_instructions": 345,
-    "host_bytes": 1477,
-    "per_guest": 16.429,
-    "bytes_per_guest": 70.333
+    "host_instructions": 342,
+    "host_bytes": 1462,
+    "per_guest": 16.286,
+    "bytes_per_guest": 69.619
    },
    "arm64": {
-    "host_instructions": 227,
-    "host_bytes": 908,
-    "per_guest": 10.81,
-    "bytes_per_guest": 43.238
+    "host_instructions": 230,
+    "host_bytes": 920,
+    "per_guest": 10.952,
+    "bytes_per_guest": 43.81
    },
    "module": "syn_neon",
    "class": "neon",
@@ -2405,10 +2423,10 @@
    "functions": 1,
    "guest": 13,
    "x64": {
-    "host_instructions": 346,
-    "host_bytes": 1479,
-    "per_guest": 26.615,
-    "bytes_per_guest": 113.769
+    "host_instructions": 283,
+    "host_bytes": 1165,
+    "per_guest": 21.769,
+    "bytes_per_guest": 89.615
    },
    "arm64": {
     "host_instructions": 229,
@@ -2699,16 +2717,16 @@
    "functions": 1,
    "guest": 7,
    "x64": {
-    "host_instructions": 35,
-    "host_bytes": 125,
-    "per_guest": 5.0,
-    "bytes_per_guest": 17.857
+    "host_instructions": 36,
+    "host_bytes": 115,
+    "per_guest": 5.143,
+    "bytes_per_guest": 16.429
    },
    "arm64": {
-    "host_instructions": 29,
-    "host_bytes": 116,
-    "per_guest": 4.143,
-    "bytes_per_guest": 16.571
+    "host_instructions": 27,
+    "host_bytes": 108,
+    "per_guest": 3.857,
+    "bytes_per_guest": 15.429
    },
    "module": "syn_regs",
    "class": "vfp",
@@ -2884,7 +2902,28 @@
    "vfp": 0,
    "calls": 0
   },
-  "across_direct (f_8203015C)": {
+  "vmsr_restore (f_8203015C)": {
+   "functions": 1,
+   "guest": 6,
+   "x64": {
+    "host_instructions": 43,
+    "host_bytes": 154,
+    "per_guest": 7.167,
+    "bytes_per_guest": 25.667
+   },
+   "arm64": {
+    "host_instructions": 41,
+    "host_bytes": 164,
+    "per_guest": 6.833,
+    "bytes_per_guest": 27.333
+   },
+   "module": "syn_regs",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 2,
+   "calls": 0
+  },
+  "across_direct (f_8203016E)": {
    "functions": 1,
    "guest": 11,
    "x64": {
@@ -2905,7 +2944,7 @@
    "vfp": 0,
    "calls": 2
   },
-  "across_clobber (f_82030182)": {
+  "across_clobber (f_82030194)": {
    "functions": 1,
    "guest": 5,
    "x64": {
@@ -2926,7 +2965,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "across_some_paths (f_8203018E)": {
+  "across_some_paths (f_820301A0)": {
    "functions": 1,
    "guest": 7,
    "x64": {
@@ -2947,7 +2986,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "across_alloca (f_820301A0)": {
+  "across_alloca (f_820301B2)": {
    "functions": 1,
    "guest": 9,
    "x64": {
@@ -2968,7 +3007,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "sp_round_trip (f_820301B8)": {
+  "sp_round_trip (f_820301CA)": {
    "functions": 1,
    "guest": 9,
    "x64": {
@@ -2989,7 +3028,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "lr_cases (f_820301CE)": {
+  "lr_cases (f_820301E0)": {
    "functions": 1,
    "guest": 6,
    "x64": {
@@ -3010,7 +3049,7 @@
    "vfp": 0,
    "calls": 2
   },
-  "wide_results (f_820301E0)": {
+  "wide_results (f_820301F2)": {
    "functions": 1,
    "guest": 6,
    "x64": {
@@ -3031,7 +3070,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "with_stack_args (f_820301F0)": {
+  "with_stack_args (f_82030202)": {
    "functions": 1,
    "guest": 9,
    "x64": {
@@ -3052,7 +3091,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "slot_and_swap (f_82030206)": {
+  "slot_and_swap (f_82030218)": {
    "functions": 1,
    "guest": 9,
    "x64": {
@@ -3073,20 +3112,20 @@
    "vfp": 0,
    "calls": 2
   },
-  "with_vfp_frame (f_8203021E)": {
+  "with_vfp_frame (f_82030230)": {
    "functions": 1,
    "guest": 5,
    "x64": {
-    "host_instructions": 77,
-    "host_bytes": 255,
-    "per_guest": 15.4,
-    "bytes_per_guest": 51.0
+    "host_instructions": 74,
+    "host_bytes": 249,
+    "per_guest": 14.8,
+    "bytes_per_guest": 49.8
    },
    "arm64": {
-    "host_instructions": 70,
-    "host_bytes": 280,
-    "per_guest": 14.0,
-    "bytes_per_guest": 56.0
+    "host_instructions": 68,
+    "host_bytes": 272,
+    "per_guest": 13.6,
+    "bytes_per_guest": 54.4
    },
    "module": "syn_regs",
    "class": "call-heavy",
@@ -3094,7 +3133,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "recursion (f_8203022A)": {
+  "recursion (f_8203023C)": {
    "functions": 1,
    "guest": 5,
    "x64": {
@@ -3115,7 +3154,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "tail_caller (f_82030238)": {
+  "tail_caller (f_8203024A)": {
    "functions": 1,
    "guest": 5,
    "x64": {
@@ -3136,7 +3175,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "indirect_callback (f_82030244)": {
+  "indirect_callback (f_82030256)": {
    "functions": 1,
    "guest": 9,
    "x64": {
@@ -3157,7 +3196,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "cond_write_sync (f_82030260)": {
+  "cond_write_sync (f_82030274)": {
    "functions": 1,
    "guest": 8,
    "x64": {
@@ -3178,7 +3217,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "direct_and_table (f_82030274)": {
+  "direct_and_table (f_82030288)": {
    "functions": 1,
    "guest": 10,
    "x64": {
@@ -3199,7 +3238,7 @@
    "vfp": 0,
    "calls": 2
   },
-  "calls_elsewhere (f_82030290)": {
+  "calls_elsewhere (f_820302A4)": {
    "functions": 1,
    "guest": 12,
    "x64": {
@@ -3220,7 +3259,7 @@
    "vfp": 0,
    "calls": 2
   },
-  "conditional_calls (f_820302AE)": {
+  "conditional_calls (f_820302C2)": {
    "functions": 1,
    "guest": 10,
    "x64": {
@@ -3241,7 +3280,7 @@
    "vfp": 0,
    "calls": 2
   },
-  "loop_kept (f_820302C6)": {
+  "loop_kept (f_820302DA)": {
    "functions": 1,
    "guest": 8,
    "x64": {
@@ -3262,7 +3301,7 @@
    "vfp": 0,
    "calls": 1
   },
-  "arm_keep (f_820302D8)": {
+  "arm_keep (f_820302EC)": {
    "functions": 1,
    "guest": 6,
    "x64": {
@@ -3283,7 +3322,7 @@
    "vfp": 0,
    "calls": 0
   },
-  "arm_clobber (f_820302F0)": {
+  "arm_clobber (f_82030304)": {
    "functions": 1,
    "guest": 3,
    "x64": {
@@ -3304,7 +3343,7 @@
    "vfp": 0,
    "calls": 0
   },
-  "arm_mov_pc (f_820302FC)": {
+  "arm_mov_pc (f_82030310)": {
    "functions": 1,
    "guest": 2,
    "x64": {
@@ -3325,7 +3364,7 @@
    "vfp": 0,
    "calls": 0
   },
-  "arm_conditional_calls (f_82030304)": {
+  "arm_conditional_calls (f_82030318)": {
    "functions": 1,
    "guest": 9,
    "x64": {
@@ -3350,16 +3389,16 @@
    "functions": 1,
    "guest": 23,
    "x64": {
-    "host_instructions": 321,
-    "host_bytes": 1274,
-    "per_guest": 13.957,
-    "bytes_per_guest": 55.391
+    "host_instructions": 337,
+    "host_bytes": 1511,
+    "per_guest": 14.652,
+    "bytes_per_guest": 65.696
    },
    "arm64": {
-    "host_instructions": 262,
-    "host_bytes": 1048,
-    "per_guest": 11.391,
-    "bytes_per_guest": 45.565
+    "host_instructions": 340,
+    "host_bytes": 1360,
+    "per_guest": 14.783,
+    "bytes_per_guest": 59.13
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3371,16 +3410,16 @@
    "functions": 1,
    "guest": 10,
    "x64": {
-    "host_instructions": 152,
-    "host_bytes": 556,
-    "per_guest": 15.2,
-    "bytes_per_guest": 55.6
+    "host_instructions": 174,
+    "host_bytes": 635,
+    "per_guest": 17.4,
+    "bytes_per_guest": 63.5
    },
    "arm64": {
-    "host_instructions": 120,
-    "host_bytes": 480,
-    "per_guest": 12.0,
-    "bytes_per_guest": 48.0
+    "host_instructions": 125,
+    "host_bytes": 500,
+    "per_guest": 12.5,
+    "bytes_per_guest": 50.0
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3392,16 +3431,16 @@
    "functions": 1,
    "guest": 12,
    "x64": {
-    "host_instructions": 184,
-    "host_bytes": 700,
-    "per_guest": 15.333,
-    "bytes_per_guest": 58.333
+    "host_instructions": 212,
+    "host_bytes": 831,
+    "per_guest": 17.667,
+    "bytes_per_guest": 69.25
    },
    "arm64": {
-    "host_instructions": 151,
-    "host_bytes": 604,
-    "per_guest": 12.583,
-    "bytes_per_guest": 50.333
+    "host_instructions": 190,
+    "host_bytes": 760,
+    "per_guest": 15.833,
+    "bytes_per_guest": 63.333
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3413,16 +3452,16 @@
    "functions": 1,
    "guest": 32,
    "x64": {
-    "host_instructions": 186,
-    "host_bytes": 719,
-    "per_guest": 5.812,
-    "bytes_per_guest": 22.469
+    "host_instructions": 156,
+    "host_bytes": 615,
+    "per_guest": 4.875,
+    "bytes_per_guest": 19.219
    },
    "arm64": {
-    "host_instructions": 135,
-    "host_bytes": 540,
-    "per_guest": 4.219,
-    "bytes_per_guest": 16.875
+    "host_instructions": 113,
+    "host_bytes": 452,
+    "per_guest": 3.531,
+    "bytes_per_guest": 14.125
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3434,16 +3473,16 @@
    "functions": 1,
    "guest": 27,
    "x64": {
-    "host_instructions": 212,
-    "host_bytes": 877,
-    "per_guest": 7.852,
-    "bytes_per_guest": 32.481
+    "host_instructions": 281,
+    "host_bytes": 1091,
+    "per_guest": 10.407,
+    "bytes_per_guest": 40.407
    },
    "arm64": {
-    "host_instructions": 177,
-    "host_bytes": 708,
-    "per_guest": 6.556,
-    "bytes_per_guest": 26.222
+    "host_instructions": 107,
+    "host_bytes": 428,
+    "per_guest": 3.963,
+    "bytes_per_guest": 15.852
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3455,16 +3494,16 @@
    "functions": 1,
    "guest": 22,
    "x64": {
-    "host_instructions": 307,
-    "host_bytes": 1183,
-    "per_guest": 13.955,
-    "bytes_per_guest": 53.773
+    "host_instructions": 338,
+    "host_bytes": 1299,
+    "per_guest": 15.364,
+    "bytes_per_guest": 59.045
    },
    "arm64": {
-    "host_instructions": 243,
-    "host_bytes": 972,
-    "per_guest": 11.045,
-    "bytes_per_guest": 44.182
+    "host_instructions": 306,
+    "host_bytes": 1224,
+    "per_guest": 13.909,
+    "bytes_per_guest": 55.636
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3476,16 +3515,16 @@
    "functions": 1,
    "guest": 12,
    "x64": {
-    "host_instructions": 214,
-    "host_bytes": 801,
-    "per_guest": 17.833,
-    "bytes_per_guest": 66.75
+    "host_instructions": 234,
+    "host_bytes": 927,
+    "per_guest": 19.5,
+    "bytes_per_guest": 77.25
    },
    "arm64": {
-    "host_instructions": 171,
-    "host_bytes": 684,
-    "per_guest": 14.25,
-    "bytes_per_guest": 57.0
+    "host_instructions": 202,
+    "host_bytes": 808,
+    "per_guest": 16.833,
+    "bytes_per_guest": 67.333
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3497,16 +3536,16 @@
    "functions": 1,
    "guest": 10,
    "x64": {
-    "host_instructions": 354,
-    "host_bytes": 1640,
-    "per_guest": 35.4,
-    "bytes_per_guest": 164.0
+    "host_instructions": 165,
+    "host_bytes": 653,
+    "per_guest": 16.5,
+    "bytes_per_guest": 65.3
    },
    "arm64": {
-    "host_instructions": 198,
-    "host_bytes": 792,
-    "per_guest": 19.8,
-    "bytes_per_guest": 79.2
+    "host_instructions": 142,
+    "host_bytes": 568,
+    "per_guest": 14.2,
+    "bytes_per_guest": 56.8
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3518,16 +3557,16 @@
    "functions": 1,
    "guest": 21,
    "x64": {
-    "host_instructions": 729,
-    "host_bytes": 3243,
-    "per_guest": 34.714,
-    "bytes_per_guest": 154.429
+    "host_instructions": 317,
+    "host_bytes": 1385,
+    "per_guest": 15.095,
+    "bytes_per_guest": 65.952
    },
    "arm64": {
-    "host_instructions": 485,
-    "host_bytes": 1940,
-    "per_guest": 23.095,
-    "bytes_per_guest": 92.381
+    "host_instructions": 256,
+    "host_bytes": 1024,
+    "per_guest": 12.19,
+    "bytes_per_guest": 48.762
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3539,16 +3578,16 @@
    "functions": 1,
    "guest": 24,
    "x64": {
-    "host_instructions": 733,
-    "host_bytes": 3216,
-    "per_guest": 30.542,
-    "bytes_per_guest": 134.0
+    "host_instructions": 421,
+    "host_bytes": 2116,
+    "per_guest": 17.542,
+    "bytes_per_guest": 88.167
    },
    "arm64": {
-    "host_instructions": 439,
-    "host_bytes": 1756,
-    "per_guest": 18.292,
-    "bytes_per_guest": 73.167
+    "host_instructions": 406,
+    "host_bytes": 1624,
+    "per_guest": 16.917,
+    "bytes_per_guest": 67.667
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3560,16 +3599,16 @@
    "functions": 1,
    "guest": 20,
    "x64": {
-    "host_instructions": 262,
-    "host_bytes": 1253,
-    "per_guest": 13.1,
-    "bytes_per_guest": 62.65
+    "host_instructions": 228,
+    "host_bytes": 908,
+    "per_guest": 11.4,
+    "bytes_per_guest": 45.4
    },
    "arm64": {
-    "host_instructions": 167,
-    "host_bytes": 668,
-    "per_guest": 8.35,
-    "bytes_per_guest": 33.4
+    "host_instructions": 104,
+    "host_bytes": 416,
+    "per_guest": 5.2,
+    "bytes_per_guest": 20.8
    },
    "module": "syn_vfp",
    "class": "vfp",
@@ -3581,21 +3620,357 @@
    "functions": 1,
    "guest": 51,
    "x64": {
-    "host_instructions": 1996,
-    "host_bytes": 9169,
-    "per_guest": 39.137,
-    "bytes_per_guest": 179.784
+    "host_instructions": 881,
+    "host_bytes": 4078,
+    "per_guest": 17.275,
+    "bytes_per_guest": 79.961
    },
    "arm64": {
-    "host_instructions": 1279,
-    "host_bytes": 5116,
-    "per_guest": 25.078,
-    "bytes_per_guest": 100.314
+    "host_instructions": 1107,
+    "host_bytes": 4428,
+    "per_guest": 21.706,
+    "bytes_per_guest": 86.824
    },
    "module": "syn_vfp",
    "class": "vfp",
    "neon": 0,
    "vfp": 34,
+   "calls": 0
+  },
+  "int_only (f_82040000)": {
+   "functions": 1,
+   "guest": 3,
+   "x64": {
+    "host_instructions": 13,
+    "host_bytes": 43,
+    "per_guest": 4.333,
+    "bytes_per_guest": 14.333
+   },
+   "arm64": {
+    "host_instructions": 12,
+    "host_bytes": 48,
+    "per_guest": 4.0,
+    "bytes_per_guest": 16.0
+   },
+   "module": "syn_vfp_locals",
+   "class": "integer",
+   "neon": 0,
+   "vfp": 0,
+   "calls": 0
+  },
+  "saves_d8 (f_8204000A)": {
+   "functions": 1,
+   "guest": 6,
+   "x64": {
+    "host_instructions": 62,
+    "host_bytes": 215,
+    "per_guest": 10.333,
+    "bytes_per_guest": 35.833
+   },
+   "arm64": {
+    "host_instructions": 59,
+    "host_bytes": 236,
+    "per_guest": 9.833,
+    "bytes_per_guest": 39.333
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 5,
+   "calls": 0
+  },
+  "clobbers_d8_s4 (f_82040020)": {
+   "functions": 1,
+   "guest": 4,
+   "x64": {
+    "host_instructions": 49,
+    "host_bytes": 174,
+    "per_guest": 12.25,
+    "bytes_per_guest": 43.5
+   },
+   "arm64": {
+    "host_instructions": 48,
+    "host_bytes": 192,
+    "per_guest": 12.0,
+    "bytes_per_guest": 48.0
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 3,
+   "calls": 0
+  },
+  "set_mode (f_8204002E)": {
+   "functions": 1,
+   "guest": 7,
+   "x64": {
+    "host_instructions": 30,
+    "host_bytes": 117,
+    "per_guest": 4.286,
+    "bytes_per_guest": 16.714
+   },
+   "arm64": {
+    "host_instructions": 30,
+    "host_bytes": 120,
+    "per_guest": 4.286,
+    "bytes_per_guest": 17.143
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 2,
+   "calls": 0
+  },
+  "alias_sd (f_82040048)": {
+   "functions": 1,
+   "guest": 13,
+   "x64": {
+    "host_instructions": 209,
+    "host_bytes": 884,
+    "per_guest": 16.077,
+    "bytes_per_guest": 68.0
+   },
+   "arm64": {
+    "host_instructions": 184,
+    "host_bytes": 736,
+    "per_guest": 14.154,
+    "bytes_per_guest": 56.615
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 12,
+   "calls": 0
+  },
+  "nan_moves (f_8204007A)": {
+   "functions": 1,
+   "guest": 22,
+   "x64": {
+    "host_instructions": 84,
+    "host_bytes": 309,
+    "per_guest": 3.818,
+    "bytes_per_guest": 14.045
+   },
+   "arm64": {
+    "host_instructions": 63,
+    "host_bytes": 252,
+    "per_guest": 2.864,
+    "bytes_per_guest": 11.455
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 21,
+   "calls": 0
+  },
+  "keep_across_calls (f_820400DC)": {
+   "functions": 1,
+   "guest": 19,
+   "x64": {
+    "host_instructions": 600,
+    "host_bytes": 2833,
+    "per_guest": 31.579,
+    "bytes_per_guest": 149.105
+   },
+   "arm64": {
+    "host_instructions": 469,
+    "host_bytes": 1876,
+    "per_guest": 24.684,
+    "bytes_per_guest": 98.737
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 11,
+   "calls": 3
+  },
+  "across_indirect (f_8204011E)": {
+   "functions": 1,
+   "guest": 11,
+   "x64": {
+    "host_instructions": 252,
+    "host_bytes": 1081,
+    "per_guest": 22.909,
+    "bytes_per_guest": 98.273
+   },
+   "arm64": {
+    "host_instructions": 235,
+    "host_bytes": 940,
+    "per_guest": 21.364,
+    "bytes_per_guest": 85.455
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 5,
+   "calls": 1
+  },
+  "vmsr_modes (f_82040146)": {
+   "functions": 1,
+   "guest": 26,
+   "x64": {
+    "host_instructions": 459,
+    "host_bytes": 1993,
+    "per_guest": 17.654,
+    "bytes_per_guest": 76.654
+   },
+   "arm64": {
+    "host_instructions": 409,
+    "host_bytes": 1636,
+    "per_guest": 15.731,
+    "bytes_per_guest": 62.923
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 14,
+   "calls": 1
+  },
+  "cmp_flags_later (f_8204019E)": {
+   "functions": 1,
+   "guest": 29,
+   "x64": {
+    "host_instructions": 150,
+    "host_bytes": 558,
+    "per_guest": 5.172,
+    "bytes_per_guest": 19.241
+   },
+   "arm64": {
+    "host_instructions": 108,
+    "host_bytes": 432,
+    "per_guest": 3.724,
+    "bytes_per_guest": 14.897
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 8,
+   "calls": 1
+  },
+  "cmp_loop (f_820401F0)": {
+   "functions": 1,
+   "guest": 18,
+   "x64": {
+    "host_instructions": 166,
+    "host_bytes": 569,
+    "per_guest": 9.222,
+    "bytes_per_guest": 31.611
+   },
+   "arm64": {
+    "host_instructions": 78,
+    "host_bytes": 312,
+    "per_guest": 4.333,
+    "bytes_per_guest": 17.333
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 3,
+   "calls": 0
+  },
+  "mixed_neon (f_8204021E)": {
+   "functions": 1,
+   "guest": 18,
+   "x64": {
+    "host_instructions": 295,
+    "host_bytes": 1234,
+    "per_guest": 16.389,
+    "bytes_per_guest": 68.556
+   },
+   "arm64": {
+    "host_instructions": 227,
+    "host_bytes": 908,
+    "per_guest": 12.611,
+    "bytes_per_guest": 50.444
+   },
+   "module": "syn_vfp_locals",
+   "class": "neon",
+   "neon": 11,
+   "vfp": 6,
+   "calls": 0
+  },
+  "cvt_all (f_82040264)": {
+   "functions": 1,
+   "guest": 27,
+   "x64": {
+    "host_instructions": 755,
+    "host_bytes": 3376,
+    "per_guest": 27.963,
+    "bytes_per_guest": 125.037
+   },
+   "arm64": {
+    "host_instructions": 386,
+    "host_bytes": 1544,
+    "per_guest": 14.296,
+    "bytes_per_guest": 57.185
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 26,
+   "calls": 0
+  },
+  "arith_all (f_820402CE)": {
+   "functions": 1,
+   "guest": 27,
+   "x64": {
+    "host_instructions": 1840,
+    "host_bytes": 9104,
+    "per_guest": 68.148,
+    "bytes_per_guest": 337.185
+   },
+   "arm64": {
+    "host_instructions": 2416,
+    "host_bytes": 9664,
+    "per_guest": 89.481,
+    "bytes_per_guest": 357.926
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 26,
+   "calls": 0
+  },
+  "partial_d (f_82040338)": {
+   "functions": 1,
+   "guest": 4,
+   "x64": {
+    "host_instructions": 113,
+    "host_bytes": 410,
+    "per_guest": 28.25,
+    "bytes_per_guest": 102.5
+   },
+   "arm64": {
+    "host_instructions": 93,
+    "host_bytes": 372,
+    "per_guest": 23.25,
+    "bytes_per_guest": 93.0
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 3,
+   "calls": 0
+  },
+  "cond_all (f_82040346)": {
+   "functions": 1,
+   "guest": 62,
+   "x64": {
+    "host_instructions": 265,
+    "host_bytes": 1058,
+    "per_guest": 4.274,
+    "bytes_per_guest": 17.065
+   },
+   "arm64": {
+    "host_instructions": 222,
+    "host_bytes": 888,
+    "per_guest": 3.581,
+    "bytes_per_guest": 14.323
+   },
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "neon": 0,
+   "vfp": 13,
    "calls": 0
   }
  },
@@ -3864,12 +4239,12 @@
    "module": "syn_calls",
    "class": "neon",
    "x64": [
-    629,
-    2534
+    642,
+    2607
    ],
    "arm64": [
-    494,
-    1976
+    495,
+    1980
    ]
   },
   "syn_calls:f_820002C0": {
@@ -4360,12 +4735,12 @@
    "module": "syn_flags",
    "class": "vfp",
    "x64": [
-    58,
-    253
+    53,
+    199
    ],
    "arm64": [
-    46,
-    184
+    40,
+    160
    ]
   },
   "syn_flags:f_8201000A": {
@@ -4376,12 +4751,12 @@
    "module": "syn_flags",
    "class": "vfp",
    "x64": [
-    94,
-    313
+    93,
+    316
    ],
    "arm64": [
-    70,
-    280
+    65,
+    260
    ]
   },
   "syn_flags:f_8201002A": {
@@ -4968,7 +5343,7 @@
    "module": "syn_integer_arm",
    "class": "integer",
    "x64": [
-    146,
+    144,
     515
    ],
    "arm64": [
@@ -5192,12 +5567,12 @@
    "module": "syn_neon",
    "class": "neon",
    "x64": [
-    345,
-    1477
+    342,
+    1462
    ],
    "arm64": [
-    227,
-    908
+    230,
+    920
    ]
   },
   "syn_neon:f_820281D0": {
@@ -5224,8 +5599,8 @@
    "module": "syn_neon",
    "class": "neon",
    "x64": [
-    346,
-    1479
+    283,
+    1165
    ],
    "arm64": [
     229,
@@ -5448,12 +5823,12 @@
    "module": "syn_regs",
    "class": "vfp",
    "x64": [
-    35,
-    125
+    36,
+    115
    ],
    "arm64": [
-    29,
-    116
+    27,
+    108
    ]
   },
   "syn_regs:f_820300DC": {
@@ -5585,6 +5960,22 @@
    ]
   },
   "syn_regs:f_8203015C": {
+   "guest": 6,
+   "neon": 0,
+   "vfp": 2,
+   "calls": 0,
+   "module": "syn_regs",
+   "class": "vfp",
+   "x64": [
+    43,
+    154
+   ],
+   "arm64": [
+    41,
+    164
+   ]
+  },
+  "syn_regs:f_8203016E": {
    "guest": 11,
    "neon": 0,
    "vfp": 0,
@@ -5600,7 +5991,7 @@
     572
    ]
   },
-  "syn_regs:f_82030182": {
+  "syn_regs:f_82030194": {
    "guest": 5,
    "neon": 0,
    "vfp": 0,
@@ -5616,7 +6007,7 @@
     116
    ]
   },
-  "syn_regs:f_8203018E": {
+  "syn_regs:f_820301A0": {
    "guest": 7,
    "neon": 0,
    "vfp": 0,
@@ -5632,7 +6023,7 @@
     304
    ]
   },
-  "syn_regs:f_820301A0": {
+  "syn_regs:f_820301B2": {
    "guest": 9,
    "neon": 0,
    "vfp": 0,
@@ -5648,7 +6039,7 @@
     324
    ]
   },
-  "syn_regs:f_820301B8": {
+  "syn_regs:f_820301CA": {
    "guest": 9,
    "neon": 0,
    "vfp": 0,
@@ -5664,7 +6055,7 @@
     116
    ]
   },
-  "syn_regs:f_820301CE": {
+  "syn_regs:f_820301E0": {
    "guest": 6,
    "neon": 0,
    "vfp": 0,
@@ -5680,7 +6071,7 @@
     272
    ]
   },
-  "syn_regs:f_820301E0": {
+  "syn_regs:f_820301F2": {
    "guest": 6,
    "neon": 0,
    "vfp": 0,
@@ -5696,7 +6087,7 @@
     152
    ]
   },
-  "syn_regs:f_820301F0": {
+  "syn_regs:f_82030202": {
    "guest": 9,
    "neon": 0,
    "vfp": 0,
@@ -5712,7 +6103,7 @@
     180
    ]
   },
-  "syn_regs:f_82030206": {
+  "syn_regs:f_82030218": {
    "guest": 9,
    "neon": 0,
    "vfp": 0,
@@ -5728,7 +6119,7 @@
     412
    ]
   },
-  "syn_regs:f_8203021E": {
+  "syn_regs:f_82030230": {
    "guest": 5,
    "neon": 0,
    "vfp": 0,
@@ -5736,15 +6127,15 @@
    "module": "syn_regs",
    "class": "call-heavy",
    "x64": [
-    77,
-    255
+    74,
+    249
    ],
    "arm64": [
-    70,
-    280
+    68,
+    272
    ]
   },
-  "syn_regs:f_8203022A": {
+  "syn_regs:f_8203023C": {
    "guest": 5,
    "neon": 0,
    "vfp": 0,
@@ -5760,7 +6151,7 @@
     200
    ]
   },
-  "syn_regs:f_82030238": {
+  "syn_regs:f_8203024A": {
    "guest": 5,
    "neon": 0,
    "vfp": 0,
@@ -5776,7 +6167,7 @@
     220
    ]
   },
-  "syn_regs:f_82030244": {
+  "syn_regs:f_82030256": {
    "guest": 9,
    "neon": 0,
    "vfp": 0,
@@ -5792,7 +6183,7 @@
     304
    ]
   },
-  "syn_regs:f_82030260": {
+  "syn_regs:f_82030274": {
    "guest": 8,
    "neon": 0,
    "vfp": 0,
@@ -5808,7 +6199,7 @@
     292
    ]
   },
-  "syn_regs:f_82030274": {
+  "syn_regs:f_82030288": {
    "guest": 10,
    "neon": 0,
    "vfp": 0,
@@ -5824,7 +6215,7 @@
     340
    ]
   },
-  "syn_regs:f_82030290": {
+  "syn_regs:f_820302A4": {
    "guest": 12,
    "neon": 0,
    "vfp": 0,
@@ -5840,7 +6231,7 @@
     428
    ]
   },
-  "syn_regs:f_820302AE": {
+  "syn_regs:f_820302C2": {
    "guest": 10,
    "neon": 0,
    "vfp": 0,
@@ -5856,7 +6247,7 @@
     424
    ]
   },
-  "syn_regs:f_820302C6": {
+  "syn_regs:f_820302DA": {
    "guest": 8,
    "neon": 0,
    "vfp": 0,
@@ -5872,7 +6263,7 @@
     432
    ]
   },
-  "syn_regs:f_820302D8": {
+  "syn_regs:f_820302EC": {
    "guest": 6,
    "neon": 0,
    "vfp": 0,
@@ -5888,7 +6279,7 @@
     196
    ]
   },
-  "syn_regs:f_820302F0": {
+  "syn_regs:f_82030304": {
    "guest": 3,
    "neon": 0,
    "vfp": 0,
@@ -5904,7 +6295,7 @@
     48
    ]
   },
-  "syn_regs:f_820302FC": {
+  "syn_regs:f_82030310": {
    "guest": 2,
    "neon": 0,
    "vfp": 0,
@@ -5920,7 +6311,7 @@
     44
    ]
   },
-  "syn_regs:f_82030304": {
+  "syn_regs:f_82030318": {
    "guest": 9,
    "neon": 0,
    "vfp": 0,
@@ -5944,12 +6335,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    321,
-    1274
+    337,
+    1511
    ],
    "arm64": [
-    262,
-    1048
+    340,
+    1360
    ]
   },
   "syn_vfp:f_82038050": {
@@ -5960,12 +6351,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    152,
-    556
+    174,
+    635
    ],
    "arm64": [
-    120,
-    480
+    125,
+    500
    ]
   },
   "syn_vfp:f_82038074": {
@@ -5976,12 +6367,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    184,
-    700
+    212,
+    831
    ],
    "arm64": [
-    151,
-    604
+    190,
+    760
    ]
   },
   "syn_vfp:f_82038098": {
@@ -5992,12 +6383,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    186,
-    719
+    156,
+    615
    ],
    "arm64": [
-    135,
-    540
+    113,
+    452
    ]
   },
   "syn_vfp:f_82038100": {
@@ -6008,12 +6399,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    212,
-    877
+    281,
+    1091
    ],
    "arm64": [
-    177,
-    708
+    107,
+    428
    ]
   },
   "syn_vfp:f_82038158": {
@@ -6024,12 +6415,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    307,
-    1183
+    338,
+    1299
    ],
    "arm64": [
-    243,
-    972
+    306,
+    1224
    ]
   },
   "syn_vfp:f_820381A4": {
@@ -6040,12 +6431,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    214,
-    801
+    234,
+    927
    ],
    "arm64": [
-    171,
-    684
+    202,
+    808
    ]
   },
   "syn_vfp:f_820381D0": {
@@ -6056,12 +6447,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    354,
-    1640
+    165,
+    653
    ],
    "arm64": [
-    198,
-    792
+    142,
+    568
    ]
   },
   "syn_vfp:f_820381EC": {
@@ -6072,12 +6463,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    729,
-    3243
+    317,
+    1385
    ],
    "arm64": [
-    485,
-    1940
+    256,
+    1024
    ]
   },
   "syn_vfp:f_82038238": {
@@ -6088,12 +6479,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    733,
-    3216
+    421,
+    2116
    ],
    "arm64": [
-    439,
-    1756
+    406,
+    1624
    ]
   },
   "syn_vfp:f_82038298": {
@@ -6104,12 +6495,12 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    262,
-    1253
+    228,
+    908
    ],
    "arm64": [
-    167,
-    668
+    104,
+    416
    ]
   },
   "syn_vfp:f_820382D4": {
@@ -6120,12 +6511,268 @@
    "module": "syn_vfp",
    "class": "vfp",
    "x64": [
-    1996,
-    9169
+    881,
+    4078
    ],
    "arm64": [
-    1279,
-    5116
+    1107,
+    4428
+   ]
+  },
+  "syn_vfp_locals:f_82040000": {
+   "guest": 3,
+   "neon": 0,
+   "vfp": 0,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "integer",
+   "x64": [
+    13,
+    43
+   ],
+   "arm64": [
+    12,
+    48
+   ]
+  },
+  "syn_vfp_locals:f_8204000A": {
+   "guest": 6,
+   "neon": 0,
+   "vfp": 5,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    62,
+    215
+   ],
+   "arm64": [
+    59,
+    236
+   ]
+  },
+  "syn_vfp_locals:f_82040020": {
+   "guest": 4,
+   "neon": 0,
+   "vfp": 3,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    49,
+    174
+   ],
+   "arm64": [
+    48,
+    192
+   ]
+  },
+  "syn_vfp_locals:f_8204002E": {
+   "guest": 7,
+   "neon": 0,
+   "vfp": 2,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    30,
+    117
+   ],
+   "arm64": [
+    30,
+    120
+   ]
+  },
+  "syn_vfp_locals:f_82040048": {
+   "guest": 13,
+   "neon": 0,
+   "vfp": 12,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    209,
+    884
+   ],
+   "arm64": [
+    184,
+    736
+   ]
+  },
+  "syn_vfp_locals:f_8204007A": {
+   "guest": 22,
+   "neon": 0,
+   "vfp": 21,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    84,
+    309
+   ],
+   "arm64": [
+    63,
+    252
+   ]
+  },
+  "syn_vfp_locals:f_820400DC": {
+   "guest": 19,
+   "neon": 0,
+   "vfp": 11,
+   "calls": 3,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    600,
+    2833
+   ],
+   "arm64": [
+    469,
+    1876
+   ]
+  },
+  "syn_vfp_locals:f_8204011E": {
+   "guest": 11,
+   "neon": 0,
+   "vfp": 5,
+   "calls": 1,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    252,
+    1081
+   ],
+   "arm64": [
+    235,
+    940
+   ]
+  },
+  "syn_vfp_locals:f_82040146": {
+   "guest": 26,
+   "neon": 0,
+   "vfp": 14,
+   "calls": 1,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    459,
+    1993
+   ],
+   "arm64": [
+    409,
+    1636
+   ]
+  },
+  "syn_vfp_locals:f_8204019E": {
+   "guest": 29,
+   "neon": 0,
+   "vfp": 8,
+   "calls": 1,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    150,
+    558
+   ],
+   "arm64": [
+    108,
+    432
+   ]
+  },
+  "syn_vfp_locals:f_820401F0": {
+   "guest": 18,
+   "neon": 0,
+   "vfp": 3,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    166,
+    569
+   ],
+   "arm64": [
+    78,
+    312
+   ]
+  },
+  "syn_vfp_locals:f_8204021E": {
+   "guest": 18,
+   "neon": 11,
+   "vfp": 6,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "neon",
+   "x64": [
+    295,
+    1234
+   ],
+   "arm64": [
+    227,
+    908
+   ]
+  },
+  "syn_vfp_locals:f_82040264": {
+   "guest": 27,
+   "neon": 0,
+   "vfp": 26,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    755,
+    3376
+   ],
+   "arm64": [
+    386,
+    1544
+   ]
+  },
+  "syn_vfp_locals:f_820402CE": {
+   "guest": 27,
+   "neon": 0,
+   "vfp": 26,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    1840,
+    9104
+   ],
+   "arm64": [
+    2416,
+    9664
+   ]
+  },
+  "syn_vfp_locals:f_82040338": {
+   "guest": 4,
+   "neon": 0,
+   "vfp": 3,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    113,
+    410
+   ],
+   "arm64": [
+    93,
+    372
+   ]
+  },
+  "syn_vfp_locals:f_82040346": {
+   "guest": 62,
+   "neon": 0,
+   "vfp": 13,
+   "calls": 0,
+   "module": "syn_vfp_locals",
+   "class": "vfp",
+   "x64": [
+    265,
+    1058
+   ],
+   "arm64": [
+    222,
+    888
    ]
   }
  }

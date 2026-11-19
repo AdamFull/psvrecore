@@ -7,6 +7,7 @@
 #include "psvrecore/analysis/flow.hpp"
 #include "psvrecore/analysis/program.hpp"
 #include "psvrecore/analysis/registers.hpp"
+#include "psvrecore/analysis/vfp.hpp"
 #include "psvrecore/arm/instruction.hpp"
 #include "psvrecore/recomp/generator.hpp"
 #include "core/foundation/containers/hash_set.h"
@@ -26,12 +27,21 @@ inline nx::string label_name(u32 address) { return nx::format("L_{:08X}", addres
 
 using analysis::FlagSet;
 using analysis::RegSet;
+using analysis::VfpSet;
 
 // How the generated code holds the core registers.
 enum class RegisterMode : u8 {
     Context,  // in the context, as ctx->r[N] (psvrecomp --registers-in-context)
     Probe,    // locals, without the analysis: a first translation that records what each instruction reads and writes
     Locals,   // locals gN, in the context only where the analysis says (analysis/registers.hpp)
+};
+
+// How the generated code holds the floating-point registers and the FPSCR.
+enum class VfpMode : u8 {
+    Context,  // in the context, as ctx->vfp.s[N] / ctx->vfp.d[N] and ctx->fpscr (psvrecomp --vfp-in-context)
+    Probe,    // locals, without the analysis: the first translation records what each instruction reads and writes
+    Locals,   // typed locals sN (float), dN (double), fpscr and fpnzcv, in the context only where the analysis says
+              // (analysis/vfp.hpp)
 };
 
 // The C condition of an ARM condition code ("" for always), on the function's flags (the local `fl`).
@@ -41,12 +51,15 @@ class Emitter {
 public:
     Emitter(const analysis::Program& program, const analysis::Function& fn, const analysis::FlagLiveness& flags,
             const nx::string& prefix, Stats& stats, RegisterMode mode = RegisterMode::Context,
-            const analysis::FunctionRegisters* registers = nullptr);
+            const analysis::FunctionRegisters* registers = nullptr, VfpMode vfp_mode = VfpMode::Context,
+            const analysis::FunctionVfp* vfp = nullptr);
 
     // The function's C definition.
     nx::string function();
     // (RegisterMode::Probe) What the translation of each instruction read and wrote, by instruction index.
     const nx::vector<analysis::RegisterEffect>& effects() const { return effects_; }
+    // (VfpMode::Probe) What the translation of each instruction read and wrote of the floating-point registers.
+    const nx::vector<analysis::VfpEffect>& vfp_effects() const { return vfp_effects_; }
 
     // --- used by the instruction translators ---
 
@@ -123,9 +136,36 @@ public:
     void call_registers_before();
     void call_registers_after(const Instruction& in);
     // Before an exit inside the instruction's translation (a return, a jump through the runtime, a tail call).
-    void exit_registers() { store_registers(regs_ ? regs_->exit_store[index_] : RegSet(0)); }
+    // (and the floating-point registers)
+    void exit_registers();
     void store_registers(RegSet r);
     void load_registers(RegSet r);
+
+    // --- floating-point registers (analysis/vfp.hpp): typed locals, in the context where code outside may read them ---
+
+    bool vfp_locals() const { return vfp_mode_ != VfpMode::Context; }
+    // S register (or word of the register file) k as a float, D register n as a double, and their bits.
+    nx::string vs(u32 k);
+    nx::string vd(u32 n);
+    nx::string vs_bits(u32 k) { return nx::format("psv_b32({})", vs(k)); }
+    nx::string vd_bits(u32 n) { return nx::format("psv_b64({})", vd(n)); }
+    // Writes them (a statement line).
+    void set_vs(u32 k, nx::string_view value);
+    void set_vd(u32 n, nx::string_view value);
+    void set_vs_bits(u32 k, nx::string_view value) { set_vs(k, nx::format("psv_f32({})", value)); }
+    void set_vd_bits(u32 n, nx::string_view value) { set_vd(n, nx::format("psv_f64({})", value)); }
+    // The FPSCR's locals: `fpscr` (bits 27-0) and `fpnzcv` (bits 31-28).
+    nx::string fpscr();
+    nx::string fpnzcv();
+    void set_fpnzcv(nx::string_view value);
+    void set_fpscr(nx::string_view value);  // the whole register (vmsr): both
+    // A vcmp whose NZCV the next instruction (vmrs APSR_nzcv) moves to the flags: the compare's width (32, 64), else
+    // 0. The operands are kept in fc<w>a, fc<w>b; that vmrs and the conditions that follow it compare them.
+    u32 fused_compare() const { return fuse_.empty() || (fuse_[index_] & 0x80u) ? 0u : fuse_[index_]; }
+    // The vmrs after such a compare: its width, else 0.
+    u32 fused_vmrs() const { return fuse_.empty() || !(fuse_[index_] & 0x80u) ? 0u : fuse_[index_] & 0x7Fu; }
+    FlagSet fused_flags() const { return fused_flags_[index_]; }
+    void use_fused(u32 width) { (width == 64 ? uses_fc64_ : uses_fc32_) = true; }
 
     u32 next_code(const Instruction& in) const {
         return (in.address + in.size) | (in.mode == arm::Mode::Thumb ? 1u : 0u);
@@ -136,6 +176,12 @@ public:
 
 private:
     void instruction(const Instruction& in);
+    void plan_fused_compares();
+    nx::string vfp_line(VfpSet units, bool store) const;
+    void store_vfp(VfpSet units, usize& counter);
+    void call_vfp_before();
+    void call_vfp_after(const Instruction& in);
+    nx::string vfp_trap_stores();
     bool falls_through(const Instruction& in) const;
     void count_flags(const Instruction& in);
     nx::string flags_line(FlagSet f, bool store) const;
@@ -164,12 +210,24 @@ private:
     // The current instruction's register accesses so far, and (Probe) every instruction's.
     analysis::RegisterEffect access_;
     nx::vector<analysis::RegisterEffect> effects_;
+    VfpMode vfp_mode_;
+    const analysis::FunctionVfp* vfp_;  // VfpMode::Locals
+    analysis::VfpEffect vaccess_;
+    nx::vector<analysis::VfpEffect> vfp_effects_;
+    // Fused compares, by instruction index: a vcmp's width (32, 64), with bit 7 on the vmrs after it; the flags that
+    // vmrs computes (those live after the conditions that compare the operands instead); the conditions that do.
+    nx::vector<u8> fuse_;
+    nx::vector<FlagSet> fused_flags_;
+    nx::vector<u8> fused_cond_;
+    bool uses_fc32_ = false, uses_fc64_ = false;
 };
 
 // The translators, by instruction group; each returns false when the instruction is not in its group.
 bool emit_core(Emitter& e, const Instruction& in);
 bool emit_memory(Emitter& e, const Instruction& in);
 bool emit_vfp(Emitter& e, const Instruction& in);
+// (the floating-point registers in typed locals: emit_vfp_locals.cpp; emit_vfp.cpp has the context form)
+bool emit_vfp_locals(Emitter& e, const Instruction& in);
 bool emit_simd(Emitter& e, const Instruction& in);
 
 }  // namespace psvrecore::recomp::detail

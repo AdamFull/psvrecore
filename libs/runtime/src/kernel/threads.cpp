@@ -7,6 +7,7 @@
 #include "psvrecore/profile.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "psvrecore/recomp/support.hpp"
+#include "psvrecore/runtime/float_env.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "core/foundation/strings/format.h"
 #include "core/foundation/platform/os.h"
@@ -57,6 +58,8 @@ void Kernel::Impl::run_thread(Thread* t) {
                 nx::loge(logs::kernel, "thread '{}': no recompiled function at its entry 0x{:08x}", t->name, t->entry);
                 psv_trap(&t->ctx, t->entry, recomp::kTrapUnknownTarget);
             }
+            // (native floating point: the host's FPCR mirrors the thread's FPSCR while it runs, float_env.hpp)
+            enter_guest_float(&t->ctx);
             entry(&t->ctx, hle::kHostReturn);
             status = static_cast<i32>(t->ctx.r[0]);
         }
@@ -67,6 +70,7 @@ void Kernel::Impl::run_thread(Thread* t) {
         ended = true;
     }
     (void)ended;
+    leave_guest_float();
     Lock guard(lock);
     profile::release(t->track);
     t->track = nullptr;

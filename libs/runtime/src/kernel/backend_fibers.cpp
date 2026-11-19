@@ -33,6 +33,7 @@
 
 #include "backend.hpp"
 #include "psvrecore/log.hpp"
+#include "psvrecore/runtime/float_env.hpp"
 #include "psvrecore/runtime/host.hpp"
 #include "core/foundation/containers/hash_map.h"
 #include "core/foundation/fibers/context.h"
@@ -295,7 +296,12 @@ private:
     }
 
     // The calling fiber leaves its host thread (lock held), back when resumed.
-    static void suspend(GuestFiber* f) { nx::fiber::switch_to(f->context, f->on->context, nullptr); }
+    // (its floating-point state, the FPCR mirror of native floating point, back on whichever host thread resumes it)
+    static void suspend(GuestFiber* f) {
+        const FloatState state = float_state();
+        nx::fiber::switch_to(f->context, f->on->context, nullptr);
+        set_float_state(state);
+    }
 
     // A host thread runs `f` until it suspends or ends (lock held throughout).
     void run(Host* h, GuestFiber* f) {
@@ -306,6 +312,7 @@ private:
         host_.set_current(f->thread);
         host_.enter_lane(f->thread);
         nx::fiber::switch_to(h->context, f->context, f);
+        leave_guest_float();
         host_.enter_lane(nullptr);
         host_.set_current(nullptr);
         h->running = nullptr;

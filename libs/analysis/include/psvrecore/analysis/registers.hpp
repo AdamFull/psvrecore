@@ -84,6 +84,10 @@ struct FunctionRegisters {
     RegSet preserved = 0;      // of r4-r11 and sp: the same at its returns as at entry (when entered by a direct call)
     RegSet touched = 0;        // every register it reads, writes, stores or loads (the locals it has)
     bool checks_sp = false;    // checks the stack pointer after its calls to code outside the module's view
+    // Every way out of it goes back to the address LR held at entry, its return address when called directly: its
+    // returns branch to that LR, its tail calls pass it on (to functions that may not, themselves); no jump through
+    // the runtime, no import's tail call. (What the floating-point registers' summaries rely on: analysis/vfp.hpp.)
+    bool returns_to_lr = false;
     // By instruction index (Function::code):
     nx::vector<RegSet> trap_store;   // dirty before the instruction: written to the context by a trap inside it
                                      // (with what the instruction has written so far)

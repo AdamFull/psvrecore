@@ -57,7 +57,11 @@ constexpr usize kBufferSize = usize(kCorpusEnd - kCorpusBase) + 64;
 // The return address every test function is called with: never code, never fetched (the interpreter stops there).
 constexpr u32 kReturn = 0x82FF0001u;
 constexpr u64 kMaxSteps = 20'000'000;
-constexpr int kRunsPerFunction = 48;
+constexpr int kRunsPerFunction = 48;  // (CODEGEN_RUNS=<n>: n instead)
+int runs_per_function() {
+    if (const char* n = std::getenv("CODEGEN_RUNS")) return std::max(1, std::atoi(n));
+    return kRunsPerFunction;
+}
 
 // The corpus' memory: guest address -> offset in the buffer.
 usize offset_of(u32 address) {
@@ -199,6 +203,16 @@ bool apply_spec(const char* spec, Rng& rng, PsvContext& c, nx::vector<u8>& memor
     return true;
 }
 
+// The host's FPCR for generated code built with native floating point (guest.h, PSV_NATIVE_FLOAT): FZ and DN as the
+// guest's FPSCR has them (the runtime's mirror, runtime/float_env.hpp); elsewhere nothing.
+void mirror_fpscr(u32 fpscr) {
+#ifdef PSV_NATIVE_FLOAT
+    psv_native_set_fpcr(fpscr);
+#else
+    (void)fpscr;
+#endif
+}
+
 jmp_buf g_trap_jump;
 recomp::TrapInfo g_trap;
 [[noreturn]] void on_trap(PsvContext*, const recomp::TrapInfo& trap) {
@@ -298,7 +312,8 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
         }
         Rng rng{0xC0DE6E4ull ^ (static_cast<u64>(t + 1) * 0x9E3779B97F4A7C15ull)};
         usize function_failures = 0;
-        for (int trial = 0; trial < kRunsPerFunction; ++trial) {
+        const int trials = runs_per_function();
+        for (int trial = 0; trial < trials; ++trial) {
             initial = pristine;
             for (u32 at = kCorpusDataBase; at < kCorpusEnd; at += 4) {
                 const u32 w = rng.u32v();
@@ -314,8 +329,11 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             generated = initial;
             psv_membase = membase_for(generated);
             bool trapped = false;
+            // (native floating point: the FPCR mirrors the FPSCR the function starts with, as the runtime keeps it)
+            mirror_fpscr(start.fpscr);
             if (setjmp(g_trap_jump) == 0) function(&g, kReturn);
             else trapped = true;
+            mirror_fpscr(0);
 
             // The interpreter, from the same entry, until it returns there.
             PsvContext s = start;
@@ -380,6 +398,7 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             psv_membase = membase_for(generated);
             u64 best = ~u64(0);
             constexpr int kCalls = 2000;
+            mirror_fpscr(start.fpscr);
             for (int round = 0; round < rounds; ++round) {
                 const u64 t0 = nx::os::ticks_ns();
                 for (int k = 0; k < kCalls; ++k) {
@@ -388,6 +407,7 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
                 }
                 best = std::min(best, nx::os::ticks_ns() - t0);
             }
+            mirror_fpscr(0);
             const f64 ns = static_cast<f64>(best) / kCalls;
             log_sum += std::log(ns);
             std::printf("bench %-28s %10.1f ns\n", test.function, ns);

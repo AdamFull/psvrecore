@@ -266,6 +266,55 @@
   with an import or a function pointer that returns with another sp, legal only outside AAPCS, needs
   `--no-callee-saved`). `psvrecomp --registers-in-context` generates the code from before (every register in the
   context), for checking a suspected register analysis bug.
+- **Floating-point registers in locals (task 5): what is assumed and not checked.**
+  - The host's floating-point environment on x64 (and arm64 without native floating point) is the default one while
+    generated code runs: round to nearest, no flush-to-zero or denormals-are-zero (MXCSR's FTZ/DAZ clear). The typed
+    operations' fast paths take the host's IEEE result where it equals the VFP's under that environment (as the
+    binary32 fast paths before them did); host code that changed MXCSR on a guest thread would break them. Nothing in
+    the runtime does; a driver or library that did would not be noticed.
+  - A vcvtr on x64 rounds by MXCSR's mode (to nearest, as above), the exact fallback by `rint` (the same).
+  - Advanced SIMD instructions are taken to read and write only the D registers their operands name (register lists:
+    up to twice their count, four at least) and the FPSCR's bits 27-0 (QC, AHP), not its NZCV: guest_simd.h's helpers
+    do so today. A helper that touched another register would see a stale context register or have its write lost.
+  - Summaries take a callee to read and write only the registers its own instructions name, its callees' and, through
+    anything outside the module's view, everything. Code the module does not know that reaches a function's callers'
+    frames another way than through a call or a return to the LR it was given (a longjmp into the middle of a
+    caller, an exception unwound by guest code through a frame without a call) would find stale locals; the core
+    registers assume the same.
+  - The FPSCR's NZCV (what vcmp writes) is in the context at every call and exit where the function may have
+    changed it, so a loop that compares and branches still computes it each time round when the loop ends in a return
+    (x64: a few instructions; the branch itself is fused). AAPCS leaves it undefined at calls and returns; using that
+    would need a whole-program liveness like the condition flags' (not done).
+  - Operations whose result is a NaN (and, in flush-to-zero mode, whose operands or result are denormal or at the
+    smallest normal) call an out-of-line exact helper; in a loop that call costs the spills of the live
+    floating-point locals. Code that keeps computing on NaNs is slower than before: in the corpus' timing run the
+    functions whose random operands include NaNs and infinities (`dot3_f32`, `length_f32` over random memory words,
+    whose sums become NaN early; `arith_all`) take 1.5-2 times as long, while the other float functions take from 5%
+    more to 58% less (27-30% less in the geometric mean). Games are not expected to run hot loops on NaNs; not measured
+    in one.
+  Checked: the differential corpus (`vfp_locals.s`: aliasing, calls, NaN payloads, vmsr, fused compares, Advanced
+  SIMD next to VFP) in all three configurations, and the typed operations against the interpreter
+  (`vfp_typed_tests.cpp`). `psvrecomp --vfp-in-context` generates the code from before, `--vfp-calls-conservative`
+  without the summaries.
+- **Native floating point on arm64 (`PSVRECORE_GENERATED_CODE_NATIVE_FLOAT`) is not verified on a device.** It
+  compiles for android-arm64-release and its disassembly was inspected (one host instruction per guest operation), but
+  the device tests that compare it with the interpreter (`tests/device`, [BUILDING.md](BUILDING.md#device-tests)) have
+  not been run: the option stays off by default. Assumed and unchecked until then:
+  - AArch64's FPCR.FZ flushes denormal inputs and results with tininess detected before rounding, and its NaN
+    propagation and default NaN (FPCR.DN) are ARMv7 VFP's (the ARM ARM's FPRound and FPProcessNaNs say so; cores with
+    FEAT_AFP keep it while FPCR.AH is 0, which the runtime never sets);
+  - FCVT between single and double precision honours FZ and DN as VFP's vcvt.f64.f32 / vcvt.f32.f64 do;
+  - the C comparisons the generated code branches on compile to FCMP (which flushes by FPCR.FZ) with
+    `-fdenormal-fp-math=dynamic`, and nothing folds them under another assumption;
+  - the FPCR is per host thread and kept by the OS across preemption; nx::fiber's context switches leave it alone (the
+    fiber backend carries each guest fiber's FPCR itself);
+  - HLE code outside the `host_float` libraries (hle::Library) is unaffected by FZ/DN in what it computes. Libraries
+    not marked and possibly affected: none known to do floating-point arithmetic (SceCtrl, SceAppUtil, SceNet...);
+    marked as a precaution, perhaps needlessly: SceLibKernel (only printf's `%f` formats doubles), SceGxm and
+    SceDisplay (drivers' own arithmetic). Host threads of their own (the audio device's, the renderer's) never run in
+    guest mode.
+  - Only where the guest sets FZ or DN does any of this differ from the host's default (the FPSCR starts at 0, so
+    the mirror is the default FPCR until a vmsr); WipEout's libc has two vmsr instructions, not seen executed.
 - **A few system instructions are not translated.** In the 24 MB executable these are 3 `mcrr` and 3 `mrc p15`
   (coprocessor registers other than the thread ID registers). Each traps with a diagnostic.
 - **Imported variables need the SDK's reference-table format.** Analysis reads each imported variable's table of uses

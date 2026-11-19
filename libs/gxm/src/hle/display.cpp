@@ -480,8 +480,8 @@ void register_display() {
         v.uids.clear();
     }
     stop_vblank_thread();
-    runtime::hle::register_library({"SceDisplay", kSceDisplay, kDisplayFunctions});
-    runtime::hle::register_library({"SceDisplayUser", kSceDisplayUser, kDisplayUserFunctions});
+    runtime::hle::register_library({"SceDisplay", kSceDisplay, kDisplayFunctions, {}, true});
+    runtime::hle::register_library({"SceDisplayUser", kSceDisplayUser, kDisplayUserFunctions, {}, true});
 }
 
 }  // namespace psvrecore::gxm::hle

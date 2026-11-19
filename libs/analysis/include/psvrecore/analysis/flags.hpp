@@ -70,6 +70,7 @@ struct FunctionFlags {
     nx::vector<FlagSet> after;        // live after the instruction's own effect: the flags it must compute
     nx::vector<FlagSet> after_call;   // a call: live when it returns (read back from the context)
     nx::vector<FlagSet> before_call;  // a call: written to the context before it
+    nx::vector<FlagSet> live_before;  // live before the instruction (its condition included; what a trap may show)
 };
 
 struct FlagLiveness {

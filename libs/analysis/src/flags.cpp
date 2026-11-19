@@ -253,6 +253,7 @@ FlagLiveness Solver::run() {
             r.after.assign(n, kAllFlags);
             r.after_call.assign(n, kAllFlags);
             r.before_call.assign(n, kAllFlags);
+            r.live_before.assign(n, kAllFlags);
         }
         out.needed_at_entry = out.given_at_entry = out.needed_at_return = out.given_at_return = kAllFlags;
         return out;
@@ -377,8 +378,10 @@ FlagLiveness Solver::run() {
         r.after.resize(n);
         r.after_call.assign(n, 0);
         r.before_call.assign(n, 0);
+        r.live_before.resize(n);
         for (usize k = 0; k < n; ++k) {
             const CfgNode& node = f.cfg.nodes[k];
+            r.live_before[k] = with(f.live[k], f.live_out) | soft[k];
             FlagSet trap_after = 0;
             if (node.call == CallKind::None) {
                 for (const Edge* e = f.cfg.begin(node); e != f.cfg.end(node); ++e)

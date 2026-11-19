@@ -25,6 +25,9 @@ else()
 endif()
 option(PSVRECORE_BUILD_TOOLS "Build host-side tools" ${_psvrecore_host_default})
 option(PSVRECORE_BUILD_TESTS "Build unit tests (no game data or SDK files required)" ${_psvrecore_host_default})
+# Tests to run on an arm64 device by hand (tests/device: floating point and the code generator's corpus, with generated
+# code's options; docs/BUILDING.md, "Device tests").
+option(PSVRECORE_DEVICE_TESTS "Build the device tests (arm64: adb push and run them)" OFF)
 # Tracy (nx-foundation's copy of its client): the runtime's zones, plots and frame marks, the guest's own CPU and GPU
 # markers and the renderer's GPU zones (docs/PROFILING.md). Off, every hook compiles to nothing.
 option(PSVRECORE_TRACY "Build Tracy's client in and compile the profiler's hooks" OFF)
@@ -82,7 +85,7 @@ add_subdirectory(libs/vulkan)
 add_subdirectory(libs/gxm)
 add_subdirectory(libs/platform)
 add_subdirectory(libs/frontend)
-if(PSVRECORE_BUILD_TESTS)
+if(PSVRECORE_BUILD_TESTS OR PSVRECORE_DEVICE_TESTS)
     add_subdirectory(libs/interp)  # (test-only)
 endif()
 
@@ -104,4 +107,7 @@ endif()
 if(PSVRECORE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+if(PSVRECORE_DEVICE_TESTS)
+    add_subdirectory(tests/device)
 endif()

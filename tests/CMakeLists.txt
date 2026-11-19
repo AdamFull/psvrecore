@@ -32,9 +32,11 @@ add_executable(psvrecore_tests
     analysis_tests.cpp
     flags_tests.cpp
     registers_tests.cpp
+    vfp_tests.cpp
     generator_tests.cpp
     interp_tests.cpp
     float_tests.cpp
+    vfp_typed_tests.cpp
     simd_tests.cpp
     usse_tests.cpp
     usse_interp_tests.cpp
@@ -63,7 +65,7 @@ psvrecore_target_defaults(corpusgen)
 # at return and the test compares them all; the other's leave only those a caller reads (see corpusgen.cpp).
 set(PSVRECORE_CODEGEN_TEST_ARGS "" CACHE STRING "more corpusgen options for the synthetic corpus' code (tests/codegen)")
 separate_arguments(_corpus_args NATIVE_COMMAND "${PSVRECORE_CODEGEN_TEST_ARGS}")
-set(_corpus_modules calls control flags integer integer_arm neon regs vfp)  # (one per file in codegen/corpus)
+set(_corpus_modules calls control flags integer integer_arm neon regs vfp vfp_locals)  # (one per file in codegen/corpus)
 foreach(_config "" _masked _locals)
     set(_dir "${CMAKE_CURRENT_BINARY_DIR}/codegen${_config}")
     set(_corpus_sources${_config} "${_dir}/corpus_modules.c")

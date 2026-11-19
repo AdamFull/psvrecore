@@ -395,7 +395,7 @@ void register_voice() {
         v.initialized = v.started = false;
         v.ports.clear(), v.edges.clear();
     }
-    register_library({"SceVoice", kSceVoice, kFunctions});
+    register_library({"SceVoice", kSceVoice, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

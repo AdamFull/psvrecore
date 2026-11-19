@@ -15,6 +15,7 @@
 
 #include "hle_common.hpp"
 #include "psvrecore/profile.hpp"
+#include "psvrecore/runtime/float_env.hpp"
 #include "core/foundation/containers/hash_map.h"
 #include "core/foundation/fibers/context.h"
 #include "core/foundation/fibers/stack.h"
@@ -105,10 +106,12 @@ u32 resume(ThreadFibers& t, Fiber* to, u32 value) {
         to->started = true;
         to->host.reset(to->stack, &fiber_main);
     }
+    const bool guest_float = in_guest_float();
     const nx::fiber::Transfer back = nx::fiber::switch_to(from_host, to_host, &hand);
-    // (resumed: this side's registers back)
+    // (resumed: this side's registers back, its FPSCR's mirror with native floating point)
     ThreadFibers& now = g_thread_fibers.get();
     *now.ctx = from ? from->regs : now.regs;
+    if (guest_float) enter_guest_float(now.ctx);
     return static_cast<const Hand*>(back.data)->value;
 }
 

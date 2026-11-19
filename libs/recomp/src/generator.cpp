@@ -52,10 +52,13 @@ constexpr std::pair<FlagSet, char> kFlagNames[] = {{analysis::kFlagN, 'n'}, {ana
 }  // namespace
 
 Emitter::Emitter(const analysis::Program& program, const analysis::Function& fn, const analysis::FlagLiveness& flags,
-                 const nx::string& prefix, Stats& stats, RegisterMode mode, const analysis::FunctionRegisters* registers)
+                 const nx::string& prefix, Stats& stats, RegisterMode mode, const analysis::FunctionRegisters* registers,
+                 VfpMode vfp_mode, const analysis::FunctionVfp* vfp)
     : program_(program), fn_(fn), flags_(flags), flags_fn_(flags.at(fn.entry)), cfg_(analysis::build_cfg(program, fn)),
-      prefix_(prefix), stats_(stats), mode_(mode), regs_(mode == RegisterMode::Locals ? registers : nullptr) {
+      prefix_(prefix), stats_(stats), mode_(mode), regs_(mode == RegisterMode::Locals ? registers : nullptr), vfp_mode_(vfp_mode),
+      vfp_(vfp_mode == VfpMode::Locals ? vfp : nullptr) {
     if (mode == RegisterMode::Locals && !registers) mode_ = RegisterMode::Context;
+    if (vfp_mode == VfpMode::Locals && (!vfp || vfp->live_before.size() != fn.code.size())) vfp_mode_ = VfpMode::Context, vfp_ = nullptr;
 }
 
 namespace {
@@ -90,12 +93,235 @@ bool Emitter::noreturn_call(const Instruction& in) const {
     return std::find(fn_.noreturn_calls.begin(), fn_.noreturn_calls.end(), in.address) != fn_.noreturn_calls.end();
 }
 
+// ---- Floating-point registers in locals (analysis/vfp.hpp) -------------------------------------------------------
+
+nx::string Emitter::vs(u32 k) {
+    k &= 63;
+    vaccess_.uses.words |= 1ull << k;
+    if (k < 32) vaccess_.s_access |= 1u << (k / 2);
+    const u32 n = k / 2;
+    if (!vfp_ || vfp_->s_held(n)) return nx::format("s{}", k);
+    return nx::format("psv_v{}32(d{})", (k & 1) ? "hi" : "lo", n);
+}
+
+nx::string Emitter::vd(u32 n) {
+    n &= 31;
+    vaccess_.uses.words |= analysis::d_words(n);
+    vaccess_.d_access |= 1u << n;
+    if (vfp_ && vfp_->s_held(n)) return nx::format("psv_vpack64(s{}, s{})", 2 * n, 2 * n + 1);
+    return nx::format("d{}", n);
+}
+
+void Emitter::set_vs(u32 k, nx::string_view value) {
+    k &= 63;
+    vaccess_.defs.words |= 1ull << k;
+    if (k < 32) vaccess_.s_access |= 1u << (k / 2);
+    const u32 n = k / 2;
+    if (!vfp_ || vfp_->s_held(n)) line(nx::format("s{} = {};", k, value));
+    else line(nx::format("d{0} = psv_vset{1}64(d{0}, {2});", n, (k & 1) ? "hi" : "lo", value));
+}
+
+void Emitter::set_vd(u32 n, nx::string_view value) {
+    n &= 31;
+    vaccess_.defs.words |= analysis::d_words(n);
+    vaccess_.d_access |= 1u << n;
+    if (vfp_ && vfp_->s_held(n)) {
+        const nx::string t = temp("v");
+        line(nx::format("const double {0} = {1}; s{2} = psv_vlo32({0}); s{3} = psv_vhi32({0});", t, value, 2 * n, 2 * n + 1));
+    } else {
+        line(nx::format("d{} = {};", n, value));
+    }
+}
+
+nx::string Emitter::fpscr() {
+    vaccess_.uses.fpscr |= analysis::kFpscrRest;
+    return "fpscr";
+}
+
+nx::string Emitter::fpnzcv() {
+    vaccess_.uses.fpscr |= analysis::kFpscrNzcv;
+    return "fpnzcv";
+}
+
+void Emitter::set_fpnzcv(nx::string_view value) {
+    vaccess_.defs.fpscr |= analysis::kFpscrNzcv;
+    line(nx::format("fpnzcv = {};", value));
+}
+
+void Emitter::set_fpscr(nx::string_view value) {
+    vaccess_.defs.fpscr |= analysis::kFpscrAll;
+    line(nx::format("fpscr = {}; fpnzcv = fpscr & 0xF0000000u;", value));
+}
+
+nx::string Emitter::vfp_line(VfpSet units, bool store) const {
+    nx::string out;
+    const auto add = [&](nx::string_view s) {
+        if (!out.empty()) out += ' ';
+        out += s;
+    };
+    for (u32 n = 0; n < 32; ++n) {
+        if (vfp_ && vfp_->s_held(n)) {
+            for (u32 k = 2 * n; k <= 2 * n + 1; ++k)
+                if ((units.words >> k) & 1)
+                    add(store ? nx::format("ctx->vfp.s[{0}] = psv_b32(s{0});", k) : nx::format("s{0} = psv_f32(ctx->vfp.s[{0}]);", k));
+        } else if (units.words & analysis::d_words(n)) {
+            add(store ? nx::format("ctx->vfp.d[{0}] = psv_b64(d{0});", n) : nx::format("d{0} = psv_f64(ctx->vfp.d[{0}]);", n));
+        }
+    }
+    const u8 f = units.fpscr;
+    if (store) {
+        if (f == analysis::kFpscrAll) add("ctx->fpscr = (fpscr & 0x0FFFFFFFu) | fpnzcv;");
+        else if (f == analysis::kFpscrNzcv) add("ctx->fpscr = (ctx->fpscr & 0x0FFFFFFFu) | fpnzcv;");
+        else if (f == analysis::kFpscrRest) add("ctx->fpscr = (ctx->fpscr & 0xF0000000u) | (fpscr & 0x0FFFFFFFu);");
+    } else {
+        if (f & analysis::kFpscrRest) add("fpscr = ctx->fpscr;");
+        if (f & analysis::kFpscrNzcv) add("fpnzcv = ctx->fpscr & 0xF0000000u;");
+    }
+    return out;
+}
+
+void Emitter::store_vfp(VfpSet units, usize& counter) {
+    if (!vfp_ || units.empty()) return;
+    line(vfp_line(units, true));
+    ++counter;
+}
+
+void Emitter::call_vfp_before() {
+    if (!vfp_) return;
+    store_vfp(vfp_->call_store[index_], stats_.vfp_stores);
+}
+
+void Emitter::call_vfp_after(const Instruction& in) {
+    if (!vfp_ || noreturn_call(in)) return;
+    const VfpSet load = vfp_->call_load[index_];
+    if (load.empty()) return;
+    line(vfp_line(load, false));
+    ++stats_.vfp_call_loads;
+}
+
+nx::string Emitter::vfp_trap_stores() {
+    vaccess_.traps = true;
+    if (!vfp_ || vfp_->trap_store[index_].empty()) return {};
+    ++stats_.vfp_trap_stores;
+    return vfp_line(vfp_->trap_store[index_], true);
+}
+
+namespace {
+
+// The condition `c` after a fused compare of fc<w>a with fc<w>b: NZCV is less 1000, equal 0110, greater 0010,
+// unordered 0011, so each condition is one comparison (an ordered one, or the negation of one).
+nx::string fused_condition(arm::Cond c, u32 width) {
+    const nx::string a = nx::format("fc{}a", width), b = nx::format("fc{}b", width);
+    switch (c) {
+        case arm::Cond::Eq: return nx::format("({} == {})", a, b);
+        case arm::Cond::Ne: return nx::format("!({} == {})", a, b);
+        case arm::Cond::Cs: return nx::format("!({} < {})", a, b);
+        case arm::Cond::Cc: return nx::format("({} < {})", a, b);
+        case arm::Cond::Mi: return nx::format("({} < {})", a, b);
+        case arm::Cond::Pl: return nx::format("!({} < {})", a, b);
+        case arm::Cond::Vs: return nx::format("__builtin_isunordered({}, {})", a, b);
+        case arm::Cond::Vc: return nx::format("!__builtin_isunordered({}, {})", a, b);
+        case arm::Cond::Hi: return nx::format("!({} <= {})", a, b);
+        case arm::Cond::Ls: return nx::format("({} <= {})", a, b);
+        case arm::Cond::Ge: return nx::format("({} >= {})", a, b);
+        case arm::Cond::Lt: return nx::format("!({} >= {})", a, b);
+        case arm::Cond::Gt: return nx::format("({} > {})", a, b);
+        case arm::Cond::Le: return nx::format("!({} > {})", a, b);
+        default: return {};
+    }
+}
+
+bool is_vfp_compare(const Instruction& in) {
+    if (in.op != Op::Vcmp && in.op != Op::Vcmpe) return false;
+    if (in.dt == arm::Dt::F64) return true;
+    return in.operand_count >= 1 && in.operands[0].kind == OperandKind::SReg;
+}
+
+bool is_vmrs_nzcv(const Instruction& in) {
+    // (Sysreg codes: format.cpp; 5 FPSCR, 11 APSR_nzcv)
+    return in.op == Op::Vmrs && in.operand_count == 2 && in.operands[0].kind == OperandKind::Sysreg && in.operands[0].imm == 11 &&
+           in.operands[1].imm == 5;
+}
+
+}  // namespace
+
+// A vcmp right before vmrs APSR_nzcv in the same block (both unconditional): the compare keeps its operands, the vmrs
+// computes only the flags live after the instructions that follow it and test only its flags in their conditions,
+// and those conditions compare the operands themselves (cmp + branch: one host compare and branch).
+void Emitter::plan_fused_compares() {
+    const auto& code = fn_.code;
+    const usize n = code.size();
+    fuse_.assign(n, 0);
+    fused_flags_.assign(n, 0);
+    fused_cond_.assign(n, 0);
+    const auto same_block = [&](usize i, usize j) {
+        return cfg_.block_of[i] == cfg_.block_of[j] && code[j].address == code[j - 1].address + code[j - 1].size &&
+               !labels_.contains(code[j].address);
+    };
+    for (usize i = 0; i + 1 < n; ++i) {
+        const Instruction& c = code[i];
+        if (!is_vfp_compare(c) || analysis::is_conditional(c) || !c.valid() || (c.flags & arm::kUnpredictable)) continue;
+        // (the vmrs: the next instruction, or a later one of the block, after instructions that leave the FPSCR's NZCV
+        // alone and call nothing)
+        usize m = i + 1;
+        while (m < n && same_block(i, m) && !is_vmrs_nzcv(code[m])) {
+            const Instruction& x = code[m];
+            if (is_vfp_compare(x) || x.op == Op::Vmsr || x.op == Op::Vmrs || cfg_.nodes[m].call != analysis::CallKind::None || !x.valid() ||
+                (x.flags & arm::kUnpredictable))
+                break;
+            ++m;
+        }
+        if (m >= n || !same_block(i, m) || !is_vmrs_nzcv(code[m]) || analysis::is_conditional(code[m])) continue;
+        const u8 width = c.dt == arm::Dt::F64 ? 64 : 32;
+        fuse_[i] = width;
+        fuse_[m] = static_cast<u8>(0x80 | width);
+        usize last = m;
+        for (usize j = m + 1; j < n && same_block(i, j); ++j) {
+            const Instruction& in = code[j];
+            const analysis::FlagEffect fe = analysis::flag_effect(in);
+            const bool conditional = analysis::is_conditional(in) && in.op != Op::It;
+            const FlagSet tested = conditional ? analysis::condition_flags(in.cond) : FlagSet(0);
+            if (fe.defs || (fe.uses & ~tested) || is_vfp_compare(in) || !in.valid() || (in.flags & arm::kUnpredictable)) break;
+            if (vfp_ && vfp_->may_trap[j]) break;
+            const bool call = cfg_.nodes[j].call != analysis::CallKind::None;
+            if (call && !conditional) break;
+            if (conditional) fused_cond_[j] = width;
+            last = j;
+            if (call) break;  // (the flags are the callee's after it)
+        }
+        // (the flags something reads after the window: on each way out of it, the skip edge of its last
+        // instruction included; a trap there shows all four)
+        FlagSet needed = 0;
+        const auto edge_flags = [&](const analysis::Edge& e) -> FlagSet {
+            switch (e.kind) {
+                case analysis::EdgeKind::Next: return e.to > m && e.to <= last ? FlagSet(0) : flags_fn_->live_before[e.to];
+                case analysis::EdgeKind::Trap: return analysis::kAllFlags;
+                default: return flags_.at_exit(*flags_fn_, e);
+            }
+        };
+        for (usize j = m; j <= last; ++j) {
+            const analysis::CfgNode& node = cfg_.nodes[j];
+            if (node.call != analysis::CallKind::None) needed |= flags_fn_->before_call[j];  // (a conditional call's)
+            for (const analysis::Edge* e = cfg_.begin(node); e != cfg_.end(node); ++e) needed |= edge_flags(*e);
+            if (node.conditional) needed |= edge_flags(node.skip);
+        }
+        fused_flags_[m] = needed;
+    }
+}
+
+void Emitter::exit_registers() {
+    store_registers(regs_ ? regs_->exit_store[index_] : RegSet(0));
+    if (vfp_) store_vfp(vfp_->exit_store[index_], stats_.vfp_stores);
+}
+
 void Emitter::call_registers_before() {
+    call_vfp_before();
     if (!regs_) return;
     store_registers(regs_->call_store[index_]);
 }
 
 void Emitter::call_registers_after(const Instruction& in) {
+    call_vfp_after(in);
     if (!regs_ || noreturn_call(in)) return;
     const auto& node = cfg_.nodes[index_];
     const RegSet kept = regs_->call_kept[index_];
@@ -122,11 +348,14 @@ void Emitter::call_registers_after(const Instruction& in) {
 
 nx::string Emitter::trap_register_stores() {
     access_.traps = true;
-    if (!regs_) return {};
+    nx::string vfp = vfp_trap_stores();
+    if (!regs_) return vfp;
     const RegSet r = static_cast<RegSet>(regs_->trap_store[index_] | access_.defs);
-    if (!r) return {};
+    if (!r) return vfp;
     stats_.register_trap_stores += static_cast<usize>(std::popcount(r));
-    return register_line(r, true);
+    nx::string out = register_line(r, true);
+    if (!vfp.empty()) out += " " + vfp;
+    return out;
 }
 
 nx::string Emitter::trap_stores() {
@@ -270,6 +499,10 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
                 store += (store.empty() ? "" : " ") + register_line(regs_->exit_store[index_], true);
                 stats_.register_stores += static_cast<usize>(std::popcount(regs_->exit_store[index_]));
             }
+            if (vfp_ && !vfp_->exit_store[index_].empty()) {
+                store += (store.empty() ? "" : " ") + vfp_line(vfp_->exit_store[index_], true);
+                ++stats_.vfp_stores;
+            }
             line(nx::format("case {}u: {}{}{}(ctx, ret); return;", i, store, store.empty() ? "" : " ", function_name(target_code)));
         } else {
             line(nx::format("case {}u: goto {};", i, label_name(target_code)));
@@ -304,10 +537,12 @@ void Emitter::branch_to_value(const Instruction& in, nx::string_view target) {
 void Emitter::branch_to(const Instruction& in, u32 target_code, bool after) {
     (void)in;
     const RegSet exit = regs_ ? (after ? regs_->after_store[index_] : regs_->exit_store[index_]) : RegSet(0);
+    const VfpSet vexit = vfp_ ? (after ? vfp_->after_store[index_] : vfp_->exit_store[index_]) : VfpSet{};
     if (auto stub = program_.import_stubs.find(target_code & ~1u); stub != program_.import_stubs.end()) {
         ++stats_.import_calls;
         store_flags(flags_.into_unknown(flags_fn_->live_out));
         store_registers(exit);
+        store_vfp(vexit, stats_.vfp_stores);
         line(nx::format("psv_call_import(ctx, &{}_imports[{}], ret);", prefix_, stub->second));
         line("return;");
         return;
@@ -316,6 +551,7 @@ void Emitter::branch_to(const Instruction& in, u32 target_code, bool after) {
         ++stats_.tail_calls;
         store_flags(flags_.into(target_code, flags_fn_->live_out));
         store_registers(exit);
+        store_vfp(vexit, stats_.vfp_stores);
         line(nx::format("{}(ctx, ret);", function_name(target_code)));
         line("return;");
         return;
@@ -375,13 +611,56 @@ bool Emitter::falls_through(const Instruction& in) const {
     }
 }
 
+namespace {
+
+// The D registers an Advanced SIMD instruction may read or write (its helpers work on the context's), and the
+// FPSCR's QC and AHP (the rest): more than it does for register lists (both spacings), never less.
+VfpSet simd_context(const Instruction& in) {
+    VfpSet s;
+    s.fpscr = analysis::kFpscrRest;
+    for (u8 i = 0; i < in.operand_count; ++i) {
+        const Operand& o = in.operands[i];
+        switch (o.kind) {
+            case OperandKind::DReg:
+            case OperandKind::DScalar: s.words |= analysis::d_words(o.reg & 31); break;
+            case OperandKind::QReg: s.words |= analysis::d_words((2 * o.reg) & 31) | analysis::d_words((2 * o.reg + 1) & 31); break;
+            case OperandKind::DRegList:
+            case OperandKind::DLaneList: {  // (d<reg> on, by one or two, four at least)
+                const u32 count = std::max<u32>(o.count, 4);
+                for (u32 k = 0; k < 2 * count && o.reg + k < 32; ++k) s.words |= analysis::d_words(o.reg + k);
+                break;
+            }
+            default: break;
+        }
+    }
+    return s;
+}
+
+}  // namespace
+
 void Emitter::instruction(const Instruction& in) {
     ended_ = false;
     access_ = {};
+    vaccess_ = {};
     if (!in.valid()) return trap(in, "PSV_TRAP_UNDEFINED", "undefined");
     if (in.flags & arm::kUnpredictable) return trap(in, "PSV_TRAP_UNPREDICTABLE", nx::format("unpredictable {}", arm::mnemonic(in.op)));
     count_flags(in);
-    if (emit_core(*this, in) || emit_memory(*this, in) || emit_vfp(*this, in) || emit_simd(*this, in)) return;
+    if (emit_core(*this, in) || emit_memory(*this, in) || emit_vfp(*this, in)) return;
+    const usize mark = body_.size();
+    if (emit_simd(*this, in)) {
+        // (Advanced SIMD works on the context's registers: the locals it reads in the context first, those it may
+        // have written read back after)
+        if (vfp_mode_ == VfpMode::Probe) vaccess_.context = simd_context(in);
+        if (vfp_) {
+            const VfpSet before = vfp_->call_store[index_], after = vfp_->call_load[index_];
+            if (!before.empty()) body_.insert(mark, "        " + vfp_line(before, true) + "\n");
+            if (!after.empty()) line(vfp_line(after, false));
+            stats_.vfp_stores += !before.empty();
+            stats_.vfp_call_loads += !after.empty();
+            stats_.vfp_simd_syncs += !before.empty() || !after.empty();
+        }
+        return;
+    }
     unimplemented(in);
 }
 
@@ -417,6 +696,8 @@ nx::string Emitter::function() {
     nx::string out;
     if (!entry_first) out += nx::format("    goto {};\n", label_name(fn_.start()));
     if (mode_ == RegisterMode::Probe) effects_.assign(code.size(), {});
+    if (vfp_mode_ == VfpMode::Probe) vfp_effects_.assign(code.size(), {});
+    if (vfp_locals()) plan_fused_compares();
     for (usize i = 0; i < code.size(); ++i) {
         const auto& in = code[i];
         index_ = i;
@@ -426,8 +707,15 @@ nx::string Emitter::function() {
         temp_counter_ = 0;
         instruction(in);
         if (mode_ == RegisterMode::Probe) effects_[i] = access_;
-        // (an IT instruction's condition is its block's first condition, not its own)
-        const nx::string cond = in.op == Op::It ? nx::string() : condition(in.cond);
+        if (vfp_mode_ == VfpMode::Probe) vfp_effects_[i] = vaccess_;
+        // (an IT instruction's condition is its block's first condition, not its own; after a fused compare, the
+        // operands compared)
+        nx::string cond = in.op == Op::It ? nx::string() : condition(in.cond);
+        if (!cond.empty() && !fused_cond_.empty() && fused_cond_[i]) {
+            cond = fused_condition(in.cond, fused_cond_[i]);
+            use_fused(fused_cond_[i]);
+            ++stats_.vfp_fused_conditions;
+        }
         const nx::string text = comment_text(arm::format(in));
         if (cond.empty()) out += nx::format("    {{ /* {:08x}: {} */\n", in.address, text);
         else out += nx::format("    if ({}) {{ /* {:08x}: {} */\n", cond, in.address, text);
@@ -450,6 +738,10 @@ nx::string Emitter::function() {
             if (regs_ && regs_->after_store[i]) {
                 stores += " " + register_line(regs_->after_store[i], true);
                 stats_.register_trap_stores += static_cast<usize>(std::popcount(regs_->after_store[i]));
+            }
+            if (vfp_ && !vfp_->after_store[i].empty()) {
+                stores += " " + vfp_line(vfp_->after_store[i], true);
+                ++stats_.vfp_trap_stores;
             }
             out += "    " + stores + "\n";
             out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n", hex(next));
@@ -477,9 +769,45 @@ nx::string Emitter::function() {
         if (!registers.empty()) registers += ";\n";
         stats_.register_entry_loads += static_cast<usize>(std::popcount(regs_->load_at_entry));
     }
+    // The floating-point registers and the FPSCR in locals (analysis/vfp.hpp): those live at entry from the context,
+    // the others 0 (never read before written); the operands of fused compares.
+    nx::string vfp;
+    if (vfp_) {
+        nx::string floats, doubles;
+        const VfpSet touched = vfp_->touched, load = vfp_->load_at_entry;
+        for (u32 n = 0; n < 32; ++n) {
+            if (vfp_->s_held(n)) {
+                bool any = false;
+                for (u32 k = 2 * n; k <= 2 * n + 1; ++k) {
+                    if (!(touched.words & (1ull << k))) continue;
+                    const bool in = (load.words >> k) & 1;
+                    floats += nx::format("{}s{} = {}", floats.empty() ? "    float " : ", ", k, in ? nx::format("psv_f32(ctx->vfp.s[{}])", k) : nx::string("0"));
+                    stats_.vfp_entry_loads += in;
+                    any = true;
+                }
+                stats_.vfp_s_held += any;
+            } else if (touched.words & analysis::d_words(n)) {
+                const bool in = (load.words & analysis::d_words(n)) != 0;
+                doubles += nx::format("{}d{} = {}", doubles.empty() ? "    double " : ", ", n, in ? nx::format("psv_f64(ctx->vfp.d[{}])", n) : nx::string("0"));
+                stats_.vfp_entry_loads += in;
+                ++stats_.vfp_d_held;
+            }
+        }
+        if (!floats.empty()) vfp += floats + ";\n";
+        if (!doubles.empty()) vfp += doubles + ";\n";
+        if (touched.fpscr & analysis::kFpscrRest)
+            vfp += nx::format("    uint32_t fpscr = {};\n", (load.fpscr & analysis::kFpscrRest) ? "ctx->fpscr" : "0");
+        if (touched.fpscr & analysis::kFpscrNzcv)
+            vfp += nx::format("    uint32_t fpnzcv = {};\n", (load.fpscr & analysis::kFpscrNzcv) ? "ctx->fpscr & 0xF0000000u" : "0");
+        stats_.vfp_entry_loads += static_cast<usize>(std::popcount(static_cast<u32>(load.fpscr)));
+        if (uses_fc32_) vfp += "    float fc32a = 0, fc32b = 0;\n";
+        if (uses_fc64_) vfp += "    double fc64a = 0, fc64b = 0;\n";
+        if (!touched.empty()) ++stats_.vfp_functions;
+        stats_.vfp_calls_keeping += vfp_->calls_keeping;
+    }
     if (sp_trap_) out += nx::format("L_SP_MOVED:;\n    psv_trap(ctx, {}, PSV_TRAP_STACK_POINTER);\n", hex(fn_.start()));
-    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl = {{{}}};\n{}", function_name(fn_.entry),
-                      memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags, registers) +
+    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl = {{{}}};\n{}{}", function_name(fn_.entry),
+                      memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags, registers, vfp) +
            out + "}\n";
 }
 
@@ -559,15 +887,29 @@ Output generate(const analysis::Program& program, const Options& options) {
     analysis::FlagLiveness flags = analysis::flag_liveness(program, flag_options);
     // The registers (analysis/registers.hpp): a first translation records what each instruction's translation reads
     // and writes (checked against analysis::register_effect), the analysis runs on that, then the translation.
+    // The floating-point registers likewise (analysis/vfp.hpp): what the first translation reads and writes of them,
+    // then their analysis (on the registers', which says which functions return where they were called from).
     const bool locals = !options.registers_in_context;
+    const bool vfp_locals = !options.vfp_in_context;
     analysis::RegisterAnalysis registers;
+    analysis::VfpAnalysis vfp;
+    nx::map<u32, nx::vector<analysis::VfpEffect>> vfp_effects;
     Stats& st = result.stats;
+    if (vfp_locals && !locals) {
+        Stats scratch;
+        for (const auto& [code, fn] : program.functions) {
+            Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe, nullptr, VfpMode::Probe);
+            (void)e.function();
+            vfp_effects[code] = e.vfp_effects();
+        }
+    }
     if (locals) {
         nx::map<u32, nx::vector<analysis::RegisterEffect>> effects;
         Stats scratch;
         for (const auto& [code, fn] : program.functions) {
-            Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe);
+            Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe, nullptr, vfp_locals ? VfpMode::Probe : VfpMode::Context);
             (void)e.function();
+            if (vfp_locals) vfp_effects[code] = e.vfp_effects();
             const auto& got = e.effects();
             for (usize i = 0; i < got.size(); ++i) {
                 const analysis::RegisterEffect model = analysis::register_effect(fn.code[i]);
@@ -600,8 +942,16 @@ Output generate(const analysis::Program& program, const Options& options) {
             if (r.checks_sp) ++st.functions_checking_sp;
         }
     }
+    if (vfp_locals) {
+        analysis::VfpOptions vfp_options;
+        vfp_options.summaries = !options.vfp_calls_conservative;
+        vfp_options.effects = &vfp_effects;
+        vfp_options.registers = locals ? &registers : nullptr;
+        vfp = analysis::vfp_analysis(program, vfp_options);
+    }
     for (const auto& [code, fn] : program.functions) {
-        Emitter e(program, fn, flags, p, st, locals ? RegisterMode::Locals : RegisterMode::Context, registers.at(code));
+        Emitter e(program, fn, flags, p, st, locals ? RegisterMode::Locals : RegisterMode::Context, registers.at(code),
+                  vfp_locals ? VfpMode::Locals : VfpMode::Context, vfp.at(code));
         chunk += e.function();
         chunk_instructions += static_cast<u32>(fn.code.size());
         if (chunk_instructions >= options.instructions_per_file) flush();
@@ -613,6 +963,7 @@ Output generate(const analysis::Program& program, const Options& options) {
         nx::vector<FlagSet>().swap(f.after);
         nx::vector<FlagSet>().swap(f.after_call);
         nx::vector<FlagSet>().swap(f.before_call);
+        nx::vector<FlagSet>().swap(f.live_before);
     }
     result.flags = std::move(flags);
     for (auto& [code, r] : registers.functions) {

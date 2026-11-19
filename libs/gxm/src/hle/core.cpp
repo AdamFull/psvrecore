@@ -367,7 +367,7 @@ const runtime::hle::Function kFunctions[] = {
 
 }  // namespace
 
-void register_core() { runtime::hle::register_library({"SceGxm", kSceGxm, kFunctions}); }
+void register_core() { runtime::hle::register_library({"SceGxm", kSceGxm, kFunctions, {}, true}); }
 
 }  // namespace psvrecore::gxm::hle
 

@@ -148,6 +148,8 @@ struct FlagArgs {
     bool registers_in_context = false, no_callee_saved = false;
     nx::string keep_registers = "all";
     bool no_sp_check = false;
+    bool vfp_in_context = false;
+    bool vfp_calls_conservative = false;
 };
 
 bool valid_identifier(nx::string_view name) {
@@ -180,6 +182,8 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     gen.registers_in_context = flag_args.registers_in_context;
     gen.no_callee_saved = flag_args.no_callee_saved;
     gen.check_sp = !flag_args.no_sp_check;
+    gen.vfp_in_context = flag_args.vfp_in_context;
+    gen.vfp_calls_conservative = flag_args.vfp_calls_conservative;
     if (flag_args.keep_registers == "all") gen.keep_registers = analysis::KeepPolicy::All;
     else if (flag_args.keep_registers == "loops") gen.keep_registers = analysis::KeepPolicy::Loops;
     else if (flag_args.keep_registers == "none") gen.keep_registers = analysis::KeepPolicy::None;
@@ -233,6 +237,19 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
             for (const auto& note : st.register_notes) print("              {}\n", note);
         }
     }
+    if (gen.vfp_in_context) {
+        print("vfp         in the context (--vfp-in-context)\n");
+    } else {
+        print("vfp         {} functions with floating-point locals ({} D registers as two floats, {} as a double); {} read at "
+              "entry\n",
+              st.vfp_functions, st.vfp_s_held, st.vfp_d_held, st.vfp_entry_loads);
+        print("            {} places write locals to the context, {} read them back ({} Advanced SIMD instructions); {} calls "
+              "keep a live local the callee does not write{}; {} at traps\n",
+              st.vfp_stores, st.vfp_call_loads, st.vfp_simd_syncs, st.vfp_calls_keeping,
+              gen.vfp_calls_conservative ? " (--vfp-calls-conservative)" : "", st.vfp_trap_stores);
+        print("            {} vcmp + vmrs pairs compare once, {} conditions compare their operands\n", st.vfp_fused_compares,
+              st.vfp_fused_conditions);
+    }
     print("discovery   {} errors (psvrecomp analyze --diagnostics lists them)\n", errors);
     usize traps = 0;
     for (const auto& [what, n] : st.traps) traps += n;
@@ -284,6 +301,11 @@ int main(int argc, char** argv) {
         .option("keep-registers", flag_args.keep_registers,
                 "where a caller keeps the registers a callee preserves in locals instead of reading them back: all "
                 "(direct calls), loops (direct calls inside loops) or none", {.value_name = "WHERE"})
+        .flag("vfp-in-context", flag_args.vfp_in_context,
+              "floating-point registers and the FPSCR in the context everywhere, not in locals (the translation from before "
+              "they were locals, for checking a suspected floating-point locals bug)")
+        .flag("vfp-calls-conservative", flag_args.vfp_calls_conservative,
+              "every call taken to read and write all floating-point registers: none kept in locals across a call")
         .flag("no-sp-check", flag_args.no_sp_check,
               "take calls to code outside the module to return with the stack pointer they were called with, without "
               "checking it after them")

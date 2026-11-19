@@ -162,6 +162,10 @@ struct Library {
     u32 nid;
     std::span<const Function> functions;
     std::span<const Variable> variables = {};
+    // Its host code does floating-point arithmetic where flush-to-zero or default NaN would change results that matter
+    // (decoders, mixers, the renderer, number parsing): with native floating point its imports run in the host's
+    // default floating-point environment, not the guest's mode (runtime/float_env.hpp).
+    bool host_float = false;
 };
 
 #define HLE_FUNCTION(nid, fn) ::psvrecore::runtime::hle::Function{nid, #fn, &::psvrecore::runtime::hle::entry<&fn>}

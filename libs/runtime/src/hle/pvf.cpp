@@ -590,7 +590,7 @@ void register_pvf() {
         Lock held(p.lock);
         p.libs.clear(), p.fonts.clear();
     }
-    register_library({"ScePvf", kScePvf, kFunctions});
+    register_library({"ScePvf", kScePvf, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle

@@ -1436,7 +1436,7 @@ void register_ngs() {
     n.racks.clear();
     n.exists = false;
     for (u32& d : n.definitions) d = 0;
-    register_library({"SceNgs", kSceNgs, kFunctions});
+    register_library({"SceNgs", kSceNgs, kFunctions, {}, true});
 }
 
 }  // namespace psvrecore::runtime::hle
