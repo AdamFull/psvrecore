@@ -99,6 +99,9 @@ bool color_format(u32 gxm, ColorFormat& out) {
         case 0x80800000u: out = {VK_FORMAT_R8_UNORM, 1, {0, 4, 4, 5}}; return true;            // U8_R
         case 0x80900000u: out = {VK_FORMAT_R8_UNORM, 1, {3, 4, 4, 5}}; return true;            // U8_A
         case 0x11000000u: out = {VK_FORMAT_R32G32_SFLOAT, 8, {0, 1, 4, 5}}; return true;       // F32F32_GR
+        // (U2U10U10U10_ABGR: A in the top two bits, then B, G and R from bit 20, 10 and 0, as Vulkan's packed format,
+        // which every device can draw into and blend)
+        case 0x60800000u: out = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, {0, 1, 2, 3}}; return true;
         case 0x41000000u:  // U2F10F10F10_ABGR
             out = {VK_FORMAT_R16G16B16A16_SFLOAT, 8, {0, 1, 2, 3}, Packing::U2F10F10F10};
             return true;
