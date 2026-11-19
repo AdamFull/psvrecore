@@ -181,9 +181,9 @@ bool multiply(Emitter& e, const Instruction& in) {
             nx::string product;
             if (in.op == Op::Smull || in.op == Op::Smlal) product = nx::format("(uint64_t)((int64_t)(int32_t){} * (int32_t){})", rr(2), rr(3));
             else product = nx::format("(uint64_t){} * {}", rr(2), rr(3));
-            const nx::string acc = nx::format("(((uint64_t){} << 32) | {})", rr(1), rr(0));
             nx::string value = product;
-            if (in.op == Op::Umlal || in.op == Op::Smlal) value = product + " + " + acc;
+            // (the accumulator only where it is read: rr records the read)
+            if (in.op == Op::Umlal || in.op == Op::Smlal) value = product + " + " + nx::format("(((uint64_t){} << 32) | {})", rr(1), rr(0));
             if (in.op == Op::Umaal) value = nx::format("{} + {} + {}", product, rr(0), rr(1));
             e.line(nx::format("const uint64_t {} = {};", r, value));
             if (s && (e.live() & analysis::kFlagN)) e.line(nx::format("fl.n = (uint32_t)({} >> 63);", r));
@@ -395,7 +395,7 @@ bool branches(Emitter& e, const Instruction& in) {
         case Op::Cbz:
         case Op::Cbnz: {
             const auto f = analysis::flow_of(in);
-            e.line(nx::format("if ({} {} 0) {{", R(in.operands[0].reg), in.op == Op::Cbz ? "==" : "!="));
+            e.line(nx::format("if ({} {} 0) {{", e.reg(in.operands[0].reg), in.op == Op::Cbz ? "==" : "!="));
             e.branch_to(in, f.target);
             e.line("}");
             return true;
@@ -407,9 +407,11 @@ bool branches(Emitter& e, const Instruction& in) {
             } else {
                 const nx::string t = e.temp("target");
                 e.line(nx::format("const uint32_t {} = {};", t, e.read(in, in.operands[0].reg)));
-                e.line(nx::format("{} = {};", R(arm::kLr), hex(e.next_code(in))));
+                e.line(e.assignment(arm::kLr, hex(e.next_code(in))));
+                e.call_registers_before();
                 e.call_flags_before();
                 e.line(nx::format("psv_call(ctx, {}, {});", t, hex(e.next_code(in))));
+                e.call_registers_after(in);
                 e.call_flags_after(in);
                 ++e.stats().indirect_calls;
             }
@@ -460,8 +462,10 @@ bool system(Emitter& e, const Instruction& in) {
         case Op::Svc:
             // (a call to code the module does not know; it traps today: every local flag in the context first)
             e.store_flags_for_trap();
+            e.call_registers_before();
             e.call_flags_before();
             e.line(nx::format("psv_svc(ctx, {}, {});", hex(in.address), hex(in.operands[0].imm)));
+            e.call_registers_after(in);
             e.call_flags_after(in);
             return true;
         case Op::Bkpt: e.trap(in, "PSV_TRAP_BKPT", "bkpt"); return true;

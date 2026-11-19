@@ -422,3 +422,169 @@ every call and return wrote and read all four. The executables' code reads no fl
 entry or after a return. The libraries' flags at return are their exported functions' (all four, for callers in
 other modules) and what those exports' callees then leave. Every module's contract is empty (no flag read at entry or
 after an indirect call or jump), so the modules fit each other.
+
+## Core registers in locals
+
+Measured 2026-11-19 with the same compilers and options. r0-r14 are locals of each generated function, in the context
+only where code outside it may read them ([ARCHITECTURE.md](ARCHITECTURE.md), "Registers"). Two stages: **A**, the
+locals with no callee-saved knowledge (`psvrecomp --no-callee-saved`: every live register read back after every call);
+**B**, the default, a caller keeping the registers a callee preserves in its locals across direct calls to it, sp
+checked after calls to code outside the module where callers rely on it. "Before" is the generator at f05a38a. The
+corpus has a module more (`regs`, between `neon` and `vfp` in file order: `vfp` moved by 0x8000), so the synthetic
+"before" is f05a38a's corpusgen built on the new corpus; WipEout's "before" is `build/t3/wo-after.json`, the same code
+byte for byte as f05a38a's psvrecomp gives (checked) with the same compilers and flags. `docs/codegen_metrics_synthetic.json`
+now holds the numbers of B, the baseline for the next change.
+
+### Synthetic corpus
+
+| | Guest | x64 before | x64 A | x64 B | arm64 before | arm64 A | arm64 B |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 2156 | 9.07 | 9.19 (+1.3%) | 9.25 (+2.0%) | 6.86 | 6.52 (-4.9%) | 6.56 (-4.3%) |
+| Module `syn_calls` | 377 | 5.24 | 5.17 (-1.4%) | 5.30 (+1.2%) | 4.62 | 4.22 (-8.7%) | 4.25 (-8.1%) |
+| Module `syn_control` | 134 | 6.82 | 7.03 (+3.1%) | 7.01 (+2.7%) | 5.49 | 5.29 (-3.7%) | 5.27 (-4.1%) |
+| Module `syn_flags` | 146 | 6.86 | 7.02 (+2.4%) | 7.01 (+2.3%) | 5.65 | 5.47 (-3.1%) | 5.47 (-3.1%) |
+| Module `syn_integer` | 605 | 4.31 | 4.38 (+1.5%) | 4.38 (+1.5%) | 3.20 | 2.75 (-13.9%) | 2.75 (-13.9%) |
+| Module `syn_integer_arm` | 151 | 5.60 | 5.36 (-4.4%) | 5.36 (-4.4%) | 3.99 | 3.38 (-15.4%) | 3.38 (-15.4%) |
+| Module `syn_neon` | 194 | 22.32 | 22.95 (+2.8%) | 22.95 (+2.8%) | 15.30 | 15.44 (+0.9%) | 15.44 (+0.9%) |
+| Module `syn_regs` | 285 | 8.35 | 8.22 (-1.5%) | 8.53 (+2.1%) | 7.34 | 6.90 (-6.1%) | 7.17 (-2.4%) |
+| Module `syn_vfp` | 264 | 20.86 | 21.40 (+2.6%) | 21.40 (+2.6%) | 14.72 | 14.50 (-1.5%) | 14.50 (-1.5%) |
+| Class integer | 1071 | 5.11 | 5.01 (-1.9%) | 5.03 (-1.6%) | 4.17 | 3.75 (-10.0%) | 3.77 (-9.6%) |
+| Class vfp | 287 | 19.85 | 20.34 (+2.4%) | 20.34 (+2.4%) | 14.07 | 13.84 (-1.6%) | 13.84 (-1.6%) |
+| Class neon | 533 | 11.69 | 12.00 (+2.7%) | 12.03 (+2.9%) | 8.26 | 7.96 (-3.7%) | 7.96 (-3.6%) |
+| Class call-heavy | 265 | 8.17 | 8.39 (+2.8%) | 8.77 (+7.3%) | 7.13 | 6.93 (-2.9%) | 7.17 (+0.6%) |
+
+Static counts understate this change on loops: with the registers out of memory the compiler unrolls loops it could
+not before (`sum_bytes`, `copy_bytes`, `fill_words`, `neon_u64` on x64, unrolled by 2: more instructions in all, fewer
+per iteration, no context stores in the loop), and inlines callees in the same file differently (`loop_kept`, three
+calls of `next_value` inlined and the loop unrolled). The same, compiled with `-fno-unroll-loops` on both hosts (only
+to compare like with like; the builds unroll):
+
+| | Guest | x64 before | x64 A | x64 B | arm64 before | arm64 A | arm64 B |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 2156 | 8.78 | 8.69 (-1.0%) | 8.74 (-0.4%) | 6.90 | 6.56 (-4.9%) | 6.59 (-4.5%) |
+| Class integer | 1071 | 4.99 | 4.66 (-6.7%) | 4.68 (-6.2%) | 4.14 | 3.73 (-10.0%) | 3.74 (-9.7%) |
+| Class vfp | 287 | 19.85 | 20.34 (+2.4%) | 20.34 (+2.4%) | 14.07 | 13.84 (-1.6%) | 13.84 (-1.6%) |
+| Class neon | 533 | 10.72 | 10.67 (-0.5%) | 10.69 (-0.3%) | 8.45 | 8.15 (-3.5%) | 8.15 (-3.5%) |
+| Class call-heavy | 265 | 8.17 | 8.39 (+2.8%) | 8.66 (+6.0%) | 7.13 | 6.93 (-2.9%) | 7.07 (-0.9%) |
+
+What the code does in time, the corpus' functions run by the differential test's harness (`CODEGEN_BENCH=<rounds>`:
+2000 calls per round from the first random state, the fastest round; `build/t4/bench2.py`: the three builds' test
+programs alternately, 6 rounds each, pinned to one logical CPU of a performance core at high priority, the fastest of
+all rounds per function). This machine was running other builds, so the numbers move by a few percent from run to run:
+the same program run as two builds differed by 1.9% in the geometric mean, and functions whose code is identical in A
+and B (no calls) differed by up to 8%. Geometric means over the 114 functions: before 48.5 ns, A 49.7 ns (+2.3%), B
+47.2 ns (-2.7%): within that noise. Loops over memory without calls gain clearly in both: `arm_mla` 83 -> 53 ns
+(-36%), `copy_bytes` 64 -> 42/39, `arm_checksum` 296 -> 214, `insertion_sort` 103 -> 86/80, `fill_words` 76 -> 60/56,
+`bounded_strlen` 124 -> 96/89, `carry_loop` 38 -> 29, `step_particles` 52 -> 44 (A/B where they differ). An earlier
+run of the same programs without pinning gave B at -30%, an artifact of the cores the programs landed on.
+
+### WipEout 2048
+
+Regenerated with this generator (`build/t4/wo-a`, `build/t4/wo-b2`; the game build's code is the latter, byte for byte).
+
+| | Guest | x64 before | x64 A | x64 B | arm64 before | arm64 A | arm64 B |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 1479360 | 4.05 | 4.00 (-1.4%) | 4.02 (-0.8%) | 3.68 | 3.45 (-6.2%) | 3.48 (-5.4%) |
+| Module `wo_eboot` | 1350786 | 4.04 | 3.97 (-1.6%) | 3.99 (-1.1%) | 3.68 | 3.45 (-6.1%) | 3.47 (-5.5%) |
+| Module `wo_libc` | 65672 | 5.47 | 5.58 (+2.0%) | 5.58 (+2.0%) | 4.52 | 4.30 (-4.9%) | 4.47 (-1.2%) |
+| Module `wo_libfios2` | 39042 | 3.04 | 2.98 (-2.0%) | 3.05 (+0.1%) | 2.96 | 2.59 (-12.6%) | 2.62 (-11.6%) |
+| Module `wo_libult` | 23860 | 2.66 | 2.69 (+1.1%) | 2.80 (+5.2%) | 2.65 | 2.50 (-5.9%) | 2.64 (-0.6%) |
+| Class integer | 757832 | 2.86 | 2.77 (-3.1%) | 2.82 (-1.2%) | 2.75 | 2.42 (-12.2%) | 2.50 (-9.0%) |
+| Class vfp | 224442 | 5.88 | 5.84 (-0.6%) | 5.86 (-0.3%) | 5.08 | 4.99 (-1.9%) | 5.01 (-1.5%) |
+| Class neon | 122161 | 12.35 | 12.35 (-0.0%) | 12.33 (-0.1%) | 9.75 | 9.77 (+0.2%) | 9.74 (-0.1%) |
+| Class call-heavy | 374925 | 2.67 | 2.65 (-0.9%) | 2.62 (-1.9%) | 2.74 | 2.56 (-6.4%) | 2.50 (-8.6%) |
+
+| | Guest | x64 before | x64 A | x64 B | arm64 before | arm64 A | arm64 B |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `f_8311A9C8` | 383 | 3.42 | 3.47 (+1.5%) | 3.52 (+2.9%) | 2.69 | 2.35 (-13.0%) | 2.42 (-10.3%) |
+| `f_8128DB48` | 443 | 9.90 | 9.53 (-3.7%) | 9.62 (-2.8%) | 8.50 | 8.18 (-3.8%) | 8.23 (-3.2%) |
+| `f_813BAC40` | 408 | 4.52 | 5.13 (+13.5%) | 5.16 (+14.2%) | 3.51 | 3.06 (-12.8%) | 3.35 (-4.6%) |
+| `f_812FC59A` | 1125 | 9.24 | 9.18 (-0.7%) | 9.46 (+2.4%) | 7.97 | 8.42 (+5.6%) | 8.36 (+4.9%) |
+| `f_812FC39E` | 117 | 43.50 | 43.20 (-0.7%) | 43.20 (-0.7%) | 32.13 | 32.67 (+1.7%) | 32.67 (+1.7%) |
+| `f_81276E14` | 112 | 20.05 | 20.08 (+0.1%) | 20.08 (+0.1%) | 15.16 | 14.96 (-1.3%) | 14.96 (-1.3%) |
+| `f_8127A712` | 123 | 15.74 | 16.17 (+2.7%) | 16.52 (+5.0%) | 10.85 | 11.94 (+10.0%) | 12.16 (+12.1%) |
+| `f_8118C300` | 716 | 14.90 | 14.71 (-1.3%) | 14.77 (-0.9%) | 12.14 | 13.12 (+8.1%) | 12.63 (+4.1%) |
+| `f_813C32DC` | 31 | 4.10 | 4.58 (+11.8%) | 4.84 (+18.1%) | 3.74 | 3.35 (-10.3%) | 3.65 (-2.6%) |
+| `f_812A7EDC` | 475 | 6.16 | 6.55 (+6.3%) | 6.53 (+6.0%) | 5.25 | 5.70 (+8.5%) | 5.87 (+11.7%) |
+
+The integer and call-heavy code shrinks on arm64 (-9 to -12%), little on x64. Of the hot ten, the integer and VFP
+ones shrink on arm64 and grow on x64 (`f_813BAC40` +14%, `f_813C32DC` +18%; not looked into), and the NEON ones grow
+on arm64 by up to 12%. They call out-of-line helpers; probably the locals live across those calls take callee-saved
+host registers or spills, where before the values were loaded from the context again after each call (not checked).
+
+What each part costs, whole program (B's variants are psvrecomp options):
+
+| | x64 /g | | arm64 /g | |
+| --- | ---: | ---: | ---: | ---: |
+| before (f05a38a) | 4.05 | | 3.68 | |
+| A | 4.00 | -1.4% | 3.45 | -6.2% |
+| B (the default) | 4.02 | -0.8% | 3.48 | -5.4% |
+| B, sp checked by a trap at each call | 4.04 | -0.4% | 3.49 | -5.0% |
+| B, sp not checked (`--no-sp-check`) | 3.99 | -1.5% | 3.45 | -6.1% |
+| B, sp checked by a trap at each call, kept in loops only (`--keep-registers loops`) | 4.04 | -0.4% | 3.50 | -5.0% |
+| B, sp checked by a trap at each call, kept nowhere (`--keep-registers none`) | 4.03 | -0.6% | 3.48 | -5.4% |
+
+The check of sp after calls to code outside the module (B against B without it) costs 0.7% on x64 and 0.7% on arm64,
+down from 1.1% and 1.2% with a trap at each call: one trap per function now, the check a load, a compare and a branch.
+Keeping registers across calls costs about as much as reading them back in static counts (kept nowhere, or only in
+loops, against kept at every call, all three with the trap at each call: 0.2% on x64, 0.4% on arm64); A and B without
+the check are within 0.1%. The default keeps the check (a trap where the analysis'
+one assumption about other code fails, instead of wrong values) and keeps registers at every direct call (fewer loads
+in loops that call, which a static count does not see).
+
+Context traffic as the generated C writes it (`build/t4/ctxcount.py`: `ctx->r[N]` read and written, all four modules,
+the stores before calls, exits and traps, the reads at entry and after calls; the C compiler removes some of either):
+
+| | Reads of `ctx->r[]` | of them at function entry | Writes |
+| --- | ---: | ---: | ---: |
+| before | 1231271 | | 1039554 |
+| A | 469729 | 98949 | 633872 |
+| B | 327332 | 98950 | 631333 |
+
+Registers read back after calls (`build/t4/reloads.py`), WipEout's four modules:
+
+| | Direct calls (104956) | of them r4-r11 | sp | Imports (16748) | Indirect (5497) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A | 296460 | 157192 | 42530 | 52087 | 22233 |
+| B | 150066 | 47618 | 5710 | 56187 | 22129 |
+
+(After imports B reads more than A: sp stays in the local after 7706 of them, checked, and what that frees is spent
+elsewhere; the rest are the registers the import may change.) psvrecomp's counts for the executable: 12436 of its
+14792 functions preserve r4, 10917 r5, 8087 r8, 5941 r11, 12478 sp, 5870 all of r4-r11 and sp; 82209 of its 104956
+direct calls keep 212227 registers in locals; 6225 functions check sp after their calls to code outside the module
+(7706 checks). The exception index cross-check: 11518 of its functions have unwind opcodes that describe a frame, and
+all 11518 agree (every register a function is found to preserve and writes, its unwinding restores); 2296 restore a
+register the analysis does not show preserved (a frame the proof does not follow: an indirect jump, an unknown stack
+pointer); 3829 entries describe no frame or do not unwind. No internal entries
+(stage C, arguments in C arguments) are generated: not done.
+
+Generated source: 242.8 MB before, 247.7 MB with A (+2.0%), 253.3 MB with B (+4.3%; the `PSV_KEPT` lines a
+`PSV_CHECK_KEPT_REGISTERS` build checks, one per call that keeps a register, are most of the difference).
+
+The numbers above were taken before a bug in `vmsr` was fixed (its register stores, which belong on the way to its
+trap only, were on every path; found by WipEout's first run and the `vmsr_restore` corpus test since): the fixed
+generator's WipEout code differs in two libc files, 4 lines each, at two `vmsr` sites.
+
+Compile time (`build/t4/compile_time.py`: three of WipEout's files, before and B, one at a time, alternating, twice
+each, the fastest kept): x64 31.5 -> 31.9 s (+1.3%; `wo_eboot_code_10.c` 5.7 -> 5.9, `_40.c` 14.2 -> 14.5,
+`wo_libc_code_2.c` 11.6 -> 11.5), arm64 40.9 -> 39.8 s (-2.8%; 8.6 -> 7.8, 17.6 -> 17.1, 14.7 -> 14.9). Generating
+WipEout's four modules takes psvrecomp (with the script around it) 19 s, 9-10 s with `--registers-in-context` (the
+same program: the probe pass and the analysis are the difference). With `--registers-in-context` the generator writes
+the code of f05a38a byte for byte (all of WipEout's files compared).
+
+### Games
+
+Hidden runs (`--hidden`), each with its own data, settings and shots, the build of f05a38a's generator and this one
+back to back, Windows x64 release.
+
+- WipEout 2048, the race script, twice: first base then new (the new build still with the `vmsr` bug), then new then
+  base (fixed). At the 199 s shot all four runs are on lap 1/3 in 8th place with 89% shield, total time 1:47.60 /
+  1:47.60 and 1:47.65 (new) / 1:47.58 (base); the same four warnings (system module 0x002d twice, one untranslated
+  GXP program), no traps. Frames 11814 / 11658 and 11767 / 11825 (base / new, new / base); race 150-199 s 58.3 / 56.9
+  and 58.4 (new) / 58.9 (base) fps. The time and the frames move together (the game counts frames). The new build
+  was the slower in both pairs (by 2.4% and 0.8% over 150-199 s), but the machine was building and testing in the
+  background (in the second pair, the debug tests during the new run and the start of the base run), so these runs
+  do not tell a speed difference either way; the game holds 60 fps most of the race in all four.
+- Persona 4 Dancing All Night, the fixed-time run (shots at 3-55 s), base then new: both reach the opening movie and
+  are at the same scenes at 40 s and 55 s (a few frames apart, the 8 s shot identical), the same single gxm warning,
+  no traps, 1658 / 1656 frames.

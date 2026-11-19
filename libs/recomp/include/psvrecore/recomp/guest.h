@@ -72,7 +72,21 @@ enum {
     PSV_TRAP_BAD_JUMP,           /* a jump table index outside the table */
     PSV_TRAP_FPSCR,              /* an FPSCR setting the runtime does not implement */
     PSV_TRAP_BIG_ENDIAN,         /* setend be */
+    PSV_TRAP_STACK_POINTER,      /* a call to code outside the module returned with another stack pointer */
+    PSV_TRAP_KEPT_REGISTER,      /* (PSV_CHECK_KEPT_REGISTERS) a callee did not preserve a register it was found to */
 };
+
+/* After a direct call, the registers the callee was found to preserve (analysis/registers.hpp) stay in the caller's
+ * locals. Built with PSV_CHECK_KEPT_REGISTERS, the generated code checks that the context holds the same values, which
+ * is what the analysis assumes and cannot show (the words a function saves them in are changed only by itself). */
+#ifdef PSV_CHECK_KEPT_REGISTERS
+#define PSV_KEPT(ctx, pc, same) \
+    do { \
+        if (!(same)) psv_trap(ctx, pc, PSV_TRAP_KEPT_REGISTER); \
+    } while (0)
+#else
+#define PSV_KEPT(ctx, pc, same) ((void)0)
+#endif
 
 PSVRECORE_API PSV_NORETURN void psv_trap(PsvContext* ctx, uint32_t pc, uint32_t kind);
 /* Calls the function at a code address (blx rN, and calls into the middle of nowhere). */

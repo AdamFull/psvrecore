@@ -117,8 +117,9 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     library (`-Bsymbolic` on Android), so calls between generated functions are direct; inline atomics on arm64;
     full inlining (`/Ob2`) with clang-cl; line tables only as debug information. Options for the instruction set,
     ThinLTO and debug information are in [BUILDING.md](BUILDING.md#options).
-  - Registers live in the context, and the C compiler keeps them in host registers where it can. The condition
-    flags live in a local of each function and are computed only where an instruction reads them (below).
+  - The core registers live in locals of each function and are in the context only where code outside the
+    function may read them (below, "Registers"). The condition flags live in a local of each function and are
+    computed only where an instruction reads them (below).
   - IT blocks become per-instruction conditions.
   - Loads from read-only data are folded into constants, except words the loader patches.
   - Imports go through a per-module table the loader fills, and so do imported variables' addresses.
@@ -131,7 +132,8 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
   through the runtime, svc) and its edges, to another instruction or out of the function (return, indirect jump, tail
   call, import tail call, trap); and basic blocks over them (a call ends a block). A `bx rN` just after `ldr rN, =f` or
   `movw`/`movt`, and `ldr pc, =f`, are taken as tail calls of `f` (a veneer's jump), though the generated code still
-  jumps through the runtime. It is what dataflow over guest state runs on (the flags now; registers next).
+  jumps through the runtime. Each node also says which of its edges is the continuation the generator writes after
+  the instruction's own translation. It is what dataflow over guest state runs on (the flags and the registers).
 - **Condition flags** (`analysis/flags.hpp`). N, Z, C and V are a local `fl` of each generated function. Q and GE
   stay in the context.
   - Each instruction's reads and writes are known (`flag_effect`): its condition; carry in (adc, sbc, rsc, rrx, rrx
@@ -192,6 +194,90 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     do not fit, naming the psvrecomp option that fixes it. `psvrecomp generate` prints each module's contract.
   - `psvrecomp --flags-everywhere` turns the liveness off: every flag computed and in the context at every call, jump
     and return (as before), for checking a suspected liveness bug.
+- **Registers** (`analysis/registers.hpp`). r0-r12, sp and lr are locals `g0`-`g14` of each generated function.
+  - What each instruction's translation reads and writes is recorded by a first translation of the function (its
+    reads and writes of registers go through the emitter), and checked against the analysis' own model
+    (`register_effect`): psvrecomp lists every instruction where they differ (none in WipEout 2048's and P4D's
+    modules), and corpusgen fails on one. The analysis uses the translation's.
+  - A forward pass gives every register two symbolic values at each point, the guest's (the local) and the
+    context's: unknown, a register's value at entry, the entry's sp plus a constant, or what the context held after
+    a given call (or a store before it; a call's symbols are forgotten when it runs again). It also follows the stack
+    words the function writes at known offsets from the entry's sp (push, str, strd, stm, vpush and vstm, which only
+    make words unknown). A register is dirty where its two values are not known to be the same (a pop that restores
+    the value the context still holds is clean). A backward pass gives the live registers: read by an instruction,
+    or written to the context at a call, an exit or a trap before being written. Every register a store writes
+    from its local is live there, so the local always holds the guest's value where it is written to the context.
+  - **The contract.** Where control goes and what the context holds there (the same as before registers were
+    locals, except where said):
+    - Function entry (every way in: a direct call or tail call, `psv_call`, `psv_jump`, `call_guest` with callbacks,
+      thread and fiber entries, `module_start`, a function watch, `override_function`'s replacement): the context
+      holds every register. The function reads into its locals those it reads before writing them; the others start
+      at 0 and are never read before written.
+    - A direct call to a function of the module (bl/blx to its entry): before it, the context holds every register
+      (each dirty one written). After it, the registers the callee preserves (below) stay in the caller's locals,
+      which equal the context's; the others live after the call are read back. LR is written as before
+      (`lr = next`), and the callee gets `ret = next`.
+    - An indirect call (`psv_call`), an import (`psv_call_import`: a system library or another module's export),
+      svc: before it, the context holds every register. After it, every live register is read back, except sp in a
+      function that has direct callers and preserves something (they rely on it): there sp stays in the local and
+      the generated code checks that the context holds the same, and traps otherwise (one `psv_trap` per function,
+      `PSV_TRAP_STACK_POINTER` at the function's address: "a call to code outside the module returned with another
+      stack pointer"). `--no-sp-check` assumes it without the check (sp read back), `--no-callee-saved` generates
+      without the reliance.
+    - A return (a return-form branch to `ret`), any jump through the runtime (`psv_jump`, a return-form branch to
+      another address included), a tail call, an import's tail call, running into another function: the context
+      holds every register before it. So the context is exact when a function returns, as before, and the
+      differential tests compare every register at every exit.
+    - A trap (`psv_trap`: undefined or untranslated instructions, a table index outside its table, a place
+      discovery did not follow, an FPSCR setting vmsr does not implement, a no-return call returning): every
+      register that differs from the context at the trapping instruction's start and those it has written before
+      the trap are written first, so the handler's dump (r0-r14) shows the guest's registers there.
+    - Host code that reads the context while generated code runs without calling it: the guest memory fault report
+      and the memory write watch (`PSVRECORE_WATCH=<address>`) print `t->ctx`, which holds the registers as of the
+      function's last call, exit or trap; later values are in locals. Before, the C compiler could also keep values
+      in host registers past the stores; now the window is the whole stretch between calls.
+    - System libraries: the HLE adapter reads r0-r3 and the stack through sp from an exact context and writes r0
+      (and r1); `call_guest` writes r0-r3 and lr, moves sp for stack arguments and puts it back; fibers save and
+      restore the whole context at their switches. All of this happens inside an import call, after which every
+      live register but a checked sp is read back. `sceKernelExitThread` ends a thread by a C++ exception through the
+      generated frames: their locals are dropped, the context was exact at the import call.
+    - mrs, msr, vmrs, vmsr: the flags and FPSCR, no register beyond the instruction's own operands.
+    - Guest memory: unchanged. Pushes store the same values at the same addresses, so the guest's C++ exception
+      unwinding (which reads saved registers from guest frames, and still traps where it leaves a function by a
+      non-local path, KNOWN_ISSUES) sees the frames it did.
+  - **Callee-saved registers.** A function preserves r4-r11 and sp that are, at each of its returns, the values they
+    had at entry, when it is entered with LR holding the address it returns to (a direct call): shown by its own code
+    (each such register still its entry value, or loaded back from the word it was pushed to; sp moved back, through
+    a frame pointer as well), and through its calls (after a direct call the callee's preserved set keeps its symbolic
+    values; after any other call only sp, by the check above). Every return must branch to the LR value the function
+    was entered with (else it is a jump through the runtime to code that may do anything: nothing preserved), a tail
+    call must pass that LR on and the callee preserve the register, an import's tail call preserves nothing. The
+    sets are the greatest fixed point over the module's direct calls and tail calls: a function that calls itself
+    keeps what its returning paths keep (by induction over the length of a returning execution). A caller keeps the
+    callee's preserved registers in its locals across direct calls to it (`--keep-registers all`, the default), only
+    across those inside a loop of the caller (`loops`), or nowhere (`none`: read back, though known the same), and
+    reads back the rest.
+  - The proof is cross-checked against the module's exception index table (`.ARM.exidx`, ARM EHABI: the compact
+    models and the generic one): a function found to preserve a register it writes should have that register
+    restored by its unwind opcodes. psvrecomp prints the counts. WipEout 2048's and P4D's ten modules: every function
+    with unwind opcodes that describe a frame agrees; the entries that describe none (only "finish", what the
+    toolchain gives a function that calls nothing, though it may push registers) are not compared. What is assumed
+    and not checked is in KNOWN_ISSUES: the saved words are changed by nothing but the function's own stores.
+    Builds with `PSV_CHECK_KEPT_REGISTERS` (`PSVRECORE_GENERATED_CODE_CHECK_KEPT`) check after every such call that
+    the context holds what the locals kept (`PSV_KEPT`, `PSV_TRAP_KEPT_REGISTER`; the masked corpus tests are built
+    so).
+  - **Module boundaries.** Nothing is assumed of another module's code beyond the checked stack pointer: calls into
+    it (imports, indirect calls) keep nothing else, and other modules' calls into this one (through their imports)
+    get an exact context and give one. So `PsvModuleCode` records nothing for the registers, and code generated
+    before (which has every register in the context at every call and return) and after mix.
+  - `override_function` replaces a function for table lookups only (`psv_call`, `psv_jump`, `call_guest`, thread
+    entries); direct calls stay calls of the generated function, as before. A replacement is entered with an exact
+    context and must leave the registers in the context; nothing is assumed of what it preserves, as nothing that
+    reaches it through the runtime keeps a register across it.
+  - `psvrecomp --registers-in-context` generates the code from before, every register in the context (byte for
+    byte what the generator gave before: checked on WipEout 2048's four modules); `--no-callee-saved` keeps the
+    locals and reads every live register back after every call (stage A alone), for chasing a suspected bug in a
+    game.
 - **Reference interpreter** (`interp`, tests only). It is written from the ARM ARM pseudocode, independently of the
   generator, and shares only the decoder and the context layout. It has its own integer soft float. Two kinds of
   test compare generated code against it:

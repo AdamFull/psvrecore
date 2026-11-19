@@ -69,6 +69,7 @@ discrete GPU.
 | `PSVRECORE_PROGRAMS_DIR` | empty | The same for `scripts/program_check.py` and its program runners |
 | `PSVRECORE_GENERATED_CODE_ARCH`, `PSVRECORE_GENERATED_CODE_CPU` | empty | `-march` / `-mcpu` for generated code only (`psvrecore_generated_code`), e.g. `x86-64-v3` or `armv8.2-a`. Empty: the toolchain's baseline (x86-64, ARMv8.0). A build so made runs only on CPUs that have it. Measured in [CODEGEN_METRICS.md](CODEGEN_METRICS.md) |
 | `PSVRECORE_GENERATED_CODE_LTO` | OFF | ThinLTO across generated code (clang, with lld or lld-link): inlining between generated files at link time, for a longer link. Measured in [CODEGEN_METRICS.md](CODEGEN_METRICS.md) |
+| `PSVRECORE_GENERATED_CODE_CHECK_KEPT` | OFF | Generated code checks, after every direct call where it keeps a register the callee was found to preserve in a local, that the callee left that value in the context (`PSV_CHECK_KEPT_REGISTERS`), and stops with a diagnostic if not: for a game suspected of breaking what the register analysis assumes ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)); `psvrecomp --no-callee-saved` or `--registers-in-context` then generate without it |
 | `PSVRECORE_GENERATED_CODE_DEBUG` | `lines` | Debug information of generated code in builds that have it: `lines` (function names and line tables: debuggers' and profilers' symbols, simpleperf's and Tracy's `f_<address>`, under a third of the size of full debug information), `full` (types and variables too), `none` |
 
 ## The shared runtime library

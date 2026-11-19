@@ -6,6 +6,7 @@ add_library(psvrecore_analysis STATIC
     src/flow.cpp
     src/image.cpp
     src/program.cpp
+    src/registers.cpp
 )
 add_library(psvrecore::analysis ALIAS psvrecore_analysis)
 

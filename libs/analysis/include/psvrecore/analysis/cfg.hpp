@@ -49,6 +49,10 @@ struct CfgNode {
     u32 edge_count = 0;
     Edge skip;            // conditional instructions: where control goes when the condition fails
     bool conditional = false;
+    // The continuation the generator emits after the instruction's own translation (the next instruction, a goto,
+    // running into another function, a trap where discovery did not go): which of the edges it is (kNoIndex: none;
+    // the skip edge of a conditional instruction is always it).
+    u32 cont_edge = 0xFFFFFFFFu;
     CallKind call = CallKind::None;
     u32 call_target = 0;
 };

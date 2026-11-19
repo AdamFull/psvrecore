@@ -46,6 +46,8 @@ option(PSVRECORE_GENERATED_CODE_LTO "ThinLTO across generated code (clang with l
 set(PSVRECORE_GENERATED_CODE_DEBUG "lines" CACHE STRING
     "debug information of generated code in builds that have it: lines (function names and line tables), full, none")
 set_property(CACHE PSVRECORE_GENERATED_CODE_DEBUG PROPERTY STRINGS lines full none)
+option(PSVRECORE_GENERATED_CODE_CHECK_KEPT
+    "generated code checks after each direct call that the registers it kept in locals are what the callee left" OFF)
 
 # The cache options above (each changes nothing when left at its default). Apart from psvrecore_generated_code so that
 # scripts/codegen_metrics.py, which reads that function's options, measures the defaults; it takes these as --flags-*.
@@ -72,6 +74,9 @@ function(_psvrecore_generated_code_options target)
         target_compile_options(${target} PRIVATE $<$<CONFIG:RelWithDebInfo,Debug>:${_clang}-g0>)
     elseif(NOT PSVRECORE_GENERATED_CODE_DEBUG STREQUAL "full")
         message(FATAL_ERROR "PSVRECORE_GENERATED_CODE_DEBUG: lines, full or none, not ${PSVRECORE_GENERATED_CODE_DEBUG}")
+    endif()
+    if(PSVRECORE_GENERATED_CODE_CHECK_KEPT)
+        target_compile_definitions(${target} PRIVATE PSV_CHECK_KEPT_REGISTERS)
     endif()
     if(PSVRECORE_GENERATED_CODE_LTO)
         if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")

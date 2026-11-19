@@ -1,6 +1,7 @@
 #include "psvrecore/recomp/generator.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <utility>
 
 #include "emit.hpp"
@@ -51,9 +52,91 @@ constexpr std::pair<FlagSet, char> kFlagNames[] = {{analysis::kFlagN, 'n'}, {ana
 }  // namespace
 
 Emitter::Emitter(const analysis::Program& program, const analysis::Function& fn, const analysis::FlagLiveness& flags,
-                 const nx::string& prefix, Stats& stats)
+                 const nx::string& prefix, Stats& stats, RegisterMode mode, const analysis::FunctionRegisters* registers)
     : program_(program), fn_(fn), flags_(flags), flags_fn_(flags.at(fn.entry)), cfg_(analysis::build_cfg(program, fn)),
-      prefix_(prefix), stats_(stats) {}
+      prefix_(prefix), stats_(stats), mode_(mode), regs_(mode == RegisterMode::Locals ? registers : nullptr) {
+    if (mode == RegisterMode::Locals && !registers) mode_ = RegisterMode::Context;
+}
+
+namespace {
+
+constexpr RegSet reg_bit(u32 r) { return r < 15 ? static_cast<RegSet>(1u << r) : RegSet(0); }
+
+}  // namespace
+
+nx::string Emitter::register_line(RegSet r, bool store) const {
+    nx::string out;
+    for (u32 k = 0; k < 15; ++k) {
+        if (!(r & (1u << k))) continue;
+        if (!out.empty()) out += ' ';
+        out += store ? nx::format("ctx->r[{}] = g{};", k, k) : nx::format("g{} = ctx->r[{}];", k, k);
+    }
+    return out;
+}
+
+void Emitter::store_registers(RegSet r) {
+    if (mode_ != RegisterMode::Locals || !r) return;
+    line(register_line(r, true));
+    stats_.register_stores += static_cast<usize>(std::popcount(r));
+}
+
+void Emitter::load_registers(RegSet r) {
+    if (mode_ != RegisterMode::Locals || !r) return;
+    line(register_line(r, false));
+    stats_.register_call_loads += static_cast<usize>(std::popcount(r));
+}
+
+bool Emitter::noreturn_call(const Instruction& in) const {
+    return std::find(fn_.noreturn_calls.begin(), fn_.noreturn_calls.end(), in.address) != fn_.noreturn_calls.end();
+}
+
+void Emitter::call_registers_before() {
+    if (!regs_) return;
+    store_registers(regs_->call_store[index_]);
+}
+
+void Emitter::call_registers_after(const Instruction& in) {
+    if (!regs_ || noreturn_call(in)) return;
+    const auto& node = cfg_.nodes[index_];
+    const RegSet kept = regs_->call_kept[index_];
+    if (node.call == analysis::CallKind::Direct) {
+        if (kept) {
+            // (the callee preserves them: builds with PSV_CHECK_KEPT_REGISTERS check that it did)
+            nx::string same;
+            for (u32 k = 0; k < 15; ++k)
+                if (kept & (1u << k)) same += nx::format("{}ctx->r[{}] == g{}", same.empty() ? "" : " && ", k, k);
+            line(nx::format("PSV_KEPT(ctx, {}, {});", hex(in.address), same));
+            ++stats_.calls_keeping;
+            stats_.registers_kept += static_cast<usize>(std::popcount(kept));
+        }
+    } else if (kept & analysis::kSpRegister) {
+        // (code outside the module's view returns with the stack pointer it was called with: checked, as what the
+        // function's callers know it preserves relies on it; one trap for all of the function's checks, at its end,
+        // the report naming the function)
+        line("if (__builtin_expect(ctx->r[13] != g13, 0)) goto L_SP_MOVED;");
+        sp_trap_ = true;
+        ++stats_.stack_checks;
+    }
+    load_registers(regs_->call_load[index_]);
+}
+
+nx::string Emitter::trap_register_stores() {
+    access_.traps = true;
+    if (!regs_) return {};
+    const RegSet r = static_cast<RegSet>(regs_->trap_store[index_] | access_.defs);
+    if (!r) return {};
+    stats_.register_trap_stores += static_cast<usize>(std::popcount(r));
+    return register_line(r, true);
+}
+
+nx::string Emitter::trap_stores() {
+    nx::string s = flags_line(analysis::kAllFlags, true);
+    const nx::string r = trap_register_stores();
+    if (!r.empty()) s += (s.empty() ? "" : " ") + r;
+    return s;
+}
+
+void Emitter::store_for_trap() { line(trap_stores()); }
 
 nx::string Emitter::flags_line(FlagSet f, bool store) const {
     nx::string out;
@@ -94,7 +177,7 @@ void Emitter::add_with_carry(nx::string_view r, nx::string_view x, nx::string_vi
 }
 
 void Emitter::trap(const Instruction& in, const char* kind, nx::string_view what) {
-    store_flags_for_trap();
+    store_for_trap();
     line(nx::format("psv_trap(ctx, {}, {});", hex(in.address), kind));
     ++stats_.traps[nx::string(what)];
     ended_ = true;
@@ -111,14 +194,25 @@ nx::string Emitter::variable_address(u32 site, u8& type) const {
     return nx::format("({}_variables[{}].address + {})", prefix_, it->second.variable, hex(it->second.addend));
 }
 
-nx::string Emitter::read(const Instruction& in, u32 r) const {
+nx::string Emitter::read(const Instruction& in, u32 r) {
     if (r == arm::kPc) return hex(analysis::pc_value(in));
-    return R(r);
+    return reg(r);
+}
+
+nx::string Emitter::reg(u32 r) {
+    access_.uses |= reg_bit(r);
+    return mode_ == RegisterMode::Context ? nx::format("ctx->r[{}]", r) : nx::format("g{}", r);
+}
+
+nx::string Emitter::assignment(u32 r, nx::string_view value) {
+    access_.defs |= reg_bit(r);
+    // (a base write-back to the PC, which is unpredictable, goes to the context's unused r[15] as it always has)
+    return mode_ == RegisterMode::Context || r >= 15 ? nx::format("ctx->r[{}] = {};", r, value) : nx::format("g{} = {};", r, value);
 }
 
 void Emitter::write(const Instruction& in, u32 r, nx::string_view value, PcWrite kind) {
     if (r != arm::kPc) {
-        line(nx::format("{} = {};", R(r), value));
+        line(assignment(r, value));
         return;
     }
     // BranchWritePC (Thumb data processing): bit 0 is ignored and the state stays Thumb. Elsewhere (loads, ARM
@@ -132,7 +226,7 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
     const auto& targets = table.targets;
     const u32 n = static_cast<u32>(targets.size());
     if (n == 0) {  // (a bound of no entries: every index is outside the table)
-        store_flags_for_trap();
+        store_for_trap();
         line(nx::format("psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
         return;
     }
@@ -151,7 +245,7 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
     const nx::string index = temp("index");
     if (!constant) line(nx::format("uint32_t {} = 0xFFFFFFFFu;", index));
     else if (table.base_reg != 0xFF)
-        line(nx::format("uint32_t {} = {} == {} ? {} : 0xFFFFFFFFu;", index, R(table.base_reg), hex(table.table), read(in, table.index_reg)));
+        line(nx::format("uint32_t {} = {} == {} ? {} : 0xFFFFFFFFu;", index, reg(table.base_reg), hex(table.table), read(in, table.index_reg)));
     else line(nx::format("uint32_t {} = {};", index, read(in, table.index_reg)));
     // Any other index (or table): the target the instruction computes, if it is one of the table's (the entry of the
     // first index that has it), as the guest's branch would go there; else a trap.
@@ -162,7 +256,7 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
     line(nx::format("    static const uint32_t {}[{}] = {{{}\n            }};", list, n, values));
     line(nx::format("    {} = psv_table_find({}, {}u, {});", index, list, n, target));
     line(nx::format("    if ({} >= {}u) {{", index, n));
-    line("        " + flags_line(analysis::kAllFlags, true));
+    line("        " + trap_stores());
     line(nx::format("        psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
     line("    }");
     line("}");
@@ -171,7 +265,11 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
         const u32 target_code = targets[i];
         const bool tail = target_code != fn_.entry && program_.function_at(target_code) != nullptr;
         if (tail) {
-            const nx::string store = flags_line(flags_.into(target_code, flags_fn_->live_out), true);
+            nx::string store = flags_line(flags_.into(target_code, flags_fn_->live_out), true);
+            if (regs_ && regs_->exit_store[index_]) {
+                store += (store.empty() ? "" : " ") + register_line(regs_->exit_store[index_], true);
+                stats_.register_stores += static_cast<usize>(std::popcount(regs_->exit_store[index_]));
+            }
             line(nx::format("case {}u: {}{}{}(ctx, ret); return;", i, store, store.empty() ? "" : " ", function_name(target_code)));
         } else {
             line(nx::format("case {}u: goto {};", i, label_name(target_code)));
@@ -196,17 +294,20 @@ void Emitter::branch_to_value(const Instruction& in, nx::string_view target) {
     ++stats_.return_sites;
     if (out) ++stats_.return_sites_store;
     store_flags(out);
+    exit_registers();
     line(nx::format("if ({} == ret) return;", t));
     store_flags(static_cast<FlagSet>(jump & ~out));
     line(nx::format("psv_jump(ctx, {}, ret, {});", t, hex(in.address)));
     line("return;");
 }
 
-void Emitter::branch_to(const Instruction& in, u32 target_code) {
+void Emitter::branch_to(const Instruction& in, u32 target_code, bool after) {
     (void)in;
+    const RegSet exit = regs_ ? (after ? regs_->after_store[index_] : regs_->exit_store[index_]) : RegSet(0);
     if (auto stub = program_.import_stubs.find(target_code & ~1u); stub != program_.import_stubs.end()) {
         ++stats_.import_calls;
         store_flags(flags_.into_unknown(flags_fn_->live_out));
+        store_registers(exit);
         line(nx::format("psv_call_import(ctx, &{}_imports[{}], ret);", prefix_, stub->second));
         line("return;");
         return;
@@ -214,6 +315,7 @@ void Emitter::branch_to(const Instruction& in, u32 target_code) {
     if (target_code != fn_.entry && program_.function_at(target_code)) {
         ++stats_.tail_calls;
         store_flags(flags_.into(target_code, flags_fn_->live_out));
+        store_registers(exit);
         line(nx::format("{}(ctx, ret);", function_name(target_code)));
         line("return;");
         return;
@@ -223,7 +325,8 @@ void Emitter::branch_to(const Instruction& in, u32 target_code) {
 
 void Emitter::call(const Instruction& in, u32 target_code) {
     const u32 next = next_code(in);
-    line(nx::format("{} = {};", R(arm::kLr), hex(next)));
+    line(assignment(arm::kLr, hex(next)));
+    call_registers_before();
     call_flags_before();
     if (auto stub = program_.import_stubs.find(target_code & ~1u); stub != program_.import_stubs.end()) {
         ++stats_.import_calls;
@@ -234,6 +337,7 @@ void Emitter::call(const Instruction& in, u32 target_code) {
         ++stats_.indirect_calls;
         line(nx::format("psv_call(ctx, {}, {});", hex(target_code), hex(next)));
     }
+    call_registers_after(in);
     call_flags_after(in);
 }
 
@@ -246,7 +350,7 @@ void Emitter::call_flags_before() {
 
 void Emitter::call_flags_after(const Instruction& in) {
     // (a call to a function that never returns: a trap if it does. The flags are the callee's then.)
-    if (std::find(fn_.noreturn_calls.begin(), fn_.noreturn_calls.end(), in.address) != fn_.noreturn_calls.end()) {
+    if (noreturn_call(in)) {
         line(nx::format("psv_trap(ctx, {}, PSV_TRAP_RETURNED);", hex(in.address + in.size)));
         ended_ = true;
         return;
@@ -273,6 +377,7 @@ bool Emitter::falls_through(const Instruction& in) const {
 
 void Emitter::instruction(const Instruction& in) {
     ended_ = false;
+    access_ = {};
     if (!in.valid()) return trap(in, "PSV_TRAP_UNDEFINED", "undefined");
     if (in.flags & arm::kUnpredictable) return trap(in, "PSV_TRAP_UNPREDICTABLE", nx::format("unpredictable {}", arm::mnemonic(in.op)));
     count_flags(in);
@@ -311,6 +416,7 @@ nx::string Emitter::function() {
 
     nx::string out;
     if (!entry_first) out += nx::format("    goto {};\n", label_name(fn_.start()));
+    if (mode_ == RegisterMode::Probe) effects_.assign(code.size(), {});
     for (usize i = 0; i < code.size(); ++i) {
         const auto& in = code[i];
         index_ = i;
@@ -319,6 +425,7 @@ nx::string Emitter::function() {
         body_.clear();
         temp_counter_ = 0;
         instruction(in);
+        if (mode_ == RegisterMode::Probe) effects_[i] = access_;
         // (an IT instruction's condition is its block's first condition, not its own)
         const nx::string cond = in.op == Op::It ? nx::string() : condition(in.cond);
         const nx::string text = comment_text(arm::format(in));
@@ -331,7 +438,7 @@ nx::string Emitter::function() {
         const u32 next = in.address + in.size;
         if (auto into = fn_.runs_into.find(in.address); into != fn_.runs_into.end()) {
             body_.clear();
-            branch_to(in, into->second);  // (a code address, or an import stub's address)
+            branch_to(in, into->second, true);  // (a code address, or an import stub's address)
             out += "    /* runs into the next function */\n" + body_;
             continue;
         }
@@ -339,7 +446,12 @@ nx::string Emitter::function() {
         if (addresses.contains(next)) {
             out += nx::format("    goto {};\n", label_name(next));
         } else {
-            out += "    " + flags_line(analysis::kAllFlags, true) + "\n";
+            nx::string stores = flags_line(analysis::kAllFlags, true);
+            if (regs_ && regs_->after_store[i]) {
+                stores += " " + register_line(regs_->after_store[i], true);
+                stats_.register_trap_stores += static_cast<usize>(std::popcount(regs_->after_store[i]));
+            }
+            out += "    " + stores + "\n";
             out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n", hex(next));
         }
     }
@@ -353,8 +465,21 @@ nx::string Emitter::function() {
     nx::string flags;
     for (const auto& [bit, name] : kFlagNames)
         flags += nx::format("{}{}", flags.empty() ? "" : ", ", (flags_fn_->live_in & bit) ? nx::format("ctx->{}", name) : nx::string("0u"));
-    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl = {{{}}};\n", function_name(fn_.entry),
-                      memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags) +
+    // The registers in locals (analysis/registers.hpp): those read before they are written from the context, the
+    // others 0 (never read before they are written).
+    nx::string registers;
+    if (regs_) {
+        for (u32 k = 0; k < 15; ++k) {
+            if (!(regs_->touched & (1u << k))) continue;
+            const bool load = regs_->load_at_entry & (1u << k);
+            registers += nx::format("{}g{} = {}", registers.empty() ? "    uint32_t " : ", ", k, load ? nx::format("ctx->r[{}]", k) : nx::string("0"));
+        }
+        if (!registers.empty()) registers += ";\n";
+        stats_.register_entry_loads += static_cast<usize>(std::popcount(regs_->load_at_entry));
+    }
+    if (sp_trap_) out += nx::format("L_SP_MOVED:;\n    psv_trap(ctx, {}, PSV_TRAP_STACK_POINTER);\n", hex(fn_.start()));
+    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl = {{{}}};\n{}", function_name(fn_.entry),
+                      memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags, registers) +
            out + "}\n";
 }
 
@@ -432,8 +557,51 @@ Output generate(const analysis::Program& program, const Options& options) {
     flag_options.given_at_return = options.flags_given_at_return;
     flag_options.full_exit = options.full_exit_flags;
     analysis::FlagLiveness flags = analysis::flag_liveness(program, flag_options);
+    // The registers (analysis/registers.hpp): a first translation records what each instruction's translation reads
+    // and writes (checked against analysis::register_effect), the analysis runs on that, then the translation.
+    const bool locals = !options.registers_in_context;
+    analysis::RegisterAnalysis registers;
+    Stats& st = result.stats;
+    if (locals) {
+        nx::map<u32, nx::vector<analysis::RegisterEffect>> effects;
+        Stats scratch;
+        for (const auto& [code, fn] : program.functions) {
+            Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe);
+            (void)e.function();
+            const auto& got = e.effects();
+            for (usize i = 0; i < got.size(); ++i) {
+                const analysis::RegisterEffect model = analysis::register_effect(fn.code[i]);
+                // (a table branch traps for an index outside its table: the model does not know the tables)
+                const bool traps = model.traps || fn.tables.contains(fn.code[i].address);
+                const bool fits = got[i].defs == model.defs && (got[i].uses & ~model.uses) == 0 && (!got[i].traps || traps);
+                if (fits) continue;
+                ++st.register_effect_mismatches;
+                if (st.register_notes.size() < 20)
+                    st.register_notes.push_back(nx::format("0x{:08x} {}: translation reads {} writes {}{}, analysis::register_effect reads {} writes {}{}",
+                                                           fn.code[i].address, arm::format(fn.code[i]), analysis::register_names(got[i].uses),
+                                                           analysis::register_names(got[i].defs), got[i].traps ? " (traps)" : "",
+                                                           analysis::register_names(model.uses), analysis::register_names(model.defs),
+                                                           model.traps ? " (traps)" : ""));
+            }
+            effects[code] = got;
+        }
+        analysis::RegisterOptions register_options;
+        register_options.callee_saved = !options.no_callee_saved;
+        register_options.keep = options.keep_registers;
+        register_options.check_sp = options.check_sp;
+        register_options.effects = &effects;
+        registers = analysis::register_analysis(program, register_options);
+        for (const auto& [code, r] : registers.functions) {
+            const auto* fn = program.function_at(code);
+            if (!fn || fn->code.empty()) continue;
+            for (u32 k = 4; k < 14; ++k)
+                if (r.preserved & (1u << k)) ++st.functions_preserving[k];
+            if ((r.preserved & analysis::kPreservable) == analysis::kPreservable) ++st.functions_preserving_all;
+            if (r.checks_sp) ++st.functions_checking_sp;
+        }
+    }
     for (const auto& [code, fn] : program.functions) {
-        Emitter e(program, fn, flags, p, result.stats);
+        Emitter e(program, fn, flags, p, st, locals ? RegisterMode::Locals : RegisterMode::Context, registers.at(code));
         chunk += e.function();
         chunk_instructions += static_cast<u32>(fn.code.size());
         if (chunk_instructions >= options.instructions_per_file) flush();
@@ -447,6 +615,11 @@ Output generate(const analysis::Program& program, const Options& options) {
         nx::vector<FlagSet>().swap(f.before_call);
     }
     result.flags = std::move(flags);
+    for (auto& [code, r] : registers.functions) {
+        for (auto* v : {&r.trap_store, &r.call_store, &r.call_load, &r.call_kept, &r.exit_store, &r.after_store, &r.live_before})
+            nx::vector<RegSet>().swap(*v);
+    }
+    result.registers = std::move(registers);
     return result;
 }
 

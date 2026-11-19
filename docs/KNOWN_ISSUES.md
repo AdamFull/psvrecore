@@ -242,6 +242,30 @@
   Across modules the contract is checked: the loader refuses modules that do not fit (`psvrecomp
   --flags-given-at-entry`/`--flags-given-at-return` fix it). `psvrecomp --flags-everywhere` generates without flag
   liveness, for checking a suspected liveness bug against a game.
+- **The core registers are in the context only where the contract says** (ARCHITECTURE.md, "Registers"). What is
+  assumed and not checked:
+  - a word a function wrote at a known offset of its stack frame (the registers it pushes, words it stores through
+    sp or a frame pointer) is changed only by its own later stores there: not by a function it calls (one writing
+    to its incoming stack arguments may, but no compiler restores a register from those), not by a store through a
+    pointer the analysis does not know to be a stack address (an array overrun into the saved registers), not by
+    another thread. A function that restores a register from such a word is taken to preserve it, and its direct
+    callers keep their copy of the register instead of reading the context. The generated code built with
+    `PSV_CHECK_KEPT_REGISTERS` checks this after every call where it is relied on (the masked corpus tests are),
+    a game's build does not; `psvrecomp --no-callee-saved` generates without the reliance;
+  - what a function preserves is known only for entries where LR holds its return address (direct calls); entered
+    otherwise (a tail call that changed LR, `psv_jump`), nothing relies on it;
+  - host code that reads `t->ctx` while generated code runs, without a call in between (the guest memory fault
+    report, the memory write watch), sees the registers as of the function's last call, exit or trap;
+  - the callee-saved proof comes from the code alone; the exception index table only cross-checks it (where its
+    entries describe a frame);
+  - with `psvrecomp --no-sp-check`, code outside the module's view (imports, function pointers) is taken to return
+    with the stack pointer it was called with, unchecked;
+  Checked: what each instruction's translation reads and writes against the analysis' model (psvrecomp lists every
+  difference, corpusgen fails on one; none in WipEout 2048's or P4D's modules); the stack pointer after a call to
+  code outside the module's view, where a function's callers rely on it (a trap, `PSV_TRAP_STACK_POINTER`: a game
+  with an import or a function pointer that returns with another sp, legal only outside AAPCS, needs
+  `--no-callee-saved`). `psvrecomp --registers-in-context` generates the code from before (every register in the
+  context), for checking a suspected register analysis bug.
 - **A few system instructions are not translated.** In the 24 MB executable these are 3 `mcrr` and 3 `mrc p15`
   (coprocessor registers other than the thread ID registers). Each traps with a diagnostic.
 - **Imported variables need the SDK's reference-table format.** Analysis reads each imported variable's table of uses

@@ -12,6 +12,7 @@
 
 #include "psvrecore/analysis/flags.hpp"
 #include "psvrecore/analysis/program.hpp"
+#include "psvrecore/analysis/registers.hpp"
 #include "core/foundation/containers/map.h"
 #include "core/foundation/core/foundation.h"
 #include "core/foundation/strings/utf8_string.h"
@@ -30,6 +31,17 @@ struct Options {
     u8 flags_given_at_entry = 0;
     u8 flags_given_at_return = 0;
     nx::vector<u32> full_exit_flags;
+    // The core registers (analysis/registers.hpp): in the context everywhere, as before they were locals
+    // (psvrecomp --registers-in-context); no callee-saved knowledge, every register live after a call read back
+    // from the context (psvrecomp --no-callee-saved).
+    bool registers_in_context = false;
+    bool no_callee_saved = false;
+    // Where callers keep a callee's preserved registers in locals rather than read them back (psvrecomp
+    // --keep-registers: all, loops, none; analysis::KeepPolicy).
+    analysis::KeepPolicy keep_registers = analysis::KeepPolicy::All;
+    // The stack pointer checked after calls to code outside the module's view where callers rely on it (psvrecomp
+    // --no-sp-check: assumed, not checked; analysis::RegisterOptions::check_sp).
+    bool check_sp = true;
 };
 
 struct GeneratedFile {
@@ -60,6 +72,24 @@ struct Stats {
     usize return_sites_store = 0;
     usize functions_need = 0;
     usize functions_live_out = 0;
+    // Core registers in locals: read from the context at functions' entries; written to it (before calls, exits,
+    // traps); read back after calls; direct calls with registers kept in locals across them, and those registers;
+    // calls to code outside the module's view followed by a check of the stack pointer; functions that preserve each
+    // of r4-r11 and sp (by register number), all of them, and that check the stack pointer.
+    usize register_entry_loads = 0;
+    usize register_stores = 0;
+    usize register_trap_stores = 0;
+    usize register_call_loads = 0;
+    usize calls_keeping = 0;
+    usize registers_kept = 0;
+    usize stack_checks = 0;
+    usize functions_preserving[15] = {};
+    usize functions_preserving_all = 0;
+    usize functions_checking_sp = 0;
+    // Instructions whose translation reads or writes other registers than analysis::register_effect says (the
+    // analysis uses the translation's; a mismatch is a generator or model bug to look at), and the first few.
+    usize register_effect_mismatches = 0;
+    nx::vector<nx::string> register_notes;
     // Instructions translated to a trap, by mnemonic (undefined, unimplemented, privileged...).
     nx::map<nx::string, usize> traps;
 };
@@ -69,6 +99,8 @@ struct Output {
     Stats stats;
     // Each function's flag summary and the module's contract (analysis::FlagLiveness without its per-instruction sets).
     analysis::FlagLiveness flags;
+    // Each function's register summary (analysis::RegisterAnalysis without its per-instruction sets).
+    analysis::RegisterAnalysis registers;
 };
 
 Output generate(const analysis::Program& program, const Options& options);

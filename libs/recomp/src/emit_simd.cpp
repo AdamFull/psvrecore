@@ -409,8 +409,12 @@ bool memory(Emitter& e, const Instruction& in) {
         }
         size = n * ebytes;
     }
-    if (m.flags & arm::kMemPostReg) e.line(nx::format("{} = {} + {};", R(m.reg), base, e.read(in, m.reg2)));
-    else if (m.flags & arm::kMemWriteBack) e.line(nx::format("{} = {} + {}u;", R(m.reg), base, size));
+    if (m.flags & arm::kMemPostReg) {
+        const nx::string step = e.read(in, m.reg2);
+        e.line(e.assignment(m.reg, nx::format("{} + {}", base, step)));
+    } else if (m.flags & arm::kMemWriteBack) {
+        e.line(e.assignment(m.reg, nx::format("{} + {}u", base, size)));
+    }
     return true;
 }
 

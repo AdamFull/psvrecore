@@ -16,6 +16,8 @@
 // test function leaving all four flags at return (as an exported function does), and there all four are compared
 // for every function (the test fails if any is not).
 
+#include <algorithm>
+#include <cmath>
 #include <csetjmp>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +28,7 @@
 #include "nxtest.h"
 #include "psvrecore/interp/interpreter.hpp"
 #include "psvrecore/recomp/support.hpp"
+#include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
 
 extern "C" {
@@ -355,6 +358,44 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             }
         }
     }
+    // (CODEGEN_BENCH=<rounds>: time each test function's generated code too, from its first random state, the state
+    // put back before each call and memory not: a measurement for comparing generators, printed, never checked)
+    if (const char* bench = std::getenv("CODEGEN_BENCH"); bench && failures == 0) {
+        const int rounds = std::max(1, std::atoi(bench));
+        f64 log_sum = 0;
+        for (usize t = 0; t < sizeof kCorpusTests / sizeof kCorpusTests[0]; ++t) {
+            const CorpusTest& test = kCorpusTests[t];
+            const PsvFunction function = recomp::find_function(test.address);
+            Rng rng{0xC0DE6E4ull ^ (static_cast<u64>(t + 1) * 0x9E3779B97F4A7C15ull)};
+            initial = pristine;
+            for (u32 at = kCorpusDataBase; at < kCorpusEnd; at += 4) {
+                const u32 w = rng.u32v();
+                std::memcpy(initial.data() + offset_of(at), &w, 4);
+            }
+            PsvContext start = random_state(rng);
+            apply_spec(test.spec, rng, start, initial);
+            start.r[13] = kCorpusStackBase + kCorpusStackSize - 256 - 8 * rng.below(16);
+            start.r[14] = kReturn;
+            generated = initial;
+            psv_membase = membase_for(generated);
+            u64 best = ~u64(0);
+            constexpr int kCalls = 2000;
+            for (int round = 0; round < rounds; ++round) {
+                const u64 t0 = nx::os::ticks_ns();
+                for (int k = 0; k < kCalls; ++k) {
+                    PsvContext g = start;
+                    function(&g, kReturn);
+                }
+                best = std::min(best, nx::os::ticks_ns() - t0);
+            }
+            const f64 ns = static_cast<f64>(best) / kCalls;
+            log_sum += std::log(ns);
+            std::printf("bench %-28s %10.1f ns\n", test.function, ns);
+        }
+        std::printf("bench geometric mean %.2f ns over %zu functions\n",
+                    std::exp(log_sum / static_cast<f64>(sizeof kCorpusTests / sizeof kCorpusTests[0])),
+                    sizeof kCorpusTests / sizeof kCorpusTests[0]);
+    }
     recomp::set_trap_handler(previous);
     recomp::clear_modules();
     psv_membase = nullptr;
@@ -365,4 +406,60 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
                                    some_flags, sizeof kCorpusTests / sizeof kCorpusTests[0] - all_flags - some_flags)
                             .c_str());
     CHECK(failures == 0);
+}
+
+namespace {
+
+// A callback that returns with another stack pointer (outside AAPCS): what the generated code checks after a call
+// to code outside its module's view where its callers rely on the stack pointer (ARCHITECTURE.md, "Registers").
+void moves_sp(PsvContext* ctx, uint32_t) {
+    ctx->r[0] = ctx->r[0] + ctx->r[1];
+    ctx->r[13] -= 8;
+}
+
+}  // namespace
+
+TEST_CASE("recomp: a call that returns with another stack pointer stops where callers rely on it") {
+    recomp::clear_modules();
+    for (unsigned i = 0; i < corpus_module_count; ++i) recomp::register_module(*corpus_modules[i]);
+    const auto previous = recomp::set_trap_handler(on_trap);
+    // fold_all calls fold directly, fold calls each reducer through a function pointer (psv_call): r_add replaced.
+    u32 fold_all = 0, r_add = 0, fold = 0;
+    for (const CorpusTest& t : kCorpusTests)
+        if (std::strcmp(t.function, "fold_all") == 0) fold_all = t.address;
+    for (const CorpusModule& m : kCorpusModules)
+        for (u32 i = 0; i < m.function_count; ++i) {
+            if (std::strcmp(m.functions[i].name, "r_add") == 0) r_add = m.functions[i].address;
+            if (std::strcmp(m.functions[i].name, "fold") == 0) fold = m.functions[i].address;
+        }
+    REQUIRE(fold_all != 0);
+    REQUIRE(r_add != 0);
+    recomp::override_function(r_add, moves_sp);
+    nx::vector<u8> memory(kBufferSize, 0);
+    for (const CorpusModule& m : kCorpusModules) std::memcpy(memory.data() + offset_of(m.base), m.bytes, m.size);
+    psv_membase = membase_for(memory);
+    PsvContext c;
+    std::memset(&c, 0, sizeof c);
+    c.r[0] = kCorpusDataBase;
+    c.r[1] = 4;
+    c.r[13] = kCorpusStackBase + kCorpusStackSize - 256;
+    c.r[14] = kReturn;
+    bool trapped = false;
+    g_trap = {};
+    if (setjmp(g_trap_jump) == 0) recomp::find_function(fold_all)(&c, kReturn);
+    else trapped = true;
+#ifdef CODEGEN_TEST_NO_CALLEE_SAVED
+    // (without callee-saved knowledge nothing relies on it: fold reads sp back after the call and goes on, where the
+    // moved stack leads it, as the interpreter would)
+    (void)fold;
+    CHECK((!trapped || g_trap.kind != PSV_TRAP_STACK_POINTER));
+#else
+    // (fold's callers rely on what it preserves, which relies on the call keeping sp: it checks)
+    CHECK(trapped);
+    CHECK(g_trap.kind == PSV_TRAP_STACK_POINTER);
+    CHECK(g_trap.pc == (fold & ~1u));
+#endif
+    recomp::set_trap_handler(previous);
+    recomp::clear_modules();
+    psv_membase = nullptr;
 }

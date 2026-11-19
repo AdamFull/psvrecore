@@ -31,6 +31,7 @@ add_executable(psvrecore_tests
     arm_tests.cpp
     analysis_tests.cpp
     flags_tests.cpp
+    registers_tests.cpp
     generator_tests.cpp
     interp_tests.cpp
     float_tests.cpp
@@ -41,7 +42,7 @@ add_executable(psvrecore_tests
     gxm_translate_tests.cpp
 )
 target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")
-target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::analysis psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code
+target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::analysis psvrecore::recomp_support psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code
                                               nx::foundation zlib-ng::zlibstatic)
 psvrecore_target_defaults(psvrecore_tests)
 
@@ -49,16 +50,21 @@ add_test(NAME psvrecore_tests COMMAND psvrecore_tests)
 
 # The generator's synthetic corpus (codegen/: compiled and hand-written ARM code, checked in as corpus_data.inc by
 # scripts/codegen_corpus.py), translated at build time: whole functions run against the interpreter, through the
-# production memory path (psvrecore_codegen_tests) and through folded memory (psvrecore_codegen_masked_tests).
-# scripts/codegen_metrics.py measures the same code (corpusgen writes it with the default file size there).
+# production memory path (psvrecore_codegen_tests), through folded memory with the kept registers checked after each
+# call (psvrecore_codegen_masked_tests), and with the registers in locals but no callee-saved knowledge
+# (psvrecore_codegen_locals_tests: psvrecomp --no-callee-saved). scripts/codegen_metrics.py measures the same code
+# (corpusgen writes it with the default file size there). PSVRECORE_CODEGEN_TEST_ARGS: more corpusgen options for the
+# first two (--registers-in-context, --keep-registers loops...: for measuring or chasing a variant).
 add_executable(corpusgen codegen/corpusgen.cpp)
 target_include_directories(corpusgen PRIVATE codegen)
 target_link_libraries(corpusgen PRIVATE psvrecore::recomp)
 psvrecore_target_defaults(corpusgen)
 # The masked configuration's code is generated with --full-exit: its test functions leave all four condition flags
 # at return and the test compares them all; the other's leave only those a caller reads (see corpusgen.cpp).
-set(_corpus_modules calls control flags integer integer_arm neon vfp)  # (one per file in codegen/corpus)
-foreach(_config "" _masked)
+set(PSVRECORE_CODEGEN_TEST_ARGS "" CACHE STRING "more corpusgen options for the synthetic corpus' code (tests/codegen)")
+separate_arguments(_corpus_args NATIVE_COMMAND "${PSVRECORE_CODEGEN_TEST_ARGS}")
+set(_corpus_modules calls control flags integer integer_arm neon regs vfp)  # (one per file in codegen/corpus)
+foreach(_config "" _masked _locals)
     set(_dir "${CMAKE_CURRENT_BINARY_DIR}/codegen${_config}")
     set(_corpus_sources${_config} "${_dir}/corpus_modules.c")
     set(_corpus_includes${_config} "")
@@ -69,20 +75,27 @@ foreach(_config "" _masked)
 endforeach()
 add_custom_command(
     OUTPUT ${_corpus_sources}
-    COMMAND corpusgen "${CMAKE_CURRENT_BINARY_DIR}/codegen" 0xFFFFFFFF
+    COMMAND corpusgen "${CMAKE_CURRENT_BINARY_DIR}/codegen" 0xFFFFFFFF ${_corpus_args}
     DEPENDS corpusgen "${CMAKE_CURRENT_SOURCE_DIR}/codegen/corpus_data.inc"
     COMMENT "Translating the code generator's synthetic corpus"
     VERBATIM)
 add_custom_command(
     OUTPUT ${_corpus_sources_masked}
-    COMMAND corpusgen "${CMAKE_CURRENT_BINARY_DIR}/codegen_masked" 0xFFFFFFFF --full-exit
+    COMMAND corpusgen "${CMAKE_CURRENT_BINARY_DIR}/codegen_masked" 0xFFFFFFFF --full-exit ${_corpus_args}
     DEPENDS corpusgen "${CMAKE_CURRENT_SOURCE_DIR}/codegen/corpus_data.inc"
     COMMENT "Translating the code generator's synthetic corpus (every flag at exit)"
     VERBATIM)
+add_custom_command(
+    OUTPUT ${_corpus_sources_locals}
+    COMMAND corpusgen "${CMAKE_CURRENT_BINARY_DIR}/codegen_locals" 0xFFFFFFFF --no-callee-saved
+    DEPENDS corpusgen "${CMAKE_CURRENT_SOURCE_DIR}/codegen/corpus_data.inc"
+    COMMENT "Translating the code generator's synthetic corpus (no callee-saved knowledge)"
+    VERBATIM)
 add_library(psvrecore_codegen_code STATIC ${_corpus_sources})
 add_library(psvrecore_codegen_code_masked STATIC ${_corpus_sources_masked})
-target_compile_definitions(psvrecore_codegen_code_masked PRIVATE PSV_ADDRESS_MASK=0x7FFFF)
-foreach(_config "" _masked)
+add_library(psvrecore_codegen_code_locals STATIC ${_corpus_sources_locals})
+target_compile_definitions(psvrecore_codegen_code_masked PRIVATE PSV_ADDRESS_MASK=0x7FFFF PSV_CHECK_KEPT_REGISTERS)
+foreach(_config "" _masked _locals)
     target_include_directories(psvrecore_codegen_code${_config} PRIVATE ${_corpus_includes${_config}})
     target_link_libraries(psvrecore_codegen_code${_config} PUBLIC psvrecore::recomp_support)
     psvrecore_generated_code(psvrecore_codegen_code${_config})
@@ -94,6 +107,7 @@ foreach(_config "" _masked)
     set_tests_properties(psvrecore_codegen${_config}_tests PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 target_compile_definitions(psvrecore_codegen_masked_tests PRIVATE CODEGEN_TEST_MASK=0x7FFFF)
+target_compile_definitions(psvrecore_codegen_locals_tests PRIVATE CODEGEN_TEST_NO_CALLEE_SAVED)
 
 # Same-source probes, built only by scripts/probe_check.py (they need the SDK and recompiled SDK code: local only).
 set(PSVRECORE_PROBES_DIR "" CACHE PATH "folder of SDK-built probes and their recompiled code (scripts/probe_check.py)")

@@ -145,6 +145,9 @@ Result<u8> parse_flags(nx::string_view text) {
 struct FlagArgs {
     bool everywhere = false;
     nx::string given_at_entry, given_at_return;
+    bool registers_in_context = false, no_callee_saved = false;
+    nx::string keep_registers = "all";
+    bool no_sp_check = false;
 };
 
 bool valid_identifier(nx::string_view name) {
@@ -174,6 +177,13 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     gen.flags_everywhere = flag_args.everywhere;
     gen.flags_given_at_entry = *given_at_entry;
     gen.flags_given_at_return = *given_at_return;
+    gen.registers_in_context = flag_args.registers_in_context;
+    gen.no_callee_saved = flag_args.no_callee_saved;
+    gen.check_sp = !flag_args.no_sp_check;
+    if (flag_args.keep_registers == "all") gen.keep_registers = analysis::KeepPolicy::All;
+    else if (flag_args.keep_registers == "loops") gen.keep_registers = analysis::KeepPolicy::Loops;
+    else if (flag_args.keep_registers == "none") gen.keep_registers = analysis::KeepPolicy::None;
+    else return failure(nx::format("--keep-registers '{}': all, loops or none", flag_args.keep_registers));
     const auto output = recomp::generate(program, gen);
     const nx::fs::path_view dir(out_dir);
     if (auto made = nx::fs::create_directories(dir); !made)
@@ -198,6 +208,31 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     print("            contract: read at entry {}, given at entry {}, read after indirect calls {}, given at return {}\n",
           analysis::flag_names(fl.needed_at_entry), analysis::flag_names(fl.given_at_entry), analysis::flag_names(fl.needed_at_return),
           analysis::flag_names(fl.given_at_return));
+    if (gen.registers_in_context) {
+        print("registers   in the context (--registers-in-context)\n");
+    } else {
+        print("registers   {} read at entry, {} written to the context, {} read back after calls ({} at traps)\n",
+              st.register_entry_loads, st.register_stores, st.register_call_loads, st.register_trap_stores);
+        nx::string kept;
+        for (u32 k = 4; k < 14; ++k) kept += nx::format(" {}:{}", k == 13 ? nx::string("sp") : nx::format("r{}", k), st.functions_preserving[k]);
+        print("            {} direct calls keep {} registers in locals; {} calls check the stack pointer{}\n", st.calls_keeping,
+              st.registers_kept, st.stack_checks, gen.no_callee_saved ? " (--no-callee-saved)" : "");
+        print("            functions preserving r4-r11 and sp: {} all;{} ({} check sp)\n", st.functions_preserving_all, kept,
+              st.functions_checking_sp);
+        const auto& uw = output.registers.unwind;
+        if (uw.entries || uw.undecoded) {
+            print("            exception index: {} functions with unwind opcodes: {} agree, {} preserve a register they write that "
+                  "unwinding does not restore{}; {} restore by unwinding one not shown preserved; {} entries without a frame, not "
+                  "unwinding or not decoded\n",
+                  uw.entries, uw.agree, uw.disagree, uw.disagreeing.empty() ? nx::string() : nx::format(" (0x{:08x}...)", uw.disagreeing[0]),
+                  uw.unproven, uw.undecoded);
+        }
+        if (st.register_effect_mismatches) {
+            print("            {} instructions' translations read or write other registers than the analysis' model says:\n",
+                  st.register_effect_mismatches);
+            for (const auto& note : st.register_notes) print("              {}\n", note);
+        }
+    }
     print("discovery   {} errors (psvrecomp analyze --diagnostics lists them)\n", errors);
     usize traps = 0;
     for (const auto& [what, n] : st.traps) traps += n;
@@ -242,6 +277,16 @@ int main(int argc, char** argv) {
         .option("flags-given-at-return", flag_args.given_at_return,
                 "condition flags other modules read after an indirect call returns (left in the context by every "
                 "function's return)", {.value_name = "FLAGS"})
+        .flag("registers-in-context", flag_args.registers_in_context,
+              "core registers in the context everywhere, not in locals (for checking a suspected register analysis bug)")
+        .flag("no-callee-saved", flag_args.no_callee_saved,
+              "no callee-saved knowledge: every register live after a call is read back from the context")
+        .option("keep-registers", flag_args.keep_registers,
+                "where a caller keeps the registers a callee preserves in locals instead of reading them back: all "
+                "(direct calls), loops (direct calls inside loops) or none", {.value_name = "WHERE"})
+        .flag("no-sp-check", flag_args.no_sp_check,
+              "take calls to code outside the module to return with the stack pointer they were called with, without "
+              "checking it after them")
         .option_many("db", dbs, "NID database (.yml, .tsv, or a directory of them); repeatable", {.value_name = "PATH"})
         .flag("no-default-db", no_default_db, "do not load vita-headers' database");
     nx::string command;

@@ -1,7 +1,8 @@
 // corpusgen — translates the synthetic corpus (corpus.hpp) with the code generator, as psvrecomp translates a
 // module: code discovery from the modules' function symbols (no exception index), then the generator.
 //
-//   corpusgen <out-dir> [instructions-per-file] [--full-exit]
+//   corpusgen <out-dir> [instructions-per-file] [--full-exit] [--no-callee-saved] [--registers-in-context]
+//             [--keep-registers all|loops|none] [--no-sp-check]
 //
 // Output: <out-dir>/syn_<module>/syn_<module>_{functions.h,code_<k>.c,module.c} for each module (the layout of a
 // game's generated/code folder), <out-dir>/corpus_modules.c, the table of the modules' PsvModuleCode and of each
@@ -10,7 +11,8 @@
 //
 // The modules are generated as a game's are, each given what the others read (psvrecomp --flags-given-at-entry and
 // --flags-given-at-return). --full-exit: the functions the test runs leave all four flags at return, as exported
-// functions do, so that the test compares every flag at exit.
+// functions do, so that the test compares every flag at exit. --no-callee-saved and --registers-in-context: as
+// psvrecomp's (for measuring the register stages apart, and for chasing a register analysis bug).
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,14 +48,20 @@ analysis::Program discover(const analysis::Image& image, const CorpusModule& m) 
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool full_exit = false;
+    bool full_exit = false, no_callee_saved = false, registers_in_context = false;
+    nx::string keep = "all";
+    bool no_sp_check = false;
     nx::vector<const char*> args;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--full-exit") == 0) full_exit = true;
+        else if (std::strcmp(argv[i], "--no-callee-saved") == 0) no_callee_saved = true;
+        else if (std::strcmp(argv[i], "--registers-in-context") == 0) registers_in_context = true;
+        else if (std::strcmp(argv[i], "--keep-registers") == 0 && i + 1 < argc) keep = argv[++i];
+        else if (std::strcmp(argv[i], "--no-sp-check") == 0) no_sp_check = true;
         else args.push_back(argv[i]);
     }
     if (args.size() != 1 && args.size() != 2) {
-        std::fprintf(stderr, "usage: corpusgen <out-dir> [instructions-per-file] [--full-exit]\n");
+        std::fprintf(stderr, "usage: corpusgen <out-dir> [instructions-per-file] [--full-exit] [--no-callee-saved] [--registers-in-context]\n");
         return 2;
     }
     const nx::fs::path_view dir(args[0]);
@@ -102,7 +110,15 @@ int main(int argc, char** argv) {
         gen.flags_given_at_entry = needed_at_entry;
         gen.flags_given_at_return = needed_at_return;
         gen.full_exit_flags = full_exit_of(m);
+        gen.no_callee_saved = no_callee_saved;
+        gen.registers_in_context = registers_in_context;
+        gen.check_sp = !no_sp_check;
+        gen.keep_registers = keep == "loops" ? analysis::KeepPolicy::Loops : keep == "none" ? analysis::KeepPolicy::None : analysis::KeepPolicy::All;
         const auto output = recomp::generate(program, gen);
+        if (output.stats.register_effect_mismatches) {
+            for (const auto& note : output.stats.register_notes) std::fprintf(stderr, "corpusgen: %s: %s\n", m.name, note.c_str());
+            ++errors;  // (the analysis' model of what each instruction reads and writes must be the translation's)
+        }
         for (const auto& [code, f] : output.flags.functions) exits += nx::format("    {{0x{:08X}u, 0x{:X}u}},\n", code, f.live_out);
         for (const auto& [what, n] : output.stats.traps) {
             std::fprintf(stderr, "corpusgen: %s: %zu x %s\n", m.name, static_cast<size_t>(n), what.c_str());

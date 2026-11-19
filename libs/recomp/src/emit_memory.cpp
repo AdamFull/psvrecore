@@ -9,7 +9,7 @@ namespace psvrecore::recomp::detail {
 nx::string Emitter::address(const Instruction& in, const Operand& m, nx::string* writeback) {
     if (writeback) writeback->clear();
     // The PC as a base reads word-aligned (literal loads).
-    const nx::string base = m.reg == arm::kPc ? hex(analysis::pc_value(in) & ~3u) : R(m.reg);
+    const nx::string base = m.reg == arm::kPc ? hex(analysis::pc_value(in) & ~3u) : reg(m.reg);
     nx::string offset;
     if (m.flags & arm::kMemIndexReg) {
         const nx::string x = read(in, m.reg2);
@@ -31,7 +31,7 @@ nx::string Emitter::address(const Instruction& in, const Operand& m, nx::string*
     line(nx::format("const uint32_t {} = {};", a, (m.flags & arm::kMemPre) ? offset_address : b));
     if ((m.flags & arm::kMemWriteBack) && writeback) {
         if (m.reg == arm::kPc) *writeback = "/* (writeback to the PC: unpredictable) */";
-        else *writeback = nx::format("{} = {};", R(m.reg), offset_address);
+        else *writeback = assignment(m.reg, offset_address);
     }
     return a;
 }
@@ -180,7 +180,7 @@ bool multiple(Emitter& e, const Instruction& in) {
             e.line(nx::format("const uint32_t {} = psv_mld32(mb, {} + {}u);", v, first, 4 * index++));
             loaded.emplace_back(r, v);
         }
-        if (writeback) e.line(nx::format("{} = {};", R(rn), final_base));
+        if (writeback) e.line(e.assignment(rn, final_base));
         for (const auto& [r, v] : loaded) e.write(in, r, v);  // (the PC last: a branch)
     } else {
         for (u32 r = 0; r < 16; ++r) {
@@ -188,7 +188,7 @@ bool multiple(Emitter& e, const Instruction& in) {
             // (the base register, when stored, has its original value)
             e.line(nx::format("psv_mst32(mb, {} + {}u, {});", first, 4 * index++, r == rn ? base : e.read(in, r)));
         }
-        if (writeback) e.line(nx::format("{} = {};", R(rn), final_base));
+        if (writeback) e.line(e.assignment(rn, final_base));
     }
     return true;
 }

@@ -255,7 +255,7 @@ bool load_store(Emitter& e, const Instruction& in) {
                 if (load) e.line(nx::format("{} = psv_mld{}(mb, {} + {}u);", reg, dbl ? 64 : 32, at, offset));
                 else e.line(nx::format("psv_mst{}(mb, {} + {}u, {});", dbl ? 64 : 32, at, offset, reg));
             }
-            if (writeback) e.line(nx::format("{} = {} {} {}u;", R(rn), base, increment ? "+" : "-", bytes));
+            if (writeback) e.line(e.assignment(rn, nx::format("{} {} {}u", base, increment ? "+" : "-", bytes)));
             return true;
         }
         default: return false;
@@ -287,9 +287,18 @@ bool status(Emitter& e, const Instruction& in) {
             e.trap(in, "PSV_TRAP_PRIVILEGED", "vmsr of a system register other than FPSCR");
             return true;
         }
-        // (it traps on a setting not implemented: every local flag in the context first)
+        // (it traps on a setting not implemented: every local flag in the context first, and the registers on the
+        // way to that trap only)
+        const nx::string value = e.read(in, in.operands[1].reg);
         e.store_flags_for_trap();
-        e.line(nx::format("psv_write_fpscr(ctx, {}, {});", e.read(in, in.operands[1].reg), hex(in.address)));
+        if (const nx::string regs = e.trap_register_stores(); !regs.empty()) {
+            const nx::string v = e.temp("value");
+            e.line(nx::format("const uint32_t {} = {};", v, value));
+            e.line(nx::format("if (__builtin_expect(({} & PSV_FPSCR_UNSUPPORTED) != 0u, 0)) {{ {} }}", v, regs));
+            e.line(nx::format("psv_write_fpscr(ctx, {}, {});", v, hex(in.address)));
+        } else {
+            e.line(nx::format("psv_write_fpscr(ctx, {}, {});", value, hex(in.address)));
+        }
         return true;
     }
     return false;

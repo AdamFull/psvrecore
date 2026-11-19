@@ -154,6 +154,10 @@ const char* trap_name(u32 kind) {
         case PSV_TRAP_BAD_JUMP: return "jump table index outside the table";
         case PSV_TRAP_FPSCR: return "FPSCR setting not implemented";
         case PSV_TRAP_BIG_ENDIAN: return "big-endian data (setend be)";
+        case PSV_TRAP_STACK_POINTER:
+            return "a call to code outside the module returned with another stack pointer, in the function at this address (the "
+                   "module relies on it: generate it with psvrecomp --no-callee-saved)";
+        case PSV_TRAP_KEPT_REGISTER: return "a callee did not preserve a register it was found to preserve (psvrecomp --no-callee-saved)";
         case kTrapUnknownTarget: return "branch to an address no recompiled function starts at";
         case kTrapMissingImport: return "call to an import nothing implements";
         case kTrapSvc: return "svc";

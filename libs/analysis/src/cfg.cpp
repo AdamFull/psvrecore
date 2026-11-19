@@ -131,6 +131,7 @@ Cfg build_cfg(const Program& program, const Function& fn) {
         switch (f.kind) {
             case FlowKind::Next:
                 if (in.op == Op::Svc) node.call = CallKind::System;
+                node.cont_edge = 0;
                 add(cont);
                 break;
             case FlowKind::Call:
@@ -147,11 +148,16 @@ Cfg build_cfg(const Program& program, const Function& fn) {
                     node.call = CallKind::Indirect;
                 }
                 // (a call to a function that never returns: a trap after it, when it executes)
-                add(noreturn.contains(in.address) ? Edge{EdgeKind::Trap, 0} : cont);
+                if (noreturn.contains(in.address)) {
+                    add(Edge{EdgeKind::Trap, 0});
+                } else {
+                    node.cont_edge = 0;
+                    add(cont);
+                }
                 break;
             case FlowKind::Branch:
                 add(branch_edge(f.target));
-                if (in.op == Op::Cbz || in.op == Op::Cbnz) add(cont);
+                if (in.op == Op::Cbz || in.op == Op::Cbnz) node.cont_edge = 1, add(cont);
                 break;
             case FlowKind::IndirectBranch: {
                 if (auto t = fn.tables.find(in.address); t != fn.tables.end()) {
