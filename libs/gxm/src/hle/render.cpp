@@ -680,6 +680,9 @@ struct Renderer {
     nx::vector<Repack> scene_repacks;
     nx::vector<u8> scene_indices;
     u64 ended = 0, rendered = 0;
+    // (scenes rendered ahead of one ended before them, by another of the game's threads: `rendered` counts up to
+    // a scene once every scene before it is rendered too)
+    nx::vector<u64> rendered_ahead;
     bool worker = false;
     nx::vector<nx::unique_ptr<vk::OneShot>> display_copies;  // (the frames copied to the sink's image, in flight)
     u64 submitted = 0, finished = 0;  // (the numbers of the last scene submitted and the last finished)
@@ -5522,6 +5525,25 @@ void render_ended(Renderer& r, Renderer::Ended& e) {
     }
 }
 
+// Scene `number` rendered (under the scenes' lock).
+void mark_rendered(Renderer& r, u64 number) {
+    if (number != r.rendered + 1) {
+        r.rendered_ahead.push_back(number);
+        return;
+    }
+    r.rendered = number;
+    for (bool more = true; more;) {
+        more = false;
+        for (usize i = 0; i < r.rendered_ahead.size(); ++i)
+            if (r.rendered_ahead[i] == r.rendered + 1) {
+                r.rendered = r.rendered_ahead[i];
+                r.rendered_ahead.erase(r.rendered_ahead.begin() + static_cast<isize>(i));
+                more = true;
+                break;
+            }
+    }
+}
+
 void scene_thread(Renderer& r) {
     t_scene_thread = true;
     for (;;) {
@@ -5535,7 +5557,7 @@ void scene_thread(Renderer& r) {
         render_ended(r, e);
         {
             nx::scoped_lock<nx::mutex> held(r.scenes_lock);
-            r.rendered = e.number;
+            mark_rendered(r, e.number);
         }
         r.scenes_changed.notify_all();
     }
@@ -5574,8 +5596,12 @@ void end_scene(Scene&& scene, nx::vector<Notification> notifications) {
             e.number = ++r.ended;
         }
         render_ended(r, e);
-        nx::scoped_lock<nx::mutex> held(r.scenes_lock);
-        r.rendered = e.number;
+        // (and those waiting for it told: a thread that ends no scene, a transfer's, may wait in wait_rendered)
+        {
+            nx::scoped_lock<nx::mutex> held(r.scenes_lock);
+            mark_rendered(r, e.number);
+        }
+        r.scenes_changed.notify_all();
         return;
     }
     bool start = false, queued = false;
