@@ -126,12 +126,12 @@ void fiber_main(nx::fiber::Transfer t) {
     psv_trap(ctx, f->entry, PSV_TRAP_RETURNED);
 }
 
-// `detached`: a fiber made without its context memory (0 and 0), given one when it is first switched to
-// (_sceFiberAttachContextAndSwitch): libult makes its threads' fibers so.
-i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context, u32 context_size,
-               bool detached) {
+// A fiber may be made without its context memory (0 and 0): given one when it is first switched to
+// (_sceFiberAttachContextAndSwitch: libult makes its threads' fibers so), or run on the stack of the side that resumes
+// it (Gravity Rush's tasks of no stack size, through _sceFiberInitializeImpl: its loading waits on them).
+i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context, u32 context_size) {
     if (!fiber || !entry) return kNull;
-    const bool none = detached && !context && !context_size;
+    const bool none = !context && !context_size;
     if (!context && !none) return kNull;
     if ((fiber.address & 7) || (context & 7) || (context_size & 7)) return kAlignment;
     if (!none && context_size < kContextMinimum) return kRange;
@@ -161,15 +161,15 @@ i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initia
 
 i32 _sceFiberInitializeImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context,
                             u32 context_size, Ptr<const void> /*opt*/, u32 /*build_version*/) {
-    return initialize(fiber, name, entry, arg_on_initialize, context, context_size, false);
+    return initialize(fiber, name, entry, arg_on_initialize, context, context_size);
 }
 
 // The same with an internal option word before the build version (libult passes 2 for a fiber without context
-// memory, 3 with): only a missing context is told apart here.
+// memory, 3 with): nothing else is told apart here.
 i32 _sceFiberInitializeWithInternalOptionImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize,
                                               u32 context, u32 context_size, Ptr<const void> /*opt*/,
                                               u32 /*internal_option*/, u32 /*build_version*/) {
-    return initialize(fiber, name, entry, arg_on_initialize, context, context_size, true);
+    return initialize(fiber, name, entry, arg_on_initialize, context, context_size);
 }
 
 i32 sceFiberFinalize(Ptr<u8> fiber) {

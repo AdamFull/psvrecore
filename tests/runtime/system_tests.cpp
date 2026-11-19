@@ -132,6 +132,13 @@ TEST_CASE("fiber: options zeroed; a fiber without context memory given one and r
     CHECK(call32(ctx, kSceFiber, kRenameSelf, {g_fiber_name}) == kFiberPermission);  // (from a thread)
     CHECK(call32(ctx, kSceFiber, kFinalize, {fiber}) == 0);
 
+    // The plain initialisation without context memory too (0 and 0); a size without memory is refused.
+    constexpr u32 kInit = 0xF24A298C;
+    const u32 plain = scratch(128);
+    CHECK(call32(ctx, kSceFiber, kInit, {plain, guest_string("task"), entry, 30, 0, 0x4000, 0, 0}) == kFiberNull);
+    REQUIRE(call32(ctx, kSceFiber, kInit, {plain, guest_string("task"), entry, 30, 0, 0, 0, 0}) == 0);
+    CHECK(call32(ctx, kSceFiber, kFinalize, {plain}) == 0);
+
     // (the context's use is not measured; markers are accepted)
     CHECK(call32(ctx, kSceFiber, kStartCheck, {0}) == 0);
     CHECK(call32(ctx, kSceFiber, kStopCheck, {}) == 0);
