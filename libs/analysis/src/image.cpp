@@ -140,8 +140,10 @@ Result<nx::vector<VariableUse>> Image::variable_uses(nx::vector<ImportedVariable
             for (u32 i = 0; i < entries; ++i) {
                 const u32 word = u32_at(table + 4 + 8 * i), offset = u32_at(table + 8 + 8 * i);
                 const u8 type = static_cast<u8>(word >> 8);
-                if ((word & 0xFF) != 1 || (type != reloc::kAbs32 && type != reloc::kThmMovwAbsNc && type != reloc::kThmMovtAbs &&
-                                           type != reloc::kMovwAbsNc && type != reloc::kMovtAbs))
+                // (REL32: a word holding the variable's address less its own, as C++ exception tables name the
+                // typeinfo of what a handler catches)
+                if ((word & 0xFF) != 1 || (type != reloc::kAbs32 && type != reloc::kRel32 && type != reloc::kThmMovwAbsNc &&
+                                           type != reloc::kThmMovtAbs && type != reloc::kMovwAbsNc && type != reloc::kMovtAbs))
                     return failure(nx::format("variable 0x{:08x} of {}: reference entry 0x{:08x} not supported", v.nid, lib.name, word));
                 out.push_back(VariableUse{index, base + offset, type, word >> 16});
             }

@@ -172,8 +172,10 @@ void Loader::link_module(LoadedModule& m) {
         if (!s.writable()) memory.protect(s.base, Access::ReadWrite);
     if (auto uses = m.image.variable_uses()) {
         for (const auto& u : *uses)
-            if (u.type == 2 && u.variable < m.code->variable_count) {  // (ABS32; code uses read the generated table)
-                const u32 value = m.code->variables[u.variable].address + u.addend;
+            if ((u.type == 2 || u.type == 3) && u.variable < m.code->variable_count) {
+                // (ABS32: S + A; REL32: S + A - P, in C++ exception tables. Code uses read the generated table.)
+                u32 value = m.code->variables[u.variable].address + u.addend;
+                if (u.type == 3) value -= u.at;
                 std::memcpy(memory.host(u.at), &value, 4);
                 nx::logd(logs::loader, "{}: variable {} at 0x{:08x} = 0x{:08x}", m.name, u.variable, u.at, value);
             }
