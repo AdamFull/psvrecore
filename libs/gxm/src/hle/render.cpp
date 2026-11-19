@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -339,13 +340,16 @@ void read_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 
     }
 }
 
-// And back. (DF32M_S8: the mask bit of every sample is the surface's background mask.)
+// And back. (DF32M_S8: the mask bit of every sample is the surface's background mask.) Into guest memory, or into
+// `depth_out` (and `stencil_out`): the surface's bytes from its depth address (and its stencil's), elsewhere.
+// `keep`: only the samples (indices in the surface) it takes.
 void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height, bool unorm24,
-                         const u32* depth, const u8* stencil) {
+                         const u32* depth, const u8* stencil, u8* depth_out = nullptr, u8* stencil_out = nullptr,
+                         nx::function_ref<bool(u32)> keep = {}) {
     const u32 mask = l.mask && (s.background_control & 0x100) ? 0x80000000u : 0;
-    if (plain_depth(l, unorm24)) {
-        u8* d = memory().host(s.depth_data);
-        u8* st = l.stencil ? memory().host(s.stencil_data) : nullptr;
+    u8* const d = depth_out ? depth_out : l.depth_bytes ? memory().host(s.depth_data) : nullptr;
+    u8* const st = !l.stencil ? nullptr : stencil_out ? stencil_out : memory().host(s.stencil_data);
+    if (plain_depth(l, unorm24) && !keep) {
         for (u32 y = 0; y < height; ++y)
             for (u32 x = 0; x < width;) {
                 const u32 n = depth_run(s, x, width), i = depth_sample(s, x, y), at = y * width + x;
@@ -365,16 +369,17 @@ void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32
     for (u32 y = 0; y < height; ++y) {
         for (u32 x = 0; x < width; ++x) {
             const u32 i = depth_sample(s, x, y), at = y * width + x;
+            if (keep && !keep(i)) continue;
             const f32 z = unorm24 ? static_cast<f32>(depth[at] & 0xFFFFFF) / 16777215.0f : std::bit_cast<f32>(depth[at]);
             if (l.depth_bytes == 4) {
                 const u32 w = l.packed ? static_cast<u32>(std::lround(z * 16777215.0f)) | u32{stencil[at]} << 24
                                        : std::bit_cast<u32>(z) | (mask_in_stencil(l) ? u32{stencil[at] & 1u} << 31 : mask);
-                std::memcpy(memory().host(s.depth_data + i * 4), &w, 4);
+                std::memcpy(d + usize{i} * 4, &w, 4);
             } else if (l.depth_bytes == 2) {
                 const u16 h = depth16_of(z);
-                std::memcpy(memory().host(s.depth_data + i * 2), &h, 2);
+                std::memcpy(d + usize{i} * 2, &h, 2);
             }
-            if (l.stencil) *memory().host(s.stencil_data + i) = stencil[at];
+            if (st) st[i] = stencil[at];
         }
     }
 }
@@ -483,6 +488,26 @@ struct Target {
     u64 generation = 0;  // (a scene drawing it submitted: +1)
 };
 
+// What a scene's store of a depth surface left in guest memory: how many bytes, and the bytes themselves only where
+// they may be compared with guest memory (PSVRECORE_WRITE_WATCH=0 or verify, or a range that could not be watched).
+// Watched, nothing compares them: a copy of a 960 x 544 surface (2 MiB) each scene was a third of the copying the
+// thread that ends WipEout 2048's scenes did.
+struct StoredDepth {
+    nx::vector<u8> bytes;
+    usize size_ = 0;
+    bool empty() const { return size_ == 0; }
+    usize size() const { return size_; }
+    bool held() const { return size_ && bytes.size() == size_; }  // (`bytes` are what was stored)
+    void clear() { size_ = 0, bytes.clear(); }
+};
+// Whether a store's bytes are kept for comparing: not when every range of it is watched (and not verified).
+bool keep_stored_bytes(std::initializer_list<const WrittenWatch*> watches) {
+    if (write_watch_mode() != 1) return true;
+    for (const WrittenWatch* w : watches)
+        if (w->size && !w->armed) return true;
+    return false;
+}
+
 // A depth surface a depth-only scene stores (a shadow map), at the internal resolution: its depth image, kept from
 // scene to scene, a view of its depth for textures, and the bytes last stored to guest memory (while they are still
 // there, the image is the surface).
@@ -491,7 +516,7 @@ struct DepthTarget {
     u32 scale = 1;
     vk::Image image;
     VkImageView depth_view = VK_NULL_HANDLE;
-    nx::vector<u8> written;
+    StoredDepth written;
     u32 stencil_address = 0;  // (a kept one's: its key has the stencil's address too)
     u64 used = 0;             // (a kept one's: the scene it was last used in)
     u64 generation = 0;       // (a kept one's: +1 each time a scene's store of it is written back)
@@ -568,6 +593,7 @@ struct Renderer {
     struct TargetCopy {
         u64 key = 0;
         Target* from = nullptr;
+        u32 x = 0, y = 0;  // (where in the surface the texture starts)
         u32 width = 0, height = 0;
         u32 scale = 1;
         vk::Buffer strip{};
@@ -706,6 +732,9 @@ struct Renderer {
     bool flusher = false;
     nx::hash_map<u64, nx::string> failed_textures;
     u64 scenes = 0;
+    // (deferred depth stores' samples, by the surface's depth address: the read-back buffer, or at a scale the
+    // middle samples; given back once their write-back is no longer deferred. Under g_lazy_lock.)
+    nx::hash_map<u32, Snapshot> lazy_depths;
 #if PSVRECORE_TRACY
     tracy::VkCtx* gpu_zones = nullptr;  // (Tracy's GPU zones: the scenes' and the game's markers; null: none)
 #endif
@@ -736,12 +765,9 @@ void make_target_converter(Renderer& r) {
 struct GuestRange {
     u32 address = 0, size = 0;
 };
-template <typename F>
-void write_back(Renderer& r, std::initializer_list<GuestRange> ranges, const WrittenWatch* exempt, F&& write) {
-    if (!write_watch_mode()) {
-        write();
-        return;
-    }
+// The watches of other surfaces sharing a page with `ranges`, not their bytes (or `exempt`), which nothing has
+// written since they were watched.
+nx::vector<WrittenWatch*> sharing_watches(Renderer& r, std::initializer_list<GuestRange> ranges, const WrittenWatch* exempt) {
     constexpr u64 kGranule = 1ull << 16;  // (as large as any host's page: pages shared are a subset)
     nx::vector<WrittenWatch*> keep;
     auto consider = [&](WrittenWatch& w) {
@@ -758,10 +784,154 @@ void write_back(Renderer& r, std::initializer_list<GuestRange> ranges, const Wri
     for (auto& t : r.targets) consider(t->watch);
     for (auto& t : r.kept_depths) consider(t->watch[0]), consider(t->watch[1]), consider(t->background_watch);
     for (auto& t : r.depth_targets) consider(t->watch[0]);
+    return keep;
+}
+template <typename F>
+void write_back(Renderer& r, std::initializer_list<GuestRange> ranges, const WrittenWatch* exempt, F&& write) {
+    if (!write_watch_mode()) {
+        write();
+        return;
+    }
+    const nx::vector<WrittenWatch*> keep = sharing_watches(r, ranges, exempt);
     for (const GuestRange& g : ranges)
         if (g.size) memory().note_write(g.address, g.size);
     write();
     for (WrittenWatch* w : keep) watch_range(*w, w->address, w->size);
+}
+
+// Lazy write-backs (PSVRECORE_LAZY_WRITEBACK=0: off): a colour surface's bytes, read back after its scene, are not
+// written into guest memory then. Its pages are deferred (GuestMemory::defer: inaccessible) and the bytes kept (the
+// surface's `written`, the read-back buffer itself); whatever touches those pages first (the game's code on the
+// CPU, the renderer reading guest memory, the display, the OS through a file written from there) has them written
+// then (lazy_materialize, from the fault). A surface drawn again before anything touched it is never written: a
+// race's surfaces (1024 x 1024, 960 x 544 HDR, ...) that only the GPU reads, as textures made from their images.
+// A depth surface's store likewise (without a stencil): its samples kept as read back (Renderer::lazy_depths),
+// converted into the surface's format when written; WipEout 2048's 960 x 544 depth, stored each frame, was two fifths
+// of the copying the thread that ends its scenes did, and nothing on the CPU reads it.
+struct LazyWriteBack {
+    Target* target = nullptr;
+    u32 address = 0, span = 0;
+    SurfaceLayout layout;
+    const u8* bytes = nullptr;  // (the target's `written`; a depth store's samples)
+    const u8* stencil = nullptr;  // (a depth store's stencil samples, after its depth ones: S8D24's, a mask's)
+    bool depth = false;  // (a depth store's: the surface, its layout and size, how its samples are read)
+    DepthStencilSurface ds{};
+    DepthLayout dl;
+    u32 width = 0, height = 0;
+    bool unorm24 = false;
+};
+std::mutex g_lazy_lock;  // (taken from fault handlers: held only around the list and the writing, never around
+                         // anything that touches deferred guest memory or takes GuestMemory's own lock)
+nx::vector<LazyWriteBack> g_lazy;
+std::atomic<u64> g_lazy_deferred{0}, g_lazy_written{0};  // (PSVRECORE_GXM_PROFILE)
+
+bool lazy_write_backs() {
+    static const bool on = [] {
+        const char* v = std::getenv("PSVRECORE_LAZY_WRITEBACK");
+        return !(v && *v == '0') && write_watch_mode() != 0;
+    }();
+    return on;
+}
+
+// The deferred write-backs with a page in [address, address + size) written, their pages watched again. The surface
+// a fault is in (`address` the faulting byte) whole: what is read next is likely the rest (a fault a page would cost
+// a surface hundreds); before a write the OS or the renderer makes there, a linear surface's bytes on those pages
+// only, a tiled, swizzled or depth one's whole. Another surface with bytes on those pages is written there only and
+// stays deferred for the rest (WipEout 2048's D16 shadow map ends on the page its 128 x 128 surface starts on, read
+// each frame: written whole, the shadow map's 128 KiB were converted and written each frame for that page).
+void write_lazy_depth(const LazyWriteBack& e, u64 w0, u64 w1) {
+    // (the samples landing on the pages the materializer opened, converted into the surface's bytes there; the rest
+    // of those pages as guest memory holds them)
+    const u64 page = memory().host_page_size();
+    const u64 lo = std::max<u64>(e.address, w0), hi = std::min<u64>(u64{e.address} + e.span, w1);
+    if (lo >= hi) return;
+    const u64 first = lo & ~(page - 1);
+    nx::vector<u8> opened(static_cast<usize>((hi - first + page - 1) / page), 0);
+    for (usize k = 0; k < opened.size(); ++k) opened[k] = memory().opened_deferred(static_cast<u32>(first + k * page));
+    auto open_at = [&](u64 a) { return a >= lo && a < hi && opened[static_cast<usize>((a - first) / page)]; };
+    nx::vector<u8> out(e.span);
+    for (u64 at = lo; at < hi;) {
+        const u64 to = std::min(hi, (at & ~(page - 1)) + page);
+        if (open_at(at)) std::memcpy(out.data() + (at - e.address), memory().host(static_cast<u32>(at)), static_cast<usize>(to - at));
+        at = to;
+    }
+    const u32 bytes = e.dl.depth_bytes;
+    write_depth_surface(e.ds, e.dl, e.width, e.height, e.unorm24, reinterpret_cast<const u32*>(e.bytes), e.stencil, out.data(),
+                        nullptr, [&](u32 i) { return open_at(u64{e.address} + u64{i} * bytes); });
+    for (u64 at = lo; at < hi;) {
+        const u64 to = std::min(hi, (at & ~(page - 1)) + page);
+        if (open_at(at)) std::memcpy(memory().host(static_cast<u32>(at)), out.data() + (at - e.address), static_cast<usize>(to - at));
+        at = to;
+    }
+}
+void write_lazy_part(const LazyWriteBack& e, u64 w0, u64 w1) {
+    if (e.depth) return write_lazy_depth(e, w0, w1);
+    const SurfaceLayout& l = e.layout;
+    const usize row = usize{l.width} * l.bytes;
+    const u64 page = memory().host_page_size();
+    for (u32 y = 0; y < l.height; ++y)
+        for (u32 x = 0; x < l.width;) {
+            const u32 n = l.run(x);
+            const u64 a0 = u64{e.address} + l.offset(x, y), a1 = a0 + u64{n} * l.bytes;
+            const u8* from = e.bytes + y * row + usize{x} * l.bytes;
+            x += n;
+            // (the run's bytes in the window, page by page: those the materializer opened)
+            for (u64 at = std::max(a0, w0); at < std::min(a1, w1);) {
+                const u64 to = std::min({a1, w1, (at & ~(page - 1)) + page});
+                if (memory().opened_deferred(static_cast<u32>(at)))
+                    std::memcpy(memory().host(static_cast<u32>(at)), from + (at - a0), static_cast<usize>(to - at));
+                at = to;
+            }
+        }
+}
+void lazy_materialize(u32 address, u32 size, bool whole) {
+    std::lock_guard<std::mutex> held(g_lazy_lock);
+    if (g_lazy.empty()) return;
+    const u64 page = memory().host_page_size();
+    u64 w0 = u64{address} & ~(page - 1), w1 = (u64{address} + size + page - 1) & ~(page - 1);
+    auto overlaps = [&](const LazyWriteBack& e) { return e.address < w1 && w0 < u64{e.address} + e.span; };
+    // (widened to the surfaces the asked bytes are in: whole after a fault, and a tiled, swizzled or depth one's
+    // whole always; the others with bytes on the window's pages written there only, and kept for their other pages)
+    for (const LazyWriteBack& e : g_lazy) {
+        const bool asked = e.address < u64{address} + size && address < u64{e.address} + e.span;
+        if (!asked || (!whole && !e.depth && e.layout.kind == SurfaceLayout::kLinear)) continue;
+        w0 = std::min(w0, u64{e.address} & ~(page - 1)), w1 = std::max(w1, (u64{e.address} + e.span + page - 1) & ~(page - 1));
+    }
+    bool any = false;
+    for (const LazyWriteBack& e : g_lazy) any |= overlaps(e);
+    if (!any) return;
+    memory().open_deferred(static_cast<u32>(w0), static_cast<u32>(w1 - w0));
+    for (const LazyWriteBack& e : g_lazy)
+        if (overlaps(e)) write_lazy_part(e, w0, w1);
+    memory().close_deferred(static_cast<u32>(w0), static_cast<u32>(w1 - w0));
+    // (those written whole forgotten; a linear one written in part stays for its other pages)
+    usize kept = 0;
+    for (usize i = 0; i < g_lazy.size(); ++i) {
+        const LazyWriteBack& e = g_lazy[i];
+        const bool whole = overlaps(e) && w0 <= (u64{e.address} & ~(page - 1)) && u64{e.address} + e.span <= w1;
+        if (whole) g_lazy_written.fetch_add(1, std::memory_order_relaxed);
+        else g_lazy[kept++] = e;
+    }
+    g_lazy.resize(kept);
+}
+// (their memory unmapped, or mapped again: forgotten)
+void lazy_discard(u32 address, u32 size) {
+    std::lock_guard<std::mutex> held(g_lazy_lock);
+    std::erase_if(g_lazy, [&](const LazyWriteBack& e) { return e.address < u64{address} + size && address < u64{e.address} + e.span; });
+}
+// A surface's deferred write-back, if any, written (before its `written` changes otherwise).
+void settle_lazy(const Target& t) {
+    if (lazy_write_backs() && t.layout.span()) memory().materialize(t.address, static_cast<u32>(t.layout.span()));
+
+}
+// A write-back deferred (its bytes registered before this): the watches of the surfaces sharing its pages kept, as
+// write_back keeps them (and `exempt`). False: it could not be (some page not read/write): written as usual.
+bool defer_write_back(Renderer& r, u32 address, u32 size, const WrittenWatch* exempt = nullptr) {
+    const nx::vector<WrittenWatch*> keep = sharing_watches(r, {{address, size}}, exempt);
+    if (!memory().defer(address, size)) return false;
+    for (WrittenWatch* w : keep) watch_range(*w, w->address, w->size);
+    g_lazy_deferred.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 // The YUV420 conversion's pipeline (yuv420_shader): unless PSVRECORE_YUV_CPU is set, or the device has none.
@@ -892,7 +1062,7 @@ void finish_pending(Renderer& r, bool all, usize keep = 0);
 
 // A cached texture's image given up (evicted, or a reused one whose scene failed): destroyed now only if no pending
 // scene can sample it, else once the scenes rendered up to now are finished. A scene's descriptors name the image's
-// view until the GPU is done with it, and up to kScenesInFlight - 1 scenes are still on the GPU when the next
+// view until the GPU is done with it, and up to scenes_in_flight() - 1 scenes are still on the GPU when the next
 // starts: destroyed earlier, the GPU read freed memory and descriptors (the validation layer's
 // VUID-vkDestroyImage-image-01000).
 void retire_image(Renderer& r, vk::Image& image) {
@@ -916,9 +1086,17 @@ void destroy_retired(Renderer& r) {
     });
 }
 
-// How many scenes the GPU may have in flight (a frame's worth: the CPU prepares a frame's scenes while the GPU draws
-// them one after another; a scene is waited for only when the GPU is that far behind).
-constexpr usize kScenesInFlight = 4;
+// How many scenes the GPU may have in flight (PSVRECORE_GXM_SCENES_IN_FLIGHT, 1 to 64; 8): most of a frame's, the
+// CPU preparing them while the GPU draws them one after another; a scene is waited for only when the GPU is that far
+// behind. (WipEout 2048 has 11 scenes a frame; at 4 its render thread waited for the GPU in every other one on an
+// Odin 3, 57.1 frames a second in a race; 57.6 at 8, as at 12 and 16.)
+usize scenes_in_flight() {
+    static const usize n = [] {
+        const char* v = std::getenv("PSVRECORE_GXM_SCENES_IN_FLIGHT");
+        return v && *v ? nx::clamp<usize>(std::strtoul(v, nullptr, 10), 1, 64) : usize{8};
+    }();
+    return n;
+}
 
 // Whether a pending scene writes any of [address, address + bytes) in guest memory.
 bool pending_writes(const Renderer& r, u32 address, u32 bytes) {
@@ -1203,6 +1381,7 @@ bool ensure(Renderer& r) {
     vkCreatePipelineLayout(d.device(), &li, nullptr, &r.layout);
     make_yuv_pipeline(r);
     make_target_converter(r);
+    if (lazy_write_backs()) memory().set_deferral(lazy_materialize, lazy_discard);
     vk::ImageDesc wd;
     wd.width = wd.height = 1;
     if (auto img = vk::create_image(d, wd)) {
@@ -1533,7 +1712,7 @@ Target* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format, c
     const u32 width = layout.width, height = layout.height;
     for (auto& t : r.targets) {
         if (t->address != address || t->format != format || t->width != width || t->height != height) continue;
-        if (t->layout != layout) t->layout = layout, t->written.clear();  // (the same memory, laid out otherwise)
+        if (t->layout != layout) settle_lazy(*t), t->layout = layout, t->written.clear();  // (the same memory, laid out otherwise)
         return t.get();
     }
     auto img = target_image(r, vk_format, width, height);
@@ -1575,6 +1754,7 @@ bool ensure_scaled(Renderer& r, Target& t, u32 scale) {
         vk::destroy_image(*r.device, t.scaled);
         t.scaled = {};
     }
+    settle_lazy(t);
     t.written.clear();
     auto img = target_image(r, t.image.desc.format, t.width * scale, t.height * scale);
     if (!img) return false;
@@ -1671,7 +1851,7 @@ Result<void> queue_texels(Renderer& r, u64 key, const Texels& t) {
     auto staging = take_host_buffer(r, t.data.size());
     if (!staging) return nx::err(staging.error());
     std::memcpy(staging->mapped, t.data.data(), t.data.size());
-    vk::flush(d, *staging);
+    vk::flush(d, *staging, t.data.size());
     Renderer::TextureUpload u{key, *staging, {}};
     VkDeviceSize at = 0;
     for (u32 face = 0; face < t.faces; ++face) {
@@ -2064,7 +2244,8 @@ bool kept_holds(const DepthTarget& t, const DepthRanges& g) {
     const bool watched = (!g.depth_bytes || unwritten(t.watch[0], g.depth, g.depth_bytes)) &&
                          (!g.stencil_bytes || unwritten(t.watch[1], g.stencil, g.stencil_bytes));
     if (watched && write_watch_mode() != 2) return true;
-    const bool equal = depth_contents_equal(g, t.written);
+    if (!t.written.held()) return false;  // (written there since: not compared)
+    const bool equal = depth_contents_equal(g, t.written.bytes);
     if (watched && !equal) unseen_write("a depth surface", g.depth ? g.depth : g.stencil, g.depth_bytes + g.stencil_bytes);
     return equal;
 }
@@ -2114,7 +2295,8 @@ DepthTarget* kept_aspect(Renderer& r, const DepthStencilSurface& s, const DepthR
         if (t->written.size() < offset + bytes) continue;
         const bool watched = unwritten(t->watch[stencil ? 1 : 0], at, bytes);
         if (watched && write_watch_mode() != 2) return t.get();
-        if (std::memcmp(memory().host(at), t->written.data() + offset, bytes) == 0) return t.get();
+        if (!t->written.held()) continue;
+        if (std::memcmp(memory().host(at), t->written.bytes.data() + offset, bytes) == 0) return t.get();
         if (watched) unseen_write("a depth surface's aspect", at, bytes);
     }
     return nullptr;
@@ -2148,7 +2330,8 @@ bool depth_target_holds(const DepthTarget& t) {
     if (!n || !memory().valid(t.address, n)) return false;
     const bool watched = unwritten(t.watch[0], t.address, n);
     if (watched && write_watch_mode() != 2) return true;
-    const bool equal = std::memcmp(memory().host(t.address), t.written.data(), n) == 0;
+    if (!t.written.held()) return false;
+    const bool equal = std::memcmp(memory().host(t.address), t.written.bytes.data(), n) == 0;
     if (watched && !equal) unseen_write("a stored depth surface", t.address, n);
     return equal;
 }
@@ -2192,7 +2375,7 @@ struct SceneProfile {
     u64 shaders_made = 0, shader_ns = 0, shaders_before = 0, shader_ns_before = 0;
     u64 finish_wait_before = 0, finish_work_before = 0, finished_before = 0;
     // (the write-back's parts: the colour, the uniform buffers and counters, the depth and stencil, the rest)
-    u64 back_ns[4] = {}, back_before[4] = {};
+    u64 back_ns[4] = {}, back_before[4] = {}, back_printed[4] = {};
     u64 tex_before[5] = {};  // (hash_ns, decode_ns, create_ns, upload_ns, ahead at this scene's start)
     u64 buffer_wait_ns = 0;  // (sceGxmEndScene's wait for the display to let the scene's buffer go)
     bool on = false;
@@ -2205,6 +2388,8 @@ struct SceneProfile {
     // (the GPU's timeline: idle between one scene's end and the next one's start, and the scenes' own spans from
     // the later of their start and the scene before's end)
     u64 gpu_idle_ns = 0, gpu_span_ns = 0, gpu_last_end = 0;
+    // (the GPU's gaps between scenes by length: under 0.1 ms, 0.5, 2, longer; how many and their time)
+    u64 gap_count[4] = {}, gap_ns[4] = {};
     u64 finished = 0, finish_wait_ns = 0, finish_work_ns = 0;  // (scenes finished: waiting for the GPU, the rest)
     // (by why they were: at a submission, read by a later scene, a point of synchronisation, the flusher)
     // (reads: memory copied (uniforms, vertices), indices, a colour surface, a depth surface, a texture)
@@ -2274,13 +2459,21 @@ struct SceneProfile {
         if (++scenes < 200) return;
         u64 all = 0;
         for (u64 n : ns) all += n;
-        std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each:", scenes, static_cast<f64>(all) / 1e6 / scenes);
+        static const u64 since = nx::os::ticks_ns();
+        std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each (%.1f s):", scenes, static_cast<f64>(all) / 1e6 / scenes,
+                     static_cast<f64>(nx::os::ticks_ns() - since) / 1e9);
         for (u32 i : kOrder) std::fprintf(stderr, " %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
         std::fprintf(stderr, " %.2f colour surfaces uploaded a scene; %.2f ms waiting for the display to let the buffer go;",
                      static_cast<f64>(colour_uploads) / scenes, static_cast<f64>(buffer_wait_ns) / 1e6 / scenes);
         if (finished)
             std::fprintf(stderr, " finishing a scene: %.2f ms waiting, %.2f ms the rest;",
                          static_cast<f64>(finish_wait_ns) / 1e6 / finished, static_cast<f64>(finish_work_ns) / 1e6 / finished);
+        if (finished) {
+            std::fprintf(stderr, " written back: colour %.2f, buffers and counters %.2f, depth %.2f, the rest %.2f ms a scene;",
+                         static_cast<f64>(back_ns[0] - back_printed[0]) / 1e6 / finished, static_cast<f64>(back_ns[1] - back_printed[1]) / 1e6 / finished,
+                         static_cast<f64>(back_ns[2] - back_printed[2]) / 1e6 / finished, static_cast<f64>(back_ns[3] - back_printed[3]) / 1e6 / finished);
+            std::memcpy(back_printed, back_ns, sizeof back_ns);
+        }
         for (u32 i = 0; i < kWhys; ++i)
             if (why_count[i])
                 std::fprintf(stderr, " %s %.2f a scene (%.2f ms waiting);", kWhy[i], static_cast<f64>(why_count[i]) / scenes,
@@ -2291,12 +2484,26 @@ struct SceneProfile {
         if (gpu_measured)
             std::fprintf(stderr, " GPU: idle %.2f ms, busy %.2f ms a scene;", static_cast<f64>(gpu_idle_ns) / 1e6 / gpu_measured,
                          static_cast<f64>(gpu_span_ns) / 1e6 / gpu_measured);
+        if (gpu_measured) {
+            std::fprintf(stderr, " GPU gaps between scenes:");
+            static constexpr const char* kGaps[4] = {"under 0.1 ms", "0.1-0.5", "0.5-2", "over 2"};
+            for (u32 i = 0; i < 4; ++i)
+                std::fprintf(stderr, " %s %.2f (%.2f ms)%s", kGaps[i], static_cast<f64>(gap_count[i]) / gpu_measured,
+                             static_cast<f64>(gap_ns[i]) / 1e6 / gpu_measured, i < 3 ? "," : " a scene;");
+        }
         if (gpu_measured)
             std::fprintf(stderr, " GPU: %.2f ms before the pass, %.2f the pass, %.2f after it a scene;",
                          static_cast<f64>(gpu_before_ns) / 1e6 / gpu_measured, static_cast<f64>(gpu_pass_ns) / 1e6 / gpu_measured,
                          static_cast<f64>(gpu_after_ns) / 1e6 / gpu_measured);
         std::fprintf(stderr, " surfaces written back found unchanged: %.2f by watching, %.2f compared a scene;",
                      static_cast<f64>(g_watch_seen.exchange(0)) / scenes, static_cast<f64>(g_watch_compared.exchange(0)) / scenes);
+        if (const DisplayQueueTimes q = take_display_queue_times(); q.entries)
+            std::fprintf(stderr, " display queue: %llu frames, a frame: %.2f ms the game waited for room, %.2f its scenes "
+                         "finishing, %.2f the game's callback;", static_cast<unsigned long long>(q.entries),
+                         static_cast<f64>(q.room_ns) / 1e6 / q.entries, static_cast<f64>(q.finish_ns) / 1e6 / q.entries,
+                         static_cast<f64>(q.callback_ns) / 1e6 / q.entries);
+        std::fprintf(stderr, " write-backs deferred %.2f, written when touched %.2f a scene;",
+                     static_cast<f64>(g_lazy_deferred.exchange(0)) / scenes, static_cast<f64>(g_lazy_written.exchange(0)) / scenes);
         std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene (%.2f converted, %.3f backgrounds);",
                      static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
                      static_cast<f64>(from_targets + converted) / scenes, static_cast<f64>(converted) / scenes,
@@ -2365,12 +2572,36 @@ u64 texture_contents(const TextureInfo& info, u32 size, u32 palette) {
 
 namespace {
 
+// Where a texture starts inside a colour surface (at its address, or past it, smaller): laid out alike (rows of the surface's
+// stride, or rows of tiles as wide as its own: a tile row's bytes from the surface's start), wholly within its size.
+bool texture_in_surface(const TextureInfo& info, const Target& t, u32& ox, u32& oy) {
+    const SurfaceLayout& l = t.layout;
+    if (info.address < t.address || info.address - t.address >= l.span() || l.bytes != 4) return false;
+    const u32 delta = info.address - t.address;
+    if (l.kind == SurfaceLayout::kLinear &&
+        (info.type == texture_type::kLinear || info.type == texture_type::kLinearStrided) && info.stride == l.stride * 4 &&
+        delta % 4 == 0) {
+        oy = delta / (l.stride * 4), ox = delta % (l.stride * 4) / 4;
+    } else if (l.kind == SurfaceLayout::kTiled && info.type == texture_type::kTiled &&
+               (l.stride + 31) / 32 == (info.width + 31) / 32) {
+        const u32 tile_row = (l.stride + 31) / 32 * 1024 * 4;
+        if (delta % tile_row) return false;
+        ox = 0, oy = delta / tile_row * 32;
+    } else {
+        return false;
+    }
+    return u64{ox} + info.width <= t.width && u64{oy} + info.height <= t.height;
+}
+
 // A texture that reads a colour surface whose image holds what guest memory does (the surface drawn and written
 // back, nothing else written there since): made on the GPU from that image instead of being read back, decoded and
 // uploaded (a render target read as a texture each frame). One level, texels as the image holds them, the surface's
 // layout, as tall; wider for a linear surface (its stride's columns past the width come from guest memory). A surface
 // drawn at the internal resolution gives a texture at that resolution, from its scaled image (a draw reading the
 // surface it draws into, or wider than the surface, still sees what was drawn there at that resolution).
+//
+// Or a texture inside the surface, laid out as it is (rows of its stride, or rows of tiles as wide; WipEout 2048 reads
+// a 256 x 128 texture from a 256 x 1536 surface each frame): copied from that part of the image.
 //
 // `only`: that surface, which a pending scene draws (its image will hold what guest memory will: not compared).
 CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key, u64 words_key, Target* only = nullptr) {
@@ -2379,9 +2610,12 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         if (only && t.get() != only) continue;
         // (the surface this scene draws into too: the copy is recorded before the draws, so it holds what the scene
         // starts from, as the console's texture unit reads it)
-        if (t->address != info.address || (!only && t->written.empty())) continue;
-        if (info.height != t->height || info.width < t->width) continue;
-        if (info.width != t->width && t->layout.kind != SurfaceLayout::kLinear) continue;
+        if (!only && t->written.empty()) continue;
+        // (the surface, or as tall and wider when linear: the columns past it from guest memory; else a part of it)
+        u32 ox = 0, oy = 0;
+        const bool whole = t->address == info.address && info.height == t->height && info.width >= t->width &&
+                           (info.width == t->width || t->layout.kind == SurfaceLayout::kLinear);
+        if (!whole && !texture_in_surface(info, *t, ox, oy)) continue;
         if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) continue;
         if (!only) {
             const Changes changes = surface_changes(*t);
@@ -2417,7 +2651,8 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         Renderer::TargetCopy copy;
         copy.key = key;
         copy.from = t.get();
-        copy.width = t->width, copy.height = t->height;
+        copy.x = ox, copy.y = oy;
+        copy.width = whole ? t->width : info.width, copy.height = whole ? t->height : info.height;
         copy.scale = s;
         if (info.width > t->width) {
             // (the columns past the surface's width: as they are in guest memory)
@@ -2847,7 +3082,8 @@ CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words
 CachedTexture* texture_from_pending_target(Renderer& r, const TextureInfo& info, u64 words_key, u64* key) {
     for (const Renderer::Pending& p : r.pending) {
         Target* t = p.target;
-        if (!t || t->address != info.address) continue;
+        u32 ox = 0, oy = 0;
+        if (!t || (t->address != info.address && !texture_in_surface(info, *t, ox, oy))) continue;
         if (CachedTexture* c = converted_texture(r, info, words_key, key, t)) return c;
         *key = (words_key * 0x9E3779B97F4A7C15ull) ^ (t->generation * 0xC2B2AE3D27D4EB4Full) ^ 0x70656E64696E67ull;
         if (auto it = r.textures.find(*key); it != r.textures.end()) {
@@ -2980,6 +3216,7 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
         vk::transition(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageCopy region{};
         region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.srcOffset = {static_cast<i32>(c.x * c.scale), static_cast<i32>(c.y * c.scale), 0};
         region.extent = {c.width * c.scale, c.height * c.scale, 1};
         vkCmdCopyImage(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to.image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
@@ -3086,6 +3323,29 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
     if (u64 converted_key = 0; CachedTexture* c = converted_texture(r, info, wh.value(), &converted_key)) {
         seen[wh.value()] = converted_key;
         return c;
+    }
+    // (a colour surface's image, the texture exactly over it, unchanged since its write-back: copied from the image,
+    // keyed by the surface's generation, before guest memory is read: a deferred write-back stays unwritten)
+    for (auto& t : r.targets) {
+        u32 ox = 0, oy = 0;
+        if (t->written.empty() || info.levels != 1) continue;
+        if (!texture_in_surface(info, *t, ox, oy)) continue;
+        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) break;
+        const Changes changes = surface_changes(*t);
+        if (changes.all || changes.pixels) break;
+        const u64 key = (wh.value() * 0x9E3779B97F4A7C15ull) ^ (reinterpret_cast<u64>(t.get()) * 0xC2B2AE3D27D4EB4Full) ^
+                        (t->generation * 0x165667B19E3779F9ull) ^ 0x696D616765ull;
+        seen[wh.value()] = key;
+        if (auto it = r.textures.find(key); it != r.textures.end()) {
+            it->second.used = r.scenes;
+            return &it->second;
+        }
+        if (CachedTexture* c = texture_from_target(r, info, key, wh.value(), t.get())) {
+            if (g_profile.on) ++g_profile.from_targets;
+            return c;
+        }
+        seen.erase(wh.value());
+        break;
     }
     const u32 palette = info.palette && memory().valid(info.palette, 1024) ? info.palette : 0;
     auto writes = [&] { return memory().writes(info.address, size) + (palette ? memory().writes(palette, 1024) : 0); };
@@ -4133,7 +4393,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             };
             g_finish_why = 0;
             finish_pending(r, false);
-            finish_pending(r, true, kScenesInFlight - 1);
+            finish_pending(r, true, scenes_in_flight() - 1);
             r.pending.push_back(std::move(pending));
             r.pending_count.store(static_cast<u32>(r.pending.size()), std::memory_order_release);
             return true;
@@ -4697,7 +4957,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         auto b = take_host_buffer(r, nx::max<usize>(bytes, 16));
         if (!b) return nullptr;
         if (data && bytes) std::memcpy(b->mapped, data, bytes);
-        vk::flush(d, *b);
+        vk::flush(d, *b, nx::max<usize>(bytes, 16));
         buffers.push_back(*b);
         return &buffers.back();
     };
@@ -4749,7 +5009,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 std::memset(out + v.offset, 0, v.bytes);
             }
         }
-        vk::flush(d, *vb);
+        vk::flush(d, *vb, vertex_bytes);
     }
     vk::Buffer* ib = make(indices.data(), indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     const VkDeviceSize readback_bytes = color ? VkDeviceSize{width} * height * cf.bytes : 0;
@@ -5288,9 +5548,12 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     Renderer::Pending pending;
     if (color) pending.writes.push_back({cs.data, static_cast<u32>(layout.span())});
     if (store_depth && depth.image) {
-        const u32 n = depth_samples(ds, width, height);
-        pending.writes.push_back({ds.depth_data, n * 4});
-        if (ds.stencil_data) pending.writes.push_back({ds.stencil_data, n});
+        // (the bytes the store writes: the layout's a sample, of the depth and of the stencil. Taken as 4 of depth
+        // and one of stencil whatever the layout, WipEout 2048's D16 shadow map (256 x 256) covered the 128 x 128
+        // surface after it, which the next scene draws: that scene waited for the GPU to finish all it had, a frame.)
+        const DepthRanges g = depth_ranges(ds, dl, width, height);
+        if (g.depth_bytes) pending.writes.push_back({g.depth, g.depth_bytes});
+        if (g.stencil_bytes) pending.writes.push_back({g.stencil, g.stencil_bytes});
     }
     for (const auto& [address, c] : buffer_copies)
         if (c.written && c.placed) pending.writes.push_back({address, c.bytes});
@@ -5315,7 +5578,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             pending.converted_from.push_back(c.depth);
     const bool stores_depth = store_depth && depth.image;
     pending.finish = [&r, &d, stamps, color = color != nullptr, readback, mem_buf, depth_buf, buffers = std::move(buffers),
-                      layout, data = cs.data, width, height, bytes = cf.guest_bytes(), packing = cf.packing, target,
+                      layout, data = cs.data, width, height, bytes = cf.guest_bytes(), image_bytes = cf.bytes, packing = cf.packing, target,
                       buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
                       stores_depth, ds, dl, unorm24, samples, depth_target, kept_depth, depth, pool, sets,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
@@ -5329,7 +5592,12 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 g_profile.gpu_pass_ns += static_cast<u64>(static_cast<f64>(ts[2] - ts[1]) * period);
                 g_profile.gpu_after_ns += static_cast<u64>(static_cast<f64>(ts[3] - ts[2]) * period);
                 const u64 last = g_profile.gpu_last_end;
-                if (last && ts[0] > last) g_profile.gpu_idle_ns += static_cast<u64>(static_cast<f64>(ts[0] - last) * period);
+                if (last && ts[0] > last) {
+                    const u64 gap = static_cast<u64>(static_cast<f64>(ts[0] - last) * period);
+                    g_profile.gpu_idle_ns += gap;
+                    const u32 bucket = gap < 100000 ? 0 : gap < 500000 ? 1 : gap < 2000000 ? 2 : 3;
+                    ++g_profile.gap_count[bucket], g_profile.gap_ns[bucket] += gap;
+                }
                 const u64 from = last && last > ts[0] ? last : ts[0];
                 if (ts[3] > from) g_profile.gpu_span_ns += static_cast<u64>(static_cast<f64>(ts[3] - from) * period);
                 g_profile.gpu_last_end = ts[3];
@@ -5344,25 +5612,46 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             back_at = n;
         };
         if (ok && color) {
-            vk::invalidate(d, *readback);
+            vk::invalidate(d, *readback, VkDeviceSize{width} * height * (pack_set ? 4 : image_bytes));
             const u8* src = static_cast<const u8*>(readback->mapped);
             nx::vector<u8> packed;
             const bool gpu_packed = pack_set != VK_NULL_HANDLE;  // (the words guest memory gets, read back)
             if (gpu_packed && pack_verify.buffer) verify_packing(d, pack_verify, src, width, height);
+            const u32 span = static_cast<u32>(layout.span());
+            const bool lazy = lazy_write_backs();
+            // (the bytes become `written`: the packed ones, or the read-back buffer itself, kept rather than copied;
+            // what guest memory holds once written back, to know whether the image (or the scaled one) is still the
+            // surface. A deferred write-back of the surface not written yet is superseded: dropped with its bytes.)
+            std::unique_lock<std::mutex> held(g_lazy_lock, std::defer_lock);
+            if (lazy) {
+                held.lock();
+                std::erase_if(g_lazy, [&](const LazyWriteBack& e) { return e.target == target; });
+            }
             if (packing != Packing::None && !gpu_packed) {
-                packed = target->written.take_bytes();  // (its memory, packed into: `written` again once written back)
+                packed = target->written.take_bytes();  // (its memory, packed into)
                 packed.resize(usize{width} * height * bytes);
                 pack_pixels(packing, src, packed.data(), usize{width} * height);
-                src = packed.data();
+                target->written.clear();
+                target->written.bytes = std::move(packed);
+            } else {
+                target->written.adopt(*readback, usize{width} * height * bytes);
             }
-            const u32 span = static_cast<u32>(layout.span());
-            write_back(r, {{data, span}}, nullptr, [&] { scatter(layout, data, src); });
-            // (what guest memory holds now, to know whether the image (or the scaled one) is still the surface: the
-            // packed bytes, or the read-back buffer itself, kept rather than copied)
-            if (packing != Packing::None && !gpu_packed) target->written.clear(), target->written.bytes = std::move(packed);
-            else target->written.adopt(*readback, usize{width} * height * bytes);
+            const u8* written = target->written.data();
+            bool deferred = false;
+            if (lazy) {
+                g_lazy.push_back(LazyWriteBack{target, data, span, layout, written});
+                held.unlock();
+                deferred = defer_write_back(r, data, span);
+                if (!deferred) {
+                    held.lock();
+                    std::erase_if(g_lazy, [&](const LazyWriteBack& e) { return e.target == target; });
+                    held.unlock();
+                }
+            }
+            if (!deferred) write_back(r, {{data, span}}, nullptr, [&] { scatter(layout, data, written); });
             watch_range(target->watch, data, span);
         } else if (!ok && target) {
+            settle_lazy(*target);
             target->written.clear();  // (the image may hold what guest memory does not)
         }
         back_mark(0);
@@ -5394,26 +5683,62 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             vk::invalidate(d, *depth_buf);
             const u8* src = static_cast<const u8*>(depth_buf->mapped);
             const DepthRanges g = depth_ranges(ds, dl, width, height);
-            write_back(r, {{g.depth, g.depth_bytes}, {g.stencil, g.stencil_bytes}},
-                       kept_depth ? &kept_depth->background_watch : nullptr, [&] {
-                if (scale > 1) {
-                    const nx::vector<u8> down = scale_down_samples(src, width, height, scale);
-                    write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(down.data()),
-                                        down.data() + usize{width} * height * 4);
-                } else {
-                    write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src), src + samples * 4);
+            const WrittenWatch* exempt = kept_depth ? &kept_depth->background_watch : nullptr;
+            bool deferred = false;
+            if (lazy_write_backs() && g.depth_bytes && !g.stencil_bytes) {
+                std::unique_lock<std::mutex> held(g_lazy_lock);
+                std::erase_if(g_lazy, [&](const LazyWriteBack& e) { return e.depth && e.address == g.depth; });
+                Snapshot& kept = r.lazy_depths[g.depth];
+                if (scale > 1) kept.clear(), kept.bytes = scale_down_samples(src, width, height, scale);
+                else kept.adopt(*depth_buf, static_cast<usize>(samples) * 4);
+                LazyWriteBack e;
+                e.depth = true, e.address = g.depth, e.span = g.depth_bytes, e.bytes = kept.data();
+                e.stencil = e.bytes + (scale > 1 ? usize{width} * height : static_cast<usize>(samples)) * 4;
+                e.ds = ds, e.dl = dl, e.width = width, e.height = height, e.unorm24 = unorm24;
+                g_lazy.push_back(e);
+                // (the samples of stores written since, or forgotten, given back)
+                nx::vector<u32> done;
+                for (const auto& [at, k] : r.lazy_depths)
+                    if (std::none_of(g_lazy.begin(), g_lazy.end(), [&](const LazyWriteBack& x) { return x.depth && x.address == at; }))
+                        done.push_back(at);
+                for (u32 at : done) r.lazy_depths[at].clear(), r.lazy_depths.erase(at);
+                held.unlock();
+                deferred = defer_write_back(r, g.depth, g.depth_bytes, exempt);
+                if (!deferred) {
+                    held.lock();
+                    std::erase_if(g_lazy, [&](const LazyWriteBack& x) { return x.depth && x.address == g.depth; });
+                    held.unlock();
                 }
-            });
+            }
+            if (!deferred) {
+                write_back(r, {{g.depth, g.depth_bytes}, {g.stencil, g.stencil_bytes}}, exempt, [&] {
+                    if (scale > 1) {
+                        const nx::vector<u8> down = scale_down_samples(src, width, height, scale);
+                        write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(down.data()),
+                                            down.data() + usize{width} * height * 4);
+                    } else {
+                        write_depth_surface(ds, dl, width, height, unorm24, reinterpret_cast<const u32*>(src),
+                                            src + samples * 4);
+                    }
+                });
+            }
             // (what guest memory holds now, to know whether the kept depth image is still the surface)
+            // (watched first: a copy of the bytes kept only if they may be compared)
             if (depth_target) {
                 const auto now = depth_bytes(ds, width, height);
-                depth_target->written.assign(now.begin(), now.end());
                 watch_range(depth_target->watch[0], ds.depth_data, static_cast<u32>(now.size()));
+                StoredDepth& w = depth_target->written;
+                w.size_ = now.size();
+                if (keep_stored_bytes({&depth_target->watch[0]})) w.bytes.assign(now.begin(), now.end());
+                else w.bytes.clear();
             }
             if (kept_depth) {
-                depth_contents(g, kept_depth->written);
                 watch_range(kept_depth->watch[0], g.depth, g.depth_bytes);
                 watch_range(kept_depth->watch[1], g.stencil, g.stencil_bytes);
+                StoredDepth& w = kept_depth->written;
+                w.size_ = usize{g.depth_bytes} + g.stencil_bytes;
+                if (keep_stored_bytes({&kept_depth->watch[0], &kept_depth->watch[1]})) depth_contents(g, w.bytes);
+                else w.bytes.clear();
                 ++kept_depth->generation;
             }
         }
@@ -5451,10 +5776,10 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     pending.index = r.scenes;
     r.submitted = number;
     g_profile.mark(6);
-    // (the scenes the GPU is done with; and the oldest, waited for, when it has kScenesInFlight with this one)
+    // (the scenes the GPU is done with; and the oldest, waited for, when it has scenes_in_flight() with this one)
     g_finish_why = 0;
     finish_pending(r, false);
-    finish_pending(r, true, kScenesInFlight - 1);
+    finish_pending(r, true, scenes_in_flight() - 1);
     g_profile.mark(5);
     r.pending.push_back(std::move(pending));
     r.pending_count.store(static_cast<u32>(r.pending.size()), std::memory_order_release);
@@ -5745,21 +6070,26 @@ void finish_scenes(u64 limit) {
     }
 }
 
+// At the surface's own size too (the image, in the sink's format): no readback into guest memory, nor the CPU's copy
+// of it to the window (on an Odin 3 at 1x, the display's thread spent ~3 ms a frame on that, which the game waits for).
 bool scaled_frame_to(const DisplayFrameBuf& f, DisplaySink& sink, u32* width, u32* height) {
     Renderer& r = renderer();
     if (!r.device || f.pixel_format != 0 || r.device != state().options->shared_device) return false;
     TargetsHeld held(r);
     for (auto& t : r.targets) {
-        if (t->address != f.base || t->width != f.width || t->height != f.height || t->scale <= 1) continue;
+        if (t->address != f.base || t->width != f.width || t->height != f.height) continue;
+        const bool scaled = t->scale > 1 && t->scaled.image;
+        vk::Image& from = scaled ? t->scaled : t->image;
+        if (!from.image) return false;
         ColorFormat cf;
         if (!color_format(t->format, cf) || cf.bytes != 4) return false;
         if (t->layout.kind != SurfaceLayout::kLinear || t->layout.stride != f.pitch) return false;
         // (only as the scene left it: what the CPU drew over it since is in guest memory, scaled_frame's)
         const Changes changes = surface_changes(*t);
         if (changes.all || changes.pixels) return false;
-        vk::Image* out = sink.gpu_frame(t->scaled.desc.width, t->scaled.desc.height);
-        if (!out || out->desc.width != t->scaled.desc.width || out->desc.height != t->scaled.desc.height ||
-            vk::texel_size(out->desc.format) != 4)
+        vk::Image* out = sink.gpu_frame(from.desc.width, from.desc.height);
+        if (!out || out->desc.width != from.desc.width || out->desc.height != from.desc.height ||
+            vk::texel_size(out->desc.format) != 4 || (!scaled && out->desc.format != from.desc.format))
             return false;
         // (the copies the GPU is done with let go; the frame's after the scenes drawing it, on the same queue)
         for (usize i = 0; i < r.display_copies.size();) {
@@ -5769,12 +6099,12 @@ bool scaled_frame_to(const DisplayFrameBuf& f, DisplaySink& sink, u32* width, u3
         auto shot = nx::make_unique<vk::OneShot>(*r.device);
         auto cmd = shot->begin();
         if (!cmd) return false;
-        vk::transition(*cmd, t->scaled, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vk::transition(*cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         vk::transition(*cmd, *out, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageCopy copy{};
         copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.extent = {t->scaled.desc.width, t->scaled.desc.height, 1};
-        vkCmdCopyImage(*cmd, t->scaled.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out->image,
+        copy.extent = {from.desc.width, from.desc.height, 1};
+        vkCmdCopyImage(*cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out->image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         vk::transition(*cmd, *out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         if (auto submitted = shot->submit(); !submitted) {
@@ -5782,7 +6112,7 @@ bool scaled_frame_to(const DisplayFrameBuf& f, DisplaySink& sink, u32* width, u3
             return false;
         }
         r.display_copies.push_back(std::move(shot));
-        *width = t->scaled.desc.width, *height = t->scaled.desc.height;
+        *width = from.desc.width, *height = from.desc.height;
         return true;
     }
     return false;

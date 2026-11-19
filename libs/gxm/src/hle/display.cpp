@@ -2,6 +2,7 @@
 // clock. Also the thread of GXM's display queue, which calls the game's display callback for each queued frame.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -49,11 +50,10 @@ void show(DisplaySink* sink, const DisplayFrameBuf& f, u64 vcount) {
     PSV_PROFILE_ZONE("display: frame shown");
     Frame frame{f.base, f.pitch, f.pixel_format, f.width, f.height, vcount};
     nx::vector<u8> scaled;
-    if (state().options->render_scale > 1) {
-        // (on the GPU when the sink takes it so: no readback, nor the CPU's copies)
-        if (scaled_frame_to(f, *sink, &frame.scaled_width, &frame.scaled_height)) frame.gpu = true;
-        else if (scaled_frame(f, scaled, &frame.scaled_width, &frame.scaled_height)) frame.scaled = scaled.data();
-    }
+    // (on the GPU when the sink takes it so, at any internal resolution: no readback, nor the CPU's copies)
+    if (scaled_frame_to(f, *sink, &frame.scaled_width, &frame.scaled_height)) frame.gpu = true;
+    else if (state().options->render_scale > 1 && scaled_frame(f, scaled, &frame.scaled_width, &frame.scaled_height))
+        frame.scaled = scaled.data();
     sink->show(frame);
     profile::frame();  // (a frame displayed: Tracy's frame mark)
 }
@@ -350,6 +350,8 @@ void late_frame_why(const DisplayEntry& e, u64 finishing) {
              static_cast<f64>(g_finish_times.get().finish_ns) / 1e6);
 }
 
+std::atomic<u64> g_dq_entries{0}, g_dq_room_ns{0}, g_dq_finish_ns{0}, g_dq_callback_ns{0};
+
 void display_queue_main() {
     State& s = state();
     runtime::Runtime& rt = runtime::runtime();
@@ -370,12 +372,16 @@ void display_queue_main() {
         const u64 finishing = nx::os::ticks_ns();
         finish_scenes(entry.scenes);
         late_frame_why(entry, finishing);
+        const u64 calling = nx::os::ticks_ns();
         if (s.init.display_queue_callback) {
             const u32 args[] = {entry.data};
             g_frame_scenes.get() = entry.scenes;
             runtime::hle::call_guest(&runtime::Kernel::current()->ctx, s.init.display_queue_callback, args);
             g_frame_scenes.get() = ~0ull;
         }
+        g_dq_entries.fetch_add(1, std::memory_order_relaxed);
+        g_dq_finish_ns.fetch_add(calling - finishing, std::memory_order_relaxed);
+        g_dq_callback_ns.fetch_add(nx::os::ticks_ns() - calling, std::memory_order_relaxed);
         {
             nx::scoped_lock<nx::mutex> held(s.queue_lock);
             s.queue_data_free.push_back(entry.data);
@@ -394,6 +400,14 @@ void display_queue_main() {
 }
 
 }  // namespace
+
+DisplayQueueTimes take_display_queue_times() {
+    DisplayQueueTimes t;
+    t.entries = g_dq_entries.exchange(0), t.room_ns = g_dq_room_ns.exchange(0);
+    t.finish_ns = g_dq_finish_ns.exchange(0), t.callback_ns = g_dq_callback_ns.exchange(0);
+    return t;
+}
+void add_display_queue_room_wait(u64 ns) { g_dq_room_ns.fetch_add(ns, std::memory_order_relaxed); }
 
 void start_display_queue() {
     State& s = state();

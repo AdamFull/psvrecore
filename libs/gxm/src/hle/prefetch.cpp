@@ -76,6 +76,7 @@ void decode(Prefetcher& p, u32 words_at) {
     if (!info.address || is_yuv420(info)) return;  // (movie frames: converted on the GPU)
     const u32 size = texture_size(info);
     if (!size || !memory().valid(info.address, size)) return;
+    if (memory().deferred(info.address, size)) return;  // (a surface's write-back not made: left so, as long as it may)
     const u32 palette = info.palette && memory().valid(info.palette, 1024) ? info.palette : 0;
     if (paletted(info) && !palette) return;
     const u64 key = described(info);

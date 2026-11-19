@@ -196,10 +196,12 @@ i32 sceGxmDisplayQueueAddEntry(u32 old_buffer, u32 new_buffer, u32 data) {
     {
         // (at most the queue's pending count waiting: the caller waits for room, as libgxm's does)
         runtime::Kernel::Blocking blocking(rt.kernel());
+        const u64 t0 = nx::os::ticks_ns();
         nx::scoped_lock<nx::mutex> held(s.queue_lock);
         s.queue_changed.wait(s.queue_lock, [&] {
             return s.stopping || (s.queue.size() < s.init.display_queue_max_pending && !s.queue_data_free.empty());
         });
+        add_display_queue_room_wait(nx::os::ticks_ns() - t0);
         if (s.stopping) return err::kUninitialized;
         slot = s.queue_data_free.back();
         s.queue_data_free.pop_back();

@@ -167,9 +167,11 @@ struct Buffer {
 
 Result<Buffer> create_host_buffer(Device& device, VkDeviceSize size, VkBufferUsageFlags usage);
 void destroy_buffer(Device& device, Buffer& buffer);
-// Makes the device's writes visible to the host (for memory that is not coherent).
-void invalidate(Device& device, const Buffer& buffer);
-void flush(Device& device, const Buffer& buffer);
+// Makes the device's writes visible to the host (for memory that is not coherent), and the host's to the device: the
+// first `bytes` (all of it by default; a device's cache maintenance costs by the byte: a Mali driver's took 12% of a
+// phone's render thread with whole buffers of which a part was used).
+void invalidate(Device& device, const Buffer& buffer, VkDeviceSize bytes = VK_WHOLE_SIZE);
+void flush(Device& device, const Buffer& buffer, VkDeviceSize bytes = VK_WHOLE_SIZE);
 
 // Runs a compute shader once and waits: binding i of descriptor set 0 is the storage buffer buffers[i]; `groups`
 // workgroups along x.

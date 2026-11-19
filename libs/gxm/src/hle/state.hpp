@@ -430,6 +430,13 @@ bool scaled_frame_to(const DisplayFrameBuf& f, DisplaySink& sink, u32* width, u3
 // The display (display.cpp): what the display queue thread needs.
 void start_display_queue();
 void stop_display_queue();
+// (PSVRECORE_GXM_PROFILE: the display queue's entries since the last call, and the time the game waited for room in
+// it, the time their scenes took to finish on its thread, and the time the game's callback took; reset)
+struct DisplayQueueTimes {
+    u64 entries = 0, room_ns = 0, finish_ns = 0, callback_ns = 0;
+};
+DisplayQueueTimes take_display_queue_times();
+void add_display_queue_room_wait(u64 ns);
 
 void register_display();
 void register_core();

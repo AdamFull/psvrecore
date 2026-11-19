@@ -106,8 +106,32 @@ public:
     bool watch_writes(u32 address, u32 size);
     u64 writes(u32 address, u32 size) const;
     void note_write(u32 address, u32 size);
-    // (the fault handler's, from the faulting thread: a write to a watched page, let through; false: not one)
+    // (the fault handler's, from the faulting thread: a write to a watched page, let through, or an access to a
+    // deferred one, written first; false: not one)
     bool resolve_write_fault(u64 offset);
+
+    // Deferred ranges: guest memory whose bytes the renderer holds and has not written yet (a surface's write-back
+    // nothing on the CPU may read). Their host pages are inaccessible until something touches them: the fault, a
+    // write the OS is about to make (note_write) or a change of protection has the materializer write the deferred
+    // ranges with a page there first; the pages are then watched (read-only), their counts unchanged. Unmapped or
+    // mapped again, the discarder forgets them. A deferral counts as a write. The OS reading guest memory (a file
+    // written from it) does not fault: host code touches such buffers first.
+    // Every deferred range with a page in [address, address + size) written: whole (`whole`: from a fault, where
+    // more of it is likely read next), or on those pages (a write the OS or the renderer is about to make there).
+    using Materializer = void (*)(u32 address, u32 size, bool whole);
+    using Discarder = void (*)(u32 address, u32 size);     // every deferred range with a page in it, forgotten
+    void set_deferral(Materializer materialize, Discarder discard);
+    bool defer(u32 address, u32 size);  // false: a page of it cannot be (not all mapped read/write)
+    // (the materializer's, which writes a range's bytes in between: its deferred pages opened read/write, then
+    // watched; materializers do not run at once)
+    void open_deferred(u32 address, u32 size);
+    void close_deferred(u32 address, u32 size);
+    bool opened_deferred(u32 address) const;  // (its page opened by open_deferred, not closed yet)
+    u32 host_page_size() const { return 1u << host_shift_; }
+    // The deferred pages of a range written (the materializer called), when there are any.
+    void materialize(u32 address, u32 size);
+    // Whether a page of the range is deferred (what only might be read, such as a texture decoded ahead, is not).
+    bool deferred(u32 address, u32 size) const { return any_deferred(address, u64{address} + size); }
     u64 write_faults() const { return write_faults_.load(std::memory_order_relaxed); }
 
 private:
@@ -124,7 +148,8 @@ private:
         std::atomic<u8> access[(1ull << 32) / kPageSize];
     };
     nx::unique_ptr<Pages> pages_;
-    // By host page (at least the guest's): 0 open, 1 read-only (watched), 2 being opened; and its writes seen.
+    // By host page (at least the guest's): 0 open, 1 read-only (watched), 2 being opened, 3 deferred (no access), 4
+    // being written by the materializer; and its writes seen.
     struct Watches {
         std::atomic<u8> state[(1ull << 32) / kPageSize];
         std::atomic<u32> count[(1ull << 32) / kPageSize];
@@ -133,6 +158,9 @@ private:
     std::atomic<Watches*> watches_{nullptr};
     u32 host_shift_ = 12;  // (log2 of the host's page size)
     std::atomic<u64> write_faults_{0};
+    std::atomic<Materializer> materializer_{nullptr};
+    std::atomic<Discarder> discarder_{nullptr};
+    bool any_deferred(u64 begin, u64 end) const;
     void unwatch(u64 begin, u64 end);       // (under lock_: pages whose protection is set or that go back)
     nx::map<u32, Block> blocks_;  // by base
     nx::vector<Region> reserved_ranges_;

@@ -26,6 +26,9 @@ void set_fault_region(void* base, u64 size, FaultHandler on_fault);
 using FaultResolver = bool (*)(u64 offset);
 using WriteNotice = void (*)(u64 offset, u64 size);
 void set_write_watch(FaultResolver resolve, WriteNotice notice);
+// Before the OS reads a buffer that may be guest memory (a file or a socket written from it): each of its pages read
+// once here, so that a deferred page (GuestMemory::defer) faults and is written first, as the OS would not fault.
+void touch_for_os(const void* buffer, u64 size);
 
 // Debugging: up to four hardware watchpoints, in every thread of the process (threads started later are covered
 // within a few milliseconds). Each is an aligned range of 1, 2, 4 or 8 bytes, hit by a write, or (size 0) an

@@ -31,6 +31,7 @@
 #include <cstring>
 
 #include "core/foundation/threading/sync.h"
+#include "psvrecore/runtime/host.hpp"
 
 namespace psvrecore::runtime::hostnet {
 
@@ -269,6 +270,7 @@ i32 accept(Fd fd, Fd* out, Endpoint* from) {
 }
 
 i32 send(Fd fd, const void* data, u32 length, const Endpoint* to) {
+    host::touch_for_os(data, length);  // (guest memory's deferred pages written first)
 #if defined(MSG_NOSIGNAL)
     const int flags = MSG_NOSIGNAL;
 #else

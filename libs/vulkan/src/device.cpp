@@ -564,12 +564,12 @@ void destroy_buffer(Device& device, Buffer& buffer) {
     buffer = Buffer{};
 }
 
-void invalidate(Device& device, const Buffer& buffer) {
-    vmaInvalidateAllocation(device.allocator(), buffer.allocation, 0, VK_WHOLE_SIZE);
+void invalidate(Device& device, const Buffer& buffer, VkDeviceSize bytes) {
+    vmaInvalidateAllocation(device.allocator(), buffer.allocation, 0, bytes >= buffer.size ? VK_WHOLE_SIZE : bytes);
 }
 
-void flush(Device& device, const Buffer& buffer) {
-    vmaFlushAllocation(device.allocator(), buffer.allocation, 0, VK_WHOLE_SIZE);
+void flush(Device& device, const Buffer& buffer, VkDeviceSize bytes) {
+    vmaFlushAllocation(device.allocator(), buffer.allocation, 0, bytes >= buffer.size ? VK_WHOLE_SIZE : bytes);
 }
 
 namespace {

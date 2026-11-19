@@ -66,6 +66,8 @@ bool GuestMemory::commit(u32 base, u32 size, Access access) {
     // access (only pages wholly inside the block get the block's protection).
     const u64 page = host_page();
     const u64 begin = base & ~(page - 1), end = (u64{base} + size + page - 1) & ~(page - 1);
+    if (any_deferred(begin, end))
+        if (const Discarder d = discarder_.load(std::memory_order_acquire)) d(static_cast<u32>(begin), static_cast<u32>(end - begin));
     unwatch(begin, end);
     if (!nx::vmem::commit(base_ + begin, static_cast<usize>(end - begin))) return false;
     // Pages wholly inside the block come fresh (zero) from the host: unmap gives every such page back. Only the
@@ -157,6 +159,8 @@ bool GuestMemory::unmap(u32 base) {
     const u64 page = host_page();
     const u64 begin = it->second.base, end = u64{it->second.base} + it->second.size;
     set_pages(it->second.base, it->second.size, Access::None);
+    if (any_deferred(begin, end))
+        if (const Discarder d = discarder_.load(std::memory_order_acquire)) d(static_cast<u32>(begin), static_cast<u32>(end - begin));
     unwatch(begin, end);
     blocks_.erase(it);
     // Give back the host pages no other block touches.
@@ -169,6 +173,7 @@ bool GuestMemory::unmap(u32 base) {
 }
 
 bool GuestMemory::protect(u32 base, Access access) {
+    if (Block b; find(base, &b) && b.base == base) materialize(b.base, b.size);  // (its bytes kept)
     nx::scoped_lock<nx::mutex> guard(lock_);
     auto it = blocks_.find(base);
     if (it == blocks_.end()) return false;
@@ -266,8 +271,11 @@ void GuestMemory::unwatch(u64 begin, u64 end) {
         run = ~0ull;
     };
     for (u64 p = begin >> host_shift_; p < last; ++p) {
-        u8 expected = 1;
-        if (w->state[p].compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
+        // (a page the materializer is writing: once it has, it is watched)
+        while (w->state[p].load(std::memory_order_acquire) == 4) std::this_thread::yield();
+        u8 expected = 1, deferred = 3;
+        if (w->state[p].compare_exchange_strong(expected, 2, std::memory_order_acq_rel) ||
+            w->state[p].compare_exchange_strong(deferred, 2, std::memory_order_acq_rel)) {
             if (run == ~0ull) run = p;
         } else {
             open_run(p);
@@ -300,8 +308,9 @@ bool GuestMemory::watch_writes(u32 address, u32 size) {
         run = ~0ull;
     };
     for (u64 p = first; p <= last; ++p) {
-        while (w.state[p].load(std::memory_order_acquire) == 2) std::this_thread::yield();
-        if (w.state[p].load(std::memory_order_acquire) == 1) {
+        u8 st;
+        while ((st = w.state[p].load(std::memory_order_acquire)) == 2 || st == 4) std::this_thread::yield();
+        if (st == 1 || st == 3) {  // (watched already, or deferred: no access, its write counted when it is touched)
             protect_run(p);
             continue;
         }
@@ -324,6 +333,7 @@ u64 GuestMemory::writes(u32 address, u32 size) const {
 
 void GuestMemory::note_write(u32 address, u32 size) {
     if (!watches_.load(std::memory_order_acquire) || !size) return;
+    materialize(address, size);  // (what is not overwritten stays as written back)
     nx::scoped_lock<nx::mutex> guard(lock_);
     const u64 end = std::min<u64>(u64{address} + size, kGuestSpace);
     unwatch(address, end);
@@ -333,7 +343,24 @@ bool GuestMemory::resolve_write_fault(u64 offset) {
     Watches* w = watches_.load(std::memory_order_acquire);
     if (!w || offset >= kGuestSpace) return false;
     const u64 p = offset >> host_shift_;
-    const u8 state = w->state[p].load(std::memory_order_acquire);
+    u8 state = w->state[p].load(std::memory_order_acquire);
+    if (state == 3) {
+        // (a deferred page: written, then watched; a write faults again and goes through as on a watched page. The
+        // materializer told the faulting byte: the surface it is in written whole)
+        if (const Materializer m = materializer_.load(std::memory_order_acquire)) m(static_cast<u32>(offset), 1, true);
+        state = w->state[p].load(std::memory_order_acquire);
+        if (state == 3) {
+            // (no range claims it: opened as it is rather than fault for ever)
+            u8 expected = 3;
+            if (w->state[p].compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
+                nx::vmem::protect(base_ + (p << host_shift_), usize{1} << host_shift_, host_protection(Access::ReadWrite));
+                w->count[p].fetch_add(1, std::memory_order_acq_rel);
+                w->state[p].store(0, std::memory_order_release);
+            }
+        }
+        return true;
+    }
+    if (state == 4) return true;  // (being written by another thread: retried once it is)
     if (state == 1) {
         u8 expected = 1;
         if (w->state[p].compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
@@ -348,6 +375,100 @@ bool GuestMemory::resolve_write_fault(u64 offset) {
     // (opened by another thread after this one's write faulted: run again, where a block maps the page read/write;
     // anything else is a fault of the program's)
     return pages_ && pages_->access[offset / kPageSize].load(std::memory_order_acquire) == static_cast<u8>(Access::ReadWrite);
+}
+
+void GuestMemory::set_deferral(Materializer materialize, Discarder discard) {
+    materializer_.store(materialize, std::memory_order_release);
+    discarder_.store(discard, std::memory_order_release);
+}
+
+bool GuestMemory::any_deferred(u64 begin, u64 end) const {
+    const Watches* w = watches_.load(std::memory_order_acquire);
+    if (!w || end <= begin) return false;
+    const u64 last = std::min((end + (u64{1} << host_shift_) - 1) >> host_shift_, kGuestSpace >> host_shift_);
+    for (u64 p = begin >> host_shift_; p < last; ++p) {
+        const u8 st = w->state[p].load(std::memory_order_acquire);
+        if (st == 3 || st == 4) return true;
+    }
+    return false;
+}
+
+bool GuestMemory::defer(u32 address, u32 size) {
+    if (!base_ || !pages_ || !size || u64{address} + size > kGuestSpace || !materializer_.load(std::memory_order_acquire))
+        return false;
+    nx::scoped_lock<nx::mutex> guard(lock_);
+    if (!watches_owner_) {
+        watches_owner_ = nx::make_unique<Watches>();
+        watches_.store(watches_owner_.get(), std::memory_order_release);
+    }
+    Watches& w = *watches_owner_;
+    const u64 first = address >> host_shift_, last = (u64{address} + size - 1) >> host_shift_;
+    const u64 guest_end = std::min<u64>(((last + 1) << host_shift_) / kPageSize, kGuestSpace / kPageSize);
+    for (u64 g = (first << host_shift_) / kPageSize; g < guest_end; ++g)
+        if (pages_->access[g].load(std::memory_order_acquire) != static_cast<u8>(Access::ReadWrite)) return false;
+    for (u64 p = first; p <= last; ++p) {
+        u8 st;
+        while ((st = w.state[p].load(std::memory_order_acquire)) == 2 || st == 4) std::this_thread::yield();
+        w.state[p].store(3, std::memory_order_release);
+        w.count[p].fetch_add(1, std::memory_order_acq_rel);
+    }
+    nx::vmem::protect(base_ + (first << host_shift_), static_cast<usize>((last + 1 - first) << host_shift_),
+                      host_protection(Access::None));
+    return true;
+}
+
+void GuestMemory::open_deferred(u32 address, u32 size) {
+    Watches* w = watches_.load(std::memory_order_acquire);
+    if (!w || !size) return;
+    const u64 last = (u64{address} + size - 1) >> host_shift_;
+    u64 run = ~0ull;
+    auto open_run = [&](u64 to) {
+        if (run == ~0ull) return;
+        nx::vmem::protect(base_ + (run << host_shift_), static_cast<usize>((to - run) << host_shift_),
+                          host_protection(Access::ReadWrite));
+        run = ~0ull;
+    };
+    for (u64 p = address >> host_shift_; p <= last; ++p) {
+        u8 expected = 3;
+        if (w->state[p].compare_exchange_strong(expected, 4, std::memory_order_acq_rel)) {
+            if (run == ~0ull) run = p;
+        } else {
+            open_run(p);
+        }
+    }
+    open_run(last + 1);
+}
+
+void GuestMemory::close_deferred(u32 address, u32 size) {
+    Watches* w = watches_.load(std::memory_order_acquire);
+    if (!w || !size) return;
+    const u64 last = (u64{address} + size - 1) >> host_shift_;
+    u64 run = ~0ull;
+    auto close_run = [&](u64 to) {
+        if (run == ~0ull) return;
+        nx::vmem::protect(base_ + (run << host_shift_), static_cast<usize>((to - run) << host_shift_),
+                          host_protection(Access::Read));
+        for (u64 p = run; p < to; ++p) w->state[p].store(1, std::memory_order_release);
+        run = ~0ull;
+    };
+    for (u64 p = address >> host_shift_; p <= last; ++p) {
+        if (w->state[p].load(std::memory_order_acquire) == 4) {
+            if (run == ~0ull) run = p;
+        } else {
+            close_run(p);
+        }
+    }
+    close_run(last + 1);
+}
+
+bool GuestMemory::opened_deferred(u32 address) const {
+    const Watches* w = watches_.load(std::memory_order_acquire);
+    return w && w->state[address >> host_shift_].load(std::memory_order_acquire) == 4;
+}
+
+void GuestMemory::materialize(u32 address, u32 size) {
+    if (!size || !any_deferred(address, u64{address} + size)) return;
+    if (const Materializer m = materializer_.load(std::memory_order_acquire)) m(address, size, false);
 }
 
 nx::string GuestMemory::string(u32 address, u32 max) const {

@@ -107,6 +107,7 @@ struct PerfHints {
     using GetManager = void* (*)();
     using Create = void* (*)(void*, const i32*, size_t, int64_t);
     using Report = int (*)(void*, int64_t);
+    using UpdateTarget = int (*)(void*, int64_t);
     using SetThreads = int (*)(void*, const i32*, size_t);
     using Close = void (*)(void*);
     nx::mutex lock;
@@ -114,11 +115,15 @@ struct PerfHints {
     void* manager = nullptr;
     Create create = nullptr;
     Report report = nullptr;
+    UpdateTarget update_target = nullptr;
     SetThreads set_threads = nullptr;
     Close close = nullptr;
     void* session = nullptr;
     nx::vector<i32> threads;
     bool changed = false;
+    int64_t target = 0;
+    int64_t recent[32] = {};  // (the last frames' intervals, for the target)
+    u32 seen = 0;
 
     void load() {
         loaded = true;
@@ -127,6 +132,7 @@ struct PerfHints {
         auto get = reinterpret_cast<GetManager>(dlsym(lib, "APerformanceHint_getManager"));
         create = reinterpret_cast<Create>(dlsym(lib, "APerformanceHint_createSession"));
         report = reinterpret_cast<Report>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+        update_target = reinterpret_cast<UpdateTarget>(dlsym(lib, "APerformanceHint_updateTargetWorkDuration"));
         set_threads = reinterpret_cast<SetThreads>(dlsym(lib, "APerformanceHint_setThreads"));
         close = reinterpret_cast<Close>(dlsym(lib, "APerformanceHint_closeSession"));
         if (get && create && report && close) manager = get();
@@ -138,9 +144,11 @@ PerfHints& perf_hints() {
     return h;
 }
 
-// (a frame's work aimed under the 33 ms of 30 frames a second: the frame times reported are the frames' intervals,
-// so the system raises the CPUs' clocks while they reach it)
-constexpr int64_t kFrameTarget = 28'000'000;
+// (a frame's work aimed under the 33 ms of 30 frames a second, or the 16.7 of 60 once the game's frames come that
+// often (their median interval under 25 ms: a game, or a part of one, at 60): the frame times reported are the
+// frames' intervals, so the system raises the CPUs' clocks while they reach it. With 28 ms aimed at all along, a
+// race at 60 on an Odin 3 reported 17-20 ms frames as well within it.)
+constexpr int64_t kFrameTarget30 = 28'000'000, kFrameTarget60 = 14'500'000;
 
 }  // namespace
 
@@ -170,13 +178,23 @@ void frame_time(u64 ns) {
         } else {
             if (h.session) h.close(h.session);
             const bool first = !h.session;
-            h.session = h.create(h.manager, h.threads.data(), h.threads.size(), kFrameTarget);
+            if (!h.target) h.target = kFrameTarget30;
+            h.session = h.create(h.manager, h.threads.data(), h.threads.size(), h.target);
             h.changed = false;
             if (first)
                 nx::logi(logs::kernel, "performance hints: {} for {} threads", h.session ? "on" : "refused", h.threads.size());
         }
     }
-    if (h.session) h.report(h.session, static_cast<int64_t>(ns));
+    if (!h.session) return;
+    h.recent[h.seen++ % 32] = static_cast<int64_t>(ns);
+    if (h.seen % 32 == 0 && h.update_target) {
+        int64_t sorted[32];
+        std::copy(std::begin(h.recent), std::end(h.recent), sorted);
+        std::nth_element(sorted, sorted + 16, sorted + 32);
+        const int64_t want = sorted[16] < 25'000'000 ? kFrameTarget60 : kFrameTarget30;
+        if (want != h.target && h.update_target(h.session, want) == 0) h.target = want;
+    }
+    h.report(h.session, static_cast<int64_t>(ns));
 }
 #else
 void frame_thread() {}
@@ -279,6 +297,13 @@ void File::close() {
 }
 
 // (a read into the fault region: its watched pages opened first, and again if one was watched meanwhile)
+void touch_for_os(const void* buffer, u64 size) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(buffer), base = g_fault.base.load(std::memory_order_relaxed);
+    if (!size || at < base || at - base >= g_fault.size.load(std::memory_order_relaxed)) return;
+    for (uintptr_t p = at & ~uintptr_t{4095}; p < at + size; p += 4096)
+        (void)*reinterpret_cast<const volatile u8*>(p < at ? at : p);
+}
+
 static bool notice_write(const void* buffer, u64 size) {
     const WriteNotice notice = g_fault.notice.load(std::memory_order_acquire);
     const uintptr_t base = g_fault.base.load(std::memory_order_relaxed);
@@ -307,6 +332,7 @@ i64 File::read_at(u64 offset, void* buffer, u64 size) const {
 }
 
 i64 File::write_at(u64 offset, const void* buffer, u64 size) const {
+    touch_for_os(buffer, size);
     const u8* in = static_cast<const u8*>(buffer);
     u64 done = 0;
     while (done < size) {
@@ -321,6 +347,7 @@ i64 File::write_at(u64 offset, const void* buffer, u64 size) const {
 }
 
 i64 File::append(const void* buffer, u64 size) const {
+    touch_for_os(buffer, size);
     for (;;) {
         const ssize_t n = ::write(static_cast<int>(handle_), buffer, size);
         if (n < 0 && errno == EINTR) continue;

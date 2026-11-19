@@ -62,7 +62,8 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
     const uintptr_t base = g_fault.base.load(std::memory_order_relaxed);
     const uintptr_t address = static_cast<uintptr_t>(r->ExceptionInformation[1]);
     if (address < base || address - base >= g_fault.size.load(std::memory_order_relaxed)) return EXCEPTION_CONTINUE_SEARCH;
-    if (r->ExceptionInformation[0] == 1) {
+    // (a write to a watched page, or a read or write of a deferred one: GuestMemory::resolve_write_fault)
+    if (r->ExceptionInformation[0] == 0 || r->ExceptionInformation[0] == 1) {
         const FaultResolver resolve = g_fault.resolve.load(std::memory_order_acquire);
         if (resolve && resolve(address - base)) return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -319,6 +320,13 @@ void File::close() {
 }
 
 // (a read into the fault region: its watched pages opened first, and again if one was watched meanwhile)
+void touch_for_os(const void* buffer, u64 size) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(buffer), base = g_fault.base.load(std::memory_order_relaxed);
+    if (!size || at < base || at - base >= g_fault.size.load(std::memory_order_relaxed)) return;
+    for (uintptr_t p = at & ~uintptr_t{4095}; p < at + size; p += 4096)
+        (void)*reinterpret_cast<const volatile u8*>(p < at ? at : p);
+}
+
 static bool notice_write(const void* buffer, u64 size) {
     const WriteNotice notice = g_fault.notice.load(std::memory_order_acquire);
     const uintptr_t base = g_fault.base.load(std::memory_order_relaxed);
@@ -353,6 +361,7 @@ i64 File::read_at(u64 offset, void* buffer, u64 size) const {
 }
 
 i64 File::write_at(u64 offset, const void* buffer, u64 size) const {
+    touch_for_os(buffer, size);
     const u8* in = static_cast<const u8*>(buffer);
     u64 done = 0;
     while (done < size) {
@@ -375,6 +384,7 @@ i64 File::append(const void* buffer, u64 size) const {
     o.OffsetHigh = 0xFFFFFFFFu;
     DWORD n = 0;
     if (size > 0xFFFFFFFFu) size = 0xFFFFFFFFu;
+    touch_for_os(buffer, size);
     if (!WriteFile(reinterpret_cast<HANDLE>(handle_), buffer, static_cast<DWORD>(size), &n, &o)) return -1;
     return n;
 }
