@@ -731,6 +731,11 @@ i32 update(PsvContext* ctx, Ngs& n) {
 // The system's memory: its state is the host's, the guest's memory only names it, so it asks for little. (Games
 // size it for the console's: CRI's sound engine initializes the system in a static 8 KiB buffer and gives up when
 // more is asked for; 43 racks and some hundred voices fit there.)
+//
+// The memory a game gives the system and its racks is only checked to be word-aligned, not 16-byte aligned as the
+// console asks: asked for less than the console asks, an allocator that aligns blocks by their size gives smaller,
+// less aligned ones (FMOD's: a rack's 128 bytes at an 8-byte boundary), and nothing of psvrecore's lives there.
+constexpr u32 kAlignment = 4;
 u32 system_size(const InitParams& p) {
     return 512 + 8 * static_cast<u32>(nx::max(p.max_racks, 0)) + 8 * static_cast<u32>(nx::max(p.max_voices, 0));
 }
@@ -745,7 +750,7 @@ i32 sceNgsSystemGetRequiredMemorySize(Ptr<const InitParams> params, Ptr<u32> siz
 i32 sceNgsSystemInit(Ptr<u8> mem, u32 size, Ptr<const InitParams> params, Ptr<u32> handle) {
     if (!mem || !params || !memory().valid(params.address, sizeof(InitParams)) || !writable(handle.address, 4))
         return nerr::kInvalidParam;
-    if (mem.address & 15) return nerr::kInvalidAlignment;
+    if (mem.address & (kAlignment - 1)) return nerr::kInvalidAlignment;
     const InitParams p = *params;
     const i32 g = p.granularity;
     if (p.max_racks < 1 || p.max_voices < 1 || p.sample_rate <= 0 || (g != 64 && g != 128 && g != 256 && g != 512))
@@ -854,7 +859,7 @@ i32 sceNgsRackInit(u32 system, Ptr<const BufferInfo> buffer, Ptr<const RackDescr
         !writable(handle.address, 4))
         return nerr::kInvalidParam;
     const BufferInfo b = *buffer;
-    if (b.data & 15) return nerr::kInvalidAlignment;
+    if (b.data & (kAlignment - 1)) return nerr::kInvalidAlignment;
     const u32 need = rack_size(*def, d);
     if (b.size < need || !writable(b.data, need)) return nerr::kSizeMismatch;
     if (n.racks.size() >= static_cast<usize>(n.params.max_racks) ||
