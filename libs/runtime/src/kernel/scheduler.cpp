@@ -566,10 +566,11 @@ Uid Kernel::adopt_host_thread(nx::string_view name, i32 priority, u32 stack_size
     t->stack_size = stack_size;
     t->stack = memory_.map_anywhere(impl_->config.stack_region, stack_size, GuestMemory::kPageSize, Access::ReadWrite,
                                     BlockKind::Stack, name);
-    t->tls = memory_.map_anywhere(impl_->config.stack_region, kTlsSize, GuestMemory::kPageSize, Access::ReadWrite,
+    t->tls_size = impl_->tls_area_size();
+    t->tls = memory_.map_anywhere(impl_->config.stack_region, t->tls_size, GuestMemory::kPageSize, Access::ReadWrite,
                                   BlockKind::ThreadLocal, name);
     t->ctx.r[13] = t->stack + stack_size;
-    t->ctx.tpidruro = t->tls;
+    impl_->init_tls(t.get());
     Thread* raw = impl_->add(std::move(t), name, 0);
     raw->ctx.thread = raw;
     raw->started_once = true;

@@ -224,6 +224,16 @@ Result<i32> Loader::boot(const BootOptions& options) {
     if (!main_uid) return nx::err(main_uid.error());
     const LoadedModule* main = find(*main_uid);
     runtime_.process_param = main->process_param;
+    // Its thread-local variables (the module information's TLS image: an offset from the segment the information is
+    // in, the bytes it starts with and its whole size), copied for each thread from now on.
+    if (main->module_info && runtime_.memory().valid(main->module_info + 56, 12)) {
+        const u32 tls = psv_ld32(main->module_info + 56), tls_file = psv_ld32(main->module_info + 60),
+                  tls_memory = psv_ld32(main->module_info + 64);
+        u32 base = 0;
+        for (const auto& seg : main->image.segments())
+            if (seg.contains(main->module_info)) base = seg.base;
+        if (tls_memory) runtime_.kernel().set_module_tls(tls < 0x80000000u ? base + tls : tls, tls_file, tls_memory);
+    }
 
     for (const auto& path : options.modules) {
         auto uid = load_guest(path);

@@ -107,7 +107,7 @@ void Kernel::Impl::free_thread_memory(Thread* t) {
     t->callbacks.clear();
     if (t->stack) memory.unmap(t->stack);
     if (t->tls) memory.unmap(t->tls);
-    t->stack = t->tls = 0;
+    t->stack = t->tls = t->tls_size = 0;
 }
 
 void Kernel::Impl::log_thread_stats() {
@@ -149,7 +149,8 @@ Uid Kernel::create_thread(nx::string_view name, u32 entry, i32 priority, u32 sta
     t->stack = memory_.map_anywhere(impl_->config.stack_region, stack_size, GuestMemory::kPageSize, Access::ReadWrite,
                                     BlockKind::Stack, name);
     if (!t->stack) return err::kNoMemory;
-    t->tls = memory_.map_anywhere(impl_->config.stack_region, kTlsSize, GuestMemory::kPageSize, Access::ReadWrite,
+    t->tls_size = impl_->tls_area_size();
+    t->tls = memory_.map_anywhere(impl_->config.stack_region, t->tls_size, GuestMemory::kPageSize, Access::ReadWrite,
                                   BlockKind::ThreadLocal, name);
     if (!t->tls) {
         memory_.unmap(t->stack);
@@ -183,9 +184,8 @@ i32 Kernel::start_thread(Uid uid, u32 arg_size, u32 arg_block) {
     t->ctx.r[1] = argp;
     t->ctx.r[13] = sp & ~7u;
     t->ctx.r[14] = hle::kHostReturn;
-    t->ctx.tpidruro = t->tls;
     t->ctx.thread = t;
-    std::memset(memory_.host(t->tls), 0, kTlsSize);
+    impl_->init_tls(t);
     t->priority = t->init_priority;
     t->affinity = t->init_affinity;
     t->exit_status = err::kNotDormant;
@@ -422,6 +422,36 @@ i32 Kernel::wait_signal(Timeout timeout) {
     const i32 r = impl_->block(self, nullptr, deadline, false);
     impl_->write_remaining(timeout, deadline);
     return r;
+}
+
+u32 Kernel::Impl::tls_area_size() const {
+    const u32 block = (module_tls_memory + GuestMemory::kPageSize - 1) & ~(GuestMemory::kPageSize - 1);
+    return kTlsSize + block;
+}
+
+void Kernel::Impl::init_tls(Thread* t) {
+    if (!t->tls) return;
+    std::memset(memory.host(t->tls), 0, kTlsSize);
+    t->ctx.tpidruro = t->tls;
+    if (!module_tls_memory) return;
+    // (a thread made before the image was set has no room for it)
+    if (t->tls_size < kTlsSize + module_tls_memory) return;
+    const u32 block = t->tls + kTlsSize;
+    std::memset(memory.host(block), 0, module_tls_memory);
+    if (module_tls_file) std::memcpy(memory.host(block), memory.host(module_tls), module_tls_file);
+    t->ctx.tpidruro = block;
+}
+
+void Kernel::set_module_tls(u32 image, u32 file_size, u32 memory_size) {
+    Lock guard(impl_->lock);
+    if (file_size > memory_size || (file_size && !memory_.valid(image, file_size))) {
+        nx::logw(logs::kernel, "the executable's TLS image (0x{:08x}, 0x{:x} of 0x{:x} bytes) is not readable: no "
+                               "thread-local variables", image, file_size, memory_size);
+        return;
+    }
+    impl_->module_tls = image, impl_->module_tls_file = file_size, impl_->module_tls_memory = memory_size;
+    nx::logi(logs::kernel, "the executable's thread-local variables: 0x{:x} bytes (0x{:x} from 0x{:08x})", memory_size,
+             file_size, image);
 }
 
 u32 Kernel::tls_address(u32 key) {

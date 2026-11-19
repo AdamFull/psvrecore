@@ -77,6 +77,7 @@ inline constexpr u32 kUserCpuCount = 3;
 inline constexpr i32 kAllUserCpus = 0x7 << kCpuMaskShift;
 inline constexpr u32 kStackSizeMin = 0x1000, kStackSizeMax = 0x2000000, kMainStackSize = 0x40000;
 inline constexpr u32 kTlsSize = 0x1000;  // per thread: the thread's TLS slots (sceKernelGetTLSAddr) and more
+// (then, when the executable has thread-local variables, their block: TPIDRURO points at it; see set_module_tls)
 
 // Wait queue order.
 inline constexpr u32 kAttrThreadPriority = 0x2000;  // SCE_KERNEL_ATTR_TH_PRIO (otherwise FIFO)
@@ -170,7 +171,8 @@ struct Thread : Object {
     i32 init_affinity = 0;
     u32 stack_size = 0;
     u32 stack = 0;  // guest address of the stack's lowest byte
-    u32 tls = 0;    // guest address of the TLS area
+    u32 tls = 0;    // guest address of the TLS area (the slots; the executable's TLS block after them, if any)
+    u32 tls_size = 0;
 
     // Scheduling.
     ThreadState state = ThreadState::Dormant;
@@ -364,6 +366,11 @@ public:
     i32 wait_signal(kernel::Timeout timeout);
     // The TLS slot `key` of the calling thread (0 if it has none).
     u32 tls_address(u32 key);
+    // The executable's thread-local variables (its module information's TLS image: `file_size` bytes at `image`,
+    // `memory_size` in all). Its code reaches them at TPIDRURO plus their offset in that image, so each thread
+    // started from now on gets its own copy there (the image, then zeros), after its TLS slots. Without it (as for
+    // an executable with no thread-local variables) TPIDRURO is the slots' address.
+    void set_module_tls(u32 image, u32 file_size, u32 memory_size);
 
     // ---- semaphores
     Uid create_semaphore(nx::string_view name, u32 attr, i32 init, i32 max);

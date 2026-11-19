@@ -114,6 +114,11 @@ struct Kernel::Impl {
     void run_thread(kernel::Thread* t);       // a guest thread's run, on its host context (no lock held)
     void finish_thread(kernel::Thread* t, i32 status, bool delete_thread);
     void free_thread_memory(kernel::Thread* t);
+    // The executable's TLS image (set_module_tls), and the thread's TLS area: its size, and at a start its slots
+    // cleared, the executable's block filled from the image and TPIDRURO pointed at it.
+    u32 module_tls = 0, module_tls_file = 0, module_tls_memory = 0;
+    u32 tls_area_size() const;
+    void init_tls(kernel::Thread* t);
     void unlock_owned_mutexes(kernel::Thread* t);
     // (sync.cpp) A mutex the thread owns is released as a whole: ownership passes to the next waiter.
     void hand_over_mutex(kernel::Mutex* m);
