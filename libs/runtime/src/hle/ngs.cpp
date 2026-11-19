@@ -854,7 +854,9 @@ i32 sceNgsRackInit(u32 system, Ptr<const BufferInfo> buffer, Ptr<const RackDescr
         !writable(handle.address, 4))
         return nerr::kInvalidParam;
     const BufferInfo b = *buffer;
-    if (b.data & 15) return nerr::kInvalidAlignment;
+    // (a word's alignment: FMOD Ex's NGS output gives a rack the address its allocator returns, 8-byte aligned,
+    // while it aligns the system's memory to 16 itself)
+    if (b.data & 3) return nerr::kInvalidAlignment;
     const u32 need = rack_size(*def, d);
     if (b.size < need || !writable(b.data, need)) return nerr::kSizeMismatch;
     if (n.racks.size() >= static_cast<usize>(n.params.max_racks) ||

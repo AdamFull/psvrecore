@@ -96,8 +96,10 @@ struct Ngs {
     }
     ~Ngs() { call32(ctx, kSceNgs, kSysRelease, {system}); }
 
-    // A rack of a voice definition; returns its voices' handles.
-    nx::vector<u32> rack(u32 definition_nid, i32 voices, i32 channels, i32 max_in = 4, i32 per_out = 2) {
+    // A rack of a voice definition; returns its voices' handles. Its buffer is 16-byte aligned, or `offset` bytes
+    // past that.
+    nx::vector<u32> rack(u32 definition_nid, i32 voices, i32 channels, i32 max_in = 4, i32 per_out = 2,
+                         u32 offset = 0) {
         const u32 def = static_cast<u32>(call32(ctx, kSceNgs, definition_nid, {}));
         const u32 desc = scratch(24);
         const i32 d[6] = {static_cast<i32>(def), voices, channels, max_in, per_out, 0};
@@ -105,7 +107,7 @@ struct Ngs {
         const u32 size = scratch(4);
         REQUIRE(call32(ctx, kSceNgs, kRackSize, {system, desc, size}) == 0);
         const u32 buffer = scratch(8);
-        psv_st32(buffer, aligned(psv_ld32(size)));
+        psv_st32(buffer, aligned(psv_ld32(size) + offset) + offset);
         psv_st32(buffer + 4, psv_ld32(size));
         const u32 handle = scratch(4);
         REQUIRE(call32(ctx, kSceNgs, kRackInit, {system, buffer, desc, handle}) == 0);
@@ -222,6 +224,17 @@ TEST_CASE("ngs: PCM played through the master buss comes out sample for sample; 
     REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
     CHECK(psv_ld32(st + 8) == 1000);
     CHECK(psv_ld32(st + 12) == 4000);
+}
+
+TEST_CASE("ngs: a rack's buffer needs a word's alignment, not 16 bytes (FMOD Ex gives 8)") {
+    TestRuntime t;
+    PsvContext* ctx = t.ctx();
+    Ngs ngs(ctx);
+    const u32 master = ngs.rack(kDefMaster, 1, 2, 4, 2, 8)[0];
+    const u32 voice = ngs.rack(kDefTemplate1, 1, 2, 4, 2, 4)[0];
+    CHECK(master != 0);
+    CHECK(voice != 0);
+    CHECK(ngs.patch(voice, master) == 0);
 }
 
 TEST_CASE("ngs: Scream's voices are a player, envelope, distortion, EQ, filter and pauser, two outputs, no generator") {
