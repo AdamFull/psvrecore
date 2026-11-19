@@ -86,6 +86,8 @@ TextureInfo probe_info(const TextureInfo& like, u32 width, u32 height, u32 bytes
     return t;
 }
 
+void create_image_converter(vulkan::Device& device, TargetConverter& c);
+
 u16 half_at(const Texels& t, usize texel, u32 k) {
     u16 h;
     std::memcpy(&h, t.data.data() + texel * 8 + k * 2, 2);
@@ -391,6 +393,123 @@ nx::vector<u32> target_texture_shader() {
     return b.module();
 }
 
+static_assert(sizeof(TargetImageConstants) == 9 * 4);
+
+nx::vector<u32> target_image_shader() {
+    using spirv::Builder;
+    using spirv::Id;
+    Builder b;
+    b.capability(SpvCapabilityShader);
+    const Id tu = b.t_uint(), ti = b.t_int(), tb = b.t_bool(), tf = b.t_float(), tv3 = b.t_vector(tu, 3), tvoid = b.t_void();
+    const Id tv2f = b.t_vector(tf, 2), tv4f = b.t_vector(tf, 4), tv2i = b.t_vector(ti, 2);
+    // (0: the surface's image, sampled; 1: the tables; 2: the texture, a storage image)
+    const Id t_src = b.t_image(tf, SpvDim2D, 0, 0, 0, 1, SpvImageFormatUnknown);
+    const Id t_out = b.t_image(tf, SpvDim2D, 0, 0, 0, 2, SpvImageFormatRgba16f);
+    const Id src_var = b.variable(b.t_pointer(SpvStorageClassUniformConstant, t_src), SpvStorageClassUniformConstant);
+    const Id out_var = b.variable(b.t_pointer(SpvStorageClassUniformConstant, t_out), SpvStorageClassUniformConstant);
+    const Id words = b.t_runtime_array(tu);
+    b.decorate(words, SpvDecorationArrayStride, {4});
+    const Id block = b.t_struct({words});
+    b.decorate(block, SpvDecorationBlock);
+    b.member_decorate(block, 0, SpvDecorationOffset, {0});
+    const Id tables_var = b.variable(b.t_pointer(SpvStorageClassStorageBuffer, block), SpvStorageClassStorageBuffer);
+    const Id vars[3] = {src_var, tables_var, out_var};
+    for (u32 i = 0; i < 3; ++i) {
+        b.decorate(vars[i], SpvDecorationDescriptorSet, {0});
+        b.decorate(vars[i], SpvDecorationBinding, {i});
+    }
+    b.decorate(out_var, SpvDecorationNonReadable);
+    constexpr u32 kConstants = sizeof(TargetImageConstants) / 4;
+    const Id pc_block = b.t_struct({tu, tu, tu, tu, tu, tu, tu, tu, tu});
+    b.decorate(pc_block, SpvDecorationBlock);
+    for (u32 i = 0; i < kConstants; ++i) b.member_decorate(pc_block, i, SpvDecorationOffset, {i * 4});
+    const Id pc = b.variable(b.t_pointer(SpvStorageClassPushConstant, pc_block), SpvStorageClassPushConstant);
+    const Id gid_var = b.variable(b.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+    b.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+
+    const Id fn = b.begin_function(tvoid, b.t_function(tvoid));
+    b.block(b.new_label());
+    const Id tp_pc = b.t_pointer(SpvStorageClassPushConstant, tu), tp_word = b.t_pointer(SpvStorageClassStorageBuffer, tu);
+    enum : u32 { kWidth, kHeight, kX0, kY0, kSelect, kAlphaLow, kAlpha1, kAlpha2, kAlpha3 };
+    auto k = [&](u32 i) { return b.op(SpvOpLoad, tu, {b.op(SpvOpAccessChain, tp_pc, {pc, b.c_int(static_cast<i32>(i))})}); };
+    auto u = [&](u32 v) { return b.c_uint(v); };
+    auto bin = [&](u32 op, Id type, Id x, Id y) { return b.op(op, type, {x, y}); };
+    auto add = [&](Id x, Id y) { return bin(SpvOpIAdd, tu, x, y); };
+    auto band = [&](Id x, Id y) { return bin(SpvOpBitwiseAnd, tu, x, y); };
+    auto bor = [&](Id x, Id y) { return bin(SpvOpBitwiseOr, tu, x, y); };
+    auto shr = [&](Id x, Id y) { return bin(SpvOpShiftRightLogical, tu, x, y); };
+    auto shl = [&](Id x, Id y) { return bin(SpvOpShiftLeftLogical, tu, x, y); };
+    auto eq = [&](Id x, Id y) { return bin(SpvOpIEqual, tb, x, y); };
+    auto lt = [&](Id x, Id y) { return bin(SpvOpULessThan, tb, x, y); };
+    auto sel = [&](Id c, Id x, Id y) { return b.op(SpvOpSelect, tu, {c, x, y}); };
+    auto table = [&](u32 base, Id i) {
+        const Id p = b.op(SpvOpAccessChain, tp_word, {tables_var, b.c_int(0), add(u(base), shr(i, u(1)))});
+        return band(shr(b.op(SpvOpLoad, tu, {p}), shl(band(i, u(1)), u(4))), u(0xFFFF));
+    };
+    auto coord = [&](Id x, Id y) {
+        return b.op(SpvOpCompositeConstruct, tv2i, {b.op(SpvOpBitcast, ti, {x}), b.op(SpvOpBitcast, ti, {y})});
+    };
+
+    const Id gid = b.op(SpvOpLoad, tv3, {gid_var});
+    const Id x = b.op(SpvOpCompositeExtract, tu, {gid, 0}), y = b.op(SpvOpCompositeExtract, tu, {gid, 1});
+    const Id inside = bin(SpvOpLogicalAnd, tb, lt(x, k(kWidth)), lt(y, k(kHeight)));
+    const Id body = b.new_label(), merge = b.new_label();
+    b.op0(SpvOpSelectionMerge, {merge, SpvSelectionControlMaskNone});
+    b.op0(SpvOpBranchConditional, {inside, body, merge});
+    b.block(body);
+    {
+        // ---- The image's halves, packed as pack_u2f10f10f10 packs them ----
+        const Id src = b.op(SpvOpLoad, t_src, {src_var});
+        const Id texel = b.op(SpvOpImageFetch, tv4f, {src, coord(add(x, k(kX0)), add(y, k(kY0))), SpvImageOperandsLodMask,
+                                                     b.c_int(0)});
+        auto halves = [&](u32 i) {
+            const Id pair = b.op(SpvOpCompositeConstruct, tv2f, {b.op(SpvOpCompositeExtract, tf, {texel, i}),
+                                                                 b.op(SpvOpCompositeExtract, tf, {texel, i + 1})});
+            return b.ext(tu, GLSLstd450PackHalf2x16, {pair});
+        };
+        const Id w0 = halves(0), w1 = halves(2);
+        auto f10 = [&](Id h) {
+            const Id neg = bin(SpvOpINotEqual, tb, band(h, u(0x8000)), u(0));
+            const Id e31 = eq(band(h, u(0x7C00)), u(0x7C00));
+            const Id special = sel(bin(SpvOpINotEqual, tb, band(h, u(0x3FF)), u(0)), u(0x3FF), u(0x3E0));
+            const Id r = b.ext(tu, GLSLstd450UMin, {shr(add(add(h, u(0xF)), band(shr(h, u(5)), u(1))), u(5)), u(0x3DF)});
+            return sel(neg, u(0), sel(e31, special, r));
+        };
+        const Id h0 = band(w0, u(0xFFFF)), h1 = shr(w0, u(16)), h2 = band(w1, u(0xFFFF)), h3 = shr(w1, u(16));
+        auto at_least = [&](Id h, u32 c) { return sel(bin(SpvOpUGreaterThanEqual, tb, h, k(c)), u(1), u(0)); };
+        const Id a2 = sel(bin(SpvOpINotEqual, tb, band(h3, u(0x8000)), u(0)), u(0),
+                          add(add(at_least(h3, kAlpha1), at_least(h3, kAlpha2)), at_least(h3, kAlpha3)));
+        // ---- That word decoded as read_texels decodes it (target_texture_shader's kind 2) ----
+        const Id v = bor(bor(f10(h0), shl(f10(h1), u(10))), bor(shl(f10(h2), u(20)), shl(a2, u(30))));
+        const Id alpha_low = bin(SpvOpINotEqual, tb, k(kAlphaLow), u(0));
+        const Id at = sel(alpha_low, u(2), u(0));
+        auto field = [&](u32 n) { return table(kTableF10, band(shr(v, add(at, u(10 * n))), u(0x3FF))); };
+        const Id c[4] = {field(0), field(1), field(2), table(kTableAlpha, sel(alpha_low, band(v, u(3)), shr(v, u(30))))};
+        const Id select = k(kSelect);
+        Id h[4];
+        for (u32 n = 0; n < 4; ++n) {
+            const Id f = band(shr(select, u(4 * n)), u(15));
+            h[n] = sel(eq(f, u(0)), c[0],
+                       sel(eq(f, u(1)), c[1], sel(eq(f, u(2)), c[2], sel(eq(f, u(3)), c[3], sel(eq(f, u(5)), u(0x3C00), u(0))))));
+        }
+        const Id lo = b.ext(tv2f, GLSLstd450UnpackHalf2x16, {bor(h[0], shl(h[1], u(16)))});
+        const Id hi = b.ext(tv2f, GLSLstd450UnpackHalf2x16, {bor(h[2], shl(h[3], u(16)))});
+        const Id out = b.op(SpvOpCompositeConstruct, tv4f, {b.op(SpvOpCompositeExtract, tf, {lo, 0}),
+                                                           b.op(SpvOpCompositeExtract, tf, {lo, 1}),
+                                                           b.op(SpvOpCompositeExtract, tf, {hi, 0}),
+                                                           b.op(SpvOpCompositeExtract, tf, {hi, 1})});
+        b.op0(SpvOpImageWrite, {b.op(SpvOpLoad, t_out, {out_var}), coord(x, y), out});
+        b.op0(SpvOpBranch, {merge});
+    }
+    b.block(merge);
+    b.op0(SpvOpReturn, {});
+    b.end_function();
+    const Id interface[] = {gid_var};
+    b.entry_point(SpvExecutionModelGLCompute, fn, "main", interface);
+    b.execution_mode(fn, SpvExecutionModeLocalSize, {8, 8, 1});
+    return b.module();
+}
+
 // ---- On a device ---------------------------------------------------------------------------------------------
 
 Result<void> create_target_converter(vulkan::Device& device, TargetConverter& c) {
@@ -467,10 +586,77 @@ Result<void> create_target_converter(vulkan::Device& device, TargetConverter& c)
         destroy_target_converter(device, c);
         return failure("target textures: the conversion's pipeline could not be made");
     }
+    create_image_converter(device, c);
     return {};
 }
 
+void destroy_target_image_converter(vulkan::Device& device, TargetConverter& c) {
+    const VkDevice dev = device.device();
+    if (c.image_pipeline) vkDestroyPipeline(dev, c.image_pipeline, nullptr);
+    if (c.image_pool) vkDestroyDescriptorPool(dev, c.image_pool, nullptr);
+    if (c.image_layout) vkDestroyPipelineLayout(dev, c.image_layout, nullptr);
+    if (c.image_set_layout) vkDestroyDescriptorSetLayout(dev, c.image_set_layout, nullptr);
+    c.image_pipeline = VK_NULL_HANDLE, c.image_pool = VK_NULL_HANDLE;
+    c.image_layout = VK_NULL_HANDLE, c.image_set_layout = VK_NULL_HANDLE;
+}
+
+namespace {
+
+// target_image_shader's pipeline (none where the device cannot sample RGBA16F images or store to them).
+void create_image_converter(vulkan::Device& device, TargetConverter& c) {
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(device.physical(), VK_FORMAT_R16G16B16A16_SFLOAT, &fp);
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if ((fp.optimalTilingFeatures & need) != need) return;
+    const VkDevice dev = device.device();
+    const VkDescriptorSetLayoutBinding bindings[3] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    si.bindingCount = 3;
+    si.pBindings = bindings;
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TargetImageConstants)};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.setLayoutCount = 1;
+    li.pSetLayouts = &c.image_set_layout;
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &push;
+    const nx::vector<u32> code = target_image_shader();
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = code.size() * 4;
+    mi.pCode = code.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    constexpr u32 kSets = 64;
+    const VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSets},
+                                           {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets},
+                                           {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSets}};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pi.maxSets = kSets;
+    pi.poolSizeCount = 3;
+    pi.pPoolSizes = sizes;
+    bool ok = vkCreateDescriptorSetLayout(dev, &si, nullptr, &c.image_set_layout) == VK_SUCCESS &&
+              vkCreatePipelineLayout(dev, &li, nullptr, &c.image_layout) == VK_SUCCESS &&
+              vkCreateShaderModule(dev, &mi, nullptr, &module) == VK_SUCCESS &&
+              vkCreateDescriptorPool(dev, &pi, nullptr, &c.image_pool) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module;
+        ci.stage.pName = "main";
+        ci.layout = c.image_layout;
+        ok = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &c.image_pipeline) == VK_SUCCESS;
+    }
+    if (module) vkDestroyShaderModule(dev, module, nullptr);
+    if (!ok) destroy_target_image_converter(device, c);
+}
+
+}  // namespace
+
 void destroy_target_converter(vulkan::Device& device, TargetConverter& c) {
+    destroy_target_image_converter(device, c);
     const VkDevice dev = device.device();
     if (c.pipeline) vkDestroyPipeline(dev, c.pipeline, nullptr);
     if (c.pool) vkDestroyDescriptorPool(dev, c.pool, nullptr);
@@ -513,6 +699,49 @@ void record_target_conversion(VkCommandBuffer cmd, const TargetConverter& c, VkD
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, c.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof k, &k);
+    vkCmdDispatch(cmd, (k.width + 7) / 8, (k.height + 7) / 8, 1);
+}
+
+VkDescriptorSet target_image_set(vulkan::Device& device, TargetConverter& c) {
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = c.image_pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &c.image_set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device.device(), &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return set;
+}
+
+void write_target_image_set(vulkan::Device& device, const TargetConverter& c, VkDescriptorSet set, VkImageView image,
+                            VkImageView texture) {
+    const VkDescriptorImageInfo src{VK_NULL_HANDLE, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkDescriptorBufferInfo tables{c.tables.buffer, 0, VK_WHOLE_SIZE};
+    const VkDescriptorImageInfo out{VK_NULL_HANDLE, texture, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[3];
+    const VkDescriptorType types[3] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    for (u32 i = 0; i < 3; ++i) {
+        w[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstSet = set;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = types[i];
+    }
+    w[0].pImageInfo = &src;
+    w[1].pBufferInfo = &tables;
+    w[2].pImageInfo = &out;
+    vkUpdateDescriptorSets(device.device(), 3, w, 0, nullptr);
+}
+
+void free_target_image_set(vulkan::Device& device, TargetConverter& c, VkDescriptorSet set) {
+    if (set) vkFreeDescriptorSets(device.device(), c.image_pool, 1, &set);
+}
+
+void record_target_image_conversion(VkCommandBuffer cmd, const TargetConverter& c, VkDescriptorSet set,
+                                    const TargetImageConstants& k) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.image_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.image_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cmd, c.image_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof k, &k);
     vkCmdDispatch(cmd, (k.width + 7) / 8, (k.height + 7) / 8, 1);
 }
 
@@ -701,6 +930,94 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
             check.what = nx::format("the packing on the GPU, pixel {}: {:08x}, the CPU's {:08x}", at, (*gpu)[at], cpu[at]);
         }
     }
+    check.ms = static_cast<f64>(nx::os::ticks_ns() - start) / 1e6;
+    return check;
+}
+
+TargetCheck check_target_image_conversion(vulkan::Device& device, TargetConverter& c) {
+    TargetCheck check;
+    if (!c.images_ready()) return check;
+    const u64 start = nx::os::ticks_ns();
+    u32 seed = 0x9E3779B9u;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    auto is_nan = [](u16 h) { return (h & 0x7C00) == 0x7C00 && (h & 0x3FF); };
+    check.ran = true;
+    check.ok = true;
+    // (each swizzle: a texture of w x h from the image's texels at (x0, y0), the image larger)
+    constexpr u32 sw = 45, sh = 29, w = 37, h = 23, x0 = 5, y0 = 3;
+    for (u32 swizzle = 0; swizzle < 8 && check.ok; ++swizzle) {
+        TextureInfo info;
+        info.base_format = 0x9A000000u, info.swizzle = swizzle, info.type = texture_type::kLinearStrided;
+        info.width = w, info.height = h, info.levels = 1, info.stride = w * 4;
+        const auto d = target_decode(info, TargetSource::U2F10F10F10);
+        if (!d) {
+            check.ok = false;
+            check.what = nx::format("swizzle {}: no decode", swizzle);
+            break;
+        }
+        // (a NaN's sign is the device's once fetched as a float: NaNs positive here, which pack to the same)
+        nx::vector<u16> halves(usize{sw} * sh * 4);
+        for (u16& hv : halves) {
+            const u32 r = next();
+            const u32 kinds = r & 7;
+            hv = static_cast<u16>(r >> 16);
+            if (kinds == 0) hv = static_cast<u16>(0x7C00 | (r & 0x3FF)) ^ ((r & 0x3FF) ? 0 : (r >> 12) & 0x8000);  // (infinity, NaN)
+            else if (kinds == 1) hv = static_cast<u16>((r >> 16) & 0x83FF);  // (denormal)
+            else if (kinds < 5) hv = static_cast<u16>((r >> 16) & 0x3FFF);  // (0-2)
+            else if (is_nan(hv)) hv &= 0x7FFF;
+        }
+        nx::vector<u8> guest(usize{w} * h * 4);
+        for (u32 y = 0; y < h; ++y)
+            for (u32 x = 0; x < w; ++x) {
+                const u32 v = pack_u2f10f10f10(halves.data() + (usize{y0 + y} * sw + x0 + x) * 4);
+                std::memcpy(guest.data() + (usize{y} * w + x) * 4, &v, 4);
+            }
+        auto cpu = decode_bytes(info, guest);
+        vulkan::ImageDesc sd;
+        sd.format = VK_FORMAT_R16G16B16A16_SFLOAT, sd.width = sw, sd.height = sh;
+        vulkan::ImageDesc od = sd;
+        od.width = w, od.height = h;
+        od.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        auto src = vulkan::create_image(device, sd);
+        auto out = vulkan::create_image(device, od);
+        Result<nx::vector<u8>> gpu = failure("not run");
+        const VkDescriptorSet set = src && out ? target_image_set(device, c) : VK_NULL_HANDLE;
+        if (set && vulkan::upload_image(device, *src, {reinterpret_cast<const u8*>(halves.data()), halves.size() * 2})) {
+            write_target_image_set(device, c, set, src->view, out->view);
+            TargetImageConstants k;
+            k.width = w, k.height = h, k.x0 = x0, k.y0 = y0;
+            k.select = d->select, k.alpha_low = d->alpha_low ? 1 : 0;
+            TargetTextureConstants packing;
+            target_packing(packing);
+            k.alpha1 = packing.alpha1, k.alpha2 = packing.alpha2, k.alpha3 = packing.alpha3;
+            vulkan::OneShot shot(device);
+            if (auto cmd = shot.begin()) {
+                vulkan::transition(*cmd, *out, VK_IMAGE_LAYOUT_GENERAL);
+                record_target_image_conversion(*cmd, c, set, k);
+                if (shot.submit_and_wait()) gpu = vulkan::read_image(device, *out);
+            }
+        }
+        free_target_image_set(device, c, set);
+        if (src) vulkan::destroy_image(device, *src);
+        if (out) vulkan::destroy_image(device, *out);
+        if (!cpu || !gpu || cpu->data.size() != gpu->size()) {
+            check.ok = false;
+            check.what = nx::format("swizzle {}: not decoded or not run", swizzle);
+            break;
+        }
+        for (usize i = 0; i + 1 < gpu->size(); i += 2) {
+            u16 g, e;
+            std::memcpy(&g, gpu->data() + i, 2);
+            std::memcpy(&e, cpu->data.data() + i, 2);
+            if (g == e || (is_nan(g) && is_nan(e))) continue;
+            const usize texel = i / 8;
+            check.ok = false;
+            check.what = nx::format("swizzle {}, texel ({}, {}) half {}: the GPU's {:04x}, the decoder's {:04x}", swizzle,
+                                    texel % w, texel / w, i / 2 % 4, g, e);
+            break;
+        }
+    }
+    if (!check.ok) destroy_target_image_converter(device, c);
     check.ms = static_cast<f64>(nx::os::ticks_ns() - start) / 1e6;
     return check;
 }

@@ -604,6 +604,7 @@ struct Renderer {
     // with the copies: the image's region copied into a work buffer, the shader run, its texels copied into the
     // texture. `depth`: a kept depth image (its middle samples at a scale: rows `step` apart from `first`), else the
     // colour surface's image (its scaled one at a scale). A background to upload first: its staging buffer.
+    // `from_image`: an HDR colour surface's, made from its image directly (target_image_shader: no work buffer).
     struct TargetConversion {
         u64 key = 0;
         Target* color = nullptr;
@@ -613,6 +614,7 @@ struct Renderer {
         TargetTextureConstants k{};
         vk::DeviceBuffer work{};
         VkDescriptorSet set = VK_NULL_HANDLE;
+        bool from_image = false;
         vk::Buffer background_staging{};
         vk::DeviceBuffer retired_background{};  // (a smaller one this replaced: earlier scenes may read it)
         // (PSVRECORE_TARGET_TEXTURES=verify: the decoder's texels from guest memory, and the GPU's read back)
@@ -756,6 +758,17 @@ void make_target_converter(Renderer& r) {
         return;
     }
     nx::logi(logs::gpu, "target textures: made on the GPU (the conversion checked in {:.0f} ms)", check.ms);
+    // (HDR surfaces' textures made from their images directly, unless PSVRECORE_TARGET_TEXTURES=buffers)
+    if (const char* v = std::getenv("PSVRECORE_TARGET_TEXTURES"); v && std::strcmp(v, "buffers") == 0) {
+        destroy_target_image_converter(*r.device, r.converter);
+        return;
+    }
+    const TargetCheck images = check_target_image_conversion(*r.device, r.converter);
+    if (images.ran && !images.ok)
+        nx::logw(logs::gpu, "target textures: the device's conversion from images differs from the decoder's ({}): HDR "
+                 "surfaces' textures are made through buffers", images.what);
+    else if (images.ran)
+        nx::logi(logs::gpu, "target textures: HDR surfaces' made from their images (checked in {:.0f} ms)", images.ms);
 }
 
 // A write-back of the renderer's into guest memory (`ranges`, `write`): their watched pages opened at once (one call,
@@ -2743,7 +2756,8 @@ void give_work(Renderer& r, vk::DeviceBuffer& b) {
 // A conversion's buffers and set given back (once the scene that recorded it is done, or it was not recorded).
 void release_conversion(Renderer& r, Renderer::TargetConversion& c) {
     give_work(r, c.work);
-    free_target_converter_set(*r.device, r.converter, c.set);
+    if (c.from_image) free_target_image_set(*r.device, r.converter, c.set);
+    else free_target_converter_set(*r.device, r.converter, c.set);
     c.set = VK_NULL_HANDLE;
     give_host_buffer(r, c.background_staging);
     give_host_buffer(r, c.verify);
@@ -2830,14 +2844,24 @@ CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u
         constexpr VkComponentSwizzle of[3] = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
         d.components = {of[dec.rgba_of[0]], of[dec.rgba_of[1]], of[dec.rgba_of[2]], of[dec.rgba_of[3]]};
     }
-    // (the work buffer: the image's texels, then the texels made, 16-byte aligned)
+    // (an HDR surface's: from its image into the texture, a storage image, where the device's shader makes the same)
+    conv.from_image = conv.color && r.converter.images_ready() && !dec.single && k.a_width == k.width &&
+                      k.a_height == k.height;
+    if (conv.from_image) {
+        d.usage |= VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        conv.set = target_image_set(*r.device, r.converter);
+        if (!conv.set) conv.from_image = false, d.usage = vk::ImageDesc{}.usage;
+    }
+    // (else the work buffer: the image's texels, then the texels made, 16-byte aligned)
     const u32 src_words = conv.w * conv.h * target_source_words(static_cast<TargetSource>(k.source));
     k.src = 0;
     k.out = (src_words + 3) & ~3u;
     const VkDeviceSize work_bytes = (VkDeviceSize{k.out} + VkDeviceSize{k.width} * k.height * target_out_words(dec)) * 4;
-    auto work = take_work(r, work_bytes);
-    if (!work) return nullptr;
-    conv.work = *work;
+    if (!conv.from_image) {
+        auto work = take_work(r, work_bytes);
+        if (!work) return nullptr;
+        conv.work = *work;
+    }
     DepthTarget* bg = k.a_width < k.width || k.a_height < k.height ? conv.depth : nullptr;
     const bool upload = bg && !bg->background_uploaded;
     if (upload) {
@@ -2861,8 +2885,9 @@ CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u
         std::memcpy(conv.background_staging.mapped, bg->background_bytes.data(), bg->background_bytes.size());
         vk::flush(*r.device, conv.background_staging);
     }
-    conv.set = target_converter_set(*r.device, r.converter, conv.work.buffer, work_bytes,
-                                    bg ? bg->background.buffer : VK_NULL_HANDLE, bg ? bg->background.size : 0);
+    if (!conv.from_image)
+        conv.set = target_converter_set(*r.device, r.converter, conv.work.buffer, work_bytes,
+                                        bg ? bg->background.buffer : VK_NULL_HANDLE, bg ? bg->background.size : 0);
     CachedTexture c;
     bool reused = false;
     if (conv.set) {
@@ -2871,7 +2896,8 @@ CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u
             if (old != r.textures.end() && old->second.used != r.scenes) {
                 const vk::ImageDesc& od = old->second.image.desc;
                 if (od.format == d.format && od.width == d.width && od.height == d.height && od.mips == 1 &&
-                    od.layers == 1 && !od.cube && std::memcmp(&od.components, &d.components, sizeof d.components) == 0) {
+                    od.layers == 1 && !od.cube && od.usage == d.usage &&
+                    std::memcmp(&od.components, &d.components, sizeof d.components) == 0) {
                     c = old->second;
                     r.textures.erase(old);
                     reused = true;
@@ -3140,7 +3166,7 @@ void record_target_conversions(Renderer& r, VkCommandBuffer cmd) {
             vkCmdCopyImageToBuffer(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->work.buffer,
                                    static_cast<u32>(rows.size()), rows.data());
             vk::transition(cmd, from, was);  // (as the scene's own use of it expects it)
-        } else {
+        } else if (!c->from_image) {
             vk::Image& from = c->color->scale > 1 && c->color->scaled.image ? c->color->scaled : c->color->image;
             vk::transition(cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             const VkBufferImageCopy region{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -3148,13 +3174,43 @@ void record_target_conversions(Renderer& r, VkCommandBuffer cmd) {
             vkCmdCopyImageToBuffer(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->work.buffer, 1, &region);
         }
     }
+    // (HDR surfaces' from their images: the image read by the shader, the texture its storage image. A transition of
+    // an image already in SHADER_READ_ONLY adds no barrier: the copies' barrier (record_target_copies) orders a
+    // pending scene's drawing before these reads too)
+    for (Renderer::TargetConversion* c : live) {
+        if (!c->from_image) continue;
+        vk::Image& from = c->color->scale > 1 && c->color->scaled.image ? c->color->scaled : c->color->image;
+        vk::Image& to = r.textures.find(c->key)->second.image;
+        vk::transition(cmd, from, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        vk::transition(cmd, to, VK_IMAGE_LAYOUT_GENERAL);
+        write_target_image_set(*r.device, r.converter, c->set, from.view, to.view);
+    }
     barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT);
-    for (Renderer::TargetConversion* c : live) record_target_conversion(cmd, r.converter, c->set, c->k);
+    for (Renderer::TargetConversion* c : live) {
+        if (!c->from_image) {
+            record_target_conversion(cmd, r.converter, c->set, c->k);
+            continue;
+        }
+        TargetImageConstants k;
+        k.width = c->k.width, k.height = c->k.height, k.x0 = c->x, k.y0 = c->y;
+        k.select = c->k.select, k.alpha_low = c->k.alpha_low;
+        k.alpha1 = c->k.alpha1, k.alpha2 = c->k.alpha2, k.alpha3 = c->k.alpha3;
+        record_target_image_conversion(cmd, r.converter, c->set, k);
+    }
     barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT);
     for (Renderer::TargetConversion* c : live) {
         vk::Image& to = r.textures.find(c->key)->second.image;
+        if (c->from_image) {
+            if (c->verify.buffer) {
+                vk::transition(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                const VkBufferImageCopy back{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {c->k.width, c->k.height, 1}};
+                vkCmdCopyImageToBuffer(cmd, to.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->verify.buffer, 1, &back);
+            }
+            vk::transition(cmd, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            continue;
+        }
         vk::transition(cmd, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         const VkBufferImageCopy region{VkDeviceSize{c->k.out} * 4, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                                        {c->k.width, c->k.height, 1}};
@@ -3176,11 +3232,12 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                            VK_ACCESS_TRANSFER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr,
+                             0, nullptr);
     }
     bool converted = false;
     for (Renderer::TextureUpload& u : r.texture_uploads) {

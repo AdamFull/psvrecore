@@ -84,17 +84,38 @@ nx::vector<u32> target_texture_shader();
 // The decoder's tables (buffer 1): the U16 values' halves (65536), the 10-bit floats' (1024), the 2-bit alphas' (4).
 const nx::vector<u32>& target_texture_tables();
 
-// The shader's pipeline on a device, its tables in a device buffer, and a pool of its descriptor sets.
+// An HDR surface's texture made from its image directly (target_image_shader, 8 x 8 invocations, one a texel): the
+// image's halves fetched (set 0 binding 0, a sampled RGBA16F image), packed as the write-back packs them, decoded as
+// target_texture_shader decodes U2F10F10F10 (binding 1: the tables), written to the texture (binding 2, an RGBA16F
+// storage image). No copies through buffers; texels (x, y) of the texture from (x0 + x, y0 + y) of the image. The
+// halves are fetched as floats: the same bits but a NaN's, whose sign the device may drop (a negative NaN packs to
+// 0, a positive one to a NaN).
+struct TargetImageConstants {
+    u32 width = 0, height = 0, x0 = 0, y0 = 0;
+    u32 select = 0, alpha_low = 0;           // (TargetDecode)
+    u32 alpha1 = 0, alpha2 = 0, alpha3 = 0;  // (target_packing)
+};
+nx::vector<u32> target_image_shader();
+
+// The shaders' pipelines on a device, the tables in a device buffer, and pools of their descriptor sets.
 struct TargetConverter {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     vulkan::DeviceBuffer tables{};
+    // (target_image_shader's: none where the start-up check found its texels differ)
+    VkDescriptorSetLayout image_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout image_layout = VK_NULL_HANDLE;
+    VkPipeline image_pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool image_pool = VK_NULL_HANDLE;
     bool ready() const { return pipeline != VK_NULL_HANDLE; }
+    bool images_ready() const { return image_pipeline != VK_NULL_HANDLE; }
 };
 Result<void> create_target_converter(vulkan::Device& device, TargetConverter& out);
 void destroy_target_converter(vulkan::Device& device, TargetConverter& c);
+// target_image_shader's pipeline alone (images_ready() false after).
+void destroy_target_image_converter(vulkan::Device& device, TargetConverter& c);
 // A set for one conversion (null: the pool has none free now): the work buffer, and the background's (or, with none,
 // the work buffer again).
 VkDescriptorSet target_converter_set(vulkan::Device& device, TargetConverter& c, VkBuffer work, VkDeviceSize work_bytes,
@@ -102,6 +123,14 @@ VkDescriptorSet target_converter_set(vulkan::Device& device, TargetConverter& c,
 void free_target_converter_set(vulkan::Device& device, TargetConverter& c, VkDescriptorSet set);
 void record_target_conversion(VkCommandBuffer cmd, const TargetConverter& c, VkDescriptorSet set,
                               const TargetTextureConstants& k);
+// target_image_shader's: a set (null: none free now), its views written (when recording: the image's view then),
+// given back; the conversion recorded (the image in SHADER_READ_ONLY_OPTIMAL, the texture in GENERAL).
+VkDescriptorSet target_image_set(vulkan::Device& device, TargetConverter& c);
+void write_target_image_set(vulkan::Device& device, const TargetConverter& c, VkDescriptorSet set, VkImageView image,
+                            VkImageView texture);
+void free_target_image_set(vulkan::Device& device, TargetConverter& c, VkDescriptorSet set);
+void record_target_image_conversion(VkCommandBuffer cmd, const TargetConverter& c, VkDescriptorSet set,
+                                    const TargetImageConstants& k);
 
 // One conversion run on the device and waited for (the tests' and the start-up check's): the image's texels as the
 // work buffer holds them at `src`, the background's bytes; the texels made (width * height * out words).
@@ -118,5 +147,8 @@ struct TargetCheck {
     f64 ms = 0;
 };
 TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c);
+// The same for target_image_shader: HDR images of halves of every kind, each swizzle, against read_texels of their
+// packed words. Not ok: its pipeline is destroyed (images_ready() false), the buffer conversion used instead.
+TargetCheck check_target_image_conversion(vulkan::Device& device, TargetConverter& c);
 
 }  // namespace psvrecore::gxm
