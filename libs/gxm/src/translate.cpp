@@ -2236,10 +2236,15 @@ nx::vector<u32> half_check_shader() {
 }
 
 void fill_secondary(const usse::Gxp& gxp, std::span<const u32> default_uniforms, std::span<const u32> buffer_addresses,
-                    std::span<u32, 256> out) {
+                    std::span<u32, 256> out, std::span<const std::span<const u32>> buffer_words) {
     std::fill(out.begin(), out.end(), 0u);
     if (const usse::Container* c = gxp.container(usse::kDefaultUniformContainer))
         for (u32 i = 0; i < c->size && c->base + i < 256; ++i) out[c->base + i] = i < default_uniforms.size() ? default_uniforms[i] : 0;
+    for (const usse::Container& c : gxp.containers) {
+        if (c.index >= usse::kDefaultUniformContainer) continue;
+        const std::span<const u32> words = c.index < buffer_words.size() ? buffer_words[c.index] : std::span<const u32>{};
+        for (u32 i = 0; i < c.size && c.base + i < 256; ++i) out[c.base + i] = i < words.size() ? words[i] : 0;
+    }
     const usse::Container* k = gxp.container(usse::kConstantsContainer);
     if (!k) return;
     for (const usse::BufferSlot& s : gxp.buffer_slots)

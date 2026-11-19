@@ -3,6 +3,9 @@
 // reference interpreter (scripts/usse_exec_check.py --gpu); validity against the SPIR-V rules by spirv-val (see
 // docs/BUILDING.md).
 
+#include <array>
+#include <span>
+
 #include "nxtest.h"
 #include "psvrecore/gxm/translate.hpp"
 
@@ -204,4 +207,28 @@ TEST_CASE("gxm translate: a colour read left to the blending reads no attachment
     REQUIRE(blends);
     REQUIRE(walk(*blends).ok);
     CHECK(!has_capability(*blends, kCapabilityInputAttachment));
+}
+
+TEST_CASE("gxm translate: the driver's secondary attributes hold a user uniform buffer's container") {
+    // (container 1: BUFFER[1]'s first words in sa0-sa3; the default uniform buffer's in sa4-sa5; a literal after)
+    Gxp gxp;
+    gxp.containers = {Container{1, 0, 4}, Container{kDefaultUniformContainer, 4, 2}, Container{kConstantsContainer, 6, 1}};
+    gxp.literals = {Literal{0, 0x3C00}};
+    const u32 uniforms[2] = {7, 8};
+    const u32 buffer1[3] = {0x41000000, 0x42C80000, 0x3DCCC800};  // (shorter than the container: zeros after)
+    std::span<const u32> words[14];
+    words[1] = buffer1;
+    std::array<u32, 256> sa{};
+    gxm::fill_secondary(gxp, uniforms, {}, sa, words);
+    CHECK(sa[0] == 0x41000000u);
+    CHECK(sa[1] == 0x42C80000u);
+    CHECK(sa[2] == 0x3DCCC800u);
+    CHECK(sa[3] == 0u);
+    CHECK(sa[4] == 7u);
+    CHECK(sa[5] == 8u);
+    CHECK(sa[6] == 0x3C00u);
+    // (without the buffer's words: zeros, as before)
+    gxm::fill_secondary(gxp, uniforms, {}, sa);
+    CHECK(sa[0] == 0u);
+    CHECK(sa[4] == 7u);
 }

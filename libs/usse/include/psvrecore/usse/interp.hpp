@@ -71,8 +71,9 @@ struct RunLimits {
 Result<void> run(std::span<const Decoded> program, ProgramKind kind, Machine& m, const RunLimits& limits = {});
 
 // Fills the secondary attributes as the driver does before a draw: the default uniform buffer (32-bit words), the
-// uniform buffers' addresses (by BUFFER index; index kDefaultUniformContainer: the default buffer's copy in memory)
-// and the literals.
+// first words of the user uniform buffers a program keeps in registers (read through m.memory at their addresses),
+// the uniform buffers' addresses (by BUFFER index; index kDefaultUniformContainer: the default buffer's copy in
+// memory) and the literals.
 Result<void> load_secondary(const Gxp& gxp, std::span<const u32> default_uniforms,
                             std::span<const u32> buffer_addresses, Machine& m,
                             std::span<const SamplerState> samplers = {});

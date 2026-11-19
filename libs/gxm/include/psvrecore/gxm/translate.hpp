@@ -167,9 +167,11 @@ Result<nx::vector<u32>> translate_fragment(const usse::Gxp& gxp, std::span<const
                                            const FragmentShader& shader, std::span<const usse::Decoded> secondary = {});
 
 // The secondary attributes as the driver fills them before a draw: the default uniform buffer (its first words),
-// the uniform buffers' addresses (by BUFFER index; index 14 the default buffer's copy in memory) and the literals.
-// Sampler state words are left zero (the draw forms find texture units in the program's sampler slots).
+// the first words of the user uniform buffers the program keeps in registers (`buffer_words`, by BUFFER index: what
+// is known of each buffer's words; zeros past them), the uniform buffers' addresses (by BUFFER index; index 14 the
+// default buffer's copy in memory) and the literals. Sampler state words are left zero (the draw forms find texture
+// units in the program's sampler slots).
 void fill_secondary(const usse::Gxp& gxp, std::span<const u32> default_uniforms, std::span<const u32> buffer_addresses,
-                    std::span<u32, 256> out);
+                    std::span<u32, 256> out, std::span<const std::span<const u32>> buffer_words = {});
 
 }  // namespace psvrecore::gxm

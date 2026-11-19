@@ -3640,11 +3640,14 @@ u32 buffer_words(const usse::Gxp& g, u32 index) {
 }
 
 // The bytes of a uniform buffer: the size the program declares for it (its UniformBuffer parameter), else an upper
-// bound from the uniforms it reads there.
+// bound from the uniforms it reads there; at least the words it keeps in secondary attributes (its container).
 u32 buffer_bytes(const usse::Gxp& g, u32 index) {
+    u32 bytes = 0;
     for (const usse::Parameter& p : g.parameters)
-        if (p.category == usse::ParameterCategory::UniformBuffer && p.resource == index && p.array_size) return p.array_size;
-    return buffer_words(g, index) * 4;
+        if (p.category == usse::ParameterCategory::UniformBuffer && p.resource == index && p.array_size) bytes = p.array_size;
+    if (!bytes) bytes = buffer_words(g, index) * 4;
+    if (const usse::Container* c = g.container(static_cast<u16>(index))) bytes = nx::max<u32>(bytes, u32{c->size} * 4);
+    return bytes;
 }
 
 void host_copy(nx::vector<u8>& out, u32 address, u32 bytes) {
@@ -4731,8 +4734,15 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             if (!uniforms.empty()) std::memcpy(mem.data() + at, uniforms.data(), uniforms.size() * 4);
             for (u32 b = 0; b < 14; ++b)
                 if (buffers[b]) addresses[b] = place(buffers[b]);
+            // (the words of the buffers a program keeps in registers: their copies in memory, made above)
+            std::span<const u32> words[14];
+            for (u32 b = 0; b < 14; ++b)
+                if (buffers[b]) {
+                    const BufferCopy& c = buffer_copies[buffers[b]];
+                    words[b] = {reinterpret_cast<const u32*>(mem.data() + c.offset), c.bytes / 4};
+                }
             fill_secondary(p.gxp, uniforms, addresses,
-                           std::span<u32, 256>(sa.data() + usize{i} * kDrawSecondaryWords + 256 * stage, 256));
+                           std::span<u32, 256>(sa.data() + usize{i} * kDrawSecondaryWords + 256 * stage, 256), words);
         }
         if ((stores(vp) || stores(fp)) && !d.caps().shader_stores) {
             nx::logw(logs::gpu, "the device has no vertex or fragment stage stores: a draw whose program stores is skipped");

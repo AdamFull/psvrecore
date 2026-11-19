@@ -149,6 +149,29 @@ TEST_CASE("usse interp: the default uniform buffer read from memory") {
     CHECK(value(m.output[3]) == 34.0f);
 }
 
+TEST_CASE("usse interp: a user uniform buffer kept in secondary attributes (its container)") {
+    // A program whose uniforms are in BUFFER[1] and read straight from sa0-sa5 (Gravity Rush's fog pass: its
+    // container 1, base 0, 6 words; the constants after it): the driver copies the buffer's first words there.
+    Gxp gxp;
+    gxp.containers = {Container{1, 0, 6}, Container{kConstantsContainer, 6, 1}};
+    gxp.literals = {Literal{0, 0x3F800000}};
+    TestMemory memory;
+    memory.base = 0x10000;
+    for (u32 i = 0; i < 8; ++i) memory.words[i] = bits(static_cast<f32>(i + 1));
+    u32 buffers[15] = {};
+    buffers[1] = memory.base;
+    Machine m;
+    m.memory = &memory;
+    REQUIRE(load_secondary(gxp, {}, buffers, m));
+    for (u32 i = 0; i < 6; ++i) CHECK(value(m.secondary[i]) == static_cast<f32>(i + 1));
+    CHECK(m.secondary[6] == 0x3F800000u);
+    // (a buffer not set: zeros)
+    Machine none;
+    none.memory = &memory;
+    REQUIRE(load_secondary(gxp, {}, {}, none));
+    for (u32 i = 0; i < 6; ++i) CHECK(none.secondary[i] == 0u);
+}
+
 TEST_CASE("usse interp: user uniform buffer arrays (single, burst and computed loads)") {
     // BUFFER[0] holds words 0, 1, 2, ... (as floats); its address goes to sa0 with the buffer's -4 bias. The
     // shader compiler's reads of: float arr[3] (lda32 at immediate 4: a single load counts from the address),

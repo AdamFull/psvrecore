@@ -955,6 +955,17 @@ Result<void> load_secondary(const Gxp& gxp, std::span<const u32> default_uniform
             m.secondary[c->base + i] = i < default_uniforms.size() ? default_uniforms[i] : 0;
         }
     }
+    // (a user uniform buffer's first words, read from the buffer as it is in memory; none where it is not given)
+    for (const Container& c : gxp.containers) {
+        if (c.index >= kDefaultUniformContainer) continue;
+        const u32 address = c.index < buffer_addresses.size() ? buffer_addresses[c.index] : 0;
+        for (u32 i = 0; i < c.size; ++i) {
+            if (c.base + i >= Machine::kBankSize) return failure("uniform buffer outside the bank");
+            u32 word = 0;
+            if (address && m.memory && !m.memory->read(address + 4 * i, &word, 4)) word = 0;
+            m.secondary[c.base + i] = word;
+        }
+    }
     const Container* k = gxp.container(kConstantsContainer);
     if (!k) {
         if (!gxp.literals.empty() || !gxp.buffer_slots.empty()) return failure("constants without their container");

@@ -53,13 +53,14 @@ struct Parameter {
 };
 
 // How the secondary attributes are filled before a draw (by the driver, not by the program): register ranges
-// ("containers") hold the default uniform buffer and a block of per-draw constants: the user uniform buffers'
-// addresses, the state words of the samplers whose coordinates are computed, and the program's literals.
+// ("containers") hold the default uniform buffer, the first words of user uniform buffers (containers 0-13: BUFFER[n]
+// itself, its words from the first), and a block of per-draw constants: the user uniform buffers' addresses, the
+// state words of the samplers whose coordinates are computed, and the program's literals.
 inline constexpr u16 kDefaultUniformContainer = 14;
 inline constexpr u16 kConstantsContainer = 19;
 
 struct Container {
-    u16 index = 0;  // kDefaultUniformContainer, kConstantsContainer
+    u16 index = 0;  // a user uniform buffer (0-13: BUFFER[n]), kDefaultUniformContainer, kConstantsContainer
     u16 base = 0;   // first secondary attribute
     u16 size = 0;   // in 32-bit registers
 };
