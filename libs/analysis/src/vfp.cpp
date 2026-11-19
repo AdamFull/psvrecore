@@ -76,15 +76,29 @@ void Solver::solve(const Fn& f, FunctionVfp& r) const {
     const usize n = g.nodes.size();
     // How each of d0-d15 is held: as two floats when its instructions access it a word at a time at least as often as
     // whole (a D register's double then costs a pack or an unpack, an S register's float an extract or an insert).
-    u32 s_count[16] = {}, d_count[16] = {};
-    for (const VfpEffect& e : f.effect)
+    u32 s_count[16] = {}, d_count[32] = {}, q_count[16] = {};
+    for (const VfpEffect& e : f.effect) {
         for (u32 k = 0; k < 16; ++k) {
             s_count[k] += (e.s_access >> k) & 1;
-            d_count[k] += (e.d_access >> k) & 1;
+            q_count[k] += (e.q_access >> k) & 1;
         }
+        for (u32 k = 0; k < 32; ++k) d_count[k] += (e.d_access >> k) & 1;
+    }
     r.s_view = 0;
     for (u32 k = 0; k < 16; ++k)
         if (s_count[k] && s_count[k] >= d_count[k]) r.s_view |= 1u << k;
+    // A Q register as one vector when its instructions access it whole at least half as often as they access its D
+    // registers and S registers apart (each such access costs a lane or half insert or extract; with two D or four S
+    // locals each whole access costs a pack and an unpack).
+    r.q_view = 0;
+    if (options_.q_view)
+        for (u32 p = 0; p < 16; ++p) {
+            const u32 parts = d_count[2 * p] + d_count[2 * p + 1] + (p < 8 ? s_count[2 * p] + s_count[2 * p + 1] : 0);
+            if (q_count[p] && 2 * q_count[p] >= parts) {
+                r.q_view |= 1u << p;
+                if (p < 8) r.s_view &= ~(3u << (2 * p));
+            }
+        }
     r.trap_store.assign(n, {});
     r.call_store.assign(n, {});
     r.call_load.assign(n, {});

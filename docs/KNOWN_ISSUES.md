@@ -273,9 +273,11 @@
     binary32 fast paths before them did); host code that changed MXCSR on a guest thread would break them. Nothing in
     the runtime does; a driver or library that did would not be noticed.
   - A vcvtr on x64 rounds by MXCSR's mode (to nearest, as above), the exact fallback by `rint` (the same).
-  - Advanced SIMD instructions are taken to read and write only the D registers their operands name (register lists:
-    up to twice their count, four at least) and the FPSCR's bits 27-0 (QC, AHP), not its NZCV: guest_simd.h's helpers
-    do so today. A helper that touched another register would see a stale context register or have its write lost.
+  - Advanced SIMD instructions in the context form (`--neon-in-context`, or one without a translation on values: none in
+    WipEout 2048, P4D or the corpora) are taken to read and write only the D registers their operands name (register
+    lists: up to twice their count, four at least) and the FPSCR's bits 27-0 (QC, AHP), not its NZCV: guest_simd.h's
+    helpers do so today. A helper that touched another register would see a stale context register or have its write
+    lost.
   - Summaries take a callee to read and write only the registers its own instructions name, its callees' and, through
     anything outside the module's view, everything. Code the module does not know that reaches a function's callers'
     frames another way than through a call or a return to the LR it was given (a longjmp into the middle of a
@@ -315,6 +317,43 @@
     guest mode.
   - Only where the guest sets FZ or DN does any of this differ from the host's default (the FPSCR starts at 0, so
     the mirror is the default FPCR until a vmsr); WipEout's libc has two vmsr instructions, not seen executed.
+- **Advanced SIMD on values (task 6): what is assumed and not checked.**
+  - Round to nearest in the host's floating-point environment while generated code runs (MXCSR's rounding on x64,
+    FPCR.RMode on arm64), as for the VFP operations. The checked single-precision code is exact under any FZ/DN (or
+    FTZ/DAZ) setting otherwise; nothing else of the environment is assumed.
+  - arm64's FRECPE, FRSQRTE, URECPE and URSQRTE give ARMv7's 8-bit estimates (ARMv8's pseudocode defines them to; the
+    device tests compare every exponent and table index with the interpreter, not run yet), and FCVTZS/FCVTZU and
+    SCVTF/UCVTF are ARM's conversions. x64 uses no instruction later than SSE2 unless the build's
+    `PSVRECORE_GENERATED_CODE_ARCH` enables it (PSHUFB for VTBL with SSSE3).
+  - With native floating point (arm64, off by default): when the guest's FPSCR is in the standard mode the NEON
+    floating-point operations are the host's instructions, relying on the FPCR mirror (task 5) having FZ and DN then:
+    AArch64's FMUL, FADD, FSUB, FABD, FMAX, FMIN, the pairwise forms, the compares and the estimates are ARMv7 NEON's in
+    that mode (flush-to-zero with tininess before rounding, the default NaN). Not run on a device.
+  - Element single-copy atomicity of VLD/VST: each register (or pair of registers) is one host access of 8 or 16
+    bytes, so an element is atomic where that access keeps it (an aligned 8-byte part on x64 and arm64; a 16-byte
+    access aligned to 16 bytes on x64 CPUs with AVX). An element the guest made aligned but that straddles an 8-byte
+    boundary of an unaligned 16-byte host access is not guaranteed atomic. Before, an aligned 8-byte register was
+    atomic and an unaligned one not either. Two guest threads racing on NEON loads and stores of one element are not
+    known in games.
+  - The known-no-denormal analysis (which skips flushing operands) is local to straight stretches of code and
+    forgets at labels, calls, conditional instructions and writes by anything but the listed operations; a wrong
+    entry would make an operand's denormal lane count as itself. The differential corpora run chains of NEON
+    floating-point instructions from random states with denormal lanes; a mutation that marks an integer result
+    "known" is caught (task 6's mutation checks, CODEGEN_METRICS.md).
+  - The Q view is chosen by a count of the function's whole-register and part accesses; any choice is correct, only
+    the code's size differs. Functions that mix VFP scalar arithmetic on lanes of a Q-held register pay a lane extract
+    or insert for each.
+  - Static code size: each single-precision multiply carries its rare branch for a product at 2^-126 (inline, about
+    15 instructions on x64 and 8 on arm64, never taken by ordinary values), which the static metric counts like the
+    fast path.
+  - Slower than before on x64 with plain SSE2: the signed 32 x 32 -> 64 multiplies (VMULL/VMLAL/VMLSL.S32,
+    VQDMULL.S32 and its accumulating forms) are vector code that SSE2 has no instruction for (PMULDQ is SSE4.1), so
+    clang builds each from three PMULUDQ and sign corrections; the corpus' `mac64` loop (one vmlal.s32 per two
+    elements) takes 36 ns instead of 31. With `PSVRECORE_GENERATED_CODE_ARCH` at x86-64-v2 or later it is PMULDQ.
+  Checked: fuzzgen's Advanced SIMD corpus (8000 blocks of one to three NEON instructions, 12 states each with lanes at
+  their edges, against the interpreter), the helpers against the interpreter on every pair of 46 single-precision edge
+  values and every estimate table index (`simd_tests.cpp`), the corpus' `neon_locals.s` (aliasing, calls, every
+  load/store form, the end of mapped memory, game loops) in all three configurations.
 - **A few system instructions are not translated.** In the 24 MB executable these are 3 `mcrr` and 3 `mrc p15`
   (coprocessor registers other than the thread ID registers). Each traps with a diagnostic.
 - **Imported variables need the SDK's reference-table format.** Analysis reads each imported variable's table of uses

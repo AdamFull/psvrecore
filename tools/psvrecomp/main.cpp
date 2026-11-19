@@ -150,6 +150,8 @@ struct FlagArgs {
     bool no_sp_check = false;
     bool vfp_in_context = false;
     bool vfp_calls_conservative = false;
+    bool neon_in_context = false;
+    bool no_q_locals = false;
 };
 
 bool valid_identifier(nx::string_view name) {
@@ -184,6 +186,8 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     gen.check_sp = !flag_args.no_sp_check;
     gen.vfp_in_context = flag_args.vfp_in_context;
     gen.vfp_calls_conservative = flag_args.vfp_calls_conservative;
+    gen.neon_in_context = flag_args.neon_in_context;
+    gen.no_q_locals = flag_args.no_q_locals;
     if (flag_args.keep_registers == "all") gen.keep_registers = analysis::KeepPolicy::All;
     else if (flag_args.keep_registers == "loops") gen.keep_registers = analysis::KeepPolicy::Loops;
     else if (flag_args.keep_registers == "none") gen.keep_registers = analysis::KeepPolicy::None;
@@ -249,6 +253,9 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
               gen.vfp_calls_conservative ? " (--vfp-calls-conservative)" : "", st.vfp_trap_stores);
         print("            {} vcmp + vmrs pairs compare once, {} conditions compare their operands\n", st.vfp_fused_compares,
               st.vfp_fused_conditions);
+        print("neon        {} Advanced SIMD instructions on values, {} in the context form{}; {} Q registers held as one vector{}\n",
+              st.neon_values, st.neon_context, gen.neon_in_context ? " (--neon-in-context)" : "", st.vfp_q_held,
+              gen.no_q_locals ? " (--no-q-locals)" : "");
     }
     print("discovery   {} errors (psvrecomp analyze --diagnostics lists them)\n", errors);
     usize traps = 0;
@@ -304,6 +311,10 @@ int main(int argc, char** argv) {
         .flag("vfp-in-context", flag_args.vfp_in_context,
               "floating-point registers and the FPSCR in the context everywhere, not in locals (the translation from before "
               "they were locals, for checking a suspected floating-point locals bug)")
+        .flag("neon-in-context", flag_args.neon_in_context,
+              "Advanced SIMD instructions in the context form, guest_simd.h's helpers with the floating-point locals synced "
+              "around each (the translation from before they were on values, for checking a suspected NEON bug)")
+        .flag("no-q-locals", flag_args.no_q_locals, "no Q register held as one vector local (each as two D locals)")
         .flag("vfp-calls-conservative", flag_args.vfp_calls_conservative,
               "every call taken to read and write all floating-point registers: none kept in locals across a call")
         .flag("no-sp-check", flag_args.no_sp_check,

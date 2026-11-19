@@ -101,6 +101,49 @@ PsvContext random_state(Rng& rng) {
     return c;
 }
 
+// A lane of `esize` bits at an edge: zero, one, all ones, the signed and unsigned extremes and their neighbours, shift
+// counts in and out of range (positive and negative, as the register shifts read the bottom byte), or random bits.
+u64 edge_lane(Rng& rng, u32 esize) {
+    const u64 mask = esize == 64 ? ~0ull : (1ull << esize) - 1, top = 1ull << (esize - 1);
+    const u64 r = (static_cast<u64>(rng.u32v()) << 32) | rng.u32v();
+    switch (rng.u32v() % 14) {
+        case 0: return 0;
+        case 1: return 1;
+        case 2: return mask;
+        case 3: return top - 1;
+        case 4: return top;
+        case 5: return top + 1;
+        case 6: return top - 2;
+        case 7: return mask - 1;
+        case 8: return rng.u32v() % (esize + 3);                                   // shift counts 0 ... esize + 2
+        case 9: return (0 - static_cast<u64>(1 + rng.u32v() % (esize + 3))) & mask;  // -1 ... -(esize + 3)
+        case 10: return (rng.u32v() & 1 ? 0x80ull : 0x7Full) & mask;             // the bottom byte's extremes
+        case 11: return (r & mask) >> (rng.u32v() % esize);                      // small values
+        default: return r & mask;
+    }
+}
+
+// A state for the Advanced SIMD corpus: random_state's, each D register refilled with lanes of one element size at
+// their edges, or single- or double-precision edge values; QC set or clear.
+PsvContext simd_state(Rng& rng) {
+    PsvContext c = random_state(rng);
+    for (int d = 0; d < 32; ++d) {
+        const u32 kind = rng.u32v() % 8;
+        if (kind < 4) {
+            const u32 esize = 8u << kind;
+            u64 v = 0;
+            for (u32 i = 0; i < 64 / esize; ++i) v |= edge_lane(rng, esize) << (i * esize);
+            c.vfp.d[d] = v;
+        } else if (kind < 6) {
+            c.vfp.d[d] = (static_cast<u64>(interesting_f32(rng)) << 32) | interesting_f32(rng);
+        } else if (kind == 6) {
+            c.vfp.d[d] = interesting_f64(rng);
+        }  // (else random_state's)
+    }
+    c.fpscr = (c.fpscr & ~PSV_FPSCR_QC) | (rng.u32v() % 2 ? PSV_FPSCR_QC : 0u);
+    return c;
+}
+
 jmp_buf g_trap_jump;
 recomp::TrapInfo g_trap;
 [[noreturn]] void on_trap(PsvContext*, const recomp::TrapInfo& trap) {
@@ -158,31 +201,37 @@ nx::string differences(const PsvContext& a, const PsvContext& b, const nx::vecto
     return out;
 }
 
-}  // namespace
-
-TEST_CASE("recomp: generated code agrees with the interpreter on random instruction blocks") {
-    REQUIRE(fuzz_block_count > 0);
+// Runs each block of a corpus from `states` random states (made by `state`) as generated code and in the interpreter.
+template <typename State>
+usize run_corpus(const FuzzBlock* blocks, u32 count, int states, const char* what, State&& state) {
+    REQUIRE(count > 0);
     const auto previous = recomp::set_trap_handler(on_trap);
     Rng rng{0x5EED5EED12345ull};
     nx::vector<u8> initial(kMemory), generated(kMemory), interpreted(kMemory);
     usize runs = 0, failures = 0;
-    constexpr int kStatesPerBlock = 4;
-    for (u32 b = 0; b < fuzz_block_count; ++b) {
-        const FuzzBlock& block = fuzz_blocks[b];
-        for (int trial = 0; trial < kStatesPerBlock; ++trial) {
+    for (u32 b = 0; b < count; ++b) {
+        const FuzzBlock& block = blocks[b];
+        for (int trial = 0; trial < states; ++trial) {
             for (usize i = 0; i < kMemory; i += 4) {
                 const u32 w = rng.u32v();
                 std::memcpy(&initial[i], &w, std::min<usize>(4, kMemory - i));
             }
-            const PsvContext start = random_state(rng);
+            const PsvContext start = state(rng);
 
             // Generated code.
             PsvContext g = start;
             generated = initial;
             psv_membase = generated.data();
             bool trapped = false;
+            // (native floating point: the FPCR mirrors the FPSCR the block starts with, as the runtime keeps it)
+#ifdef PSV_NATIVE_FLOAT
+            psv_native_set_fpcr(start.fpscr);
+#endif
             if (setjmp(g_trap_jump) == 0) block.function(&g, 0xFEED0001u);
             else trapped = true;
+#ifdef PSV_NATIVE_FLOAT
+            psv_native_set_fpcr(0);
+#endif
 
             // The interpreter, on the same instructions.
             PsvContext s = start;
@@ -229,6 +278,18 @@ TEST_CASE("recomp: generated code agrees with the interpreter on random instruct
     }
     recomp::set_trap_handler(previous);
     psv_membase = nullptr;
-    std::printf("%s\n", nx::format("generator vs interpreter: {} blocks, {} runs, {} disagreements", fuzz_block_count, runs, failures).c_str());
-    CHECK(failures == 0);
+    std::printf("%s\n", nx::format("generator vs interpreter{}: {} blocks, {} runs, {} disagreements", what, count, runs, failures).c_str());
+    return failures;
+}
+
+}  // namespace
+
+TEST_CASE("recomp: generated code agrees with the interpreter on random instruction blocks") {
+    CHECK(run_corpus(fuzz_blocks, fuzz_block_count, 4, "", [](Rng& rng) { return random_state(rng); }) == 0u);
+}
+
+TEST_CASE("recomp: Advanced SIMD instructions on values agree with the interpreter, lanes at their edges") {
+    // (fuzzgen --simd: every block one to three Advanced SIMD instructions; the registers' lanes hold each element
+    // size's edge values: saturation bounds, shift counts in and out of range, NaNs with payloads, denormals...)
+    CHECK(run_corpus(fuzzsimd_blocks, fuzzsimd_block_count, 12, " (Advanced SIMD)", [](Rng& rng) { return simd_state(rng); }) == 0u);
 }

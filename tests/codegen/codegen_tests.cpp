@@ -31,6 +31,17 @@
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
 
+#ifndef CODEGEN_TEST_MASK
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+#endif
+
 extern "C" {
 extern const PsvModuleCode* const corpus_modules[];
 extern const unsigned corpus_module_count;
@@ -77,6 +88,55 @@ uint8_t* membase_for(nx::vector<u8>& buffer) {
 #else
     // (psv_membase + guest address lands in the buffer for the corpus' addresses, as with the runtime's reservation)
     return reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(buffer.data()) - kCorpusBase);
+#endif
+}
+
+// The generated code's memory in the production configuration: a copy of the buffer whose end, kCorpusEnd, is
+// followed by a page that faults when touched (the end of mapped memory: an access of the generated code that reads or
+// writes past the guest's bytes there crashes the test). The masked configuration folds every address.
+#ifndef CODEGEN_TEST_MASK
+constexpr usize kGuardedSize = usize(kCorpusEnd - kCorpusBase);
+u8* guarded_memory() {
+    static u8* memory = [] {
+#ifdef _WIN32
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        const usize page = info.dwPageSize;
+#else
+        const usize page = static_cast<usize>(sysconf(_SC_PAGESIZE));
+#endif
+        const usize size = (kGuardedSize + page - 1) / page * page;
+#ifdef _WIN32
+        u8* m = static_cast<u8*>(VirtualAlloc(nullptr, size + page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        DWORD old = 0;
+        if (m) VirtualProtect(m + size, page, PAGE_NOACCESS, &old);
+#else
+        void* v = mmap(nullptr, size + page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        u8* m = v == MAP_FAILED ? nullptr : static_cast<u8*>(v);
+        if (m) mprotect(m + size, page, PROT_NONE);
+#endif
+        // (the guest's last byte right before the page)
+        return m ? m + (size - kGuardedSize) : nullptr;
+    }();
+    return memory;
+}
+#endif
+// Before and after a run of generated code.
+uint8_t* run_memory(nx::vector<u8>& buffer) {
+#ifdef CODEGEN_TEST_MASK
+    return membase_for(buffer);
+#else
+    u8* m = guarded_memory();
+    if (!m) return membase_for(buffer);
+    std::memcpy(m, buffer.data(), kGuardedSize);
+    return reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(m) - kCorpusBase);
+#endif
+}
+void after_run(nx::vector<u8>& buffer) {
+#ifndef CODEGEN_TEST_MASK
+    if (u8* m = guarded_memory()) std::memcpy(buffer.data(), m, kGuardedSize);
+#else
+    (void)buffer;
 #endif
 }
 
@@ -177,6 +237,10 @@ bool apply_spec(const char* spec, Rng& rng, PsvContext& c, nx::vector<u8>& memor
             const long lo = std::strtol(range, &next, 10);
             const long hi = std::strtol(next + 1, nullptr, 10);
             c.r[reg] = static_cast<u32>(lo + static_cast<long>(rng.below(static_cast<u32>(hi - lo + 1))));
+            continue;
+        }
+        if (kind.starts_with("tail:")) {  // (K bytes before the end of the corpus' memory: the stack's top)
+            c.r[reg] = kCorpusEnd - static_cast<u32>(std::atoi(kind.c_str() + 5));
             continue;
         }
         u32 align = 1;
@@ -327,13 +391,14 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             // Generated code.
             PsvContext g = start;
             generated = initial;
-            psv_membase = membase_for(generated);
+            psv_membase = run_memory(generated);
             bool trapped = false;
             // (native floating point: the FPCR mirrors the FPSCR the function starts with, as the runtime keeps it)
             mirror_fpscr(start.fpscr);
             if (setjmp(g_trap_jump) == 0) function(&g, kReturn);
             else trapped = true;
             mirror_fpscr(0);
+            after_run(generated);
 
             // The interpreter, from the same entry, until it returns there.
             PsvContext s = start;

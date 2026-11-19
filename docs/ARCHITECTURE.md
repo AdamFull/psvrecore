@@ -309,10 +309,10 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
       no floating-point register (most integer helpers) leaves every local alone.
     - Imports, indirect calls (`psv_call`), svc: before them the context holds every unit; after them every live unit
       is read back.
-    - Advanced SIMD instructions (their guest_simd.h helpers work on the context's registers): before each, the dirty
-      units of the D registers it names (lists: more than it names, never fewer) and the FPSCR's rest (QC, AHP) are
-      written; after it, the live ones are read back. Their D registers stay in the context otherwise (task 6 makes
-      them vector locals).
+    - Advanced SIMD instructions are translated on the locals' values like any other instruction (below, "Advanced
+      SIMD"). Only one without a translation on values, and every one with `psvrecomp --neon-in-context`, works on the
+      context's registers (guest_simd.h's helpers): before it, the dirty units of the D registers it names (lists: more
+      than it names, never fewer) and the FPSCR's rest (QC, AHP) are written; after it, the live ones are read back.
     - A return, a jump through the runtime, a tail call, an import's tail call, running into another function: every
       dirty unit is written first. The context is exact when a function returns; the differential tests compare
       d0-d31 and the FPSCR at every exit.
@@ -366,6 +366,80 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     context (byte for byte what the generator gave before: checked on WipEout 2048's four modules);
     `--vfp-calls-conservative` keeps the locals and takes every call to read and write everything (no summaries), for
     chasing a suspected bug in a game.
+- **Advanced SIMD** (`recomp/src/emit_neon.cpp`, `recomp/guest_neon.h`). NEON instructions work on the values of the
+  floating-point locals above: each becomes a call of a guest_neon.h helper on `PsvD` (8-byte) and `PsvQ` (16-byte)
+  vector values, its operands read from and its results written to whatever local holds each register.
+  - **Q registers as vector locals.** Besides the S and D views, q<p> (d<2p> and d<2p+1>, any p < 16) can be one
+    `PsvQ` local `q<p>`: chosen when the function's instructions access the Q register whole (recorded as for the other
+    views) at least half as often as its D and S registers apart. A Q-held unit is all four words: a D register of it
+    is its low or high half (`psv_qlo`, `psv_qsethi`), an S register a lane (`psv_vqf`, `psv_vqsetf`), the context's
+    copy written and read as 16 bytes (`psv_ctx_qput`, `psv_ctx_qget`). The analysis is the VFP registers' with the
+    new unit (`FunctionVfp::q_view`, `units()`), so the contract above holds unchanged for Q-held registers: entry,
+    direct calls with the callees' summaries, imports, indirect calls, svc, exits and traps. NEON instructions are no
+    longer places where the context is synced: they read and write locals, and are in the summaries through the words
+    they read and write. The FPSCR's QC is a bit of the `fpscr` local, which the saturating helpers OR into
+    (`uint32_t* fpscr`).
+  - **Helpers.** Each family is element-wise vector code in clang's vector extensions (`vector_size`,
+    `__builtin_shufflevector`, `__builtin_convertvector`, `__builtin_elementwise_*`), which compiles to NEON on arm64 and
+    SSE2 on x64: integer arithmetic, compares, min/max/abs/neg, halving, saturating (`__builtin_elementwise_add_sat`;
+    QC from a compare with the wrapping result), shifts by an immediate and by a register (rounding, saturating; counts
+    clamped before every host shift, so lanes never shift by their size or more; no `__int128`), inserts, logic and
+    the bit selects, long/wide/narrow forms by `__builtin_convertvector`, pairwise forms, doubling multiplies,
+    polynomial multiplies (arm64: PMUL/PMULL), counts (arm64: CNT/CLS/CLZ; x64: SWAR), permutes and VEXT/VREV/VDUP
+    lanes as constant shuffles (macros, so the indices are constants), VTBL/VTBX (arm64: TBL; x64 with SSSE3: PSHUFB;
+    SSE2: the eight bytes one by one), estimates and conversions. The only lane-by-lane code left: VTBL on an SSE2-only
+    host, the half-precision conversions (four lanes through guest.h's exact helpers; x64's baseline has no
+    half-precision instructions), and the conversions to integers on a host that is neither x64 nor arm64.
+  - **Floating point** (single precision; Advanced SIMD always uses the standard mode: flush-to-zero, default NaN,
+    round to nearest, whatever the FPSCR says). Inputs are flushed (a denormal lane to a zero of its sign) and results
+    fixed (a NaN lane to 0x7FC00000, a lane below 2^-126 to a zero of its sign). With no denormal operand the host's
+    IEEE result in round to nearest is ARM's in every lane except for NaNs (ARM's is always the default NaN where IEEE
+    gives a NaN) and results whose exact value is below 2^-126 (ARM flushes them; the host gives a denormal or zero of
+    the same sign, or rounds up to 2^-126), so the fix makes it exact, with one exception: a product at exactly 2^-126
+    may come from an exact value below it (a sum cannot: a sum of floats below 2^-126 is exact). A vector with such a
+    lane decides it inline in a rare branch (no call: x64 computes the exact products in double precision, arm64 the
+    sign of a fused residual scaled by 2^48). VMLA/VMLS round the product and flush it before the sum (ARMv7 has no
+    fused NEON form; AArch64's FRECPS/FRSQRTS are fused, so VRECPS/VRSQRTS are a product and a difference, with
+    infinity times zero taken as +0). Compares, max/min, pairwise forms work on flushed operands. Every case,
+    NaN operands, infinities, invalid operations and denormals included, is computed inline: unlike task 5's VFP
+    operations, NaN-heavy inputs take no slower path. This holds under any FZ/DN setting of the host's MXCSR or FPCR
+    (only round to nearest is assumed), so the same code is exact on x64, on arm64 by default, and on arm64 with
+    native floating point when the guest's FPSCR is not in the standard mode.
+    - Operands known to hold no denormal are not flushed again: the emitter follows, within a straight stretch of code
+      (forgotten at labels, calls, conditional instructions and any other write), the D registers last written by a
+      floating-point helper (whose results never hold one), a copy, a constant without a denormal lane, VDUP of such a
+      lane, VABS/VNEG of one, or a conversion to single precision, and passes `known` bits.
+    - Estimates: arm64's FRECPE, FRSQRTE, URECPE and URSQRTE compute ARMv7's 8-bit estimates (ARMv8's RecipEstimate and
+      RecipSqrtEstimate are defined to; FRECPE/FRSQRTE on a flushed operand, the result fixed: with FPCR.FZ clear a
+      reciprocal of |x| >= 2^126 comes out denormal, which ARM flushes). On x64 the estimate is computed in single
+      precision from the table index (a division for the reciprocal, a square root for the other), which equals the
+      integer definition for all 256 indices of each table (checked by `simd_tests.cpp`, and IEEE single precision is
+      the same on every host).
+    - Conversions to integers: arm64's FCVTZS/FCVTZU (saturating, NaN to 0: ARM's); x64's CVTTPS2DQ corrected
+      (2^31 and above to 0x7FFFFFFF, NaN to 0; unsigned by subtracting 2^31 from large values, saturating at 2^32 and
+      at -1). Fixed point: the flushed value times 2^fraction (exact, or an infinity that saturates as the exact value
+      would), then the conversion; back, the integer rounded, then scaled exactly.
+    - **arm64 with native floating point** (`PSV_NATIVE_FLOAT`, task 5's option, off by default, not verified on a
+      device). NEON needs the FPCR in the standard mode (FZ and DN set), but task 5 mirrors the guest's FPSCR into the
+      FPCR (normally FZ = DN = 0). Resolution: each floating-point helper tests the `fpscr` local; when the guest's
+      FPSCR has FZ and DN set (so the FPCR has them), the operation is the host's instruction alone (volatile assembly:
+      FADD, FMUL, FABD, FCMxx, FACGx, FMAX/FMIN, FADDP/FMAXP/FMINP, FRECPE, FRSQRTE; VMLA as FMUL + FADD), otherwise the
+      checked code above, which is exact under any FPCR. Nothing changes the FPCR for NEON, so no new ordering between
+      FPCR writes and plain C floating-point code (task 5's compares) arises. The alternative of switching the FPCR to
+      the standard mode around runs of NEON floating-point instructions was measured statically and not taken: WipEout
+      2048 has 16402 such instructions in 2536 runs (6.5 per run; P4D 10.5), so it would cost two FPCR writes per 6.5
+      operations (glibc avoids FPCR writes as slow; their latency is unmeasured here), and 87% of WipEout's NEON
+      floating-point instructions are in functions that also do VFP compares or arithmetic in C, which clang may move
+      across the FPCR writes. Games that never set FZ and DN (WipEout and P4D were not seen to) run the checked code.
+  - **Loads and stores.** VLD1-4 / VST1-4 move whole registers: each 16 bytes (two registers) or 8 bytes by one host
+    access of that size (`psv_mldq`, `psv_mldd`: volatile, so not merged, split or removed, as the relaxed atomic
+    scalar accesses), never touching a byte the instruction does not; structure forms (de)interleave by constant byte
+    shuffles of those chunks; single lanes and all-lane forms load each element once. An element is single-copy atomic
+    where the host's access keeps it so (an aligned 8-byte part of it on x64 and arm64). With `PSV_ADDRESS_MASK`
+    (tests) each element is folded on its own, as before.
+  - `psvrecomp --neon-in-context` generates the code from before (byte for byte task 5's: checked on WipEout 2048's four
+    modules), every NEON instruction in the context form; `--no-q-locals` keeps NEON on values but no Q register as one
+    vector (two D locals).
 - **Reference interpreter** (`interp`, tests only). It is written from the ARM ARM pseudocode, independently of the
   generator, and shares only the decoder and the context layout. It has its own integer soft float. Two kinds of
   test compare generated code against it:

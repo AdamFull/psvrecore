@@ -17,6 +17,21 @@ target_include_directories(psvrecore_fuzz_code PUBLIC "${_fuzz_dir}" "${CMAKE_CU
 target_link_libraries(psvrecore_fuzz_code PUBLIC psvrecore::recomp_support)
 target_compile_definitions(psvrecore_fuzz_code PRIVATE PSV_ADDRESS_MASK=0xFFFF)
 psvrecore_generated_code(psvrecore_fuzz_code)
+# The Advanced SIMD corpus (fuzzgen --simd): blocks of one to three Advanced SIMD instructions, run from states whose
+# lanes hold each element size's edge values (generator_tests.cpp).
+set(PSVRECORE_FUZZ_SIMD_BLOCKS "8000" CACHE STRING "blocks in the generator's Advanced SIMD differential test corpus")
+set(_fuzz_simd_sources "${_fuzz_dir}/fuzzsimd_code_0.c" "${_fuzz_dir}/fuzzsimd_module.c" "${_fuzz_dir}/fuzzsimd_blocks.c")
+add_custom_command(
+    OUTPUT ${_fuzz_simd_sources} "${_fuzz_dir}/fuzzsimd_functions.h"
+    COMMAND fuzzgen "${_fuzz_dir}" "${PSVRECORE_FUZZ_SEED}" "${PSVRECORE_FUZZ_SIMD_BLOCKS}" --simd
+    DEPENDS fuzzgen
+    COMMENT "Generating the code generator's Advanced SIMD differential test corpus"
+    VERBATIM)
+add_library(psvrecore_fuzz_simd_code STATIC ${_fuzz_simd_sources})
+target_include_directories(psvrecore_fuzz_simd_code PUBLIC "${_fuzz_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/fuzz")
+target_link_libraries(psvrecore_fuzz_simd_code PUBLIC psvrecore::recomp_support)
+target_compile_definitions(psvrecore_fuzz_simd_code PRIVATE PSV_ADDRESS_MASK=0xFFFF)
+psvrecore_generated_code(psvrecore_fuzz_simd_code)
 
 # Unit tests: no game data and no SDK files. Written with nxtest, nx-foundation's test framework; its runner source
 # is compiled in here so nx-foundation's own test suites (NX_FOUNDATION_TESTS) need not be configured.
@@ -44,7 +59,7 @@ add_executable(psvrecore_tests
     gxm_translate_tests.cpp
 )
 target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")
-target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::analysis psvrecore::recomp_support psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code
+target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::analysis psvrecore::recomp_support psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code psvrecore_fuzz_simd_code
                                               nx::foundation zlib-ng::zlibstatic)
 psvrecore_target_defaults(psvrecore_tests)
 
@@ -65,7 +80,7 @@ psvrecore_target_defaults(corpusgen)
 # at return and the test compares them all; the other's leave only those a caller reads (see corpusgen.cpp).
 set(PSVRECORE_CODEGEN_TEST_ARGS "" CACHE STRING "more corpusgen options for the synthetic corpus' code (tests/codegen)")
 separate_arguments(_corpus_args NATIVE_COMMAND "${PSVRECORE_CODEGEN_TEST_ARGS}")
-set(_corpus_modules calls control flags integer integer_arm neon regs vfp vfp_locals)  # (one per file in codegen/corpus)
+set(_corpus_modules calls control flags integer integer_arm neon neon_locals regs vfp vfp_locals)  # (one per file in codegen/corpus)
 foreach(_config "" _masked _locals)
     set(_dir "${CMAKE_CURRENT_BINARY_DIR}/codegen${_config}")
     set(_corpus_sources${_config} "${_dir}/corpus_modules.c")

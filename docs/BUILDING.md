@@ -73,6 +73,8 @@ discrete GPU.
 | `PSVRECORE_GENERATED_CODE_NATIVE_FLOAT` | OFF | arm64 only, **not yet verified on a device**: generated code's floating point as the host's instructions (`PSV_NATIVE_FLOAT`: one instruction per VFP operation, no checks), the runtime keeping the host's FPCR mirroring the guest's FPSCR ([ARCHITECTURE.md](ARCHITECTURE.md), "VFP registers"; it is in the build signature). Off, the operations are the host's with an exact fallback, as on x64. [Device tests](#device-tests) check it |
 | `PSVRECORE_DEVICE_TESTS` | OFF | The [device tests](#device-tests) (`tests/device`): executables to push to an arm64 device and run there |
 | `PSVRECORE_HOST_CORPUSGEN` | empty | With `PSVRECORE_DEVICE_TESTS`: a corpusgen built for the build host, which translates the synthetic corpus for the device's codegen test (left out without it) |
+| `PSVRECORE_HOST_FUZZGEN` | empty | With `PSVRECORE_DEVICE_TESTS`: a fuzzgen built for the build host, which writes the random-block corpora for the device's fuzz test (left out without it) |
+| `PSVRECORE_FUZZ_SIMD_BLOCKS` | 8000 | Blocks in the generator's Advanced SIMD differential corpus (`fuzzgen --simd`, run by `psvrecore_tests`) |
 | `PSVRECORE_GENERATED_CODE_DEBUG` | `lines` | Debug information of generated code in builds that have it: `lines` (function names and line tables: debuggers' and profilers' symbols, simpleperf's and Tracy's `f_<address>`, under a third of the size of full debug information), `full` (types and variables too), `none` |
 
 ## The shared runtime library
@@ -381,19 +383,25 @@ python scripts/sample_check.py --sdk C:/path/to/sdk input_output_devices/api_tou
 
 Native floating point on arm64 (`PSVRECORE_GENERATED_CODE_NATIVE_FLOAT`) relies on the host's FPCR behaving as the
 guest's FPSCR does, which only an arm64 CPU can show; it is off by default until these tests have passed on a device.
-`tests/device` builds two executables with generated code's options (native floating point when the option is on):
+The Advanced SIMD helpers' arm64 forms (AArch64 instructions taken to compute ARMv7's results: the estimates, the
+conversions, the native floating-point path) can only be checked there too. `tests/device` builds three executables
+with generated code's options (native floating point when the option is on):
 `psvrecore_float_device_tests` (guest.h's typed operations against the interpreter: every arithmetic operation,
 compare and conversion in both precisions, in each FPSCR mode, 10.6 million cases by default, `PSV_FLOAT_CASES=<n>`
-for n random ones per operation and mode; and the hand-computed cases of `float_tests.cpp`) and
-`psvrecore_codegen_device_tests` (the synthetic corpus' generated functions against the interpreter, d0-d31 and the
-FPSCR compared at every exit; `CODEGEN_RUNS=<n>` runs per function, 48 by default). The corpus is translated on the
-build host, so build corpusgen for Windows first, then the device tests in a folder of their own (both with the option
-on, and once off, for the default operations on the same device):
+for n random ones per operation and mode; the hand-computed cases of `float_tests.cpp`; and `simd_tests.cpp`:
+guest_neon.h's single-precision helpers on every pair of edge values, every estimate's exponent and table index, the
+products at the smallest normal, with native floating point also on the native path), `psvrecore_codegen_device_tests`
+(the synthetic corpus' generated functions against the interpreter, d0-d31 and the FPSCR compared at every exit, the
+NEON corpus `neon_locals.s` included; `CODEGEN_RUNS=<n>` runs per function, 48 by default) and
+`psvrecore_fuzz_device_tests` (the random-block corpus and the Advanced SIMD corpus of fuzzgen, every NEON family
+with lanes at their edges, against the interpreter). The corpora are translated on the build host, so build corpusgen
+and fuzzgen for Windows first, then the device tests in a folder of their own (both with the option on, and once
+off, for the default operations on the same device):
 
 ```
-scripts\build.ps1 -Preset windows-x64-release -NoTest -Target corpusgen
-scripts\build.ps1 -Preset android-arm64-release -BuildDir build/android-native-tests -Target psvrecore_float_device_tests,psvrecore_codegen_device_tests -Define PSVRECORE_DEVICE_TESTS=ON,PSVRECORE_GENERATED_CODE_NATIVE_FLOAT=ON,PSVRECORE_HOST_CORPUSGEN=C:/path/to/psvrecore/build/windows-x64-release/tests/corpusgen.exe
-scripts\build.ps1 -Preset android-arm64-release -BuildDir build/android-portable-tests -Target psvrecore_float_device_tests,psvrecore_codegen_device_tests -Define PSVRECORE_DEVICE_TESTS=ON,PSVRECORE_GENERATED_CODE_NATIVE_FLOAT=OFF,PSVRECORE_HOST_CORPUSGEN=C:/path/to/psvrecore/build/windows-x64-release/tests/corpusgen.exe
+scripts\build.ps1 -Preset windows-x64-release -NoTest -Target corpusgen,fuzzgen
+scripts\build.ps1 -Preset android-arm64-release -BuildDir build/android-native-tests -Target psvrecore_float_device_tests,psvrecore_codegen_device_tests,psvrecore_fuzz_device_tests -Define PSVRECORE_DEVICE_TESTS=ON,PSVRECORE_GENERATED_CODE_NATIVE_FLOAT=ON,PSVRECORE_HOST_CORPUSGEN=C:/path/to/psvrecore/build/windows-x64-release/tests/corpusgen.exe,PSVRECORE_HOST_FUZZGEN=C:/path/to/psvrecore/build/windows-x64-release/tests/fuzzgen.exe
+scripts\build.ps1 -Preset android-arm64-release -BuildDir build/android-portable-tests -Target psvrecore_float_device_tests,psvrecore_codegen_device_tests,psvrecore_fuzz_device_tests -Define PSVRECORE_DEVICE_TESTS=ON,PSVRECORE_GENERATED_CODE_NATIVE_FLOAT=OFF,PSVRECORE_HOST_CORPUSGEN=C:/path/to/psvrecore/build/windows-x64-release/tests/corpusgen.exe,PSVRECORE_HOST_FUZZGEN=C:/path/to/psvrecore/build/windows-x64-release/tests/fuzzgen.exe
 ```
 
 Then, with the device connected (`adb devices` lists it; `-s <serial>` after `adb` picks one of several):
@@ -401,22 +409,26 @@ Then, with the device connected (`adb devices` lists it; `-s <serial>` after `ad
 ```
 adb push build/android-native-tests/tests/device/psvrecore_float_device_tests /data/local/tmp/psv_float_native
 adb push build/android-native-tests/tests/device/psvrecore_codegen_device_tests /data/local/tmp/psv_codegen_native
+adb push build/android-native-tests/tests/device/psvrecore_fuzz_device_tests /data/local/tmp/psv_fuzz_native
 adb push build/android-portable-tests/tests/device/psvrecore_float_device_tests /data/local/tmp/psv_float_portable
 adb push build/android-portable-tests/tests/device/psvrecore_codegen_device_tests /data/local/tmp/psv_codegen_portable
-adb shell chmod 755 /data/local/tmp/psv_float_native /data/local/tmp/psv_codegen_native /data/local/tmp/psv_float_portable /data/local/tmp/psv_codegen_portable
+adb push build/android-portable-tests/tests/device/psvrecore_fuzz_device_tests /data/local/tmp/psv_fuzz_portable
+adb shell chmod 755 /data/local/tmp/psv_float_native /data/local/tmp/psv_codegen_native /data/local/tmp/psv_fuzz_native /data/local/tmp/psv_float_portable /data/local/tmp/psv_codegen_portable /data/local/tmp/psv_fuzz_portable
 adb shell /data/local/tmp/psv_float_native
 adb shell /data/local/tmp/psv_codegen_native
+adb shell /data/local/tmp/psv_fuzz_native
 adb shell /data/local/tmp/psv_float_portable
 adb shell /data/local/tmp/psv_codegen_portable
+adb shell /data/local/tmp/psv_fuzz_portable
 adb shell PSV_FLOAT_CASES=1000000 /data/local/tmp/psv_float_native
 adb shell CODEGEN_RUNS=1000 /data/local/tmp/psv_codegen_native
 ```
 
 Each prints its cases and disagreements and ends with `N/N test cases passed` (exit status 0); the native runs print
-"native floating point" first. Any disagreement names the operation, the FPSCR mode and the operands. Passing native
-runs on the phones the games run on (both of them: their CPUs differ) are what turning the option on by default
-waits for; then build a game with `-Define PSVRECORE_GENERATED_CODE_NATIVE_FLOAT=ON` and compare its scripted run
-with the default build's.
+"native floating point" first. Any disagreement names the operation, the FPSCR mode and the operands (the fuzz test:
+the block's disassembly and its first state). Passing native runs on the phones the games run on (both of them: their
+CPUs differ) are what turning the option on by default waits for; then build a game with
+`-Define PSVRECORE_GENERATED_CODE_NATIVE_FLOAT=ON` and compare its scripted run with the default build's.
 
 ## ATRAC9 check (needs the PS Vita SDK)
 

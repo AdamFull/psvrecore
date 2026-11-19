@@ -420,6 +420,8 @@ bool memory(Emitter& e, const Instruction& in) {
 
 }  // namespace
 
+u64 simd_expand_imm(u32 op, u32 cmode, u32 imm8) { return expand_imm(op, cmode, imm8); }
+
 bool emit_simd(Emitter& e, const Instruction& in) {
     return immediate(e, in) || logic(e, in) || memory(e, in) || other(e, in) || long_ops(e, in) || shifts(e, in) || same(e, in) ||
            misc(e, in);

@@ -48,6 +48,11 @@ struct Options {
     // summary used (psvrecomp --vfp-calls-conservative).
     bool vfp_in_context = false;
     bool vfp_calls_conservative = false;
+    // Advanced SIMD in the context form everywhere, guest_simd.h's helpers with the locals synced around each
+    // instruction, as before the registers' values were translated (psvrecomp --neon-in-context); no Q register held
+    // as one vector local (psvrecomp --no-q-locals).
+    bool neon_in_context = false;
+    bool no_q_locals = false;
 };
 
 struct GeneratedFile {
@@ -111,6 +116,11 @@ struct Stats {
     usize vfp_simd_syncs = 0;
     usize vfp_s_held = 0;
     usize vfp_d_held = 0;
+    usize vfp_q_held = 0;      // Q registers held as one vector local
+    // Advanced SIMD: instructions translated on the registers' values, and in the context form (no translation on
+    // values; with --neon-in-context all of them)
+    usize neon_values = 0;
+    usize neon_context = 0;
     usize vfp_fused_compares = 0;
     usize vfp_fused_conditions = 0;
     // Instructions translated to a trap, by mnemonic (undefined, unimplemented, privileged...).

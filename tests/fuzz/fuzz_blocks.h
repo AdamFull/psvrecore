@@ -19,6 +19,9 @@ typedef struct FuzzBlock {
 
 extern const FuzzBlock fuzz_blocks[];
 extern const uint32_t fuzz_block_count;
+/* (fuzzgen --simd: Advanced SIMD instructions alone) */
+extern const FuzzBlock fuzzsimd_blocks[];
+extern const uint32_t fuzzsimd_block_count;
 
 #ifdef __cplusplus
 }

@@ -3,6 +3,7 @@
 //
 //   corpusgen <out-dir> [instructions-per-file] [--full-exit] [--no-callee-saved] [--registers-in-context]
 //             [--keep-registers all|loops|none] [--no-sp-check] [--vfp-in-context] [--vfp-calls-conservative]
+//             [--neon-in-context] [--no-q-locals]
 //
 // Output: <out-dir>/syn_<module>/syn_<module>_{functions.h,code_<k>.c,module.c} for each module (the layout of a
 // game's generated/code folder), <out-dir>/corpus_modules.c, the table of the modules' PsvModuleCode and of each
@@ -50,7 +51,7 @@ analysis::Program discover(const analysis::Image& image, const CorpusModule& m) 
 int main(int argc, char** argv) {
     bool full_exit = false, no_callee_saved = false, registers_in_context = false;
     nx::string keep = "all";
-    bool no_sp_check = false, vfp_in_context = false, vfp_calls_conservative = false;
+    bool no_sp_check = false, vfp_in_context = false, vfp_calls_conservative = false, neon_in_context = false, no_q_locals = false;
     nx::vector<const char*> args;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--full-exit") == 0) full_exit = true;
@@ -60,6 +61,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--no-sp-check") == 0) no_sp_check = true;
         else if (std::strcmp(argv[i], "--vfp-in-context") == 0) vfp_in_context = true;
         else if (std::strcmp(argv[i], "--vfp-calls-conservative") == 0) vfp_calls_conservative = true;
+        else if (std::strcmp(argv[i], "--neon-in-context") == 0) neon_in_context = true;
+        else if (std::strcmp(argv[i], "--no-q-locals") == 0) no_q_locals = true;
         else args.push_back(argv[i]);
     }
     if (args.size() != 1 && args.size() != 2) {
@@ -117,6 +120,8 @@ int main(int argc, char** argv) {
         gen.check_sp = !no_sp_check;
         gen.vfp_in_context = vfp_in_context;
         gen.vfp_calls_conservative = vfp_calls_conservative;
+        gen.neon_in_context = neon_in_context;
+        gen.no_q_locals = no_q_locals;
         gen.keep_registers = keep == "loops" ? analysis::KeepPolicy::Loops : keep == "none" ? analysis::KeepPolicy::None : analysis::KeepPolicy::All;
         const auto output = recomp::generate(program, gen);
         if (output.stats.register_effect_mismatches) {

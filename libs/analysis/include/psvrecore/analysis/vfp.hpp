@@ -7,8 +7,10 @@
 //
 // Units. The register file is 64 words (word k: vfp.s[k]; d<n> is words 2n and 2n+1). Each function holds d<n>
 // (n < 16) either as two float locals s<2n>, s<2n+1> or as one double local d<n>, by how its instructions access it;
-// d16-d31 are always doubles. A unit is one such local: an S register, or a whole D register. An access to part of a
-// unit (an S register of a D-held register, a byte lane) reads the whole unit. The FPSCR is two units: its NZCV
+// d16-d31 are always doubles; or, any Q register q<p> (d<2p> and d<2p+1>, p < 16) as one 16-byte vector local q<p>
+// (when its Advanced SIMD instructions access it whole often enough). A unit is one such local: an S register, a whole
+// D register, or a whole Q register. An access to part of a unit (an S register of a D-held register, a D register of
+// a Q-held one, a byte lane) reads the whole unit. The FPSCR is two units: its NZCV
 // (bits 31-28, what vcmp writes: the local `fpnzcv`) and the rest (FZ, DN, QC, the cumulative flags: `fpscr`).
 //
 // Per function, over its control-flow graph (cfg.hpp):
@@ -16,8 +18,9 @@
 // - a backward pass gives the live units: read by an instruction, or written to the context from their local at a
 //   call, an exit or a trap, before being written. A function reads at entry the units live there.
 // The places where code outside the function reads or writes the context: calls (direct, imports, through the
-// runtime, svc), Advanced SIMD instructions (their helpers work on the context's registers), exits (returns, jumps
-// through the runtime, tail calls, running into another function) and traps. Before each, the dirty units it may
+// runtime, svc), Advanced SIMD instructions the generator translates in their context form (guest_simd.h's helpers,
+// with psvrecomp --neon-in-context, and the few without a translation on values), exits (returns, jumps through the
+// runtime, tail calls, running into another function) and traps. Before each, the dirty units it may
 // read are written to the context; after a call or an Advanced SIMD instruction, the live units it may have written
 // are read back.
 //
@@ -59,6 +62,14 @@ inline constexpr VfpSet kNoVfp{}, kAllVfp{~0ull, kFpscrAll};
 constexpr u64 d_words(u32 n) { return 3ull << (2 * n); }
 // The words of D registers any of whose words are in `w` (both halves of each).
 constexpr u64 whole_d(u64 w) { return w | ((w & 0x5555555555555555ull) << 1) | ((w >> 1) & 0x5555555555555555ull); }
+constexpr u64 q_words(u32 p) { return 0xFull << (4 * p); }
+// The words of Q registers any of whose words are in `w` (all four of each).
+constexpr u64 whole_q(u64 w) {
+    u64 out = 0;
+    for (u32 p = 0; p < 16; ++p)
+        if (w & q_words(p)) out |= q_words(p);
+    return out;
+}
 
 // "s0-s3 d8 d16-d17 fpscr", or "none" (by words: a D register when both its words are in, else its S registers).
 nx::string vfp_names(VfpSet s);
@@ -70,6 +81,7 @@ struct VfpEffect {
     VfpSet defs;         // written through the locals, whole words
     u32 s_access = 0;    // d0-d15 accessed a word at a time (an S register, a 32-bit scalar, a lane): bit n
     u32 d_access = 0;    // D registers accessed whole: bit n (n < 32)
+    u32 q_access = 0;    // Q registers accessed whole (Advanced SIMD on values): bit p (p < 16)
     VfpSet context;      // read and written in the context instead (Advanced SIMD): there before it, read back after
     bool traps = false;  // its translation may stop inside it
 };
@@ -78,6 +90,8 @@ struct VfpOptions {
     // What direct calls may read and write from the callees' summaries; off: every call reads and writes everything
     // (psvrecomp --vfp-calls-conservative).
     bool summaries = true;
+    // Q registers may be held as one vector local (FunctionVfp::q_view); off: two D locals (psvrecomp --no-q-locals).
+    bool q_view = true;
     // Each function's instructions' effects (by code address, instruction index): the code generator's.
     const nx::map<u32, nx::vector<VfpEffect>>* effects = nullptr;
     // FunctionRegisters::returns_to_lr: which functions return to the address they were called with. Without it no
@@ -87,6 +101,7 @@ struct VfpOptions {
 
 struct FunctionVfp {
     u32 s_view = 0;        // bit n (n < 16): d<n> is held as two float locals; else (and d16-d31) as a double
+    u32 q_view = 0;        // bit p (p < 16): q<p> (d<2p>, d<2p+1>) is held as one vector local (not in s_view)
     VfpSet touched;        // the units it has locals for (words; both of a D-held register)
     VfpSet load_at_entry;  // read from the context at entry
     // What it may read and write of the context, its callees included (words of whole D registers; kAllVfp when
@@ -104,7 +119,14 @@ struct FunctionVfp {
     usize calls_keeping = 0;         // calls after which a live unit stays in its local (the callee does not write it)
 
     // The units of the words in `s`: both words of a D-held register any of whose words is in.
-    VfpSet units(VfpSet s) const { return {s.words | whole_d(s.words & ~s_words()), s.fpscr}; }
+    VfpSet units(VfpSet s) const { return {s.words | whole_d(s.words & ~s_words()) | whole_q(s.words & q_view_words()), s.fpscr}; }
+    // The words held in Q vector locals.
+    u64 q_view_words() const {
+        u64 w = 0;
+        for (u32 v = q_view; v; v &= v - 1) w |= q_words(static_cast<u32>(std::countr_zero(v)));
+        return w;
+    }
+    bool q_held_d(u32 n) const { return n < 32 && (q_view & (1u << (n / 2))); }
     // The words held as floats.
     u64 s_words() const {
         u64 w = 0;

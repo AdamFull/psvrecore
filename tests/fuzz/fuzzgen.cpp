@@ -1,7 +1,10 @@
 // fuzzgen — writes the code generator's differential test corpus: blocks of random ARM and Thumb instructions
 // (seeded, so every build has the same ones), translated by the code generator.
 //
-//   fuzzgen <out-dir> <seed> <blocks>
+//   fuzzgen <out-dir> <seed> <blocks> [--simd]
+//
+// --simd: the Advanced SIMD corpus instead (fuzzsimd_*: blocks of one to three Advanced SIMD instructions, at other
+// addresses, so that both corpora link into one test program).
 //
 // Output: fuzz_functions.h, fuzz_code_0.c, fuzz_module.c (the generator's), and fuzz_blocks.c, the table of blocks:
 // each block's instructions (encodings), its address and instruction set, and its generated function. The test
@@ -12,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "psvrecore/analysis/flow.hpp"
 #include "psvrecore/analysis/program.hpp"
@@ -112,25 +116,34 @@ struct Block {
     nx::vector<arm::Instruction> code;
 };
 
+bool g_simd = false;  // (--simd)
+
+bool simd_form(const arm::Instruction& in) {
+    const u32 w = in.raw;
+    if (in.mode == arm::Mode::Arm) return (w & 0xFE000000u) == 0xF2000000u || (w & 0xFF100000u) == 0xF4000000u;
+    return (w & 0xEF000000u) == 0xEF000000u || (w & 0xFF100000u) == 0xF9000000u;
+}
+
 Block make_block(Rng& rng, u32 address, bool thumb) {
     Block b;
     b.address = address;
     b.thumb = thumb;
-    const u32 count = 1 + rng.below(8);
+    const u32 count = g_simd ? 1 + rng.below(3) : 1 + rng.below(8);
     u32 at = address;
     arm::ItState it;
     while (b.code.size() < count || it.active()) {
         // Half of the instructions come from the floating-point and Advanced SIMD encoding spaces (rare among random
         // words).
-        const u32 focus_kind = rng.below(4);  // 0, 1: none; 2: VFP; 3: Advanced SIMD
+        const u32 focus_kind = g_simd ? 3u : rng.below(4);  // 0, 1: none; 2: VFP; 3: Advanced SIMD
         const bool focus = focus_kind >= 2;
         if (!thumb) {
             for (;;) {
                 u32 word = rng.u32v();
                 if (focus_kind == 2) word = (rng.below(15) << 28) | vfp_space(rng);
                 if (focus_kind == 3) word = simd_arm(rng);
+                if (g_simd && (word & 0xFF000000u) == 0xF4000000u && rng.below(2) == 0) continue;  // (fewer loads and stores)
                 const auto in = arm::decode_arm(word, at);
-                if (acceptable(in)) {
+                if (acceptable(in) && (!g_simd || simd_form(in))) {
                     b.code.push_back(in);
                     at += 4;
                     break;
@@ -139,7 +152,7 @@ Block make_block(Rng& rng, u32 address, bool thumb) {
             continue;
         }
         // Sometimes an IT block.
-        if (!it.active() && rng.below(6) == 0) {
+        if (!g_simd && !it.active() && rng.below(6) == 0) {
             const u32 firstcond = rng.below(14), mask = 1 + rng.below(15);
             const u16 hw = static_cast<u16>(0xBF00 | (firstcond << 4) | mask);
             arm::ItState trial = it;
@@ -163,7 +176,7 @@ Block make_block(Rng& rng, u32 address, bool thumb) {
             }
             if (!wide && arm::thumb_is_32bit(hw1)) continue;
             const auto in = arm::decode_thumb(hw1, hw2, at, trial);
-            if (in.op == Op::It || !acceptable(in)) continue;
+            if (in.op == Op::It || !acceptable(in) || (g_simd && !simd_form(in))) continue;
             it = trial;
             b.code.push_back(in);
             at += in.size;
@@ -176,17 +189,19 @@ Block make_block(Rng& rng, u32 address, bool thumb) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::fprintf(stderr, "usage: fuzzgen <out-dir> <seed> <blocks>\n");
+    if (argc == 5 && std::strcmp(argv[4], "--simd") == 0) g_simd = true;
+    else if (argc != 4) {
+        std::fprintf(stderr, "usage: fuzzgen <out-dir> <seed> <blocks> [--simd]\n");
         return 2;
     }
+    const char* name = g_simd ? "fuzzsimd" : "fuzz";
     const nx::fs::path_view dir(argv[1]);
     Rng rng{std::strtoull(argv[2], nullptr, 0) | 1};
     const u32 blocks = static_cast<u32>(std::strtoul(argv[3], nullptr, 0));
 
     // A writable segment holds every block (so no load is done at generation time: the test's memory is random).
     // Blocks run into a placeholder function of their instruction set.
-    constexpr u32 kBase = 0x81000000, kStride = 0x100, kEndArm = 0x80F00000, kEndThumb = 0x80F00011;
+    const u32 kBase = g_simd ? 0x84000000u : 0x81000000u, kStride = 0x100, kEndArm = kBase - 0x100000u, kEndThumb = kBase - 0x100000u + 0x11u;
     analysis::Segment seg;
     seg.base = kBase;
     seg.flags = elf::kSegmentRead | elf::kSegmentWrite | elf::kSegmentExecute;
@@ -213,7 +228,7 @@ int main(int argc, char** argv) {
     }
 
     recomp::Options options;
-    options.name = "fuzz";
+    options.name = name;
     options.instructions_per_file = 0xFFFFFFFFu;
     // (the test compares every condition flag after a block: each leaves all four, as an exported function does)
     for (const auto& [code, fn] : program.functions) options.full_exit_flags.push_back(code);
@@ -228,18 +243,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    nx::string table = "/* Generated by fuzzgen. */\n#include \"fuzz_functions.h\"\n#include \"fuzz_blocks.h\"\n\n";
+    nx::string table = nx::format("/* Generated by fuzzgen. */\n#include \"{}_functions.h\"\n#include \"fuzz_blocks.h\"\n\n", name);
     for (usize i = 0; i < all.size(); ++i) {
         table += nx::format("static const uint32_t raw_{}[] = {{", i);
         for (const auto& in : all[i].code) table += nx::format("0x{:08X}u, ", in.raw);
         table += "};\n";
     }
-    table += nx::format("\nconst FuzzBlock fuzz_blocks[{}] = {{\n", all.size());
+    table += nx::format("\nconst FuzzBlock {}_blocks[{}] = {{\n", name, all.size());
     for (usize i = 0; i < all.size(); ++i)
         table += nx::format("    {{0x{:08X}u, {}, {}, raw_{}, {}}},\n", all[i].address, all[i].thumb ? 1 : 0, all[i].code.size(), i,
                             recomp::function_name(all[i].address));
     table += "};\n";
-    table += nx::format("const uint32_t fuzz_block_count = {};\n", all.size());
+    table += nx::format("const uint32_t {}_block_count = {};\n", name, all.size());
 
     const auto write = [&](nx::string_view name, nx::string_view text) {
         const nx::string path = dir / nx::fs::path_view(name);
@@ -253,6 +268,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     for (const auto& f : output.files) write(f.name, f.text);
-    write("fuzz_blocks.c", table);
+    write(nx::format("{}_blocks.c", name), table);
     return 0;
 }

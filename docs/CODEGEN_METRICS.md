@@ -56,6 +56,7 @@ neither the tests nor the metrics need an ARM toolchain. Seven modules, one per 
 | `calls` | getters called in a loop, recursion, more than four arguments, C++-style virtual calls, callbacks, tail calls, Thumb-ARM interworking |
 | `vfp` | single and double precision: loops, compares that branch, conversions, square roots, division |
 | `neon` | VLD1/VST1 of every element size at any alignment, VLD2-4/VST2-4, float and integer lanes, widening, narrowing, saturation, permutes, tables, estimates, fixed-point conversion |
+| `neon_locals` | hand-written (task 6): one Q register as Q, D and S registers and VFP arithmetic on its lanes, NEON values across calls (q4-q7 clobbered or saved by callees, an indirect call), every VLD/VST form with writeback and at the end of the corpus' memory, VFP and NEON on the same registers in a loop, a 4x4 matrix product, vec4 normalisation (vrsqrte + Newton steps), a saturating s16 mix, an RGBA-to-luma conversion (widening multiplies, narrowing shifts), a vld1/vst1 copy |
 | `control` | hand-written: flags live at entry and returned by a callee, flags and a carry across calls, `pop {pc}` and `ldm` returns, tail branches, hand-made TBB/TBH, 4-instruction IT blocks, cbz/cbnz, conditional calls and returns in ARM code |
 | `flags` | hand-written, for the flag liveness: flags returned by a vcmp+vmrs helper and through a veneer (`ldr pc, =f`), read at entry through a direct call, an indirect call, a tail call and an indirect jump, setters under a condition at joins (Thumb and ARM), a carry through a loop, the shifter's carry read later, flags through a jump table, mrs/msr, a call under a condition to a function that never returns, an address-table switch reached with another table in its base register |
 
@@ -782,3 +783,287 @@ back to back, Windows x64 release (the runtime and generated code of each built 
   version, new then base with the final code): all four reach the opening movie and are at the same scenes at 40 s
   and 55 s, a few frames apart (the 8 s shot identical in both pairs), the same single gxm warning (the mask bit of
   DF32M_S8 surfaces), no traps; frames 1660 / 1657 and 1661 (new) / 1658 (base).
+
+## Advanced SIMD on values, Q registers in locals
+
+Measured 2026-11-19 and 20 with the same compilers and options. NEON instructions work on the floating-point locals'
+values (guest_neon.h's vector helpers), a Q register can be one vector local, and single-precision lanes are exact by a
+flush of the inputs and a fix of the results ([ARCHITECTURE.md](ARCHITECTURE.md), "Advanced SIMD"). "Before" is the
+generator at 10acc8b with its own headers and script. The corpus has one more module (`neon_locals`, between `neon` and
+`regs` in file order, so the later modules move), and the synthetic "before" is 10acc8b's corpusgen built on the new
+corpus. WipEout's and P4D's "before" are the trees from 10acc8b's psvrecomp (`build/wo-game-base`,
+`build/p4d-game-base`). The "native" columns are arm64 with `PSV_NATIVE_FLOAT` (`--flags-arm64=-DPSV_NATIVE_FLOAT
+--flags-arm64=-fdenormal-fp-math=dynamic`), before and after. That option stays off by default and has not been
+verified on a device. `docs/codegen_metrics_synthetic.json` now holds this change's x64 and default arm64 numbers, the
+baseline for the next change.
+
+The order of the work came from a static histogram of the NEON instructions in task 5's trees (`build/t6/neon_hist.py`).
+WipEout 2048 has 51044 NEON instructions in 1479360 (3.5%). 45408 of them are in 719 functions where NEON is at least
+10% of the code (30.7% there). By form: `vorr d` as a move 5828, `vmul.f32 q` 4719, `vdup.32 d` 3788, `vld1.8` of two
+registers 3570, `vst1.8` of two 3191, `vmla.f32 q` 2464, `vbif d` 1664, `vorr q` (move) 1548, `vdup.32 q` 1423,
+`vld1.32` to all lanes 1401, `vadd.f32 d` 1066, `vmul.f32 d` 1006, `vrsqrts.f32 q` 906, `vpadd.f32` 854, `vst1.32`
+lane 662, `vcgt.f32 d` 629. After those come the immediates, `vrsqrte`, `vext`, `vmls`, `vsli.64`, `vrecpe` and
+`vtrn`. Integer arithmetic (`psv_n3`) has 134 instructions in all; there are no long or narrow forms and no `vtbl`.
+P4D has 20147 NEON instructions, led by the same forms (`vorr d`, `vmul.f32 q`, `vmla.f32 q`, `vdup.32 q`, `vbif`,
+`vadd.f32 q`), plus 127 long forms and 39 `vtbl`. In task 5 the context was synced around each of these instructions:
+19409 stores of a VFP local before them or reloads after them in WipEout's code. So the order was: locals and the
+register moves first, then single-precision arithmetic, loads and stores, duplication, and then the rest, each family
+as vector code.
+
+### Synthetic corpus
+
+| | Functions | Guest | x64 before | x64 after | | arm64 before | arm64 after | | native before | native after | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 189 | 2659 | 11.36 | 9.21 | -18.9% | 9.12 | 7.06 | -22.6% | 6.66 | 4.61 | -30.7% |
+| Module `syn_calls` | 31 | 377 | 5.34 | 4.99 | -6.5% | 4.25 | 3.73 | -12.3% | 4.25 | 3.73 | -12.3% |
+| Module `syn_control` | 16 | 134 | 7.01 | 7.01 | +0.0% | 5.27 | 5.27 | +0.0% | 5.27 | 5.27 | +0.0% |
+| Module `syn_flags` | 19 | 146 | 6.97 | 6.97 | +0.0% | 5.40 | 5.40 | +0.0% | 5.24 | 5.24 | +0.0% |
+| Module `syn_integer` | 18 | 605 | 4.38 | 3.93 | -10.2% | 2.75 | 2.46 | -10.7% | 2.75 | 2.46 | -10.7% |
+| Module `syn_integer_arm` | 6 | 151 | 5.34 | 5.29 | -1.1% | 3.38 | 3.35 | -0.8% | 3.38 | 3.35 | -0.8% |
+| Module `syn_neon` | 13 | 194 | 22.61 | 11.06 | -51.1% | 15.45 | 5.32 | -65.6% | 15.63 | 5.67 | -63.7% |
+| Module `syn_neon_locals` | 14 | 201 | 34.00 | 18.91 | -44.4% | 27.12 | 11.53 | -57.5% | 26.41 | 11.16 | -57.7% |
+| Module `syn_regs` | 44 | 291 | 8.49 | 8.49 | +0.0% | 7.14 | 7.14 | +0.0% | 7.17 | 7.17 | +0.0% |
+| Module `syn_vfp` | 12 | 264 | 14.18 | 14.12 | -0.4% | 12.87 | 12.86 | -0.1% | 2.58 | 2.52 | -2.6% |
+| Module `syn_vfp_locals` | 16 | 296 | 18.05 | 17.97 | -0.4% | 17.02 | 17.05 | +0.1% | 4.52 | 4.41 | -2.5% |
+| Class integer | 99 | 1076 | 5.02 | 5.00 | -0.3% | 3.77 | 3.76 | -0.2% | 3.77 | 3.76 | -0.2% |
+| Class vfp | 32 | 585 | 16.20 | 16.05 | -0.9% | 14.98 | 14.92 | -0.4% | 3.95 | 3.79 | -4.0% |
+| Class neon | 32 | 733 | 17.74 | 10.08 | -43.2% | 12.99 | 5.57 | -57.1% | 12.87 | 5.59 | -56.5% |
+| Class call-heavy | 26 | 265 | 8.76 | 8.76 | +0.0% | 7.17 | 7.17 | +0.0% | 7.17 | 7.17 | +0.0% |
+
+Out-of-line helpers went from 4366 to 2490 instructions on x64, from 3340 to 1826 on arm64, and from 1653 to 44 with
+native floating point. Before, the out-of-line part held guest_simd.h's per-lane loops. Now it holds only the VFP
+operations' exact fallbacks. The integer and call modules move because clang, compiling the corpus' C for the
+Cortex-A9, vectorised some of their loops (`popcount_words` uses `vcnt`, `mac64` uses `vmlal.s32`, and `stack_args`
+copies with `vld1`/`vst1`).
+
+Per guest instruction (`build/t6/ops`: one function per row repeats the instruction 8 times, minus an empty function;
+a second instruction in a row keeps the chain dependent). The first table is the static count over every path. The
+second is the fall-through path that the compiler laid out as the likely one (`build/t6/ops/hot_ops.py`). Before,
+several helpers were out-of-line loops, so their fall-through path is only the call. Those "before" cells
+(`vrsqrte`/`vrsqrts`, `vqadd`, `vqdmulh`, `vclz`, `vzip`, `vtbl` on x64) understate what the code did.
+
+| Guest instructions (8 times each) | x64 before | x64 after | arm64 before | arm64 after | native before | native after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `vorr q0, q1, q1; vorr q1, q0, q0` | 2.0 | 0.1 | 2.0 | 0.1 | 2.0 | 0.1 |
+| `vmul.f32 q0, q0, q1` | 58.4 | 48.4 | 47.4 | 32.0 | 49.4 | 33.8 |
+| `vmla.f32 q0, q1, q2` | 91.8 | 49.4 | 64.4 | 33.0 | 66.4 | 35.8 |
+| `vmla.f32 q0, q1, d4[1]` | 92.8 | 49.1 | 66.1 | 33.2 | 68.1 | 39.0 |
+| `vadd.f32 d0, d0, d1` | 59.2 | 17.1 | 47.4 | 7.5 | 49.4 | 9.1 |
+| `vmul.f32 d0, d0, d1` | 59.2 | 36.8 | 47.4 | 32.0 | 49.4 | 34.6 |
+| `vsub.f32 q0, q0, q1` | 58.5 | 15.6 | 47.4 | 7.5 | 49.4 | 9.1 |
+| `vpadd.f32 d0, d0, d1` | 71.5 | 30.4 | 53.2 | 14.8 | 53.2 | 16.4 |
+| `vcgt.f32 d0, d0, d1` | 19.0 | 4.6 | 14.6 | 2.2 | 14.6 | 3.9 |
+| `vmax.f32 q0, q0, q1` | 109.9 | 22.6 | 79.6 | 11.9 | 79.6 | 13.5 |
+| `vrsqrte.f32 q0, q0` | 325.5 | 70.6 | 85.0 | 7.1 | 85.0 | 8.8 |
+| `vrsqrts.f32 q0, q0, q1` | 128.2 | 27.5 | 103.9 | 15.9 | 103.9 | 15.9 |
+| `vrecpe.f32 d0, d0` | 72.1 | 52.4 | 59.1 | 7.1 | 59.1 | 8.8 |
+| `vcvt.s32.f32 d0, d0; vcvt.f32.s32 d0, d0` | 23.8 | 3.3 | 24.4 | 1.2 | 24.4 | 1.2 |
+| `vdup.32 q0, d2[1]; vdup.32 q1, d0[0]` | 0.6 | 0.2 | 0.2 | 0.2 | 0.2 | 0.2 |
+| `vbsl q0, q1, q2` | 4.4 | 4.4 | 1.5 | 1.5 | 1.5 | 1.5 |
+| `vext.32 d0, d0, d1, #1` | 3.6 | 0.4 | 3.5 | 0.5 | 3.5 | 0.5 |
+| `vzip.8 q0, q1` | 54.8 | 8.1 | 41.2 | 1.4 | 41.2 | 1.4 |
+| `vtbl.8 d0, {d1, d2}, d0` | 82.2 | 41.0 | 74.5 | 3.9 | 74.5 | 3.9 |
+| `vadd.i32 q0, q0, q1` | 2.5 | 0.6 | 2.1 | 0.6 | 2.1 | 0.6 |
+| `vqadd.s16 q0, q0, q1` | 146.0 | 11.9 | 45.6 | 7.8 | 45.6 | 7.8 |
+| `vshl.s16 q0, q0, q1` (by register) | 231.4 | 36.2 | 201.4 | 7.0 | 201.4 | 7.0 |
+| `vshr.u16 q0, q0, #3; vadd.i16 q0, q0, q1` | 8.7 | 1.2 | 8.4 | 1.1 | 8.4 | 1.1 |
+| `vmull.s16 q0, d2, d3; vmovn.i32 d2, q0` | 5.4 | 1.1 | 3.2 | 0.7 | 3.2 | 0.7 |
+| `vqmovn.s32 d0, q1; vmovl.s16 q1, d0` | 5.3 | 1.8 | 5.1 | 1.6 | 5.1 | 1.6 |
+| `vqdmulh.s16 q0, q0, q1` | 208.2 | 25.5 | 44.5 | 13.0 | 44.5 | 13.0 |
+| `vabd.u8 q0, q0, q1` | 43.0 | 4.4 | 32.0 | 1.4 | 32.0 | 1.4 |
+| `vpaddl.u8 q0, q0` | 24.0 | 4.4 | 16.2 | 4.1 | 16.2 | 4.1 |
+| `vcnt.8 d0, d0` | 82.1 | 20.6 | 38.1 | 1.4 | 38.1 | 1.4 |
+| `vclz.i32 q0, q0` | 126.8 | 40.9 | 37.0 | 0.4 | 37.0 | 0.4 |
+| `vld1.8 {d0, d1}, [r0]!; veor q1, q1, q0` | 5.6 | 1.9 | 4.9 | 1.9 | 4.9 | 1.9 |
+| `vst1.8 {d2, d3}, [r0]!; vadd.i8 q1, q1, q2` | 20.9 | 1.9 | 16.9 | 1.9 | 16.9 | 1.9 |
+| `vld1.32 {d0[]}, [r0]!; vadd.i32 d1, d1, d0` | 7.3 | 2.6 | 4.3 | 2.1 | 4.3 | 2.1 |
+| `vst1.32 {d0[1]}, [r0]!; vadd.i32 d0, d0, d1` | 3.3 | 2.9 | 2.5 | 2.4 | 2.5 | 2.4 |
+| `vld2.16 {d0, d1}, [r0]!; vadd.i16 q1, q1, q0` | 29.6 | 5.9 | 24.8 | 2.6 | 24.8 | 2.6 |
+| `vld4.8 {d0, d1, d2, d3}, [r0]!; vadd.i8 q2, q2, q0` | 66.7 | 19.6 | 63.1 | 3.8 | 63.1 | 3.8 |
+| `vst3.8 {d0, d1, d2}, [r0]!; vadd.i8 d0, d0, d3` | 57.1 | 17.3 | 51.9 | 5.2 | 51.9 | 5.2 |
+
+Fall-through path:
+
+| Guest instructions (8 times each) | x64 before | x64 after | arm64 before | arm64 after | native after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `vmul.f32 q0, q0, q1` | 40.6 | 23.2 | 31.6 | 14.1 | 14.6 |
+| `vmla.f32 q0, q1, q2` | 61.5 | 25.6 | 40.8 | 14.8 | 15.2 |
+| `vadd.f32 d0, d0, d1` | 41.5 | 16.5 | 31.6 | 7.4 | 8.0 |
+| `vsub.f32 q0, q0, q1` | 40.8 | 15.1 | 31.6 | 7.4 | 8.0 |
+| `vpadd.f32 d0, d0, d1` | 58.2 | 29.5 | 41.6 | 14.6 | 15.2 |
+| `vcgt.f32 d0, d0, d1` | 18.4 | 4.4 | 14.8 | 2.1 | 2.8 |
+| `vmax.f32 q0, q0, q1` | 99.8 | 22.1 | 71.8 | 11.8 | 12.4 |
+| `vrsqrte.f32 q0, q0` | 244.8 | 69.2 | 6.1 | 7.0 | 7.6 |
+| `vrsqrts.f32 q0, q0, q1` | 16.5 | 26.5 | 12.1 | 15.8 | 15.8 |
+| `vrecpe.f32 d0, d0` | 35.6 | 51.0 | 25.2 | 7.0 | 7.6 |
+| `vcvt.s32.f32 d0, d0; vcvt.f32.s32 d0, d0` | 22.2 | 3.3 | 21.2 | 1.1 | 1.1 |
+| `vzip.8 q0, q1` | 6.2 | 7.6 | 41.1 | 1.5 | 1.5 |
+| `vtbl.8 d0, {d1, d2}, d0` | 27.9 | 40.2 | 42.8 | 3.8 | 3.8 |
+| `vqadd.s16 q0, q0, q1` | 81.1 | 10.9 | 4.8 | 7.9 | 7.9 |
+| `vshl.s16 q0, q0, q1` | 51.8 | 35.5 | 46.0 | 6.9 | 6.9 |
+| `vqdmulh.s16 q0, q0, q1` | 193.0 | 24.5 | 5.1 | 13.1 | 13.1 |
+| `vabd.u8 q0, q0, q1` | 41.8 | 4.4 | 32.0 | 1.2 | 1.2 |
+| `vcnt.8 d0, d0` | 81.4 | 20.1 | 38.2 | 1.2 | 1.2 |
+| `vclz.i32 q0, q0` | 15.6 | 40.5 | 37.1 | 0.2 | 0.2 |
+| `vst1.8 {d2, d3}, [r0]!; vadd.i8 q1, q1, q2` | 20.3 | 1.9 | 16.8 | 2.0 | 2.0 |
+| `vld4.8 {d0, d1, d2, d3}, [r0]!; vadd.i8 q2, q2, q0` | 66.2 | 19.1 | 63.1 | 3.9 | 3.9 |
+
+Moves, `vneg`, `vrev`, `vtrn`, `vdup` and the logic operations fold into their neighbours in both versions (0.0 to
+1.0 per instruction). Weighted by WipEout's 24 most frequent forms (37819 of its NEON instructions), the static count
+per NEON instruction goes from 30.2 to 14.5 on x64 and from 21.5 to 9.0 on arm64.
+
+Single precision is the expensive part. Each operation flushes denormal input lanes (a compare of the absolute value
+with 2^-126 and a mask, skipped for operands that an earlier NEON float operation in the same straight stretch already
+produced) and fixes the result (NaN lanes to the default NaN, lanes below 2^-126 to a signed zero). A multiply also
+tests for a product that rounds to exactly 2^-126, where flush-to-zero before rounding differs from the host's after
+rounding. That test is about 4 inline instructions, plus a never-taken branch of about 15 instructions on x64 and 8 on
+arm64 that the static count includes (`vmul.f32 d` 36.8 vs `vadd.f32 d` 17.1 on x64). Native floating point does not
+lower the static count on its own: unless the guest's FPSCR is known, each operation holds both the host instruction
+(taken when FZ and DN are set) and the checked code (taken otherwise). The estimates are FRECPE/FRSQRTE (and
+URECPE/URSQRTE) on arm64 and about 50 to 70 instructions of exact integer formulas on x64. Conversions are
+FCVTZS/FCVTZU on arm64 and cvttps2dq corrected for out-of-range lanes on x64.
+
+What the code does in time (x64 only). `build/t4/bench2.py` runs the corpus' functions through the differential test's
+harness, both programs alternately, 6 rounds each, pinned to one logical CPU at high priority. This was done twice, on
+two CPUs, while this session ran nothing else. The geometric means:
+
+| | Functions | CPU 2: before | after | | CPU 8: before | after | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| All | 136 | 40.92 ns | 32.40 ns | -20.8% | 41.48 ns | 33.09 ns | -20.2% |
+| Class integer | 55 | 23.49 | 23.04 | -1.9% | 23.70 | 23.64 | -0.2% |
+| Class call-heavy | 25 | 24.24 | 24.01 | -0.9% | 24.71 | 24.61 | -0.4% |
+| Class vfp | 27 | 67.08 | 65.64 | -2.2% | 68.06 | 66.42 | -2.4% |
+| Class neon | 29 | 116.24 | 41.49 | -64.3% | 118.13 | 42.24 | -64.2% |
+
+The integer and call-heavy classes, whose code barely changed, moved by -1.9% to -0.2%, which is the noise here.
+Single unchanged functions moved by up to about +13% (`stack_args` 32 to 36-37 ns, `cvt_all` 52 to 57-58 ns). NEON
+functions, CPU 2 (CPU 8 within 3%): `neon_mat4` 4813 -> 946 ns, `nl_mat4x4` 2771 -> 477, `nl_normalize` 1780 -> 594,
+`neon_add_f32` 552 -> 46, `neon_complex` 507 -> 39, `popcount_words` 613 -> 49, `nl_color` 342 -> 92, `neon_fixed`
+328 -> 34, `nl_calls` 274 -> 60, `nl_alias` 142 -> 29, `neon_threshold` 94 -> 17, `nl_copy` 55 -> 30, `mixed_neon`
+57 -> 38. Slower: `mac64` 31 -> 36 ns. Its loop's `vmlal.s32` has no SSE2 instruction (PMULDQ is SSE4.1), so clang
+builds each 64-bit product from three PMULUDQ and sign corrections, where 10acc8b's per-lane loop used scalar
+multiplies (KNOWN_ISSUES.md). `neon_permute` 10.7 -> 11.6 ns.
+
+### WipEout 2048
+
+Regenerated with this generator into this worktree's game build (`build/wo-game`). "Before" is 10acc8b's tree.
+
+| | Functions | Guest | x64 before | x64 after | | arm64 before | arm64 after | | native before | native after | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 16658 | 1479360 | 4.00 | 3.56 | -11.2% | 3.53 | 3.17 | -10.2% | 3.11 | 2.74 | -11.8% |
+| Module `wo_eboot` | 14792 | 1350786 | 4.03 | 3.54 | -12.2% | 3.56 | 3.16 | -11.1% | 3.15 | 2.74 | -12.8% |
+| Module `wo_libc` | 1201 | 65672 | 4.44 | 4.43 | -0.1% | 3.83 | 3.83 | +0.2% | 2.89 | 2.89 | -0.1% |
+| Module `wo_libfios2` | 520 | 39042 | 3.04 | 3.04 | +0.0% | 2.62 | 2.62 | +0.0% | 2.62 | 2.62 | +0.0% |
+| Module `wo_libult` | 145 | 23860 | 2.80 | 2.80 | +0.0% | 2.64 | 2.64 | +0.0% | 2.64 | 2.64 | +0.0% |
+| Class integer | 10290 | 757832 | 2.83 | 2.82 | -0.4% | 2.51 | 2.50 | -0.4% | 2.48 | 2.47 | -0.3% |
+| Class vfp | 1444 | 224442 | 5.61 | 5.24 | -6.6% | 5.21 | 5.00 | -4.1% | 3.00 | 2.67 | -11.1% |
+| Class neon | 663 | 122161 | 12.56 | 7.87 | -37.4% | 9.93 | 6.00 | -39.6% | 9.16 | 5.35 | -41.6% |
+| Class call-heavy | 4261 | 374925 | 2.63 | 2.62 | -0.0% | 2.51 | 2.51 | +0.0% | 2.49 | 2.49 | +0.0% |
+| `f_8311A9C8` (integer) | 1 | 383 | 3.52 | 3.52 | +0.0% | 2.42 | 2.42 | +0.0% | 2.42 | 2.42 | +0.0% |
+| `f_8128DB48` (neon) | 1 | 443 | 9.70 | 6.70 | -31.0% | 8.45 | 5.18 | -38.7% | 7.32 | 4.06 | -44.5% |
+| `f_813BAC40` (vfp) | 1 | 408 | 5.41 | 4.83 | -10.9% | 4.16 | 3.56 | -14.4% | 3.73 | 3.18 | -14.6% |
+| `f_812FC59A` (neon) | 1 | 1125 | 9.66 | 7.63 | -21.0% | 8.71 | 5.61 | -35.6% | 7.22 | 4.04 | -44.0% |
+| `f_812FC39E` (neon) | 1 | 117 | 43.48 | 24.48 | -43.7% | 32.40 | 17.02 | -47.5% | 33.29 | 18.71 | -43.8% |
+| `f_81276E14` (neon) | 1 | 112 | 20.48 | 12.14 | -40.7% | 14.80 | 7.48 | -49.5% | 14.71 | 7.69 | -47.7% |
+| `f_8127A712` (neon) | 1 | 123 | 17.41 | 11.44 | -34.3% | 12.41 | 8.20 | -33.9% | 10.98 | 6.67 | -39.3% |
+| `f_8118C300` (neon) | 1 | 716 | 14.82 | 8.33 | -43.8% | 12.09 | 6.40 | -47.0% | 11.45 | 7.13 | -37.8% |
+| `f_813C32DC` (integer) | 1 | 31 | 4.84 | 4.84 | +0.0% | 3.65 | 3.65 | +0.0% | 3.65 | 3.65 | +0.0% |
+| `f_812A7EDC` (neon) | 1 | 475 | 6.91 | 6.25 | -9.6% | 6.21 | 5.74 | -7.7% | 3.92 | 2.90 | -25.8% |
+
+Out-of-line helpers went from 68062 to 30732 instructions on x64, from 53687 to 23513 on arm64, and from 35843 to 707
+native. The NEON class drops by 37-42%. The executable drops by 11-13%. The VFP class drops by 4-11% because the
+float functions with a few NEON instructions no longer sync their locals around them. Of the hot ten, the eight NEON
+and VFP functions shrink by 8-50%. In `f_8118C300` (a 716-instruction mix of vmul/vmla.f32 on Q registers, vbif and
+compares) the arm64 code still spends most of its instructions on the checked path's masks: of 4591 instructions,
+554 are BIC, 237 FACGT, 213 FMUL, 203 DUP and 244 AND.
+
+What psvrecomp reports for `wo_eboot` (before is task 5's psvrecomp, from that section):
+
+| | Functions with VFP locals | D registers as two floats / as a double | Read at entry | Store places | Reloads (after Advanced SIMD) | Calls keeping a live local | Advanced SIMD on values / in the context form | Q registers as one vector |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 2482 | 8952 / 1995 | 11251 | 14058 | 15156 (9174) | 6160 | 0 / 50590 | 0 |
+| after | 2625 | 6158 / 3316 | 11920 | 11490 | 10004 (0) | 8046 | 50590 / 0 | 3942 |
+
+`wo_libc` translates 454 NEON instructions on values (8 Q registers held as one vector). In every module of WipEout
+and P4D, every NEON instruction is translated on values. `psvrecomp --neon-in-context` writes 10acc8b's code byte for
+byte (WipEout's four modules compared). The generated source grows from 256.9 MB to 258.1 MB, and the game's
+executable shrinks from 26.9 MB to 24.0 MB.
+
+`f_813BAC40` grew by 4.8% (x64) and 24% (arm64) in task 5. The cause, from objects compiled with and without inlining
+at each step: most of its code is clang inlining its same-file callee `f_813BB144` (5 call sites) once that callee
+became small enough (task 3 on x64, task 5 on arm64). Loop peeling in task 4 duplicated three of the inlined sites.
+Task 4's full register flush at each of its 9 calls added 213 instructions, and task 5 added the VFP write-backs at
+calls and the FZ copy of each typed operation with its two cold calls. Without inlining it is 1687 / 1624 / 1642 /
+1773 x64 instructions and 1481 / 1433 / 1367 / 1485 arm64 instructions at tasks 2 / 3 / 4 / 5. So the metric counts
+the callee's inlined body in the caller (`/Ob2`). The fixes belong to the per-callee live-in summaries (calls) and the
+typed operations' FZ duplication, not this change. Here it shrinks to 4.83 (x64) and 3.56 (arm64).
+
+### Persona 4 Dancing All Night
+
+Regenerated into `build/p4d-game`. "Before" is 10acc8b's tree. No native columns.
+
+| | Functions | Guest | x64 before | x64 after | | arm64 before | arm64 after | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 16704 | 1164693 | 5.33 | 5.10 | -4.5% | 5.04 | 4.81 | -4.4% |
+| Module `p4d_eboot` | 12440 | 741511 | 5.40 | 5.08 | -5.9% | 4.95 | 4.64 | -6.1% |
+| Module `p4d_libc` | 1554 | 83418 | 4.34 | 4.35 | +0.1% | 3.79 | 3.80 | +0.1% |
+| Module `p4d_libface` | 451 | 29920 | 6.80 | 6.58 | -3.2% | 6.54 | 6.32 | -3.4% |
+| Module `p4d_libfios2` | 577 | 47768 | 3.26 | 3.26 | +0.0% | 2.81 | 2.81 | +0.0% |
+| Module `p4d_libsmart` | 1522 | 241328 | 5.88 | 5.73 | -2.5% | 6.16 | 6.05 | -1.9% |
+| Module `p4d_libult` | 160 | 20748 | 3.32 | 3.32 | +0.0% | 3.02 | 3.02 | +0.0% |
+| Class integer | 9093 | 568416 | 3.27 | 3.27 | -0.0% | 2.82 | 2.82 | -0.0% |
+| Class vfp | 2723 | 421903 | 7.57 | 7.37 | -2.7% | 7.71 | 7.52 | -2.6% |
+| Class neon | 147 | 28863 | 18.04 | 11.43 | -36.6% | 14.62 | 8.52 | -41.8% |
+| Class call-heavy | 4741 | 145511 | 4.38 | 4.38 | +0.0% | 4.03 | 4.03 | +0.0% |
+
+Out-of-line helpers went from 49685 to 33363 instructions on x64 and from 38276 to 25234 on arm64. psvrecomp: the
+executable has 16517 NEON instructions on values and 1228 Q registers held as one vector, libsmart has 2824 and 122,
+libface 468 and 34, and libc 338 and 3. The executable is 20.96 MB before and 19.88 MB after.
+
+### Compile time
+
+Compile time for one file, the one holding the hot NEON functions (`wo_eboot_code_49.c`; `_41.c` in parentheses), on
+one core:
+
+- x64 `/O2`: 5.2 -> 4.1 s (4.9 -> 3.8 s).
+- x64 `/Od`: 10.4 -> 2.2 s (9.9 -> 2.4 s), objects 20.0 -> 2.4 MB (19.0 -> 2.7 MB). Before, every NEON instruction
+  expanded inline into lane loops over the context.
+- arm64 `-O2`: 7.0 -> 4.9 s; native 6.5 -> 5.0 s.
+- arm64 `-O0`: 25.1 -> 2.8 s (objects 22.8 -> 2.0 MB).
+
+With `PSVRECORE_GENERATED_CODE_ARCH` (helpers compiled alone, instructions) at x86-64-v2 / v3 against plain x86-64:
+`vtbl` 50 -> 27 / 24 (PSHUFB), `vqdmull` 70 -> 38 / 26, a shift by register 150 -> 126 / 65, `vmull` 7 -> 4, the
+narrowing forms 31 -> 18 / 16, `vclz` 43 -> 43 / 34, `vrsqrte` (integer) 42 -> 26 / 29. Single precision hardly
+changes, because v3's FMA is not used for these unfused operations. Plain x86-64 objects contain no instruction later
+than SSE2 (PMAXUB and PMINUB are SSE2).
+
+### Checks
+
+- Differential: fuzzgen's Advanced SIMD corpus (`psvrecore_fuzz_simd_code`, 8000 blocks of 1-3 NEON instructions,
+  96000 runs from states with lanes at their edges) gave 0 disagreements. The main fuzz corpus (2000 blocks, 8000
+  runs) gave 0. `simd_tests.cpp` gave 0 on every pair of 46 single-precision edge values through each helper (39556
+  runs), every estimate index (131072 runs) and 50913 products near 2^-126. The synthetic corpus gave 0 in 6576 runs
+  in each of the three configurations, with a faulting page after the corpus' memory in the production one.
+- Faults put in by hand, each caught. Swapped zip lanes: 71 fuzz disagreements. No saturation in vqadd: 1047. No QC
+  from vqmovn: 1333. No product test at 2^-126: 15428 edge products and 93 helper pairs. The fix threshold off by one:
+  225 helper pairs and 2 fuzz runs. An integer result marked "known flushed": 9 fuzz runs (0 in the corpus). No
+  write-back of a Q local before a call: 1395 corpus runs and 32119 fuzz runs. A vld3 reading 8 bytes past its
+  operands: an access violation on the corpus' guard page.
+
+### Games
+
+Hidden runs (`--hidden`), each with its own data, settings and shots. The build from 10acc8b's generator and this one
+ran back to back as Windows x64 release builds (the runtime and generated code of each built from its own tree). The
+CPU time of each thread was sampled at the shot mark (`build/t6/run_game_cpu.ps1`).
+
+- WipEout 2048, the race script, two pairs (base then new, new then base). All four runs are on lap 1/3 in 8th place
+  at the 199 s shot, shield 89%. Race times are 1:47.69 and 1:47.68 (base) and 1:47.69 and 1:47.67 (new), and frames
+  drawn are 11908 and 11910 (base) and 11916 and 11904 (new). The main game thread's CPU time at 199 s is 35.0 s and
+  32.7 s for base and 23.2 s and 22.7 s for new (about -32%). The render thread is unchanged (44.5-46.7 s). Every run
+  has the same four distinct warnings (audio port behind, an untranslated GXP program, depthf, system module 0x002d
+  twice) and no traps.
+- Persona 4 Dancing All Night, the fixed-time run (shots at 3-55 s), two pairs. All four runs reach the opening movie.
+  The 8 s shot is identical in all four, the 55 s shot is identical in base-1 and new-1, and the others show the same
+  scenes a few frames apart. Frames drawn are 1661 and 1660 (base) and 1659 and 1659 (new). The same two warnings
+  appear (audio, the mask bit of DF32M_S8) and there are no traps. In this phase the game's main thread uses about
+  0.5 s of CPU (the movie decoder thread about 7 s), so the run shows no CPU difference.

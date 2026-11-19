@@ -677,4 +677,6 @@ PSV_INLINE void psv_ndup(PsvContext* PSV_RESTRICT ctx, uint32_t esize, uint32_t 
     psv_vput(ctx, d, regs, r);
 }
 
+#include "psvrecore/recomp/guest_neon.h"
+
 #endif /* PSVRECORE_RECOMP_GUEST_SIMD_H */

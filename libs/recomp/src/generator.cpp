@@ -100,6 +100,7 @@ nx::string Emitter::vs(u32 k) {
     vaccess_.uses.words |= 1ull << k;
     if (k < 32) vaccess_.s_access |= 1u << (k / 2);
     const u32 n = k / 2;
+    if (vfp_ && vfp_->q_held_d(n)) return nx::format("psv_vqf(q{}, {})", n / 2, k % 4);
     if (!vfp_ || vfp_->s_held(n)) return nx::format("s{}", k);
     return nx::format("psv_v{}32(d{})", (k & 1) ? "hi" : "lo", n);
 }
@@ -108,6 +109,7 @@ nx::string Emitter::vd(u32 n) {
     n &= 31;
     vaccess_.uses.words |= analysis::d_words(n);
     vaccess_.d_access |= 1u << n;
+    if (vfp_ && vfp_->q_held_d(n)) return nx::format("psv_vd(psv_q{}(q{}))", (n & 1) ? "hi" : "lo", n / 2);
     if (vfp_ && vfp_->s_held(n)) return nx::format("psv_vpack64(s{}, s{})", 2 * n, 2 * n + 1);
     return nx::format("d{}", n);
 }
@@ -117,7 +119,8 @@ void Emitter::set_vs(u32 k, nx::string_view value) {
     vaccess_.defs.words |= 1ull << k;
     if (k < 32) vaccess_.s_access |= 1u << (k / 2);
     const u32 n = k / 2;
-    if (!vfp_ || vfp_->s_held(n)) line(nx::format("s{} = {};", k, value));
+    if (vfp_ && vfp_->q_held_d(n)) line(nx::format("q{0} = psv_vqsetf(q{0}, {1}, {2});", n / 2, k % 4, value));
+    else if (!vfp_ || vfp_->s_held(n)) line(nx::format("s{} = {};", k, value));
     else line(nx::format("d{0} = psv_vset{1}64(d{0}, {2});", n, (k & 1) ? "hi" : "lo", value));
 }
 
@@ -125,12 +128,75 @@ void Emitter::set_vd(u32 n, nx::string_view value) {
     n &= 31;
     vaccess_.defs.words |= analysis::d_words(n);
     vaccess_.d_access |= 1u << n;
-    if (vfp_ && vfp_->s_held(n)) {
+    if (vfp_ && vfp_->q_held_d(n)) {
+        line(nx::format("q{0} = psv_qset{1}(q{0}, psv_dv({2}));", n / 2, (n & 1) ? "hi" : "lo", value));
+    } else if (vfp_ && vfp_->s_held(n)) {
         const nx::string t = temp("v");
         line(nx::format("const double {0} = {1}; s{2} = psv_vlo32({0}); s{3} = psv_vhi32({0});", t, value, 2 * n, 2 * n + 1));
     } else {
         line(nx::format("d{} = {};", n, value));
     }
+}
+
+// A D register's local as a D value (PsvD), whatever holds it (no access recorded).
+nx::string Emitter::dv_of(u32 n) const {
+    if (vfp_ && vfp_->q_held_d(n)) return nx::format("psv_q{}(q{})", (n & 1) ? "hi" : "lo", n / 2);
+    if (vfp_ && vfp_->s_held(n)) return nx::format("psv_dvf(s{}, s{})", 2 * n, 2 * n + 1);
+    return nx::format("psv_dv(d{})", n);
+}
+
+// Writes a D register's local from a D value expression (evaluated once; no access recorded).
+void Emitter::dv_assign(u32 n, nx::string_view value) {
+    if (vfp_ && vfp_->q_held_d(n)) {
+        line(nx::format("q{0} = psv_qset{1}(q{0}, {2});", n / 2, (n & 1) ? "hi" : "lo", value));
+    } else if (vfp_ && vfp_->s_held(n)) {
+        const nx::string t = temp("v");
+        line(nx::format("const PsvD {0} = {1}; s{2} = psv_vdf({0}, 0); s{3} = psv_vdf({0}, 1);", t, value, 2 * n, 2 * n + 1));
+    } else {
+        line(nx::format("d{} = psv_vd({});", n, value));
+    }
+}
+
+nx::string Emitter::vdv(u32 n) {
+    n &= 31;
+    vaccess_.uses.words |= analysis::d_words(n);
+    vaccess_.d_access |= 1u << n;
+    return dv_of(n);
+}
+
+void Emitter::set_vdv(u32 n, nx::string_view value) {
+    n &= 31;
+    vaccess_.defs.words |= analysis::d_words(n);
+    vaccess_.d_access |= 1u << n;
+    dv_assign(n, value);
+}
+
+nx::string Emitter::vq(u32 p) {
+    p &= 15;
+    vaccess_.uses.words |= analysis::q_words(p);
+    vaccess_.q_access |= 1u << p;
+    if (vfp_ && vfp_->q_held_d(2 * p)) return nx::format("q{}", p);
+    return nx::format("psv_qcat({}, {})", dv_of(2 * p), dv_of(2 * p + 1));
+}
+
+void Emitter::set_vq(u32 p, nx::string_view value) {
+    p &= 15;
+    vaccess_.defs.words |= analysis::q_words(p);
+    vaccess_.q_access |= 1u << p;
+    if (vfp_ && vfp_->q_held_d(2 * p)) {
+        line(nx::format("q{} = {};", p, value));
+        return;
+    }
+    const nx::string t = temp("qv");
+    line(nx::format("const PsvQ {} = {};", t, value));
+    dv_assign(2 * p, nx::format("psv_qlo({})", t));
+    dv_assign(2 * p + 1, nx::format("psv_qhi({})", t));
+}
+
+nx::string Emitter::fpscr_qc() {
+    vaccess_.uses.fpscr |= analysis::kFpscrRest;
+    vaccess_.defs.fpscr |= analysis::kFpscrRest;
+    return "&fpscr";
 }
 
 nx::string Emitter::fpscr() {
@@ -160,7 +226,11 @@ nx::string Emitter::vfp_line(VfpSet units, bool store) const {
         out += s;
     };
     for (u32 n = 0; n < 32; ++n) {
-        if (vfp_ && vfp_->s_held(n)) {
+        if (vfp_ && vfp_->q_held_d(n)) {
+            // (a Q-held register's unit is all four words: in both D registers' places at once)
+            if ((n & 1) == 0 && (units.words & analysis::q_words(n / 2)))
+                add(store ? nx::format("psv_ctx_qput(ctx, {}, q{});", n, n / 2) : nx::format("q{} = psv_ctx_qget(ctx, {});", n / 2, n));
+        } else if (vfp_ && vfp_->s_held(n)) {
             for (u32 k = 2 * n; k <= 2 * n + 1; ++k)
                 if ((units.words >> k) & 1)
                     add(store ? nx::format("ctx->vfp.s[{0}] = psv_b32(s{0});", k) : nx::format("s{0} = psv_f32(ctx->vfp.s[{0}]);", k));
@@ -646,6 +716,18 @@ void Emitter::instruction(const Instruction& in) {
     if (in.flags & arm::kUnpredictable) return trap(in, "PSV_TRAP_UNPREDICTABLE", nx::format("unpredictable {}", arm::mnemonic(in.op)));
     count_flags(in);
     if (emit_core(*this, in) || emit_memory(*this, in) || emit_vfp(*this, in)) return;
+    if (neon_locals()) {
+        const usize before = body_.size();
+        if (emit_neon(*this, in)) {
+            ++stats_.neon_values;
+            return;
+        }
+        // (no translation on values: the context form below, the locals synced around it)
+        body_.resize(before);
+        vaccess_ = {};
+        access_ = {};
+        temp_counter_ = 0;
+    }
     const usize mark = body_.size();
     if (emit_simd(*this, in)) {
         // (Advanced SIMD works on the context's registers: the locals it reads in the context first, those it may
@@ -659,6 +741,8 @@ void Emitter::instruction(const Instruction& in) {
             stats_.vfp_call_loads += !after.empty();
             stats_.vfp_simd_syncs += !before.empty() || !after.empty();
         }
+        if (vfp_mode_ != VfpMode::Context) ++stats_.neon_context;
+        flushed_ = 0;  // (the locals read back from the context)
         return;
     }
     unimplemented(in);
@@ -705,7 +789,18 @@ nx::string Emitter::function() {
         if (labels_.contains(in.address)) out += nx::format("{}:;\n", label_name(in.address));
         body_.clear();
         temp_counter_ = 0;
+        if (labels_.contains(in.address)) flushed_ = 0;
+        flushed_out_ = 0;
         instruction(in);
+        {
+            // (what the instruction leaves known of the D registers' lanes: see known_flushed)
+            u32 defs = 0;
+            for (u32 n = 0; n < 32; ++n)
+                if (vaccess_.defs.words & analysis::d_words(n)) defs |= 1u << n;
+            if (cfg_.nodes[i].call != analysis::CallKind::None || !vaccess_.context.empty() || in.op == Op::It) flushed_ = 0;
+            else if (analysis::is_conditional(in)) flushed_ &= ~defs;
+            else flushed_ = (flushed_ & ~defs) | (flushed_out_ & defs);
+        }
         if (mode_ == RegisterMode::Probe) effects_[i] = access_;
         if (vfp_mode_ == VfpMode::Probe) vfp_effects_[i] = vaccess_;
         // (an IT instruction's condition is its block's first condition, not its own; after a fused compare, the
@@ -773,10 +868,17 @@ nx::string Emitter::function() {
     // the others 0 (never read before written); the operands of fused compares.
     nx::string vfp;
     if (vfp_) {
-        nx::string floats, doubles;
+        nx::string floats, doubles, vectors;
         const VfpSet touched = vfp_->touched, load = vfp_->load_at_entry;
         for (u32 n = 0; n < 32; ++n) {
-            if (vfp_->s_held(n)) {
+            if (vfp_->q_held_d(n)) {
+                if ((n & 1) || !(touched.words & analysis::q_words(n / 2))) continue;
+                const bool in = (load.words & analysis::q_words(n / 2)) != 0;
+                vectors += nx::format("{}q{} = {}", vectors.empty() ? "    PsvQ " : ", ", n / 2,
+                                      in ? nx::format("psv_ctx_qget(ctx, {})", n) : nx::string("(PsvQ){0, 0, 0, 0}"));
+                stats_.vfp_entry_loads += in;
+                ++stats_.vfp_q_held;
+            } else if (vfp_->s_held(n)) {
                 bool any = false;
                 for (u32 k = 2 * n; k <= 2 * n + 1; ++k) {
                     if (!(touched.words & (1ull << k))) continue;
@@ -795,6 +897,7 @@ nx::string Emitter::function() {
         }
         if (!floats.empty()) vfp += floats + ";\n";
         if (!doubles.empty()) vfp += doubles + ";\n";
+        if (!vectors.empty()) vfp += vectors + ";\n";
         if (touched.fpscr & analysis::kFpscrRest)
             vfp += nx::format("    uint32_t fpscr = {};\n", (load.fpscr & analysis::kFpscrRest) ? "ctx->fpscr" : "0");
         if (touched.fpscr & analysis::kFpscrNzcv)
@@ -899,6 +1002,7 @@ Output generate(const analysis::Program& program, const Options& options) {
         Stats scratch;
         for (const auto& [code, fn] : program.functions) {
             Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe, nullptr, VfpMode::Probe);
+            e.set_neon_locals(!options.neon_in_context);
             (void)e.function();
             vfp_effects[code] = e.vfp_effects();
         }
@@ -908,6 +1012,7 @@ Output generate(const analysis::Program& program, const Options& options) {
         Stats scratch;
         for (const auto& [code, fn] : program.functions) {
             Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe, nullptr, vfp_locals ? VfpMode::Probe : VfpMode::Context);
+            e.set_neon_locals(!options.neon_in_context);
             (void)e.function();
             if (vfp_locals) vfp_effects[code] = e.vfp_effects();
             const auto& got = e.effects();
@@ -945,6 +1050,7 @@ Output generate(const analysis::Program& program, const Options& options) {
     if (vfp_locals) {
         analysis::VfpOptions vfp_options;
         vfp_options.summaries = !options.vfp_calls_conservative;
+        vfp_options.q_view = !options.no_q_locals;
         vfp_options.effects = &vfp_effects;
         vfp_options.registers = locals ? &registers : nullptr;
         vfp = analysis::vfp_analysis(program, vfp_options);
@@ -952,6 +1058,7 @@ Output generate(const analysis::Program& program, const Options& options) {
     for (const auto& [code, fn] : program.functions) {
         Emitter e(program, fn, flags, p, st, locals ? RegisterMode::Locals : RegisterMode::Context, registers.at(code),
                   vfp_locals ? VfpMode::Locals : VfpMode::Context, vfp.at(code));
+        e.set_neon_locals(!options.neon_in_context);
         chunk += e.function();
         chunk_instructions += static_cast<u32>(fn.code.size());
         if (chunk_instructions >= options.instructions_per_file) flush();

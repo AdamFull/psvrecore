@@ -20,6 +20,8 @@ differential test (tests/codegen/codegen_tests.cpp) runs from random states, and
   rN=ptr[:A]      a pointer into a 4 KiB region of random bytes of its own, aligned to A bytes (default: any byte)
   rN=fptr         the same, the region filled with interesting binary32 values, 4-byte aligned
   rN=dptr         the same with binary64 values, 8-byte aligned
+  rN=tail:K       K bytes before the end of the corpus' memory (the stack's top; in the production configuration a page
+                  that faults when touched follows it)
   sN=any, dN=any  (documentation only: floating-point registers are always random)
 """
 
@@ -43,7 +45,7 @@ CFLAGS = ["--target=armv7a-none-eabihf", "-mcpu=cortex-a9", "-mfpu=neon", "-mflo
           "-fno-builtin", "-fno-math-errno", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fno-exceptions",
           "-fomit-frame-pointer", "-ffp-contract=off", "-fno-pic", "-fno-stack-protector"]
 TEST_RE = re.compile(r"@test\s+(\w+)((?:\s+[rsd]\d+=[\w:]+)*)")
-SPEC_RE = re.compile(r"^(r\d+)=(any|int:-?\d+:-?\d+|ptr(?::\d+)?|fptr|dptr)$|^[sd]\d+=any$")
+SPEC_RE = re.compile(r"^(r\d+)=(any|int:-?\d+:-?\d+|ptr(?::\d+)?|fptr|dptr|tail:\d+)$|^[sd]\d+=any$")
 
 
 def find_tool(name, llvm):

@@ -154,6 +154,23 @@ public:
     void set_vd(u32 n, nx::string_view value);
     void set_vs_bits(u32 k, nx::string_view value) { set_vs(k, nx::format("psv_f32({})", value)); }
     void set_vd_bits(u32 n, nx::string_view value) { set_vd(n, nx::format("psv_f64({})", value)); }
+    // Advanced SIMD on values (emit_neon.cpp): D register n as a PsvD, Q register p as a PsvQ, whatever local holds
+    // them (an S pair, a double, a Q vector), and their writes (a statement line; `value` evaluated once).
+    nx::string vdv(u32 n);
+    nx::string vq(u32 p);
+    void set_vdv(u32 n, nx::string_view value);
+    void set_vq(u32 p, nx::string_view value);
+    // The FPSCR's rest as a pointer for a saturating helper's QC ("&fpscr": read and written).
+    nx::string fpscr_qc();
+    // Advanced SIMD instructions translated on values (emit_neon); off: all of them in the context form
+    // (emit_simd.cpp's guest_simd.h helpers with the locals synced around each: psvrecomp --neon-in-context).
+    void set_neon_locals(bool on) { neon_locals_ = on; }
+    // D registers (bit n) whose 32-bit lanes are known here to hold no denormal (results of Advanced SIMD
+    // floating-point operations, whose results never are, and copies of them; known within a straight stretch of code:
+    // forgotten at labels, calls and every other write); and the current instruction's results that are such.
+    bool known_flushed(u32 dmask) const { return dmask && (flushed_ & dmask) == dmask; }
+    void produces_flushed(u32 dmask) { flushed_out_ |= dmask; }
+    bool neon_locals() const { return neon_locals_ && vfp_mode_ != VfpMode::Context; }
     // The FPSCR's locals: `fpscr` (bits 27-0) and `fpnzcv` (bits 31-28).
     nx::string fpscr();
     nx::string fpnzcv();
@@ -178,6 +195,8 @@ private:
     void instruction(const Instruction& in);
     void plan_fused_compares();
     nx::string vfp_line(VfpSet units, bool store) const;
+    nx::string dv_of(u32 n) const;
+    void dv_assign(u32 n, nx::string_view value);
     void store_vfp(VfpSet units, usize& counter);
     void call_vfp_before();
     void call_vfp_after(const Instruction& in);
@@ -220,6 +239,8 @@ private:
     nx::vector<FlagSet> fused_flags_;
     nx::vector<u8> fused_cond_;
     bool uses_fc32_ = false, uses_fc64_ = false;
+    bool neon_locals_ = true;
+    u32 flushed_ = 0, flushed_out_ = 0;
 };
 
 // The translators, by instruction group; each returns false when the instruction is not in its group.
@@ -229,5 +250,9 @@ bool emit_vfp(Emitter& e, const Instruction& in);
 // (the floating-point registers in typed locals: emit_vfp_locals.cpp; emit_vfp.cpp has the context form)
 bool emit_vfp_locals(Emitter& e, const Instruction& in);
 bool emit_simd(Emitter& e, const Instruction& in);
+// (Advanced SIMD on the registers' values in locals; false for an instruction it has no such translation for)
+bool emit_neon(Emitter& e, const Instruction& in);
+// AdvSIMDExpandImm (op, cmode, abcdefgh): the 64-bit pattern of an Advanced SIMD modified immediate.
+u64 simd_expand_imm(u32 op, u32 cmode, u32 imm8);
 
 }  // namespace psvrecore::recomp::detail
