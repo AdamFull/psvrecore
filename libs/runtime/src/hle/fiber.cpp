@@ -28,11 +28,14 @@ constexpr i32 kNull = err::code(0x80590001), kAlignment = err::code(0x80590002),
               kInvalid = err::code(0x80590004), kPermission = err::code(0x80590005), kState = err::code(0x80590006),
               kAgain = err::code(0x80590008);
 constexpr u32 kContextMinimum = 512;
+// (the guest stack of a fiber made without context memory that is not given one later: see initialize)
+constexpr u32 kOwnStackSize = 0x20000;
 
 struct Fiber {
     u32 guest = 0;
     nx::string name;
     u32 entry = 0, arg_on_initialize = 0, context = 0, context_size = 0;
+    u32 own_stack = 0;  // (guest memory mapped for it as its context, unmapped with it; 0: the game's)
     nx::fiber::Stack stack;
     nx::fiber::Context host;
     bool started = false, running = false;
@@ -126,10 +129,20 @@ void fiber_main(nx::fiber::Transfer t) {
     psv_trap(ctx, f->entry, PSV_TRAP_RETURNED);
 }
 
-// A fiber may be made without its context memory (0 and 0): given one when it is first switched to
-// (_sceFiberAttachContextAndSwitch: libult makes its threads' fibers so), or run on the stack of the side that resumes
-// it (Gravity Rush's tasks of no stack size, through _sceFiberInitializeImpl: its loading waits on them).
-i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context, u32 context_size) {
+// A fiber's end: its host stack given back, and the guest stack mapped for it, if any.
+void forget(Fibers& fs, Fiber& f) {
+    fs.stacks.release(f.stack);
+    if (f.own_stack) memory().unmap(f.own_stack);
+    f.own_stack = 0;
+}
+
+// A fiber may be made without its context memory (0 and 0). Through the internal-option form (`attached_later`) it
+// is given one when it is first switched to (_sceFiberAttachContextAndSwitch: libult makes its threads' fibers so).
+// Through the plain form it gets a guest stack of its own here (Gravity Rush runs its tasks of no stack size so, and
+// its loading waits on them): on the stack of the side that resumes it, a fiber that switches away part way would
+// have its frames overwritten by that side's.
+i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context, u32 context_size,
+               bool attached_later) {
     if (!fiber || !entry) return kNull;
     const bool none = !context && !context_size;
     if (!context && !none) return kNull;
@@ -145,14 +158,23 @@ i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initia
     if constexpr (profile::kEnabled) f->track = profile::acquire(f->name.empty() ? nx::string_view("fiber") : f->name);
     f->entry = entry, f->arg_on_initialize = arg_on_initialize, f->context = context, f->context_size = context_size;
     f->stack = *stack;
+    if (none && !attached_later) {
+        f->own_stack = memory().map_anywhere(layout::kStacks, kOwnStackSize, GuestMemory::kPageSize, Access::ReadWrite,
+                                             BlockKind::Stack, f->name.empty() ? nx::string_view("fiber") : f->name);
+        if (!f->own_stack) {
+            fs.stacks.release(*stack);
+            return kAgain;
+        }
+        f->context = f->own_stack, f->context_size = kOwnStackSize;
+    }
     std::memset(fiber.get(), 0, 128);
     nx::scoped_lock<nx::mutex> held(fs.lock);
     if (auto it = fs.fibers.find(fiber.address); it != fs.fibers.end()) {
         if (it->second->running) {
-            fs.stacks.release(*stack);
+            forget(fs, *f);
             return kState;
         }
-        fs.stacks.release(it->second->stack);
+        forget(fs, *it->second);
         fs.fibers.erase(it);
     }
     fs.fibers[fiber.address] = std::move(f);
@@ -161,7 +183,7 @@ i32 initialize(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initia
 
 i32 _sceFiberInitializeImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize, u32 context,
                             u32 context_size, Ptr<const void> /*opt*/, u32 /*build_version*/) {
-    return initialize(fiber, name, entry, arg_on_initialize, context, context_size);
+    return initialize(fiber, name, entry, arg_on_initialize, context, context_size, false);
 }
 
 // The same with an internal option word before the build version (libult passes 2 for a fiber without context
@@ -169,7 +191,7 @@ i32 _sceFiberInitializeImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 
 i32 _sceFiberInitializeWithInternalOptionImpl(Ptr<u8> fiber, Ptr<const char> name, u32 entry, u32 arg_on_initialize,
                                               u32 context, u32 context_size, Ptr<const void> /*opt*/,
                                               u32 /*internal_option*/, u32 /*build_version*/) {
-    return initialize(fiber, name, entry, arg_on_initialize, context, context_size);
+    return initialize(fiber, name, entry, arg_on_initialize, context, context_size, true);
 }
 
 i32 sceFiberFinalize(Ptr<u8> fiber) {
@@ -179,8 +201,8 @@ i32 sceFiberFinalize(Ptr<u8> fiber) {
     auto it = fs.fibers.find(fiber.address);
     if (it == fs.fibers.end()) return kInvalid;
     if (it->second->running) return kState;
-    // (a fiber suspended part way keeps nothing alive but its host stack: given back)
-    fs.stacks.release(it->second->stack);
+    // (a fiber suspended part way keeps nothing alive but its host stack, and the guest stack mapped for it: given back)
+    forget(fs, *it->second);
     fs.fibers.erase(it);
     return 0;
 }
