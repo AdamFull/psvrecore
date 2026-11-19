@@ -32,6 +32,10 @@ struct Display {
     // for a blank or sets a frame): what is drawn into it meanwhile is shown, as the console scans it out then.
     bool pending = false;
     u64 pending_vcount = 0;
+    // The vertical blank period in which a frame buffer was last set (sceDisplayWaitSetFrameBuf* count from it).
+    bool updated = false;
+    u64 update_vcount = 0;
+    u64 updates = 0, waited = 0;  // (frame buffers set; the one the last such wait was for)
 };
 
 Display& display() {
@@ -114,6 +118,9 @@ i32 set_frame_buf(Ptr<const DisplayFrameBuf> p, i32 sync) {
         // (at the next blank; a frame set again before it replaces this one, as the console latches the last)
         d.pending = sync == 1;
         d.pending_vcount = vcount + 1;
+        d.updated = true;
+        d.update_vcount = vcount;
+        ++d.updates;
     }
     if (sync == 0) {
         if (DisplaySink* sink = state().options->display) show(sink, f, vcount);
@@ -154,13 +161,48 @@ i32 sceDisplayWaitVblankStartMultiCB(u32 count) {
     wait_vblanks(count ? count : 1, true);
     return 0;
 }
-// (a frame buffer takes effect at the next vertical blank at the latest: waiting for it is waiting for that blank)
-i32 sceDisplayWaitSetFrameBuf() { return sceDisplayWaitVblankStart(); }
-// (the frame set has been shown for `count` blanks: as many blanks as that)
-i32 sceDisplayWaitSetFrameBufMulti(u32 count) { return sceDisplayWaitVblankStartMulti(count); }
-i32 sceDisplayWaitSetFrameBufCB() { return sceDisplayWaitVblankStartCB(); }
+// Waits until `count` vertical blanks have started since the period in which the last frame buffer was set (1: the
+// blank it takes effect at), as the console counts them, not from the call: a game that waits two and then sets
+// its next frame for the next blank (a display queue callback pacing itself to 30 frames a second) shows each frame
+// for two blanks, not three. Already there: no wait, once for each frame set (waiting again without a new frame
+// waits for the next blank, so a loop of such waits does not spin). No frame buffer set yet: `count` blanks from now.
+void wait_set_frame_buf(u32 count, bool callbacks) {
+    Display& d = display();
+    bool updated, again;
+    u64 target;
+    {
+        nx::scoped_lock<nx::mutex> held(d.lock);
+        updated = d.updated;
+        target = d.update_vcount + (count ? count : 1);
+        again = d.waited == d.updates;
+        d.waited = d.updates;
+    }
+    if (!updated) return wait_vblanks(count ? count : 1, callbacks);
+    if (again && vcount_at(now_ns()) >= target) return wait_vblanks(1, callbacks);
+    if (vcount_at(now_ns()) < target) {
+        const u64 at = static_cast<u64>(std::ceil(static_cast<f64>(target) * period_ns()));
+        runtime::runtime().kernel().wait_until(at);  // (a kernel wait, without the CPU)
+    }
+    latch();
+    if (callbacks) runtime::runtime().kernel().check_callbacks();
+}
 
-i32 sceDisplayWaitSetFrameBufMultiCB(u32 count) { return sceDisplayWaitVblankStartMultiCB(count); }
+i32 sceDisplayWaitSetFrameBuf() {
+    wait_set_frame_buf(1, false);
+    return 0;
+}
+i32 sceDisplayWaitSetFrameBufMulti(u32 count) {
+    wait_set_frame_buf(count, false);
+    return 0;
+}
+i32 sceDisplayWaitSetFrameBufCB() {
+    wait_set_frame_buf(1, true);
+    return 0;
+}
+i32 sceDisplayWaitSetFrameBufMultiCB(u32 count) {
+    wait_set_frame_buf(count, true);
+    return 0;
+}
 
 // Vertical blank callbacks: each registered callback is notified at every blank, by a thread of the runtime's (as
 // the display driver notifies them); it runs when its thread checks callbacks (a CB wait).

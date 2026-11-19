@@ -184,6 +184,40 @@ TEST_CASE("display: a thread polling the vertical blank count waits for the next
     CHECK(k.clock_ns() - before < 200'000'000);
 }
 
+TEST_CASE("display: waiting for a frame buffer counts the blanks from the one it was set in, not from the call") {
+    TestRuntime t;
+    REQUIRE(t.rt.ok());
+    gxm::Options options;
+    gxm::register_libraries(options);
+    PsvContext* ctx = t.ctx();
+    Kernel& k = t.rt.kernel();
+    constexpr u32 kSceDisplay = 0x5ED8F994, kSceDisplayUser = 0x4FAACD11, kGetVcount = 0xB6FDE0BA,
+                  kWaitVblank = 0x5795E898, kWaitSetMulti = 0x7D9864A8, kSetFrameBuf = 0x7A410B64;
+    const u32 pixels = (scratch(64 * 64 * 4 + 256) + 255) & ~255u;
+    const u32 fb = scratch(24);
+    const u32 words[6] = {24, pixels, 64, 0, 64, 64};  // (size, base, pitch, A8B8G8R8, width, height)
+    std::memcpy(t.rt.memory().host(fb), words, sizeof words);
+    auto vcount = [&] { return static_cast<u32>(call32(ctx, kSceDisplay, kGetVcount, {})); };
+    // (as Lumines' display queue callback paces itself to 30 frames a second: wait two, then set the next frame for
+    // the next blank: each frame shown for two blanks)
+    REQUIRE(call32(ctx, kSceDisplay, kWaitVblank, {}) == 0);
+    REQUIRE(call32(ctx, kSceDisplayUser, kSetFrameBuf, {fb, 1}) == 0);
+    const u32 set = vcount();
+    k.delay_thread(4'000, false);  // (some of the period gone before the wait, as the callback's own work takes)
+    REQUIRE(call32(ctx, kSceDisplay, kWaitSetMulti, {2}) == 0);
+    CHECK(vcount() == ((set + 2) & 0xFFFF));
+    // (again, with no new frame: the next blank, not at once)
+    REQUIRE(call32(ctx, kSceDisplay, kWaitSetMulti, {2}) == 0);
+    CHECK(vcount() == ((set + 3) & 0xFFFF));
+    // (a frame set long enough ago: no wait)
+    REQUIRE(call32(ctx, kSceDisplayUser, kSetFrameBuf, {fb, 1}) == 0);
+    REQUIRE(call32(ctx, kSceDisplay, kWaitVblank, {}) == 0);
+    REQUIRE(call32(ctx, kSceDisplay, kWaitVblank, {}) == 0);
+    const u64 before = k.clock_ns();
+    REQUIRE(call32(ctx, kSceDisplay, kWaitSetMulti, {2}) == 0);
+    CHECK(k.clock_ns() - before < 8'000'000);
+}
+
 TEST_CASE("gxm: user markers only within a scene or a command list; Razor's capture triggers without RenderDoc") {
     TestRuntime t;
     REQUIRE(t.rt.ok());
