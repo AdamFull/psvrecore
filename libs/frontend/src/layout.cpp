@@ -73,4 +73,16 @@ nx::string game_title(const GameLayout& layout, i32 language) {
     return {};
 }
 
+std::optional<u32> game_sfo_integer(const GameLayout& layout, nx::string_view key) {
+    for (const nx::string* folder : {&layout.update, &layout.app}) {
+        if (folder->empty()) continue;
+        auto bytes = io::read_file(nx::fs::path_view(join(*folder, "sce_sys/param.sfo")));
+        if (!bytes) continue;
+        auto sfo = sfo::parse(std::span<const u8>(bytes->data(), bytes->size()));
+        if (!sfo) continue;
+        if (auto v = sfo->integer(key)) return v;
+    }
+    return std::nullopt;
+}
+
 }  // namespace psvrecore::frontend

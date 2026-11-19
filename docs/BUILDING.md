@@ -239,7 +239,8 @@ that runs and is checked), and `addcont0:` holds the add-ons, each readable once
 `data/` beside the settings
 unless `[game] data` says otherwise, save data as `ux0:user/00/savedata/<title ID>`. The shader cache is `data/cache`
 (the game's programs translated, the pipelines made, the driver's pipeline cache): what a run drew with is made before
-the next one starts. Deleting it only costs that again. `[display] internal_resolution` (1 to 4) draws the game at
+the next one starts. Deleting it only costs that again. A game whose `param.sfo` asks for the console's extended memory mode (`ATTRIBUTE2` bit 3)
+gets its larger budget for memory blocks: 365 MiB of main memory instead of 256. `[display] internal_resolution` (1 to 4) draws the game at
 that many times the console's resolution, the surfaces it draws into and reads back as textures included.
 `[display] high_frame_rate` (on by default) lets a game's own additions run what the game paces slower than its
 menus at 60 frames a second (WipEout 2048's races, 30 on the console), where the game's simulation follows the time

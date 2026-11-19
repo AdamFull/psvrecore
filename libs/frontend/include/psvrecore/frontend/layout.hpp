@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 // Where a game's files are in its folder. Either the application folder itself (eboot.bin at its top), or a copy of
 // the console's ux0: folders for the title:
 //
@@ -31,5 +33,9 @@ Result<GameLayout> find_layout(const nx::string& folder, nx::string_view title_i
 // language, SCE_SYSTEM_PARAM_LANG_*: TITLE_00 Japanese, TITLE_01 English, ...) when it has one, else TITLE. Empty
 // when neither has a title.
 nx::string game_title(const GameLayout& layout, i32 language);
+
+// An integer of the game's sce_sys/param.sfo (the update's, else the game's): ATTRIBUTE2, ... Empty when neither
+// has it.
+std::optional<u32> game_sfo_integer(const GameLayout& layout, nx::string_view key);
 
 }  // namespace psvrecore::frontend
