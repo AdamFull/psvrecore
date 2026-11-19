@@ -234,6 +234,9 @@ TEST_CASE("apputil: slots, saves through savedata0: (read-only to sceIo), the qu
     CHECK(call32(ctx, kSceAppUtil, kDataSave, {0, save_items({{"x.bin", b, 1, 0, 0}}), 1, 0, 0}) == kParameter);
     CHECK(call32(ctx, kSceAppUtil, kDataSave, {0, save_items({{"data", b, 1, 0, 0}}), 1, 0, required}) == kParameter);
     CHECK(guest_size(ctx, "savedata0:x.bin") == -1);
+    // (a backslash separates folders, as the file system's paths do)
+    CHECK(call32(ctx, kSceAppUtil, kDataSave, {0, save_items({{"saves\\s.bin", b, 1, 0, 0}}), 1, 0, required}) == 0);
+    CHECK(guest_size(ctx, "savedata0:saves/s.bin") == 1);
 
     // Searches: the slots in use by user parameter, descending; the empty ones counted.
     const u32 work = scratch(40), cond = scratch(52), result = scratch(40), list = scratch(16 * 256);
