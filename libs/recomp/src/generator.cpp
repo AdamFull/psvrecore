@@ -1,6 +1,7 @@
 #include "psvrecore/recomp/generator.hpp"
 
 #include <algorithm>
+#include <utility>
 
 #include "emit.hpp"
 #include "psvrecore/arm/format.hpp"
@@ -15,20 +16,20 @@ namespace detail {
 
 nx::string condition(arm::Cond c) {
     switch (c) {
-        case arm::Cond::Eq: return "ctx->z";
-        case arm::Cond::Ne: return "!ctx->z";
-        case arm::Cond::Cs: return "ctx->c";
-        case arm::Cond::Cc: return "!ctx->c";
-        case arm::Cond::Mi: return "ctx->n";
-        case arm::Cond::Pl: return "!ctx->n";
-        case arm::Cond::Vs: return "ctx->v";
-        case arm::Cond::Vc: return "!ctx->v";
-        case arm::Cond::Hi: return "(ctx->c & !ctx->z)";
-        case arm::Cond::Ls: return "(!ctx->c | ctx->z)";
-        case arm::Cond::Ge: return "ctx->n == ctx->v";
-        case arm::Cond::Lt: return "ctx->n != ctx->v";
-        case arm::Cond::Gt: return "(!ctx->z & (ctx->n == ctx->v))";
-        case arm::Cond::Le: return "(ctx->z | (ctx->n != ctx->v))";
+        case arm::Cond::Eq: return "fl.z";
+        case arm::Cond::Ne: return "!fl.z";
+        case arm::Cond::Cs: return "fl.c";
+        case arm::Cond::Cc: return "!fl.c";
+        case arm::Cond::Mi: return "fl.n";
+        case arm::Cond::Pl: return "!fl.n";
+        case arm::Cond::Vs: return "fl.v";
+        case arm::Cond::Vc: return "!fl.v";
+        case arm::Cond::Hi: return "(fl.c & !fl.z)";
+        case arm::Cond::Ls: return "(!fl.c | fl.z)";
+        case arm::Cond::Ge: return "fl.n == fl.v";
+        case arm::Cond::Lt: return "fl.n != fl.v";
+        case arm::Cond::Gt: return "(!fl.z & (fl.n == fl.v))";
+        case arm::Cond::Le: return "(fl.z | (fl.n != fl.v))";
         default: return "";
     }
 }
@@ -45,84 +46,55 @@ nx::string comment_text(nx::string_view text) {
     return out;
 }
 
-bool identifier_char(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+constexpr std::pair<FlagSet, char> kFlagNames[] = {{analysis::kFlagN, 'n'}, {analysis::kFlagZ, 'z'}, {analysis::kFlagC, 'c'}, {analysis::kFlagV, 'v'}};
 
-// A function's body with the condition flags (N, Z, C, V) in a local, `fl`, instead of the context: the C compiler
-// then drops the flags no instruction reads (stores to the context it cannot drop: the guest's memory accesses
-// between them are atomic). They are written to the context before whatever may read them there (a call, a jump, an
-// import, a system call, a trap, a return, MRS and MSR) and read back after what returns here.
-nx::string localize_flags(nx::string_view body) {
-    auto replaced = [](nx::string_view line) {
-        nx::string out;
-        for (usize i = 0; i < line.size();) {
-            if (line.substr(i, 7) == "psv_nz(" && line.substr(i + 7, 4) == "ctx,") {
-                out += "psv_nz_fl(&fl,", i += 11;
-                continue;
-            }
-            if (line.substr(i, 9) == "psv_adds(" && line.substr(i + 9, 4) == "ctx,") {
-                out += "psv_adds_fl(&fl,", i += 13;
-                continue;
-            }
-            if (line.substr(i, 5) == "ctx->" && i + 6 <= line.size() && nx::string_view("nzcv").find(line[i + 5]) != nx::string_view::npos &&
-                (i + 6 == line.size() || !identifier_char(line[i + 6])) && (i == 0 || !identifier_char(line[i - 1]))) {
-                out += "fl.", out += line[i + 5], i += 6;
-                continue;
-            }
-            out += line[i++];
-        }
-        return out;
-    };
-    auto has = [](nx::string_view line, nx::string_view what) { return line.find(what) != nx::string_view::npos; };
+}  // namespace
+
+Emitter::Emitter(const analysis::Program& program, const analysis::Function& fn, const analysis::FlagLiveness& flags,
+                 const nx::string& prefix, Stats& stats)
+    : program_(program), fn_(fn), flags_(flags), flags_fn_(flags.at(fn.entry)), cfg_(analysis::build_cfg(program, fn)),
+      prefix_(prefix), stats_(stats) {}
+
+nx::string Emitter::flags_line(FlagSet f, bool store) const {
     nx::string out;
-    usize at = 0;
-    while (at < body.size()) {
-        usize end = body.find('\n', at);
-        if (end == nx::string_view::npos) end = body.size();
-        nx::string line = replaced(body.substr(at, end - at));
-        at = end + 1;
-        // (a call to recompiled code, `f_XXXXXXXX(ctx, ...)`, or to the runtime)
-        bool call = false;
-        for (usize p = line.find("f_"); p != nx::string::npos; p = line.find("f_", p + 2))
-            if ((p == 0 || !identifier_char(line[p - 1])) && p + 15 <= line.size() && line.substr(p + 10, 5) == "(ctx,") call = true;
-        call |= has(line, "psv_call(") || has(line, "psv_call_import(") || has(line, "psv_jump(") || has(line, "psv_svc(") ||
-                has(line, "psv_yield(") || has(line, "psv_trap(") || has(line, "psv_read_apsr(") || has(line, "psv_write_apsr(") ||
-                has(line, "psv_import_missing(");
-        // (each return written as one that stores the flags first)
-        nx::string fixed;
-        for (usize p = 0;;) {
-            const usize r = line.find("return;", p);
-            if (r == nx::string::npos) {
-                fixed += line.substr(p);
-                break;
-            }
-            fixed += line.substr(p, r - p);
-            fixed += "{ PSV_FL_OUT(fl); return; }";
-            p = r + 7;
-        }
-        if (call) {
-            const usize indent = fixed.find_first_not_of(' ');
-            const nx::string pad = fixed.substr(0, indent == nx::string::npos ? 0 : indent);
-            const bool returns = has(line, "return;") || has(line, "psv_trap(");
-            const nx::string_view rest = nx::string_view(fixed).substr(pad.size());
-            if (rest.substr(0, 5) == "case " || rest.substr(0, 8) == "default:") {
-                // (a jump table's case: stored after its label, where the switch lands)
-                const usize colon = fixed.find(':');
-                out += fixed.substr(0, colon + 1) + " PSV_FL_OUT(fl);" + fixed.substr(colon + 1) + "\n";
-                if (!returns) out += pad + "PSV_FL_IN(fl);\n";
-                continue;
-            }
-            out += pad + "PSV_FL_OUT(fl);\n" + fixed + "\n";
-            if (!returns) out += pad + "PSV_FL_IN(fl);\n";
-        } else {
-            out += fixed + "\n";
-        }
+    for (const auto& [bit, name] : kFlagNames) {
+        if (!(f & bit)) continue;
+        if (!out.empty()) out += ' ';
+        out += store ? nx::format("ctx->{} = fl.{};", name, name) : nx::format("fl.{} = ctx->{};", name, name);
     }
     return out;
 }
 
-}  // namespace
+void Emitter::store_flags(FlagSet f) {
+    if (f) line(flags_line(f, true));
+}
+
+void Emitter::load_flags(FlagSet f) {
+    if (f) line(flags_line(f, false));
+}
+
+void Emitter::set_nz(nx::string_view r, FlagSet which) {
+    const FlagSet f = which & live();
+    if (f & analysis::kFlagN) line(nx::format("fl.n = {} >> 31;", r));
+    if (f & analysis::kFlagZ) line(nx::format("fl.z = {} == 0;", r));
+}
+
+void Emitter::add_with_carry(nx::string_view r, nx::string_view x, nx::string_view y, nx::string_view carry_in, FlagSet which) {
+    const FlagSet f = which & live();
+    if (f & analysis::kFlagC) {
+        const nx::string w = temp("w");
+        line(nx::format("const uint64_t {} = (uint64_t){} + {} + {};", w, x, y, carry_in));
+        line(nx::format("const uint32_t {} = (uint32_t){};", r, w));
+        line(nx::format("fl.c = (uint32_t)({} >> 32);", w));
+    } else {
+        line(nx::format("const uint32_t {} = {} + {} + {};", r, x, y, carry_in));
+    }
+    set_nz(r, f);
+    if (f & analysis::kFlagV) line(nx::format("fl.v = (({} ^ {}) & ({} ^ {})) >> 31;", x, r, y, r));
+}
 
 void Emitter::trap(const Instruction& in, const char* kind, nx::string_view what) {
+    store_flags_for_trap();
     line(nx::format("psv_trap(ctx, {}, {});", hex(in.address), kind));
     ++stats_.traps[nx::string(what)];
     ended_ = true;
@@ -160,6 +132,7 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
     const auto& targets = table.targets;
     const u32 n = static_cast<u32>(targets.size());
     if (n == 0) {  // (a bound of no entries: every index is outside the table)
+        store_flags_for_trap();
         line(nx::format("psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
         return;
     }
@@ -189,6 +162,7 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
     line(nx::format("    static const uint32_t {}[{}] = {{{}\n            }};", list, n, values));
     line(nx::format("    {} = psv_table_find({}, {}u, {});", index, list, n, target));
     line(nx::format("    if ({} >= {}u) {{", index, n));
+    line("        " + flags_line(analysis::kAllFlags, true));
     line(nx::format("        psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
     line("    }");
     line("}");
@@ -196,8 +170,12 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
     for (u32 i = 0; i < n; ++i) {
         const u32 target_code = targets[i];
         const bool tail = target_code != fn_.entry && program_.function_at(target_code) != nullptr;
-        if (tail) line(nx::format("case {}u: {}(ctx, ret); return;", i, function_name(target_code)));
-        else line(nx::format("case {}u: goto {};", i, label_name(target_code)));
+        if (tail) {
+            const nx::string store = flags_line(flags_.into(target_code, flags_fn_->live_out), true);
+            line(nx::format("case {}u: {}{}{}(ctx, ret); return;", i, store, store.empty() ? "" : " ", function_name(target_code)));
+        } else {
+            line(nx::format("case {}u: goto {};", i, label_name(target_code)));
+        }
     }
     line("default: __builtin_unreachable();");  // (the index is below n here)
     line("}");
@@ -208,7 +186,18 @@ void Emitter::branch_to_value(const Instruction& in, nx::string_view target) {
     const nx::string t = temp("target");
     line(nx::format("const uint32_t {} = {};", t, target));
     ++stats_.indirect_jumps;
+    // A return, with the flags the callers read; else a jump through the runtime: a return-form branch passes only
+    // those (a non-local exit), another the flags of the function it goes to when that is a constant, else what code
+    // the module does not know reads at entry (analysis/cfg.hpp: Return, IndirectJump).
+    const FlagSet out = flags_fn_->live_out;
+    FlagSet jump = out;
+    const auto& node = cfg_.nodes[index_];
+    for (const auto* e = cfg_.begin(node); e != cfg_.end(node); ++e) jump |= flags_.at_exit(*flags_fn_, *e);
+    ++stats_.return_sites;
+    if (out) ++stats_.return_sites_store;
+    store_flags(out);
     line(nx::format("if ({} == ret) return;", t));
+    store_flags(static_cast<FlagSet>(jump & ~out));
     line(nx::format("psv_jump(ctx, {}, ret, {});", t, hex(in.address)));
     line("return;");
 }
@@ -217,12 +206,14 @@ void Emitter::branch_to(const Instruction& in, u32 target_code) {
     (void)in;
     if (auto stub = program_.import_stubs.find(target_code & ~1u); stub != program_.import_stubs.end()) {
         ++stats_.import_calls;
+        store_flags(flags_.into_unknown(flags_fn_->live_out));
         line(nx::format("psv_call_import(ctx, &{}_imports[{}], ret);", prefix_, stub->second));
         line("return;");
         return;
     }
     if (target_code != fn_.entry && program_.function_at(target_code)) {
         ++stats_.tail_calls;
+        store_flags(flags_.into(target_code, flags_fn_->live_out));
         line(nx::format("{}(ctx, ret);", function_name(target_code)));
         line("return;");
         return;
@@ -233,28 +224,40 @@ void Emitter::branch_to(const Instruction& in, u32 target_code) {
 void Emitter::call(const Instruction& in, u32 target_code) {
     const u32 next = next_code(in);
     line(nx::format("{} = {};", R(arm::kLr), hex(next)));
+    call_flags_before();
     if (auto stub = program_.import_stubs.find(target_code & ~1u); stub != program_.import_stubs.end()) {
         ++stats_.import_calls;
         line(nx::format("psv_call_import(ctx, &{}_imports[{}], {});", prefix_, stub->second, hex(next)));
-        return;
-    }
-    if (program_.function_at(target_code)) {
+    } else if (program_.function_at(target_code)) {
         line(nx::format("{}(ctx, {});", function_name(target_code), hex(next)));
+    } else {
+        ++stats_.indirect_calls;
+        line(nx::format("psv_call(ctx, {}, {});", hex(target_code), hex(next)));
+    }
+    call_flags_after(in);
+}
+
+void Emitter::call_flags_before() {
+    const FlagSet f = flags_fn_->before_call[index_];
+    ++stats_.call_sites;
+    if (f) ++stats_.call_sites_store;
+    store_flags(f);
+}
+
+void Emitter::call_flags_after(const Instruction& in) {
+    // (a call to a function that never returns: a trap if it does. The flags are the callee's then.)
+    if (std::find(fn_.noreturn_calls.begin(), fn_.noreturn_calls.end(), in.address) != fn_.noreturn_calls.end()) {
+        line(nx::format("psv_trap(ctx, {}, PSV_TRAP_RETURNED);", hex(in.address + in.size)));
+        ended_ = true;
         return;
     }
-    ++stats_.indirect_calls;
-    line(nx::format("psv_call(ctx, {}, {});", hex(target_code), hex(next)));
+    const FlagSet f = flags_fn_->after_call[index_];
+    if (f) ++stats_.call_sites_load;
+    load_flags(f);
 }
 
 bool Emitter::constant_load(u32 address, u32 size, u32& value) const {
-    const auto& image = *program_.image;
-    // (a word the loader patches with an imported variable's address is not known now)
-    for (u32 at = address >= 3 ? address - 3 : 0; at < address + size; ++at)
-        if (program_.variable_uses.contains(at)) return false;
-    const auto* seg = image.segment_of(address);
-    if (!seg || seg->writable() || !image.contains(address, size)) return false;
-    value = size == 4 ? image.u32_at(address) : size == 2 ? image.u16_at(address) : image.u8_at(address);
-    return true;
+    return analysis::constant_word(program_, address, size, value);
 }
 
 bool Emitter::falls_through(const Instruction& in) const {
@@ -272,8 +275,16 @@ void Emitter::instruction(const Instruction& in) {
     ended_ = false;
     if (!in.valid()) return trap(in, "PSV_TRAP_UNDEFINED", "undefined");
     if (in.flags & arm::kUnpredictable) return trap(in, "PSV_TRAP_UNPREDICTABLE", nx::format("unpredictable {}", arm::mnemonic(in.op)));
+    count_flags(in);
     if (emit_core(*this, in) || emit_memory(*this, in) || emit_vfp(*this, in) || emit_simd(*this, in)) return;
     unimplemented(in);
+}
+
+void Emitter::count_flags(const Instruction& in) {
+    const FlagSet defs = analysis::flag_effect(in).defs;
+    if (!defs) return;
+    ++stats_.flag_setters;
+    if (defs & live()) ++stats_.flag_setters_live;
 }
 
 nx::string Emitter::function() {
@@ -286,11 +297,12 @@ nx::string Emitter::function() {
     for (u32 l : fn_.labels) labels_.insert(l);
     nx::flat_hash_set<u32> addresses;
     for (const auto& in : code) addresses.insert(in.address);
+    // (a call to a function that never returns ends the flow when it executes: see call_flags_after)
     nx::flat_hash_set<u32> noreturn(fn_.noreturn_calls.begin(), fn_.noreturn_calls.end());
     for (usize i = 0; i < code.size(); ++i) {
         const auto& in = code[i];
         const u32 next = in.address + in.size;
-        if (falls_through(in) && !fn_.runs_into.contains(in.address) && !noreturn.contains(in.address) &&
+        if (falls_through(in) && !fn_.runs_into.contains(in.address) && !(noreturn.contains(in.address) && !analysis::is_conditional(in)) &&
             (i + 1 >= code.size() || code[i + 1].address != next) && addresses.contains(next))
             labels_.insert(next);
     }
@@ -301,6 +313,7 @@ nx::string Emitter::function() {
     if (!entry_first) out += nx::format("    goto {};\n", label_name(fn_.start()));
     for (usize i = 0; i < code.size(); ++i) {
         const auto& in = code[i];
+        index_ = i;
         ++stats_.instructions;
         if (labels_.contains(in.address)) out += nx::format("{}:;\n", label_name(in.address));
         body_.clear();
@@ -313,7 +326,8 @@ nx::string Emitter::function() {
         else out += nx::format("    if ({}) {{ /* {:08x}: {} */\n", cond, in.address, text);
         out += body_;
         out += "    }\n";
-        if (!falls_through(in) || ended_) continue;
+        // (a translation that ends in a trap ends the flow only where the instruction is not conditional)
+        if (!falls_through(in) || (ended_ && !analysis::is_conditional(in))) continue;
         const u32 next = in.address + in.size;
         if (auto into = fn_.runs_into.find(in.address); into != fn_.runs_into.end()) {
             body_.clear();
@@ -321,28 +335,34 @@ nx::string Emitter::function() {
             out += "    /* runs into the next function */\n" + body_;
             continue;
         }
-        if (noreturn.contains(in.address)) {
-            out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_RETURNED);\n", hex(next));
-            continue;
-        }
         if (i + 1 < code.size() && code[i + 1].address == next) continue;
-        if (addresses.contains(next)) out += nx::format("    goto {};\n", label_name(next));
-        else out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n", hex(next));
+        if (addresses.contains(next)) {
+            out += nx::format("    goto {};\n", label_name(next));
+        } else {
+            out += "    " + flags_line(analysis::kAllFlags, true) + "\n";
+            out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n", hex(next));
+        }
     }
     ++stats_.functions;
+    if (flags_fn_->need) ++stats_.functions_need;
+    if (flags_fn_->live_out) ++stats_.functions_live_out;
     // The guest memory base, read once (see guest.h: psv_membase never changes while guest code runs, but every guest
-    // store could change it as far as the compiler knows).
+    // store could change it as far as the compiler knows). The condition flags in a local (analysis/flags.hpp): those
+    // live at entry from the context, the others 0 (no instruction reads them before writing them; a trap shows 0).
     const bool memory = out.find("(mb,") != nx::string::npos;
-    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl;\n    PSV_FL_IN(fl);\n",
-                      function_name(fn_.entry), memory ? "    uint8_t* const mb = psv_membase;\n" : "") +
-           localize_flags(out) + "}\n";
+    nx::string flags;
+    for (const auto& [bit, name] : kFlagNames)
+        flags += nx::format("{}{}", flags.empty() ? "" : ", ", (flags_fn_->live_in & bit) ? nx::format("ctx->{}", name) : nx::string("0u"));
+    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl = {{{}}};\n", function_name(fn_.entry),
+                      memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags) +
+           out + "}\n";
 }
 
 }  // namespace detail
 
 namespace {
 
-nx::string module_source(const analysis::Program& program, const Options& options) {
+nx::string module_source(const analysis::Program& program, const Options& options, const analysis::FlagLiveness& flags) {
     const nx::string& p = options.name;
     nx::string out = nx::format("/* Generated by psvrecomp: module {}. */\n#include \"{}_functions.h\"\n\n", program.image->module().info.name, p);
     out += nx::format("PsvImport {}_imports[{}] = {{\n", p, std::max<usize>(program.imports.size(), 1));
@@ -376,10 +396,12 @@ nx::string module_source(const analysis::Program& program, const Options& option
     out += " };\n\n";
     nx::string fingerprint;
     for (u8 b : program.image->fingerprint()) fingerprint += nx::format("0x{:02X},", b);
+    // (the condition flags' contract at the module's boundaries: guest.h, PsvModuleCode)
     out += nx::format("const PsvModuleCode {}_module = {{\"{}\", {}_function_table, {}u, {}_imports, {}u, {}_import_stubs, {}_variables, {}u,\n"
-                      "    {{{}}}, {}_segment_bases, {}_segment_sizes, {}u}};\n",
+                      "    {{{}}}, {}_segment_bases, {}_segment_sizes, {}u,\n    PSV_FLAG_CONTRACT, 0x{:X}u, 0x{:X}u, 0x{:X}u, 0x{:X}u}};\n",
                       p, program.image->module().info.name, p, program.functions.size(), p, program.imports.size(), p, p,
-                      program.variable_imports.size(), fingerprint, p, p, segments.size());
+                      program.variable_imports.size(), fingerprint, p, p, segments.size(), flags.needed_at_entry, flags.given_at_entry,
+                      flags.needed_at_return, flags.given_at_return);
     return out;
 }
 
@@ -404,14 +426,27 @@ Output generate(const analysis::Program& program, const Options& options) {
         chunk.clear();
         chunk_instructions = 0;
     };
+    analysis::FlagOptions flag_options;
+    flag_options.everywhere = options.flags_everywhere;
+    flag_options.given_at_entry = options.flags_given_at_entry;
+    flag_options.given_at_return = options.flags_given_at_return;
+    flag_options.full_exit = options.full_exit_flags;
+    analysis::FlagLiveness flags = analysis::flag_liveness(program, flag_options);
     for (const auto& [code, fn] : program.functions) {
-        Emitter e(program, fn, p, result.stats);
+        Emitter e(program, fn, flags, p, result.stats);
         chunk += e.function();
         chunk_instructions += static_cast<u32>(fn.code.size());
         if (chunk_instructions >= options.instructions_per_file) flush();
     }
     flush();
-    result.files.push_back(GeneratedFile{p + "_module.c", module_source(program, options)});
+    result.files.push_back(GeneratedFile{p + "_module.c", module_source(program, options, flags)});
+    // (the summaries only: the per-instruction sets are the generator's business)
+    for (auto& [code, f] : flags.functions) {
+        nx::vector<FlagSet>().swap(f.after);
+        nx::vector<FlagSet>().swap(f.after_call);
+        nx::vector<FlagSet>().swap(f.before_call);
+    }
+    result.flags = std::move(flags);
     return result;
 }
 

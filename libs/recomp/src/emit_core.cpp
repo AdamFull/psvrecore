@@ -64,7 +64,10 @@ bool data_processing(Emitter& e, const Instruction& in) {
         e.trap(in, "PSV_TRAP_PRIVILEGED", nx::format("{}s pc", arm::mnemonic(in.op)));
         return true;
     }
-    const bool need_carry = s && logic != Logic::None;
+    // The flags it writes that are live (analysis::flag_effect: the carry of a logical operation only when the
+    // shifter gives one).
+    const FlagSet out = s ? static_cast<FlagSet>(analysis::flag_effect(in).defs & e.live()) : FlagSet(0);
+    const bool need_carry = logic != Logic::None && (out & analysis::kFlagC);
     nx::string carry;
     const nx::string a = e.temp("a"), b = e.temp("b"), r = e.temp("r");
     if (!unary) e.line(nx::format("const uint32_t {} = {};", a, e.read(in, rn)));
@@ -73,14 +76,13 @@ bool data_processing(Emitter& e, const Instruction& in) {
         nx::string x = a, y = b, cin;
         switch (arith) {
             case Arith::Add: cin = "0u"; break;
-            case Arith::Adc: cin = "ctx->c"; break;
+            case Arith::Adc: cin = "fl.c"; break;
             case Arith::Sub: y = "~" + b, cin = "1u"; break;
-            case Arith::Sbc: y = "~" + b, cin = "ctx->c"; break;
+            case Arith::Sbc: y = "~" + b, cin = "fl.c"; break;
             case Arith::Rsb: x = b, y = "~" + a, cin = "1u"; break;
-            default: x = b, y = "~" + a, cin = "ctx->c"; break;  // rsc
+            default: x = b, y = "~" + a, cin = "fl.c"; break;  // rsc
         }
-        if (s) e.line(nx::format("const uint32_t {} = psv_adds(ctx, {}, {}, {});", r, x, y, cin));
-        else e.line(nx::format("const uint32_t {} = {} + {} + {};", r, x, y, cin));
+        e.add_with_carry(r, x, y, cin, out);
     } else {
         nx::string value;
         switch (logic) {
@@ -93,10 +95,8 @@ bool data_processing(Emitter& e, const Instruction& in) {
             default: value = "~" + b; break;
         }
         e.line(nx::format("const uint32_t {} = {};", r, value));
-        if (s) {
-            e.line(nx::format("psv_nz(ctx, {});", r));
-            if (carry != "ctx->c") e.line(nx::format("ctx->c = {};", carry));
-        }
+        e.set_nz(r, out);
+        if (need_carry && carry != "fl.c") e.line(nx::format("fl.c = {};", carry));
     }
     if (!compare) e.write(in, rd, r, Emitter::PcWrite::Branch);
     return true;
@@ -119,7 +119,7 @@ bool shift(Emitter& e, const Instruction& in) {
     nx::string value, carry;
     if (type == 4) {
         e.line(nx::format("const uint32_t {} = {};", x, e.read(in, in.operands[1].reg)));
-        value = nx::format("(ctx->c << 31) | ({} >> 1)", x);
+        value = nx::format("(fl.c << 31) | ({} >> 1)", x);
         carry = x + " & 1u";
     } else if (in.operand_count == 3 && in.operands[2].kind == OperandKind::Imm) {
         e.line(nx::format("const uint32_t {} = {};", x, e.read(in, in.operands[1].reg)));
@@ -143,12 +143,13 @@ bool shift(Emitter& e, const Instruction& in) {
         e.line(nx::format("const uint32_t {} = {};", x, e.read(in, rm)));
         e.line(nx::format("const uint32_t {} = {};", amount, e.read(in, rs)));
         value = nx::format("psv_shift_reg({}, {}, {})", x, type, amount);
-        carry = nx::format("psv_shift_reg_c({}, {}, {}, ctx->c)", x, type, amount);
+        carry = nx::format("psv_shift_reg_c({}, {}, {}, fl.c)", x, type, amount);
     }
     e.line(nx::format("const uint32_t {} = {};", r, value));
     if (s) {
-        e.line(nx::format("ctx->c = {};", carry));
-        e.line(nx::format("psv_nz(ctx, {});", r));
+        const FlagSet out = static_cast<FlagSet>(analysis::flag_effect(in).defs & e.live());
+        if (out & analysis::kFlagC) e.line(nx::format("fl.c = {};", carry));
+        e.set_nz(r, out);
     }
     e.write(in, rd, r, Emitter::PcWrite::Branch);
     return true;
@@ -167,7 +168,7 @@ bool multiply(Emitter& e, const Instruction& in) {
             if (in.op == Op::Mla) value = nx::format("{} * {} + {}", rr(1), rr(2), rr(3));
             if (in.op == Op::Mls) value = nx::format("{} - {} * {}", rr(3), rr(1), rr(2));
             e.line(nx::format("const uint32_t {} = {};", r, value));
-            if (s) e.line(nx::format("psv_nz(ctx, {});", r));
+            if (s) e.set_nz(r, analysis::kFlagN | analysis::kFlagZ);
             e.write(in, reg(0), r);
             return true;
         }
@@ -185,10 +186,8 @@ bool multiply(Emitter& e, const Instruction& in) {
             if (in.op == Op::Umlal || in.op == Op::Smlal) value = product + " + " + acc;
             if (in.op == Op::Umaal) value = nx::format("{} + {} + {}", product, rr(0), rr(1));
             e.line(nx::format("const uint64_t {} = {};", r, value));
-            if (s) {
-                e.line(nx::format("ctx->n = (uint32_t)({} >> 63);", r));
-                e.line(nx::format("ctx->z = {} == 0;", r));
-            }
+            if (s && (e.live() & analysis::kFlagN)) e.line(nx::format("fl.n = (uint32_t)({} >> 63);", r));
+            if (s && (e.live() & analysis::kFlagZ)) e.line(nx::format("fl.z = {} == 0;", r));
             e.write(in, reg(0), nx::format("(uint32_t){}", r));
             e.write(in, reg(1), nx::format("(uint32_t)({} >> 32)", r));
             return true;
@@ -409,7 +408,9 @@ bool branches(Emitter& e, const Instruction& in) {
                 const nx::string t = e.temp("target");
                 e.line(nx::format("const uint32_t {} = {};", t, e.read(in, in.operands[0].reg)));
                 e.line(nx::format("{} = {};", R(arm::kLr), hex(e.next_code(in))));
+                e.call_flags_before();
                 e.line(nx::format("psv_call(ctx, {}, {});", t, hex(e.next_code(in))));
+                e.call_flags_after(in);
                 ++e.stats().indirect_calls;
             }
             return true;
@@ -457,7 +458,11 @@ bool system(Emitter& e, const Instruction& in) {
             e.line("ctx->excl_size = 0;");
             return true;
         case Op::Svc:
+            // (a call to code the module does not know; it traps today: every local flag in the context first)
+            e.store_flags_for_trap();
+            e.call_flags_before();
             e.line(nx::format("psv_svc(ctx, {}, {});", hex(in.address), hex(in.operands[0].imm)));
+            e.call_flags_after(in);
             return true;
         case Op::Bkpt: e.trap(in, "PSV_TRAP_BKPT", "bkpt"); return true;
         case Op::Udf: e.trap(in, "PSV_TRAP_UDF", "udf"); return true;
@@ -470,7 +475,7 @@ bool system(Emitter& e, const Instruction& in) {
                 e.trap(in, "PSV_TRAP_PRIVILEGED", "mrs spsr");
                 return true;
             }
-            e.write(in, in.operands[0].reg, "psv_read_apsr(ctx)");
+            e.write(in, in.operands[0].reg, "psv_read_apsr_fl(&fl, ctx)");
             return true;
         case Op::Msr: {
             const u32 code = in.operands[0].imm;
@@ -481,7 +486,7 @@ bool system(Emitter& e, const Instruction& in) {
             const auto& src = in.operands[1];
             const nx::string value = src.kind == OperandKind::Reg ? e.read(in, src.reg) : hex(src.imm);
             // (in user mode only the flags and GE are written; the other fields are ignored)
-            e.line(nx::format("psv_write_apsr(ctx, {}, {});", value, code & 0xF));
+            e.line(nx::format("psv_write_apsr_fl(&fl, ctx, {}, {});", value, code & 0xF));
             return true;
         }
         case Op::Mrc:
@@ -527,10 +532,10 @@ nx::string Emitter::operand2(const Instruction& in, const Operand& o, nx::string
     switch (o.kind) {
         case OperandKind::Imm:
         case OperandKind::ModImm:
-            if (want) *carry = (in.flags & arm::kImmCarry) ? nx::string((o.imm >> 31) ? "1u" : "0u") : nx::string("ctx->c");
+            if (want) *carry = (in.flags & arm::kImmCarry) ? nx::string((o.imm >> 31) ? "1u" : "0u") : nx::string("fl.c");
             return hex(o.imm);
         case OperandKind::Reg:
-            if (want) *carry = "ctx->c";
+            if (want) *carry = "fl.c";
             return read(in, o.reg);
         case OperandKind::RegShiftImm: {
             const nx::string x = temp("x");
@@ -551,7 +556,7 @@ nx::string Emitter::operand2(const Instruction& in, const Operand& o, nx::string
                     return nx::format("psv_ror({}, {})", x, n);
                 default:  // rrx
                     if (want) *carry = x + " & 1u";
-                    return nx::format("((ctx->c << 31) | ({} >> 1))", x);
+                    return nx::format("((fl.c << 31) | ({} >> 1))", x);
             }
         }
         case OperandKind::RegShiftReg: {
@@ -559,11 +564,11 @@ nx::string Emitter::operand2(const Instruction& in, const Operand& o, nx::string
             line(nx::format("const uint32_t {} = {};", x, read(in, o.reg)));
             line(nx::format("const uint32_t {} = {};", s, read(in, o.reg2)));
             const u32 type = static_cast<u32>(o.shift);
-            if (want) *carry = nx::format("psv_shift_reg_c({}, {}, {}, ctx->c)", x, type, s);
+            if (want) *carry = nx::format("psv_shift_reg_c({}, {}, {}, fl.c)", x, type, s);
             return nx::format("psv_shift_reg({}, {}, {})", x, type, s);
         }
         default:
-            if (want) *carry = "ctx->c";
+            if (want) *carry = "fl.c";
             return "0u /* operand? */";
     }
 }

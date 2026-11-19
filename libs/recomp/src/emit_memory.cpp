@@ -18,7 +18,7 @@ nx::string Emitter::address(const Instruction& in, const Operand& m, nx::string*
             case arm::ShiftType::Lsr: offset = m.amount >= 32 ? nx::string("0u") : nx::format("({} >> {})", x, m.amount); break;
             case arm::ShiftType::Asr: offset = nx::format("psv_asr({}, {})", x, m.amount); break;
             case arm::ShiftType::Ror: offset = nx::format("psv_ror({}, {})", x, m.amount); break;
-            default: offset = nx::format("((ctx->c << 31) | ({} >> 1))", x); break;
+            default: offset = nx::format("((fl.c << 31) | ({} >> 1))", x); break;
         }
     } else if (m.imm != 0) {
         offset = hex(m.imm);

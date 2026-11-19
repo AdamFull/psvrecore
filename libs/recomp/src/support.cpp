@@ -40,6 +40,51 @@ nx::flat_hash_map<u32, const PsvImport*>& import_stubs() {
     std::abort();
 }
 
+// Each registered module's condition-flag contract (guest.h, PsvModuleCode), and what does not fit.
+struct FlagContract {
+    nx::string name;
+    u32 needed_at_entry, given_at_entry, needed_at_return, given_at_return;
+};
+nx::vector<FlagContract>& flag_contracts() {
+    static nx::vector<FlagContract> list;
+    return list;
+}
+nx::string& flag_problems() {
+    static nx::string text;
+    return text;
+}
+
+nx::string flag_letters(u32 f) {
+    nx::string s;
+    if (f & 8) s += 'n';
+    if (f & 4) s += 'z';
+    if (f & 2) s += 'c';
+    if (f & 1) s += 'v';
+    return s;
+}
+
+// `reader`'s code reads flags that `provider`'s code must have put in the context.
+void check_flags(const FlagContract& reader, const FlagContract& provider) {
+    if (const u32 missing = reader.needed_at_entry & ~provider.given_at_entry) {
+        const nx::string problem = nx::format(
+            "condition flags: {}'s functions read {} at entry, but {}'s calls and jumps to code outside it provide only {} "
+            "(generate {} with psvrecomp --flags-given-at-entry {})",
+            reader.name, flag_letters(missing), provider.name, provider.given_at_entry ? flag_letters(provider.given_at_entry) : "none",
+            provider.name, flag_letters(provider.given_at_entry | reader.needed_at_entry));
+        nx::loge(logs::kernel, "{}", problem);
+        flag_problems() += problem + "\n";
+    }
+    if (const u32 missing = reader.needed_at_return & ~provider.given_at_return) {
+        const nx::string problem = nx::format(
+            "condition flags: {} reads {} after its indirect calls and jumps return, but {}'s functions leave only {} "
+            "(generate {} with psvrecomp --flags-given-at-return {})",
+            reader.name, flag_letters(missing), provider.name, provider.given_at_return ? flag_letters(provider.given_at_return) : "none",
+            provider.name, flag_letters(provider.given_at_return | reader.needed_at_return));
+        nx::loge(logs::kernel, "{}", problem);
+        flag_problems() += problem + "\n";
+    }
+}
+
 TrapHandler g_handler = nullptr;
 
 [[noreturn]] void raise(PsvContext* ctx, const TrapInfo& trap) {
@@ -54,11 +99,26 @@ void register_module(const PsvModuleCode& module) {
     for (u32 i = 0; i < module.function_count; ++i) map[module.functions[i].address] = module.functions[i].function;
     if (module.import_stubs)
         for (u32 i = 0; i < module.import_count; ++i) import_stubs()[module.import_stubs[i]] = &module.imports[i];
+    // (code generated before the contract has every flag in the context everywhere, and is taken to read them all)
+    FlagContract c{module.name && *module.name ? module.name : "(a module without a name)", 15, 15, 15, 15};
+    if (module.flag_contract != 0)
+        c = {c.name, module.flags_needed_at_entry & 15, module.flags_given_at_entry & 15, module.flags_needed_at_return & 15,
+             module.flags_given_at_return & 15};
+    auto& list = flag_contracts();
+    list.push_back(c);
+    for (const auto& other : list) {
+        check_flags(c, other);
+        if (&other != &list.back()) check_flags(other, c);
+    }
 }
+
+nx::string flag_contract_problems() { return flag_problems(); }
 
 void clear_modules() {
     functions().clear();
     import_stubs().clear();
+    flag_contracts().clear();
+    flag_problems().clear();
 }
 
 const PsvImport* find_import_stub(u32 code) {

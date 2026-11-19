@@ -228,6 +228,20 @@
   recompiled function starts at" if reached). The generated code checks that rB holds the table's address before it
   switches on the index; another path to the branch with another value in rB goes where the word it loads says if that
   is one of the table's targets, and traps otherwise, as any table branch does for an index outside its table.
+- **The condition flags are guaranteed only where the contract says** (ARCHITECTURE.md, "Condition flags"). What
+  is assumed and not checked:
+  - a return-form branch (bx lr, pop/ldm/ldr pc from the stack) to an address other than the function's return
+    address is a non-local exit: the code it reaches gets only the function's `live_out` flags at entry and is not
+    relied on for any flag at its return;
+  - an exported function leaves all four flags at return except those that come out of an indirect call or jump it
+    ends in (those are its module's `given_at_return`): an export that hands a flag result on from a function
+    pointer to another module's caller would lose it;
+  - a function replaced with `override_function` must itself leave the flags its module gives at return;
+  - at a trap the context holds the flags the trapping function computed since its entry or last call, not those of
+    its callers.
+  Across modules the contract is checked: the loader refuses modules that do not fit (`psvrecomp
+  --flags-given-at-entry`/`--flags-given-at-return` fix it). `psvrecomp --flags-everywhere` generates without flag
+  liveness, for checking a suspected liveness bug against a game.
 - **A few system instructions are not translated.** In the 24 MB executable these are 3 `mcrr` and 3 `mrc p15`
   (coprocessor registers other than the thread ID registers). Each traps with a diagnostic.
 - **Imported variables need the SDK's reference-table format.** Analysis reads each imported variable's table of uses

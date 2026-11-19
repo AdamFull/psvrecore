@@ -47,7 +47,7 @@ python scripts/codegen_metrics.py <tree> --targets arm64 --binary-arm64 <build>/
 
 `tests/codegen/corpus/`: C (Thumb-2 and ARM) and hand-written assembly, compiled for the Cortex-A9 by
 `scripts/codegen_corpus.py` with LLVM's clang and ld.lld and checked in as `tests/codegen/corpus_data.inc`, so
-neither the tests nor the metrics need an ARM toolchain. Six modules, one per source file:
+neither the tests nor the metrics need an ARM toolchain. Seven modules, one per source file:
 
 | Module | What it holds |
 | --- | --- |
@@ -57,6 +57,7 @@ neither the tests nor the metrics need an ARM toolchain. Six modules, one per so
 | `vfp` | single and double precision: loops, compares that branch, conversions, square roots, division |
 | `neon` | VLD1/VST1 of every element size at any alignment, VLD2-4/VST2-4, float and integer lanes, widening, narrowing, saturation, permutes, tables, estimates, fixed-point conversion |
 | `control` | hand-written: flags live at entry and returned by a callee, flags and a carry across calls, `pop {pc}` and `ldm` returns, tail branches, hand-made TBB/TBH, 4-instruction IT blocks, cbz/cbnz, conditional calls and returns in ARM code |
+| `flags` | hand-written, for the flag liveness: flags returned by a vcmp+vmrs helper and through a veneer (`ldr pc, =f`), read at entry through a direct call, an indirect call, a tail call and an indirect jump, setters under a condition at joins (Thumb and ARM), a carry through a loop, the shifter's carry read later, flags through a jump table, mrs/msr, a call under a condition to a function that never returns, an address-table switch reached with another table in its base register |
 
 The same corpus is the generator's whole-function differential test (`psvrecore_codegen_tests`,
 `psvrecore_codegen_masked_tests`; see [STATUS.md](STATUS.md)).
@@ -66,8 +67,9 @@ The same corpus is the generator's whole-function differential test (`psvrecore_
 Measured 2026-11-19: x64 with clang-cl 22.1.0 (LLVM), arm64 with the NDK 29.0.14206865's clang, the flags of the
 time (the release presets' and `-fwrapv -fno-strict-aliasing -ffp-contract=off -fno-fast-math -w -funwind-tables`).
 Host instructions per guest instruction (`/g`) and code bytes per guest instruction (`B/g`). These synthetic numbers
-are in git history's `docs/codegen_metrics_synthetic.json` (before the change below); the file now holds the
-numbers [after it](#the-memory-base-in-a-local-jump-tables-on-their-index-the-generated-codes-options).
+are in git history's `docs/codegen_metrics_synthetic.json` (before the change below); the file then held the
+numbers [after it](#the-memory-base-in-a-local-jump-tables-on-their-index-the-generated-codes-options), and now those
+[after the flag liveness](#condition-flags-computed-only-where-they-are-read).
 
 ### Synthetic corpus
 
@@ -175,7 +177,8 @@ Measured 2026-11-19 with the same compilers. Three changes, none to what the gue
   `-fno-stack-protector`, `-fvisibility=hidden`, `-mno-outline-atomics` (arm64) elsewhere, and `-Bsymbolic` when
   linking on Android; line tables only as debug information. Each is measured below.
 
-The synthetic numbers after them are in `docs/codegen_metrics_synthetic.json`, the baseline for the next change.
+The synthetic numbers after them were `docs/codegen_metrics_synthetic.json` at 925071c (on the six-module corpus); the file
+now holds the numbers [after the flag liveness](#condition-flags-computed-only-where-they-are-read).
 
 ### Synthetic corpus
 
@@ -328,3 +331,94 @@ its generated code as it was, run hidden with the same input and data:
   never gets past one of its waits for a colour on the screen with either build, nor with the game's own build in
   its checkout (no shot, the time limit reached at 190 s): that run does not work here. With shots at fixed times
   instead, both builds boot through the logos into the opening movie to 55 s (1655 and 1661 frames).
+
+## Condition flags computed only where they are read
+
+Measured 2026-11-19 with the same compilers and options. The generator computes a condition flag only where an
+instruction reads it, keeps the flags in a local, and writes them to the context only where code outside the function
+may read them ([ARCHITECTURE.md](ARCHITECTURE.md), "Condition flags"). Before, every call and return wrote all four
+flags to the context and read them back, and the compiler could drop a flag only between them. "Before" is the
+generator at 925071c. The synthetic corpus has a module more (`flags`; the modules after it in file order moved by
+0x8000), so both columns are measured on the new corpus, "before" with 925071c's corpusgen built on it;
+`docs/codegen_metrics_synthetic.json` now holds the numbers after, the baseline for the next change.
+
+### Synthetic corpus
+
+| | Functions | Guest instructions | x64 before | x64 after | | arm64 before | arm64 after | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 115 | 1871 | 10.22 | 9.18 | -10.1% | 7.92 | 6.79 | -14.3% |
+| Module `calls` | 31 | 377 | 6.52 | 5.24 | -19.6% | 5.72 | 4.62 | -19.2% |
+| Module `control` | 16 | 134 | 9.81 | 6.82 | -30.4% | 7.69 | 5.49 | -28.6% |
+| Module `flags` | 19 | 146 | 8.14 | 6.86 | -15.7% | 6.93 | 5.65 | -18.5% |
+| Module `integer` | 18 | 605 | 5.29 | 4.31 | -18.4% | 4.15 | 3.20 | -22.9% |
+| Module `integer_arm` | 6 | 151 | 6.66 | 5.60 | -15.9% | 5.21 | 3.99 | -23.3% |
+| Module `neon` | 13 | 194 | 22.94 | 22.32 | -2.7% | 16.70 | 15.30 | -8.3% |
+| Module `vfp` | 12 | 264 | 20.86 | 20.86 | -0.0% | 15.42 | 14.72 | -4.6% |
+| Class integer | 70 | 909 | 6.30 | 4.86 | -23.0% | 5.19 | 3.91 | -24.6% |
+| Class vfp | 14 | 280 | 20.26 | 20.21 | -0.2% | 14.99 | 14.30 | -4.6% |
+| Class neon | 20 | 533 | 12.22 | 11.69 | -4.4% | 9.21 | 8.26 | -10.3% |
+| Class call-heavy | 11 | 149 | 8.08 | 5.91 | -26.8% | 6.62 | 4.96 | -25.0% |
+
+Out-of-line helpers: 1203 (x64) and 976 (arm64) instructions, unchanged. Some functions (x64, arm64): `vec_sum`
+(getters in a loop) 7.03 -> 3.50, 5.59 -> 2.91; `rect_area` 12.00 -> 5.67, 11.33 -> 6.00; `fib` 8.31 -> 5.69,
+6.77 -> 5.54; `flags_across_call` 10.75 -> 7.56, 7.94 -> 5.44; `large_switch` 3.74 -> 2.75, 2.99 -> 2.32;
+`sum_bytes` 4.23 -> 3.68, 4.18 -> 3.04; `neon_u64` 5.38 -> 3.69, 5.00 -> 3.00. A few float functions grow a little
+on x64 (`clamp_f32` 5.66 -> 5.78, `dot_f64` 33.10 -> 33.30; on arm64 -7.9% and -11.6%).
+
+The corpus' hand-written functions that read flags at entry (`flags_at_entry`, `reads_entry_flags`, `carry_loop`)
+make every one of its modules put all four flags in the context before each call and jump to code it does not know:
+corpusgen gives each module what the others read (`given_at_entry` nzcv), as a game's modules would need. The games'
+modules need nothing of the kind (below).
+
+### WipEout 2048
+
+Regenerated with this generator into the game worktree's `generated/code` (outside the game's repository), against
+the generator before (`build/t2/wo-final.json`: the same code, byte for byte, as 925071c's psvrecomp gives).
+
+| | Functions | Guest instructions | x64 before | x64 after | | arm64 before | arm64 after | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 16658 | 1479360 | 4.73 | 4.05 | -14.3% | 4.18 | 3.68 | -12.0% |
+| Module `wo_eboot` | 14792 | 1350786 | 4.74 | 4.04 | -14.9% | 4.20 | 3.68 | -12.4% |
+| Module `wo_libc` | 1201 | 65672 | 5.87 | 5.47 | -6.7% | 4.85 | 4.52 | -6.8% |
+| Module `wo_libfios2` | 520 | 39042 | 3.53 | 3.04 | -13.8% | 3.29 | 2.96 | -10.0% |
+| Module `wo_libult` | 145 | 23860 | 2.91 | 2.66 | -8.7% | 2.77 | 2.65 | -4.3% |
+| Class integer | 10290 | 757832 | 3.44 | 2.86 | -17.0% | 3.19 | 2.75 | -13.8% |
+| Class vfp | 1444 | 224442 | 6.30 | 5.88 | -6.8% | 5.41 | 5.08 | -6.0% |
+| Class neon | 663 | 122161 | 12.61 | 12.35 | -2.1% | 9.97 | 9.75 | -2.1% |
+| Class call-heavy | 4261 | 374925 | 3.82 | 2.67 | -29.9% | 3.55 | 2.74 | -22.8% |
+
+| Function | Class | Guest | x64 insns before | after | x64 /g before | after | arm64 insns before | after | arm64 /g before | after |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `f_8311A9C8` | integer | 383 | 1480 | 1310 | 3.86 | 3.42 | 1175 | 1032 | 3.07 | 2.69 |
+| `f_8128DB48` | neon | 443 | 4349 | 4384 | 9.82 | 9.90 | 3745 | 3766 | 8.45 | 8.50 |
+| `f_813BAC40` | vfp | 408 | 1687 | 1844 | 4.13 | 4.52 | 1481 | 1433 | 3.63 | 3.51 |
+| `f_812FC59A` | neon | 1125 | 10408 | 10390 | 9.25 | 9.24 | 9017 | 8968 | 8.02 | 7.97 |
+| `f_812FC39E` | neon | 117 | 5092 | 5089 | 43.52 | 43.50 | 3763 | 3759 | 32.16 | 32.13 |
+| `f_81276E14` | neon | 112 | 2248 | 2246 | 20.07 | 20.05 | 1705 | 1698 | 15.22 | 15.16 |
+| `f_8127A712` | neon | 123 | 1862 | 1936 | 15.14 | 15.74 | 1376 | 1335 | 11.19 | 10.85 |
+| `f_8118C300` | neon | 716 | 10832 | 10669 | 15.13 | 14.90 | 8721 | 8690 | 12.18 | 12.14 |
+| `f_813C32DC` | integer | 31 | 137 | 127 | 4.42 | 4.10 | 128 | 116 | 4.13 | 3.74 |
+| `f_812A7EDC` | neon | 475 | 3007 | 2928 | 6.33 | 6.16 | 2479 | 2494 | 5.22 | 5.25 |
+| **Together** | | 3933 | 41102 | 40923 | 10.45 | 10.40 | 33590 | 33291 | 8.54 | 8.46 |
+
+Out-of-line helpers: 55534 instructions (x64), 44923 (arm64). The hot functions are float and NEON code, where the
+flags were a small part. `f_813BAC40` and `f_8127A712` grow on x64 although their C has fewer flag computations and
+no flag stores (`f_813BAC40`: 104 flag writes instead of 109 helper calls and 23 stores or reloads); clang-cl
+allocates and schedules the rest differently. Both shrink on arm64.
+
+What psvrecomp reports for the modules (its `flags` lines):
+
+| Module | Flag-setting instructions | that compute a flag | Calls | writing flags before | reading them after | Returns leaving flags | Functions reading a flag at entry | Functions leaving flags at return |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `wo_eboot` | 349556 | 76579 (21.9%) | 119629 | 0 | 0 | 0 of 17433 | 0 | 0 |
+| `wo_libc` | 20175 | 7961 (39.5%) | 3542 | 113 | 577 | 1018 of 1441 | 0 | 900 |
+| `wo_libfios2` | 11664 | 3521 (30.2%) | 2803 | 17 | 218 | 199 of 676 | 0 | 189 |
+| `wo_libult` | 6773 | 3068 (45.3%) | 1227 | 8 | 37 | 88 of 165 | 0 | 72 |
+| **WipEout 2048** | 388168 | 91129 (23.5%) | 127201 | 138 | 832 | 1305 of 19715 | 0 | 1161 |
+| **Persona 4 Dancing All Night** (6 modules) | 288000 | 79649 (27.7%) | 83588 | 139 | 491 | 1398 of 16672 | 0 | 1410 |
+
+Before, a flag-setting instruction computed all four flags whenever a call or return came before the next setter, and
+every call and return wrote and read all four. The executables' code reads no flag across a call, at a function's
+entry or after a return. The libraries' flags at return are their exported functions' (all four, for callers in
+other modules) and what those exports' callees then leave. Every module's contract is empty (no flag read at entry or
+after an indirect call or jump), so the modules fit each other.

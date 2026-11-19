@@ -47,6 +47,9 @@ void Loader::add_code(const PsvModuleCode& code) {
 }
 
 Result<i32> Loader::load(nx::string_view host_path, nx::string_view guest_path) {
+    // (modules generated with condition-flag contracts that do not fit would compute wrong flags)
+    if (const nx::string problems = recomp::flag_contract_problems(); !problems.empty())
+        return failure(nx::format("{}: the program's modules do not fit together: {}", guest_path, problems));
     // Which generated code this file is, by fingerprint (any layout: the code says where each segment goes).
     auto probe = analysis::Image::load(nx::fs::path_view(host_path));
     if (!probe) return nx::err(probe.error());

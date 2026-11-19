@@ -30,6 +30,7 @@ add_executable(psvrecore_tests
     cpk_tests.cpp
     arm_tests.cpp
     analysis_tests.cpp
+    flags_tests.cpp
     generator_tests.cpp
     interp_tests.cpp
     float_tests.cpp
@@ -54,25 +55,35 @@ add_executable(corpusgen codegen/corpusgen.cpp)
 target_include_directories(corpusgen PRIVATE codegen)
 target_link_libraries(corpusgen PRIVATE psvrecore::recomp)
 psvrecore_target_defaults(corpusgen)
-set(_corpus_dir "${CMAKE_CURRENT_BINARY_DIR}/codegen")
-set(_corpus_modules calls control integer integer_arm neon vfp)  # (one per file in codegen/corpus)
-set(_corpus_sources "${_corpus_dir}/corpus_modules.c")
-set(_corpus_includes "")
-foreach(_m IN LISTS _corpus_modules)
-    list(APPEND _corpus_sources "${_corpus_dir}/syn_${_m}/syn_${_m}_code_0.c" "${_corpus_dir}/syn_${_m}/syn_${_m}_module.c")
-    list(APPEND _corpus_includes "${_corpus_dir}/syn_${_m}")
+# The masked configuration's code is generated with --full-exit: its test functions leave all four condition flags
+# at return and the test compares them all; the other's leave only those a caller reads (see corpusgen.cpp).
+set(_corpus_modules calls control flags integer integer_arm neon vfp)  # (one per file in codegen/corpus)
+foreach(_config "" _masked)
+    set(_dir "${CMAKE_CURRENT_BINARY_DIR}/codegen${_config}")
+    set(_corpus_sources${_config} "${_dir}/corpus_modules.c")
+    set(_corpus_includes${_config} "")
+    foreach(_m IN LISTS _corpus_modules)
+        list(APPEND _corpus_sources${_config} "${_dir}/syn_${_m}/syn_${_m}_code_0.c" "${_dir}/syn_${_m}/syn_${_m}_module.c")
+        list(APPEND _corpus_includes${_config} "${_dir}/syn_${_m}")
+    endforeach()
 endforeach()
 add_custom_command(
     OUTPUT ${_corpus_sources}
-    COMMAND corpusgen "${_corpus_dir}" 0xFFFFFFFF
+    COMMAND corpusgen "${CMAKE_CURRENT_BINARY_DIR}/codegen" 0xFFFFFFFF
     DEPENDS corpusgen "${CMAKE_CURRENT_SOURCE_DIR}/codegen/corpus_data.inc"
     COMMENT "Translating the code generator's synthetic corpus"
     VERBATIM)
+add_custom_command(
+    OUTPUT ${_corpus_sources_masked}
+    COMMAND corpusgen "${CMAKE_CURRENT_BINARY_DIR}/codegen_masked" 0xFFFFFFFF --full-exit
+    DEPENDS corpusgen "${CMAKE_CURRENT_SOURCE_DIR}/codegen/corpus_data.inc"
+    COMMENT "Translating the code generator's synthetic corpus (every flag at exit)"
+    VERBATIM)
 add_library(psvrecore_codegen_code STATIC ${_corpus_sources})
-add_library(psvrecore_codegen_code_masked STATIC ${_corpus_sources})
+add_library(psvrecore_codegen_code_masked STATIC ${_corpus_sources_masked})
 target_compile_definitions(psvrecore_codegen_code_masked PRIVATE PSV_ADDRESS_MASK=0x7FFFF)
 foreach(_config "" _masked)
-    target_include_directories(psvrecore_codegen_code${_config} PRIVATE ${_corpus_includes})
+    target_include_directories(psvrecore_codegen_code${_config} PRIVATE ${_corpus_includes${_config}})
     target_link_libraries(psvrecore_codegen_code${_config} PUBLIC psvrecore::recomp_support)
     psvrecore_generated_code(psvrecore_codegen_code${_config})
     add_executable(psvrecore_codegen${_config}_tests "${_nxtest_dir}/nxtest.cpp" codegen/codegen_tests.cpp)

@@ -2,6 +2,8 @@
 
 // The code generator's per-function state, shared by the files that translate each group of instructions.
 
+#include "psvrecore/analysis/cfg.hpp"
+#include "psvrecore/analysis/flags.hpp"
 #include "psvrecore/analysis/flow.hpp"
 #include "psvrecore/analysis/program.hpp"
 #include "psvrecore/arm/instruction.hpp"
@@ -22,13 +24,15 @@ inline nx::string dec(u32 v) { return nx::format("{}", v); }
 inline nx::string label_name(u32 address) { return nx::format("L_{:08X}", address & ~1u); }
 inline nx::string R(u32 r) { return nx::format("ctx->r[{}]", r); }
 
-// The C condition of an ARM condition code ("" for always).
+using analysis::FlagSet;
+
+// The C condition of an ARM condition code ("" for always), on the function's flags (the local `fl`).
 nx::string condition(arm::Cond c);
 
 class Emitter {
 public:
-    Emitter(const analysis::Program& program, const analysis::Function& fn, const nx::string& prefix, Stats& stats)
-        : program_(program), fn_(fn), prefix_(prefix), stats_(stats) {}
+    Emitter(const analysis::Program& program, const analysis::Function& fn, const analysis::FlagLiveness& flags,
+            const nx::string& prefix, Stats& stats);
 
     // The function's C definition.
     nx::string function();
@@ -74,6 +78,24 @@ public:
     // Literal pools: a load from a read-only segment of the module can be done at generation time.
     bool constant_load(u32 address, u32 size, u32& value) const;
 
+    // --- condition flags (analysis/flags.hpp): kept in the local `fl`, computed only where they are live ---
+
+    // The flags live after the current instruction's own effect: of those it writes, the ones to compute.
+    FlagSet live() const { return flags_fn_->after[index_]; }
+    // fl.n and fl.z from a 32-bit result, those of `which` that are live.
+    void set_nz(nx::string_view r, FlagSet which);
+    // const uint32_t r = x + y + carry_in (AddWithCarry), setting the flags of `which` that are live.
+    void add_with_carry(nx::string_view r, nx::string_view x, nx::string_view y, nx::string_view carry_in, FlagSet which);
+    // Writes flags to the context (before something outside the function may read them), and reads them back.
+    void store_flags(FlagSet f);
+    void load_flags(FlagSet f);
+    // Around the current instruction's call (to a function, an import, through the runtime, svc): the flags the
+    // callee may read, then those read back after it (or a trap after a function that never returns).
+    void call_flags_before();
+    void call_flags_after(const Instruction& in);
+    // Before a trap: every local flag in the context (what the function computed; see analysis::FunctionFlags).
+    void store_flags_for_trap() { store_flags(analysis::kAllFlags); }
+
     u32 next_code(const Instruction& in) const {
         return (in.address + in.size) | (in.mode == arm::Mode::Thumb ? 1u : 0u);
     }
@@ -84,9 +106,15 @@ public:
 private:
     void instruction(const Instruction& in);
     bool falls_through(const Instruction& in) const;
+    void count_flags(const Instruction& in);
+    nx::string flags_line(FlagSet f, bool store) const;
 
     const analysis::Program& program_;
     const analysis::Function& fn_;
+    const analysis::FlagLiveness& flags_;
+    const analysis::FunctionFlags* flags_fn_;
+    analysis::Cfg cfg_;
+    usize index_ = 0;  // the current instruction's, in fn_.code
     const nx::string& prefix_;
     Stats& stats_;
     nx::string body_;

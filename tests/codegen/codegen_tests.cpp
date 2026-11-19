@@ -8,6 +8,13 @@
 // Built twice: with the generated code's production memory path (PSV_HOST is psv_membase + address, the 8-byte
 // VLD1/VST1 accesses are one host access each), and with CODEGEN_TEST_MASK, the code compiled with
 // PSV_ADDRESS_MASK as the random-block test's is (accesses folded into a buffer, element by element).
+//
+// The condition flags at exit: a function is called here as the runtime calls it (call_guest, an indirect call),
+// and its returns leave in the context the flags its callers in the module read (ARCHITECTURE.md, "Condition
+// flags"); the others are unspecified, and are not compared. In the production configuration that is what the
+// generator gives each function as a game's module has it; the masked configuration's code is generated with every
+// test function leaving all four flags at return (as an exported function does), and there all four are compared
+// for every function (the test fails if any is not).
 
 #include <csetjmp>
 #include <cstdint>
@@ -24,6 +31,9 @@
 extern "C" {
 extern const PsvModuleCode* const corpus_modules[];
 extern const unsigned corpus_module_count;
+extern const uint32_t corpus_exit_flags[][2];
+extern const unsigned corpus_exit_flag_count;
+extern const int corpus_full_exit;
 }
 
 using namespace psvrecore;
@@ -193,17 +203,25 @@ recomp::TrapInfo g_trap;
     std::longjmp(g_trap_jump, 1);
 }
 
-nx::string differences(const PsvContext& a, const PsvContext& b, const nx::vector<u8>& ma, const nx::vector<u8>& mb) {
+// The condition flags a function's returns leave in the context (bit 3 N, 2 Z, 1 C, 0 V): what the runtime may read
+// after calling it, and what is compared at its exit. The others are unspecified there (see ARCHITECTURE.md).
+u32 exit_flags_of(u32 address) {
+    for (unsigned i = 0; i < corpus_exit_flag_count; ++i)
+        if (corpus_exit_flags[i][0] == address) return corpus_exit_flags[i][1];
+    return 15;
+}
+
+nx::string differences(const PsvContext& a, const PsvContext& b, const nx::vector<u8>& ma, const nx::vector<u8>& mb, u32 exit_flags) {
     nx::string out;
     for (int r = 0; r < 15; ++r)
         if (a.r[r] != b.r[r]) out += nx::format(" r{}: {:08x} vs {:08x};", r, a.r[r], b.r[r]);
     const auto flag = [&](const char* name, u32 x, u32 y) {
         if (x != y) out += nx::format(" {}: {:x} vs {:x};", name, x, y);
     };
-    flag("n", a.n, b.n);
-    flag("z", a.z, b.z);
-    flag("c", a.c, b.c);
-    flag("v", a.v, b.v);
+    if (exit_flags & 8) flag("n", a.n, b.n);
+    if (exit_flags & 4) flag("z", a.z, b.z);
+    if (exit_flags & 2) flag("c", a.c, b.c);
+    if (exit_flags & 1) flag("v", a.v, b.v);
     flag("q", a.q, b.q);
     flag("ge", a.ge, b.ge);
     flag("fpscr", a.fpscr, b.fpscr);
@@ -248,18 +266,28 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
     REQUIRE(corpus_module_count == sizeof kCorpusModules / sizeof kCorpusModules[0]);
     recomp::clear_modules();
     for (unsigned i = 0; i < corpus_module_count; ++i) recomp::register_module(*corpus_modules[i]);
+    // (the modules' condition-flag contracts fit: corpusgen gives each what the others read)
+    const nx::string problems = recomp::flag_contract_problems();
+    if (!problems.empty()) std::printf("%s", problems.c_str());
+    REQUIRE(problems.empty());
     const auto previous = recomp::set_trap_handler(on_trap);
 
     nx::vector<u8> pristine(kBufferSize, 0), initial, generated, interpreted;
     for (const CorpusModule& m : kCorpusModules) std::memcpy(pristine.data() + offset_of(m.base), m.bytes, m.size);
 
-    usize runs = 0, failures = 0, skipped = 0;
+    usize runs = 0, failures = 0, skipped = 0, all_flags = 0, some_flags = 0;
     u64 steps_total = 0;
     for (usize t = 0; t < sizeof kCorpusTests / sizeof kCorpusTests[0]; ++t) {
         const CorpusTest& test = kCorpusTests[t];
         const PsvFunction function = recomp::find_function(test.address);
         if (!function) std::printf("%s: no generated function at 0x%08x\n", test.function, test.address);
         REQUIRE(function != nullptr);
+        const u32 exit_flags = exit_flags_of(test.address);
+        all_flags += exit_flags == 15;
+        some_flags += exit_flags != 0 && exit_flags != 15;
+        // (--full-exit: every test function leaves all four flags, and they are all compared)
+        if (corpus_full_exit && exit_flags != 15) std::printf("%s: flags at exit %x, not all four\n", test.function, exit_flags);
+        if (corpus_full_exit) REQUIRE(exit_flags == 15);
         if (const char* reason = known_failure(test.function)) {
             std::printf("skipped (known failure) %s: %s\n", test.function, reason);
             ++skipped;
@@ -314,7 +342,7 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             else if (trapped || interp_trapped)
                 diff = nx::format(" trapped: generated {} ({}), interpreter {} (kind {} at 0x{:08x})", trapped, trapped ? recomp::describe(g_trap) : "",
                                   interp_trapped, it.trap_kind, it.pc);
-            else diff = differences(g, s, generated, interpreted);
+            else diff = differences(g, s, generated, interpreted, exit_flags);
             if (!diff.empty()) {
                 ++failures;
                 if (++function_failures <= 3) {
@@ -332,6 +360,9 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
     psv_membase = nullptr;
     std::printf("%s\n", nx::format("generator vs interpreter ({}): {} functions, {} runs, {} interpreted instructions, {} disagreements, {} skipped",
                                    kConfig, sizeof kCorpusTests / sizeof kCorpusTests[0], runs, steps_total, failures, skipped)
+                            .c_str());
+    std::printf("%s\n", nx::format("flags compared at exit: all four in {} functions, some in {}, none in {} (those no caller reads)", all_flags,
+                                   some_flags, sizeof kCorpusTests / sizeof kCorpusTests[0] - all_flags - some_flags)
                             .c_str());
     CHECK(failures == 0);
 }

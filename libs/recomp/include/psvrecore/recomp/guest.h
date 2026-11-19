@@ -132,7 +132,20 @@ typedef struct PsvModuleCode {
     const uint32_t* segment_bases;
     const uint32_t* segment_sizes; /* (in memory) */
     uint32_t segment_count;
+    /* The condition flags at the module's boundaries (ARCHITECTURE.md, "Condition flags"; bit 3 N, 2 Z, 1 C, 0 V).
+     * Generated code keeps the flags in locals and computes only those some instruction reads; the context holds
+     * them where code outside the function may read them. Inside a module the generator knows who reads what; across
+     * modules (and through indirect calls and jumps, which may lead into any module) each module states what it
+     * reads and what it provides, and registering a module checks that every module provides what every other one
+     * reads (recomp::register_module). flag_contract 0: code generated before flag liveness, which has all four flags
+     * in the context at every call, jump and return (it provides all, and is taken to read all). */
+    uint32_t flag_contract;            /* PSV_FLAG_CONTRACT */
+    uint32_t flags_needed_at_entry;    /* some function reads them at entry (any may be entered through the table) */
+    uint32_t flags_given_at_entry;     /* in the context at every call or jump to code the module does not know */
+    uint32_t flags_needed_at_return;   /* read after an indirect call or jump to code it does not know returns */
+    uint32_t flags_given_at_return;    /* in the context when any of its functions returns (exports: all four) */
 } PsvModuleCode;
+#define PSV_FLAG_CONTRACT 1u
 
 /* ---- Guest memory ---------------------------------------------------------------------------------------------- */
 
@@ -327,8 +340,9 @@ PSV_INLINE void psv_nz(PsvContext* PSV_RESTRICT ctx, uint32_t r) {
     ctx->n = r >> 31;
     ctx->z = r == 0;
 }
-/* Generated functions keep N, Z, C and V in a local (PsvFlags fl), written to the context before anything that may
- * read them there and read back after: the flags no instruction reads are then not computed. */
+/* Generated functions keep N, Z, C and V in a local (PsvFlags fl), compute only the flags some instruction reads, and
+ * write them to the context only where code outside the function may read them (see PsvModuleCode). PSV_FL_IN,
+ * PSV_FL_OUT, psv_nz, psv_nz_fl, psv_adds and psv_adds_fl are for code generated before flag liveness. */
 typedef struct PsvFlags {
     uint32_t n, z, c, v;
 } PsvFlags;
@@ -486,6 +500,20 @@ PSV_INLINE void psv_write_apsr(PsvContext* PSV_RESTRICT ctx, uint32_t value, uin
         ctx->z = (value >> 30) & 1;
         ctx->c = (value >> 29) & 1;
         ctx->v = (value >> 28) & 1;
+        ctx->q = (value >> 27) & 1;
+    }
+    if (mask & 4) ctx->ge = (value >> 16) & 0xF;
+}
+/* The same with N Z C V in a generated function's local (Q and GE stay in the context). */
+PSV_INLINE uint32_t psv_read_apsr_fl(const PsvFlags* f, const PsvContext* PSV_RESTRICT ctx) {
+    return (f->n << 31) | (f->z << 30) | (f->c << 29) | (f->v << 28) | (ctx->q << 27) | (ctx->ge << 16) | 0x10u;
+}
+PSV_INLINE void psv_write_apsr_fl(PsvFlags* f, PsvContext* PSV_RESTRICT ctx, uint32_t value, uint32_t mask) {
+    if (mask & 8) {
+        f->n = value >> 31;
+        f->z = (value >> 30) & 1;
+        f->c = (value >> 29) & 1;
+        f->v = (value >> 28) & 1;
         ctx->q = (value >> 27) & 1;
     }
     if (mask & 4) ctx->ge = (value >> 16) & 0xF;

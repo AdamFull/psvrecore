@@ -117,7 +117,8 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     library (`-Bsymbolic` on Android), so calls between generated functions are direct; inline atomics on arm64;
     full inlining (`/Ob2`) with clang-cl; line tables only as debug information. Options for the instruction set,
     ThinLTO and debug information are in [BUILDING.md](BUILDING.md#options).
-  - Registers and flags live in the context, and the C compiler keeps them in host registers where it can.
+  - Registers live in the context, and the C compiler keeps them in host registers where it can. The condition
+    flags live in a local of each function and are computed only where an instruction reads them (below).
   - IT blocks become per-instruction conditions.
   - Loads from read-only data are folded into constants, except words the loader patches.
   - Imports go through a per-module table the loader fills, and so do imported variables' addresses.
@@ -125,6 +126,72 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     and the ARM NaN rules are implemented explicitly, binary32 by way of binary64 with exact underflow detection.
   - Advanced SIMD always uses its standard FP mode.
   - Exclusive loads and stores become a host compare-and-swap.
+- **Control-flow graph** (`analysis/cfg.hpp`). Each function's instructions as the generator translates their
+  control flow: per instruction its condition (where control goes when it does not execute), its call (direct, import,
+  through the runtime, svc) and its edges, to another instruction or out of the function (return, indirect jump, tail
+  call, import tail call, trap); and basic blocks over them (a call ends a block). A `bx rN` just after `ldr rN, =f` or
+  `movw`/`movt`, and `ldr pc, =f`, are taken as tail calls of `f` (a veneer's jump), though the generated code still
+  jumps through the runtime. It is what dataflow over guest state runs on (the flags now; registers next).
+- **Condition flags** (`analysis/flags.hpp`). N, Z, C and V are a local `fl` of each generated function. Q and GE
+  stay in the context.
+  - Each instruction's reads and writes are known (`flag_effect`): its condition; carry in (adc, sbc, rsc, rrx, rrx
+    offsets); what S forms write, the carry of a logical operation only when the shifter gives one; a shift by a
+    register writes the carry without ending the old one's life (a shift by 0 keeps it); mrs reads all four, msr
+    APSR_nzcvq and vmrs APSR_nzcv write them. A conditional instruction's writes end no flag's life.
+  - Liveness runs backwards over each function's graph, twice at once: with its returns reading no flag and with
+    them reading all four. Per flag only its own bit at the returns matters, so any return set R gives
+    `live(none) | (live(all) & R)` everywhere. Each function's summary: `need` (read at entry before written, itself
+    or in what it calls) and `pass` (live at entry when its returns read all four). Summaries are a least fixed point
+    over the module's calls and tail calls; then `live_out` (what each function's returns leave in the context) is
+    propagated from callers: the flags a caller reads after the call, the `live_out` of functions that tail-call it
+    or run into it.
+  - A flag-setting instruction computes only the flags it writes that are live after it (`cmp` + `beq`: Z only); a
+    dead one is plain arithmetic.
+  - Traps show the flags the function computed: before a trap the four locals are written to the context, and the
+    liveness keeps every flag live on the way to a trap back to the function's entry or its last call (no further:
+    making a trap's flags exact through callers would make every function's flags live at its entry). The rest are
+    unspecified at a trap. Traps are fatal; the runtime's handler (`recomp/support.cpp`) logs r0-r14 and aborts,
+    and no handler reads the flags. vmsr (it traps on an FPSCR setting not implemented) and svc are such places.
+  - **The contract.** Where control goes and what the context must hold there:
+    - Function entry: the flags in `live_in` are read from the context (`need`, `pass & live_out`, and what a trap
+      may show); the others start at 0.
+    - A direct call or tail call to function G of the module (and running into G): written to the context before it
+      are `need(G) | (A & pass(G))`, A the flags live after the call (for a tail call, the caller's `live_out`); after
+      the call A is read back. G's `live_out` includes A.
+    - A return (a return-form branch to `ret`: bx lr, pop/ldm/ldr pc from the stack, mov pc, lr): the function's
+      `live_out` is written first.
+    - Code the module does not know: imports, indirect calls (`psv_call`), indirect jumps (`psv_jump`), svc. Written
+      before: the module's `given_at_entry` and what is live after (or the function's `live_out` for a jump); read
+      back after a call: what is live after it. `given_at_entry` is the union of every function's `need` (any
+      function may be entered through the function table) and `--flags-given-at-entry`. Flags read after an indirect
+      call or jump returns make the module's `needed_at_return`; every function's `live_out` includes the module's
+      `given_at_return` (that, and `--flags-given-at-return`).
+    - Exports (functions of the module's non-main export libraries) leave all four flags at return: other modules
+      call them through imports, and compiler helpers like `__aeabi_cdcmple` return their result in the flags. Their
+      callers outside the module are not seen, so an import call's continuation needs nothing from the callee's module
+      (an HLE implementation leaves the context's flags as they were). What an export passes on from an indirect call
+      or jump it ends in is that code's: the module's `given_at_return` (an export's four flags do not make the
+      module's `needed_at_return`).
+    - A return-form branch to an address other than `ret` (longjmp, exception unwinding, a hand-made context switch)
+      goes through the runtime with only the function's `live_out` in the context, and the code it reaches is taken
+      to need no more at entry and to leave nothing its caller would read. AAPCS leaves the flags undefined there;
+      this is assumed, not checked.
+    - HLE entry (`call_guest`: callbacks, thread and fiber entries, `module_start`): the runtime reads no flag after a
+      guest function returns, and a function that reads flags at entry reads what the context holds, as on the console
+      it reads what the system left. Fibers save and restore the whole context at their switches (imports, where the
+      context holds what the import call wrote).
+    - `override_function` replaces a function for table lookups only: a replacement is entered with
+      `given_at_entry` and what its caller reads after it in the context, and must leave in the context the flags the
+      original's module gives at return (all four for an export). Host code that does not touch the flags leaves them
+      as its caller wrote them.
+    - mrs and msr read and write the locals (`psv_read_apsr_fl`, `psv_write_apsr_fl`); Q and GE stay in the context.
+  - **Module boundaries.** Each module's `PsvModuleCode` records `flags_needed_at_entry`, `flags_given_at_entry`,
+    `flags_needed_at_return` and `flags_given_at_return` (`flag_contract` 1; 0 is code generated before, which has all
+    four in the context everywhere and is taken to read all four). `recomp::register_module` checks every pair of
+    registered modules (what each reads, every other must give) and the loader refuses to load a program whose modules
+    do not fit, naming the psvrecomp option that fixes it. `psvrecomp generate` prints each module's contract.
+  - `psvrecomp --flags-everywhere` turns the liveness off: every flag computed and in the context at every call, jump
+    and return (as before), for checking a suspected liveness bug.
 - **Reference interpreter** (`interp`, tests only). It is written from the ARM ARM pseudocode, independently of the
   generator, and shares only the decoder and the context layout. It has its own integer soft float. Two kinds of
   test compare generated code against it:

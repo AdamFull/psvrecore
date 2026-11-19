@@ -1,5 +1,8 @@
-# Code discovery: modules loaded at their guest addresses, functions, control flow and table branches.
+# Code discovery: modules loaded at their guest addresses, functions, control flow and table branches; each
+# function's control-flow graph and the condition flags' liveness over it.
 add_library(psvrecore_analysis STATIC
+    src/cfg.cpp
+    src/flags.cpp
     src/flow.cpp
     src/image.cpp
     src/program.cpp

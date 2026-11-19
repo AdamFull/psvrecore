@@ -127,6 +127,26 @@ Result<void> cmd_analyze(nx::string_view path, const nx::vector<u32>& bases, ana
     return {};
 }
 
+// "nzcv" (any of the letters), "none" or "all": a set of condition flags.
+Result<u8> parse_flags(nx::string_view text) {
+    if (text.empty() || text == "none") return u8(0);
+    if (text == "all") return u8(analysis::kAllFlags);
+    u8 f = 0;
+    for (const char c : text) {
+        if (c == 'n' || c == 'N') f |= analysis::kFlagN;
+        else if (c == 'z' || c == 'Z') f |= analysis::kFlagZ;
+        else if (c == 'c' || c == 'C') f |= analysis::kFlagC;
+        else if (c == 'v' || c == 'V') f |= analysis::kFlagV;
+        else return failure(nx::format("bad flags '{}' (letters of nzcv, none or all)", text));
+    }
+    return f;
+}
+
+struct FlagArgs {
+    bool everywhere = false;
+    nx::string given_at_entry, given_at_return;
+};
+
 bool valid_identifier(nx::string_view name) {
     if (name.empty() || (name[0] >= '0' && name[0] <= '9')) return false;
     for (const char c : name)
@@ -135,9 +155,13 @@ bool valid_identifier(nx::string_view name) {
 }
 
 Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const nx::string& name, const nx::vector<u32>& bases,
-                          analysis::Options options, const nids::Database& db, u32 instructions_per_file) {
+                          analysis::Options options, const nids::Database& db, u32 instructions_per_file, const FlagArgs& flag_args) {
     if (!valid_identifier(name)) return failure(nx::format("--name '{}' is not a C identifier", name));
     if (instructions_per_file == 0) return failure("--instructions-per-file must be at least 1");
+    const auto given_at_entry = parse_flags(flag_args.given_at_entry);
+    if (!given_at_entry) return nx::err(given_at_entry.error());
+    const auto given_at_return = parse_flags(flag_args.given_at_return);
+    if (!given_at_return) return nx::err(given_at_return.error());
     auto image = analysis::Image::load(nx::fs::path_view(path), bases);
     if (!image) return nx::err(image.error());
     options.noreturn_imports = noreturn_imports(*image, db);
@@ -147,6 +171,9 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     recomp::Options gen;
     gen.name = name;
     gen.instructions_per_file = instructions_per_file;
+    gen.flags_everywhere = flag_args.everywhere;
+    gen.flags_given_at_entry = *given_at_entry;
+    gen.flags_given_at_return = *given_at_return;
     const auto output = recomp::generate(program, gen);
     const nx::fs::path_view dir(out_dir);
     if (auto made = nx::fs::create_directories(dir); !made)
@@ -161,6 +188,16 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     print("calls       {} to imports, {} indirect; {} tail calls, {} indirect jumps, {} jump tables\n", st.import_calls,
           st.indirect_calls, st.tail_calls, st.indirect_jumps, st.jump_tables);
     print("literals    {} loads done at generation time\n", st.literals_folded);
+    const auto& fl = output.flags;
+    print("flags       {} of {} flag-setting instructions compute a flag; {} of {} calls write flags to the context, "
+          "{} read them back; {} of {} returns leave flags\n",
+          st.flag_setters_live, st.flag_setters, st.call_sites_store, st.call_sites, st.call_sites_load, st.return_sites_store,
+          st.return_sites);
+    print("            {} functions read a flag at entry, {} leave flags for their callers{}\n", st.functions_need,
+          st.functions_live_out, fl.everywhere ? " (--flags-everywhere)" : "");
+    print("            contract: read at entry {}, given at entry {}, read after indirect calls {}, given at return {}\n",
+          analysis::flag_names(fl.needed_at_entry), analysis::flag_names(fl.given_at_entry), analysis::flag_names(fl.needed_at_return),
+          analysis::flag_names(fl.given_at_return));
     print("discovery   {} errors (psvrecomp analyze --diagnostics lists them)\n", errors);
     usize traps = 0;
     for (const auto& [what, n] : st.traps) traps += n;
@@ -177,6 +214,7 @@ int main(int argc, char** argv) {
     bool no_default_db = false;
     bool list_functions = false, list_diagnostics = false, no_exidx = false;
     u32 instructions_per_file = recomp::Options{}.instructions_per_file;
+    FlagArgs flag_args;
     nx::cli::Parser cli("psvrecomp", "Finds the code of a Vita module and translates it to C.");
     cli.command("analyze", "code discovery: functions, table branches, diagnostics")
         .positional("file", file, "SELF or ELF module")
@@ -196,6 +234,14 @@ int main(int argc, char** argv) {
         .flag("no-exidx", no_exidx, "do not take function starts from the exception index table")
         .option("instructions-per-file", instructions_per_file,
                 "start a new .c file once a file holds this many guest instructions (default 20000)", {.value_name = "N"})
+        .flag("flags-everywhere", flag_args.everywhere,
+              "no condition-flag liveness: every flag computed, and in the context at every call, jump and return")
+        .option("flags-given-at-entry", flag_args.given_at_entry,
+                "condition flags other modules' functions read at entry (put in the context before every call or jump "
+                "to code outside this module): letters of nzcv, none or all", {.value_name = "FLAGS"})
+        .option("flags-given-at-return", flag_args.given_at_return,
+                "condition flags other modules read after an indirect call returns (left in the context by every "
+                "function's return)", {.value_name = "FLAGS"})
         .option_many("db", dbs, "NID database (.yml, .tsv, or a directory of them); repeatable", {.value_name = "PATH"})
         .flag("no-default-db", no_default_db, "do not load vita-headers' database");
     nx::string command;
@@ -219,7 +265,7 @@ int main(int argc, char** argv) {
         for (const auto& path : dbs)
             if (auto loaded = db.load(path); !loaded) return loaded;
         if (command == "analyze") return cmd_analyze(file, *bases, options, db, list_functions, list_diagnostics);
-        if (command == "generate") return cmd_generate(file, out_dir, name, *bases, options, db, instructions_per_file);
+        if (command == "generate") return cmd_generate(file, out_dir, name, *bases, options, db, instructions_per_file, flag_args);
         return failure(nx::format("unknown command '{}'", command));
     };
     if (const auto done = run(); !done) {

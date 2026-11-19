@@ -36,7 +36,7 @@ struct CorpusTest {
 // arguments point into (4 KiB regions), then the stack.
 inline constexpr uint32_t kCorpusBase = 0x82000000;
 inline constexpr uint32_t kCorpusModuleStride = 0x8000;
-inline constexpr uint32_t kCorpusDataBase = 0x82030000;
+inline constexpr uint32_t kCorpusDataBase = 0x82040000;  // (room for 8 modules)
 inline constexpr uint32_t kCorpusRegionSize = 0x1000;
 inline constexpr uint32_t kCorpusRegions = 32;
 inline constexpr uint32_t kCorpusStackBase = kCorpusDataBase + kCorpusRegions * kCorpusRegionSize;

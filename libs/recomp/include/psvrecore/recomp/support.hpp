@@ -12,8 +12,13 @@
 
 namespace psvrecore::recomp {
 
-// Adds a module's functions. Its imports are not resolved here (the loader does that).
+// Adds a module's functions. Its imports are not resolved here (the loader does that). Its condition-flag contract
+// (guest.h, PsvModuleCode) is checked against every module registered: what each reads at entry and after indirect
+// calls, every other must provide.
 PSVRECORE_API void register_module(const PsvModuleCode& module);
+// The modules registered whose flag contracts do not fit (one line each, with the psvrecomp option that fixes it);
+// empty when they all do. The loader refuses to load a program then.
+PSVRECORE_API nx::string flag_contract_problems();
 PSVRECORE_API void clear_modules();
 PSVRECORE_API PsvFunction find_function(u32 code);
 // The import whose stub is at `code` (as the module's import_stubs give it), or nullptr. Calls and jumps through a

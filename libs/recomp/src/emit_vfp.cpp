@@ -271,10 +271,12 @@ bool status(Emitter& e, const Instruction& in) {
             return true;
         }
         if (in.operands[0].kind == OperandKind::Sysreg && in.operands[0].imm == kApsrNzcv) {
-            e.line("ctx->n = ctx->fpscr >> 31;");
-            e.line("ctx->z = (ctx->fpscr >> 30) & 1u;");
-            e.line("ctx->c = (ctx->fpscr >> 29) & 1u;");
-            e.line("ctx->v = (ctx->fpscr >> 28) & 1u;");
+            // (the flags that are live)
+            const FlagSet out = e.live();
+            if (out & analysis::kFlagN) e.line("fl.n = ctx->fpscr >> 31;");
+            if (out & analysis::kFlagZ) e.line("fl.z = (ctx->fpscr >> 30) & 1u;");
+            if (out & analysis::kFlagC) e.line("fl.c = (ctx->fpscr >> 29) & 1u;");
+            if (out & analysis::kFlagV) e.line("fl.v = (ctx->fpscr >> 28) & 1u;");
             return true;
         }
         e.write(in, in.operands[0].reg, "ctx->fpscr");
@@ -285,6 +287,8 @@ bool status(Emitter& e, const Instruction& in) {
             e.trap(in, "PSV_TRAP_PRIVILEGED", "vmsr of a system register other than FPSCR");
             return true;
         }
+        // (it traps on a setting not implemented: every local flag in the context first)
+        e.store_flags_for_trap();
         e.line(nx::format("psv_write_fpscr(ctx, {}, {});", e.read(in, in.operands[1].reg), hex(in.address)));
         return true;
     }

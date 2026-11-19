@@ -215,6 +215,8 @@ int main(int argc, char** argv) {
     recomp::Options options;
     options.name = "fuzz";
     options.instructions_per_file = 0xFFFFFFFFu;
+    // (the test compares every condition flag after a block: each leaves all four, as an exported function does)
+    for (const auto& [code, fn] : program.functions) options.full_exit_flags.push_back(code);
     const auto output = recomp::generate(program, options);
     usize traps = 0;
     for (const auto& [what, n] : output.stats.traps) {

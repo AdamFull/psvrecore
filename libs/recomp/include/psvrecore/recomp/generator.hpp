@@ -10,6 +10,7 @@
 // An instruction the generator does not translate becomes a trap at that place, and is counted in the statistics;
 // nothing is skipped silently.
 
+#include "psvrecore/analysis/flags.hpp"
 #include "psvrecore/analysis/program.hpp"
 #include "core/foundation/containers/map.h"
 #include "core/foundation/core/foundation.h"
@@ -21,6 +22,14 @@ struct Options {
     nx::string name;                    // C identifier prefix of the module's tables (libc, eboot...)
     bool comments = true;               // each instruction's disassembly as a comment
     u32 instructions_per_file = 20000;  // how much code each .c file gets (psvrecomp --instructions-per-file)
+    // The condition flags (analysis/flags.hpp, FlagOptions): no liveness (psvrecomp --flags-everywhere); what other
+    // modules' code reads at entry and after their indirect calls (psvrecomp --flags-given-at-entry,
+    // --flags-given-at-return); functions whose returns leave all four (tests: functions called as the runtime calls
+    // them, whose every flag at return is compared).
+    bool flags_everywhere = false;
+    u8 flags_given_at_entry = 0;
+    u8 flags_given_at_return = 0;
+    nx::vector<u32> full_exit_flags;
 };
 
 struct GeneratedFile {
@@ -37,6 +46,20 @@ struct Stats {
     usize indirect_jumps = 0;
     usize jump_tables = 0;
     usize literals_folded = 0;
+    // Condition flags: instructions that write a flag, and those of them that compute one (one they write is live);
+    // calls (to functions, imports, through the runtime, svc), and those with flags written to the context before
+    // them / read back after; returns (branches through a register or memory that are not table branches), and those
+    // with flags written to the context; functions that read a flag at entry before writing it, and functions whose
+    // returns leave flags for their callers.
+    usize flag_setters = 0;
+    usize flag_setters_live = 0;
+    usize call_sites = 0;
+    usize call_sites_store = 0;
+    usize call_sites_load = 0;
+    usize return_sites = 0;
+    usize return_sites_store = 0;
+    usize functions_need = 0;
+    usize functions_live_out = 0;
     // Instructions translated to a trap, by mnemonic (undefined, unimplemented, privileged...).
     nx::map<nx::string, usize> traps;
 };
@@ -44,6 +67,8 @@ struct Stats {
 struct Output {
     nx::vector<GeneratedFile> files;
     Stats stats;
+    // Each function's flag summary and the module's contract (analysis::FlagLiveness without its per-instruction sets).
+    analysis::FlagLiveness flags;
 };
 
 Output generate(const analysis::Program& program, const Options& options);
