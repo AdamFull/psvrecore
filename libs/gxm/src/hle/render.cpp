@@ -108,6 +108,8 @@ bool color_format(u32 gxm, ColorFormat& out) {
         // which every device can draw into and blend)
         case 0x60800000u: out = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, {0, 1, 2, 3}}; return true;
         case 0x40800000u: out = {VK_FORMAT_R16_UNORM, 2, {0, 4, 4, 5}}; return true;           // U16_R
+        // (F11F11F10_BGR: unsigned floats, R from bit 0, G from 11, B from 22, as Vulkan's packed format)
+        case 0x21000000u: out = {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, {0, 1, 2, 5}}; return true;
         case 0x10000000u:  // U8U8U8_BGR (LittleBigPlanet)
             out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {0, 1, 2, 3}, Packing::U8U8U8};
             return true;
