@@ -468,14 +468,19 @@ nx::vector<u32> copy_words(u32 address, u32 bytes) {
 }
 
 // A stage's resources from a precomputed state: its default uniform buffer's words, buffers and textures.
+// (`buffers` holds 16 addresses, `units` `textures`; what the state's block does not hold is left zero)
 template <typename StateT>
 bool from_state(u32 address, u32 default_size, u32 textures, nx::vector<u32>& uniforms, u32* buffers, TextureWords* units) {
     if (!memory().valid(address, sizeof(StateT))) return false;
     const StateT& s = *reinterpret_cast<const StateT*>(memory().host(address));
     uniforms = copy_words(s.default_buffer, default_size);
-    if (!memory().valid(s.block, 16 * 4 + textures * 16)) return true;
-    std::memcpy(buffers, memory().host(s.block), 16 * 4);
-    std::memcpy(units, memory().host(s.block + 16 * 4), textures * 16);
+    std::memset(buffers, 0, 16 * 4);
+    std::memset(units, 0, textures * sizeof(TextureWords));
+    const u32 nb = nx::min(s.buffers, kPrecomputedBuffers), nt = nx::min(s.textures, textures);
+    const u32 at = precomputed_textures_offset(nb);
+    if (!memory().valid(s.block, at + nt * 16)) return true;
+    if (nb) std::memcpy(buffers, memory().host(s.block), nb * 4);
+    if (nt) std::memcpy(units, memory().host(s.block + at), nt * 16);
     return true;
 }
 
@@ -524,7 +529,8 @@ i32 sceGxmDrawPrecomputed(u32 context, Ptr<const PrecomputedDraw> draw_object) {
     if (!draw_object) return err::kInvalidPointer;
     const PrecomputedDraw pd = *draw_object;
     u32 streams[16] = {};
-    if (pd.block && memory().valid(pd.block, kPrecomputedDrawBlock)) std::memcpy(streams, memory().host(pd.block), sizeof streams);
+    const u32 n = nx::min(pd.streams, kPrecomputedStreams);
+    if (n && pd.block && memory().valid(pd.block, n * 4)) std::memcpy(streams, memory().host(pd.block), n * 4);
     return draw(context, pd.primitive, pd.index_format, pd.index_data, pd.index_count, nx::max(pd.instances, 1u), streams);
 }
 

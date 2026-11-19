@@ -117,27 +117,35 @@ static_assert(sizeof(DepthStencilSurface) == 20);
 inline constexpr u32 kDsTiled = 1u << 28, kDsForceLoad = 1u << 29, kDsForceStore = 1u << 30, kDsEnabled = 1u << 31;
 
 // Precomputed objects: the game allocates these (SCE_GXM_PRECOMPUTED_*_WORD_COUNT words) and a memory block for
-// each (sceGxmGetPrecomputed*Size bytes), which holds their arrays: a draw's 16 stream addresses; a state's 16
-// uniform buffer addresses, then its texture units' control words (4 vertex, 16 fragment).
+// each (sceGxmGetPrecomputed*Size bytes, for its program), which holds their arrays only as far as the program uses
+// them: a draw's stream addresses (as many as the vertex program has streams); a state's uniform buffer addresses
+// (up to the highest buffer index its program reads, padded to 16 bytes), then its texture units' control words (up
+// to the highest unit it samples). Games bump-allocate the blocks from pools sized for the console's sizes (Uncharted:
+// Golden Abyss): blocks for every unit and buffer ran its pool out, and its later states got none.
 struct PrecomputedDraw {
     u32 vertex;  // the vertex program it was made for
     u32 block;
     u32 primitive, index_format, index_data, index_count, instances;
-    u32 reserved[4];
+    u32 streams;  // (how many stream addresses the block holds)
+    u32 reserved[3];
 };
 static_assert(sizeof(PrecomputedDraw) == 11 * 4);
 struct PrecomputedVertexState {
     u32 program, block, default_buffer;
-    u32 reserved[4];
+    u32 buffers, textures;  // (how many of each the block holds)
+    u32 reserved[2];
 };
 static_assert(sizeof(PrecomputedVertexState) == 7 * 4);
 struct PrecomputedFragmentState {
     u32 program, block, default_buffer;
-    u32 reserved[6];
+    u32 buffers, textures;
+    u32 reserved[4];
 };
 static_assert(sizeof(PrecomputedFragmentState) == 9 * 4);
-inline constexpr u32 kPrecomputedDrawBlock = 16 * 4;
-inline constexpr u32 kPrecomputedVertexBlock = 16 * 4 + 4 * 16, kPrecomputedFragmentBlock = 16 * 4 + 16 * 16;
+inline constexpr u32 kPrecomputedStreams = 16, kPrecomputedBuffers = 14;
+inline constexpr u32 kPrecomputedVertexTextures = 4, kPrecomputedFragmentTextures = 16;
+// (a state's block: its buffers' addresses, padded to 16 bytes, then its textures)
+inline constexpr u32 precomputed_textures_offset(u32 buffers) { return (buffers * 4 + 15) & ~15u; }
 
 // SceGxmDeferredContextParams.
 struct DeferredContextParams {
