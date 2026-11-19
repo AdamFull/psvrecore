@@ -104,14 +104,28 @@ void trace_call(u32 slot, u64 start, u64 end) {
     trace->next.store(n + 1, std::memory_order_release);
 }
 
+// (PSVRECORE_HLE_ERRORS=1) Each call that answers with an error code (0x80000000-0x80FFFFFF in r0), logged with
+// its first four arguments: where a game gives up on something the system refused.
+bool logging_errors() {
+    static const bool on = [] {
+        const char* spec = std::getenv("PSVRECORE_HLE_ERRORS");
+        return spec && *spec && *spec != '0';
+    }();
+    return on;
+}
+
 template <u32 I>
 void counted_entry(PsvContext* ctx, uint32_t ret) {
     g_counted[I].calls.fetch_add(1, std::memory_order_relaxed);
+    const u32 a0 = ctx->r[0], a1 = ctx->r[1], a2 = ctx->r[2], a3 = ctx->r[3];
     const u64 start = nx::os::ticks_ns();
     g_counted[I].function(ctx, ret);
     const u64 end = nx::os::ticks_ns();
     g_counted[I].ns.fetch_add(end - start, std::memory_order_relaxed);
     if (tracing_calls()) trace_call(I, start, end);
+    if (logging_errors() && (ctx->r[0] & 0xFF000000u) == 0x80000000u)
+        nx::logw(logs::hle, "{}(0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}) = 0x{:08x} (lr 0x{:08x})", g_counted[I].name, a0, a1, a2,
+                 a3, ctx->r[0], ret);
 }
 template <u32... I>
 constexpr std::array<PsvFunction, sizeof...(I)> counted_entries(std::integer_sequence<u32, I...>) {
@@ -130,7 +144,7 @@ bool counting_calls() {
 }
 
 PsvFunction bind(const Function& f) {
-    if (!counting_calls() && !tracing_calls()) return f.function;
+    if (!counting_calls() && !tracing_calls() && !logging_errors()) return f.function;
     nx::scoped_lock<nx::mutex> held(g_lock);
     const u32 used = g_counted_used.load(std::memory_order_relaxed);
     for (u32 i = 0; i < used; ++i)
