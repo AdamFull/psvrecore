@@ -166,6 +166,8 @@ bool components(u32 code, u32 mode, u64 texel, f32 c[4], u32& count, bool& wide)
         }
         case kU8U3U3U2: packed({2, 3, 3, 8}, false); return true;
         case kU16: packed({16}, false); wide = true; return true;
+        // (a D24 depth surface read as a texture: the depth in the low 24 bits, the stencil or nothing above)
+        case kX8U24: packed({24, 8}, false); wide = true; return true;
         case kS16: packed({16}, true); wide = true; return true;
         case kU16U16: packed({16, 16}, false); wide = true; return true;
         case kS16S16: packed({16, 16}, true); wide = true; return true;
@@ -834,8 +836,8 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     if (code == kPVRT2 || code == kPVRTII2) return failure("texture: PVRTC 2bpp formats not implemented");
     if (code >= kYUV420P2 && code <= kYUV422) return read_yuv(t, code, read);
     if (code >= kUBC4 && code <= kSBC5) return failure("texture: format not implemented");
-    if (code == kX8S8S8U8 || code == kX8U24 || code == kU32 || code == kS32 || code == kSE5M9M9M9 ||
-        code == kU32U32)
+    if (code == kX8S8S8U8 || (code == kX8U24 && t.swizzle != 0) || code == kU32 || code == kS32 ||
+        code == kSE5M9M9M9 || code == kU32U32)
         return failure(nx::format("texture: format 0x{:08x} not implemented", t.base_format));
     const u32 size = texture_size(t);
     nx::vector<u8> raw(size + 8, 0);

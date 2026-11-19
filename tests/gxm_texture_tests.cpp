@@ -383,6 +383,39 @@ TEST_CASE("gxm textures: unsigned packed floats (U2F10F10F10, F11F11F10) come ou
     CHECK(c[3] == 0x3C00);
 }
 
+TEST_CASE("gxm textures: X8U24 (a D24 depth surface as a texture) gives its depth in R and the top byte in G") {
+    auto halves = [](u32 swizzle, u32 word) -> nx::vector<u16> {
+        Memory m;
+        m.bytes.resize(4);
+        std::memcpy(m.bytes.data(), &word, 4);
+        TextureInfo t;
+        t.base_format = 0x15000000;
+        t.swizzle = swizzle;
+        t.type = texture_type::kLinear;
+        t.width = t.height = 1;
+        t.stride = 4;
+        auto texels = read_texels(t, [&](u32 address, void* out, u32 size) { return m.read(address, out, size); });
+        if (!texels) return {};
+        REQUIRE(texels->bytes == 8);
+        nx::vector<u16> h(4);
+        std::memcpy(h.data(), texels->data.data(), 8);
+        return h;
+    };
+    auto far = halves(0, 0xFFFFFFFFu);  // (SD: the depth 1.0, the stencil byte 255)
+    REQUIRE(far.size() == 4);
+    CHECK(far[0] == 0x3C00);
+    CHECK(far[1] == 0x3C00);
+    CHECK(far[2] == 0);
+    CHECK(far[3] == 0x3C00);
+    auto zero = halves(0, 0xAB000000u);  // (depth 0 whatever the top byte)
+    REQUIRE(zero.size() == 4);
+    CHECK(zero[0] == 0);
+    auto half = halves(0, 0x00800000u);  // (0x800000 / 0xFFFFFF: just over 0.5)
+    REQUIRE(half.size() == 4);
+    CHECK(half[0] == 0x3800);
+    CHECK(halves(1, 0).empty());  // (DS: not implemented)
+}
+
 TEST_CASE("gxm textures: PVRTC 4bpp (I and II): the weights, punch-through, and the alpha each generation reaches") {
     // An 8 x 8 texture of four identical blocks (so every texel's four blocks are the same): texels 0-3 of the
     // first row with indices 0-3, the rest 0.
