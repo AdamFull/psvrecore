@@ -29,6 +29,8 @@ if(PSVRECORE_FROM_SOURCE)
     execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY "${PSVRECORE_ROOT}"
         OUTPUT_VARIABLE PSVRECORE_GIT_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 else()
+    # (the options of a build from source, which the game's presets may set: read, so CMake does not call them unused)
+    set(_psvrecore_source_options "${PSVRECORE_BUILD_TESTS}${PSVRECORE_BUILD_TOOLS}")
     if(NOT psvrecore_DIR)
         if(NOT PSVRECORE_PRESET)
             message(FATAL_ERROR "PSVRECORE_PRESET is not set: the game's presets set it (\"PSVRECORE_PRESET\": "
