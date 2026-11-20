@@ -1,5 +1,7 @@
 #include "psvrecore/recomp/support.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -26,6 +28,76 @@ nx::flat_hash_map<u32, PsvFunction>& functions() {
 nx::flat_hash_map<u32, const PsvImport*>& import_stubs() {
     static nx::flat_hash_map<u32, const PsvImport*> map;
     return map;
+}
+
+// The registered modules' indirect-call tables (guest.h, PsvDispatch), and the memory each holds.
+struct Table {
+    PsvDispatch* dispatch = nullptr;
+    u32 base = 0, span = 0;  // (the dispatch's, also for a wide table, whose dispatch has no span: psv_call only)
+    nx::vector<u16> index16;
+    nx::vector<u32> index32;
+    nx::vector<PsvFunction> functions;
+    nx::vector<u32> addresses;  // (by index in `functions`: the code address)
+};
+nx::vector<nx::unique_ptr<Table>>& tables() {
+    static nx::vector<nx::unique_ptr<Table>> list;
+    return list;
+}
+// The same tables for psv_call, which other threads may run while a module is registered (a module the game loads
+// itself): published one by one, each complete before the count says it is there.
+constexpr u32 kMaxTables = 64;
+std::atomic<Table*> g_table_slots[kMaxTables];
+std::atomic<u32> g_table_count{0};
+
+// The table's function at a Thumb code address, or nullptr.
+PsvFunction* table_slot(Table& t, u32 code) {
+    const u32 off = code - t.base - 1u;
+    if (off >= t.span || (off & 1u)) return nullptr;
+    const u32 i = t.index32.empty() ? t.index16[off >> 1] : t.index32[off >> 1];
+    return i ? &t.functions[i - 1] : nullptr;
+}
+
+// Fills a module's table from its functions (the Thumb ones).
+void fill_table(const PsvModuleCode& module) {
+    PsvDispatch* d = module.dispatch;
+    *d = PsvDispatch{};
+    u32 lo = 0xFFFFFFFFu, hi = 0;
+    for (u32 i = 0; i < module.function_count; ++i) {
+        const u32 a = module.functions[i].address;
+        if (!(a & 1u)) continue;
+        lo = std::min(lo, a & ~1u), hi = std::max(hi, a & ~1u);
+    }
+    if (lo > hi) return;  // (no Thumb function)
+    auto t = nx::make_unique<Table>();
+    t->dispatch = d;
+    t->functions.reserve(module.function_count);
+    const u32 entries = (hi - lo) / 2 + 1;
+    const bool wide = module.function_count >= 0xFFFFu;
+    if (wide) t->index32.assign(entries, 0);
+    else t->index16.assign(entries, 0);
+    for (u32 i = 0; i < module.function_count; ++i) {
+        const u32 a = module.functions[i].address;
+        if (!(a & 1u)) continue;
+        // (what the registry gives for the address: an earlier override_function included)
+        t->functions.push_back(find_function(a));
+        t->addresses.push_back(a);
+        const u32 k = ((a & ~1u) - lo) / 2;
+        if (wide) t->index32[k] = static_cast<u32>(t->functions.size());
+        else t->index16[k] = static_cast<u16>(t->functions.size());
+    }
+    t->base = lo, t->span = entries * 2;
+    d->base = lo;
+    d->index = wide ? nullptr : t->index16.data();
+    d->functions = t->functions.data();
+    // (last: the table is complete before code sees a span; a wide table is psv_call's alone)
+    if (!wide) __atomic_store_n(&d->span, entries * 2, __ATOMIC_RELEASE);
+    nx::logd(logs::kernel, "{}: indirect-call table of {} functions over {} KiB of code: {} KiB", module.name ? module.name : "?",
+             t->functions.size(), t->span / 1024, ((wide ? 4 : 2) * entries + t->functions.size() * sizeof(PsvFunction)) / 1024);
+    if (const u32 n = g_table_count.load(std::memory_order_relaxed); n < kMaxTables) {
+        g_table_slots[n].store(t.get(), std::memory_order_relaxed);
+        g_table_count.store(n + 1, std::memory_order_release);
+    }
+    tables().push_back(std::move(t));
 }
 
 [[noreturn]] void default_handler(PsvContext* ctx, const TrapInfo& trap) {
@@ -99,6 +171,7 @@ void register_module(const PsvModuleCode& module) {
     for (u32 i = 0; i < module.function_count; ++i) map[module.functions[i].address] = module.functions[i].function;
     if (module.import_stubs)
         for (u32 i = 0; i < module.import_count; ++i) import_stubs()[module.import_stubs[i]] = &module.imports[i];
+    if (module.flag_contract != 0 && module.dispatch) fill_table(module);
     // (code generated before the contract has every flag in the context everywhere, and is taken to read them all)
     FlagContract c{module.name && *module.name ? module.name : "(a module without a name)", 15, 15, 15, 15};
     if (module.flag_contract != 0)
@@ -115,6 +188,9 @@ void register_module(const PsvModuleCode& module) {
 nx::string flag_contract_problems() { return flag_problems(); }
 
 void clear_modules() {
+    g_table_count.store(0, std::memory_order_release);
+    for (auto& t : tables()) *t->dispatch = PsvDispatch{};
+    tables().clear();
     functions().clear();
     import_stubs().clear();
     flag_contracts().clear();
@@ -138,7 +214,18 @@ PsvFunction override_function(u32 code, PsvFunction f) {
     auto it = map.find(code);
     const PsvFunction previous = it == map.end() ? nullptr : it->second;
     map[code] = f;
+    // (and in the indirect-call tables, where the address is a function start of a registered module's)
+    if (code & 1u)
+        for (auto& t : tables())
+            if (PsvFunction* slot = table_slot(*t, code)) __atomic_store_n(slot, f, __ATOMIC_RELAXED);
     return previous;
+}
+
+usize call_table_bytes() {
+    usize bytes = 0;
+    for (const auto& t : tables())
+        bytes += t->index16.size() * sizeof(u16) + t->index32.size() * sizeof(u32) + t->functions.size() * sizeof(PsvFunction);
+    return bytes;
 }
 
 const char* trap_name(u32 kind) {
@@ -195,6 +282,11 @@ void psv_trap(PsvContext* ctx, uint32_t pc, uint32_t kind) {
 }
 
 void psv_call(PsvContext* ctx, uint32_t target, uint32_t ret) {
+    // (another module's Thumb function: its table, before the registry's map)
+    if (target & 1u)
+        for (u32 i = 0, n = g_table_count.load(std::memory_order_acquire); i < n; ++i)
+            if (PsvFunction* slot = table_slot(*g_table_slots[i].load(std::memory_order_relaxed), target))
+                return __atomic_load_n(slot, __ATOMIC_RELAXED)(ctx, ret);
     if (PsvFunction f = find_function(target)) return f(ctx, ret);
     if (const PsvImport* import = find_import_stub(target)) return psv_call_import(ctx, import, ret);
     TrapInfo t;

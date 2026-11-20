@@ -30,6 +30,8 @@ PSVRECORE_API const PsvImport* find_import_stub(u32 code);
 // are compiled to the function itself), and returns the one it replaces (nullptr: none was there). Before the
 // game starts: the registry is not locked.
 PSVRECORE_API PsvFunction override_function(u32 code, PsvFunction f);
+// The memory the registered modules' indirect-call tables hold (guest.h, PsvDispatch), in bytes.
+PSVRECORE_API usize call_table_bytes();
 
 struct TrapInfo {
     u32 pc = 0;

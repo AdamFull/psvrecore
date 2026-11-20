@@ -608,3 +608,428 @@ arm_conditional_calls:
     add     r0, r0, r8
     add     r0, r0, r4
     pop     {r4, r8, pc}
+
+@ ---- Internal entries (ARCHITECTURE.md, "Internal entries") ----
+@ Direct calls between generated functions pass r0-r3, sp and lr as C arguments and get r0/r1 back; callees with
+@ nothing outside in their reach are called without the context. Argument and result registers in every
+@ combination, results in r2/r3/r12 and in the flags, r4/r5 read at entry, stack arguments and a pointer into the
+@ caller's frame, VFP arguments and results, a deep chain of internal calls ending in a call through psv_call (the
+@ test checks the whole context there against the interpreter: functions named obs_*), a callee that puts back a
+@ register its own callee changed, recursion and mutual recursion, a function entered through its internal entry
+@ and through the table in one run, a tail-call chain, a jump through the runtime with another LR than ret.
+    .thumb
+
+@ Reads r0-r3, returns r0.
+    .global ie_sum4
+    .type ie_sum4, %function
+    .thumb_func
+ie_sum4:
+    add     r0, r0, r1
+    add     r2, r2, r3
+    eor     r0, r0, r2
+    bx      lr
+
+@ A 64-bit result in r0:r1.
+    .global ie_mul64
+    .type ie_mul64, %function
+    .thumb_func
+ie_mul64:
+    umull   r0, r1, r0, r1
+    bx      lr
+
+@ Results in r2, r3 and r12 (outside AAPCS); r0 and r1 unchanged.
+    .global ie_scratch_out
+    .type ie_scratch_out, %function
+    .thumb_func
+ie_scratch_out:
+    add     r2, r0, #7
+    eor     r3, r1, r0
+    add     r12, r2, r3
+    bx      lr
+
+@ Reads r4 and r5 at entry (outside AAPCS); changes r5 without saving it.
+    .global ie_reads_r4
+    .type ie_reads_r4, %function
+    .thumb_func
+ie_reads_r4:
+    add     r0, r4, r5
+    add     r5, r5, #1
+    bx      lr
+
+@ Stack arguments.
+    .global ie_stack_args
+    .type ie_stack_args, %function
+    .thumb_func
+ie_stack_args:
+    ldr     r2, [sp]
+    ldr     r3, [sp, #4]
+    add     r0, r0, r2
+    add     r0, r0, r3
+    bx      lr
+
+@ A pointer into its caller's frame: stores through it and reads it back.
+    .global ie_store_through
+    .type ie_store_through, %function
+    .thumb_func
+ie_store_through:
+    str     r1, [r0]
+    ldr     r2, [r0]
+    add     r0, r2, #1
+    bx      lr
+
+@ Changes r1 on one path only.
+    .global ie_some_paths
+    .type ie_some_paths, %function
+    .thumb_func
+ie_some_paths:
+    cmp     r0, #8
+    it      hs
+    addhs   r1, r0, #3
+    add     r0, r0, #1
+    bx      lr
+
+@ Leaves its result in the flags.
+    .global ie_flags_out
+    .type ie_flags_out, %function
+    .thumb_func
+ie_flags_out:
+    cmp     r0, r1
+    bx      lr
+
+@ Every one of the above from one caller.
+@ @test ie_caller r0=any r1=any r2=any r3=any
+    .global ie_caller
+    .type ie_caller, %function
+    .thumb_func
+ie_caller:
+    push    {r4-r7, lr}
+    sub     sp, sp, #16
+    mov     r4, r0
+    mov     r5, r1
+    mov     r6, r2
+    mov     r7, r3
+    bl      ie_sum4
+    mov     r1, r5
+    bl      ie_mul64
+    eor     r4, r4, r1
+    add     r4, r4, r0
+    mov     r0, r6
+    mov     r1, r7
+    bl      ie_scratch_out
+    add     r4, r4, r2
+    add     r4, r4, r3
+    add     r4, r4, r12
+    mov     r5, r6
+    bl      ie_reads_r4
+    add     r4, r4, r5
+    eor     r4, r4, r0
+    str     r6, [sp]
+    str     r7, [sp, #4]
+    mov     r0, r4
+    bl      ie_stack_args
+    add     r4, r4, r0
+    add     r0, sp, #8
+    mov     r1, r4
+    bl      ie_store_through
+    ldr     r1, [sp, #8]
+    add     r4, r4, r1
+    and     r0, r7, #15
+    mov     r1, r6
+    bl      ie_some_paths
+    add     r4, r4, r1
+    add     r4, r4, r0
+    mov     r0, r6
+    mov     r1, r7
+    bl      ie_flags_out
+    ite     hi
+    addhi   r4, r4, #5
+    subls   r4, r4, #9
+    mov     r0, r4
+    add     sp, sp, #16
+    pop     {r4-r7, pc}
+
+@ VFP arguments and results: s0-s2 and d1-d2 in, s0 and d1 out.
+    .global ie_vfp_leaf
+    .type ie_vfp_leaf, %function
+    .thumb_func
+ie_vfp_leaf:
+    vmul.f32 s0, s0, s1
+    vadd.f32 s0, s0, s2
+    vadd.f64 d1, d1, d2
+    bx      lr
+
+@ @test ie_vfp_caller r0=any
+    .global ie_vfp_caller
+    .type ie_vfp_caller, %function
+    .thumb_func
+ie_vfp_caller:
+    push    {r4, lr}
+    vpush   {d8}
+    vmov.f32 s16, s0
+    bl      ie_vfp_leaf
+    vadd.f32 s0, s0, s16
+    vmov.f32 s1, s16
+    bl      ie_vfp_leaf
+    vmov    r0, s0
+    vpop    {d8}
+    pop     {r4, pc}
+
+@ Reached only through psv_call: the test compares the context at its entry with the interpreter's.
+    .global obs_reads_all
+    .type obs_reads_all, %function
+    .thumb_func
+obs_reads_all:
+    add     r0, r0, r1
+    add     r0, r0, r2
+    add     r0, r0, r4
+    add     r0, r0, r12
+    bx      lr
+
+@ The bottom of a chain: a call through psv_call.
+    .global ie_chain_low
+    .type ie_chain_low, %function
+    .thumb_func
+ie_chain_low:
+    push    {r4, lr}
+    ldr     r3, =obs_reads_all
+    blx     r3
+    add     r0, r0, #3
+    pop     {r4, pc}
+    .ltorg
+
+@ The middle: touches none of r1, r2, r4-r12.
+    .global ie_chain_mid
+    .type ie_chain_mid, %function
+    .thumb_func
+ie_chain_mid:
+    push    {r3, lr}
+    add     r0, r0, #1
+    bl      ie_chain_low
+    add     r0, r0, #2
+    pop     {r3, pc}
+
+@ A middle with nothing outside in its reach.
+    .global ie_inside_mid
+    .type ie_inside_mid, %function
+    .thumb_func
+ie_inside_mid:
+    push    {r3, lr}
+    bl      ie_reads_r4
+    add     r0, r0, #5
+    pop     {r3, pc}
+
+@ The top: r1, r2, r4-r8 and r12 written before the chain, so the context must hold them at the call through psv_call.
+@ @test ie_chain_top r0=any r1=any
+    .global ie_chain_top
+    .type ie_chain_top, %function
+    .thumb_func
+ie_chain_top:
+    push    {r4-r8, lr}
+    mov     r4, r0
+    add     r5, r0, r1
+    eor     r6, r0, r1
+    movs    r7, #0x77
+    add     r8, r1, #3
+    add     r2, r1, #9
+    eor     r12, r0, #0x5A
+    eor     r1, r1, #0xA5
+    mov     r0, r5
+    bl      ie_chain_mid
+    add     r0, r0, r4
+    add     r0, r0, r5
+    mov     r4, r0
+    add     r5, r5, #1
+    bl      ie_inside_mid
+    add     r0, r0, r6
+    add     r0, r0, r7
+    add     r0, r0, r8
+    add     r1, r0, #1
+    bl      ie_chain_mid
+    pop     {r4-r8, pc}
+
+@ Changes r4 without saving it; its caller below puts it back.
+    .global ie_clobber_r4
+    .type ie_clobber_r4, %function
+    .thumb_func
+ie_clobber_r4:
+    add     r4, r0, #0x33
+    add     r0, r0, r4
+    bx      lr
+
+@ Preserves r4 by push/pop around a callee that changes it.
+    .global ie_saves_r4
+    .type ie_saves_r4, %function
+    .thumb_func
+ie_saves_r4:
+    push    {r4, lr}
+    mov     r4, r1
+    bl      ie_clobber_r4
+    add     r0, r0, r4
+    pop     {r4, pc}
+
+@ After ie_saves_r4 the context must hold r4 as it was, not ie_clobber_r4's value: the call through psv_call reads it.
+@ @test ie_restore_check r0=any r1=any
+    .global ie_restore_check
+    .type ie_restore_check, %function
+    .thumb_func
+ie_restore_check:
+    push    {r4, lr}
+    bl      ie_saves_r4
+    ldr     r3, =obs_reads_all
+    blx     r3
+    pop     {r4, pc}
+    .ltorg
+
+@ Recursion through the internal entry.
+@ @test ie_fact r0=int:0:12
+    .global ie_fact
+    .type ie_fact, %function
+    .thumb_func
+ie_fact:
+    push    {r4, lr}
+    mov     r4, r0
+    cmp     r0, #1
+    bls     1f
+    sub     r0, r0, #1
+    bl      ie_fact
+    mul     r0, r0, r4
+    pop     {r4, pc}
+1:  movs    r0, #1
+    pop     {r4, pc}
+
+@ Mutual recursion.
+@ @test ie_even r0=int:0:40
+    .global ie_even
+    .type ie_even, %function
+    .thumb_func
+ie_even:
+    cbz     r0, 1f
+    push    {r4, lr}
+    sub     r0, r0, #1
+    bl      ie_odd
+    pop     {r4, pc}
+1:  movs    r0, #1
+    bx      lr
+
+    .global ie_odd
+    .type ie_odd, %function
+    .thumb_func
+ie_odd:
+    cbz     r0, 1f
+    push    {r4, lr}
+    sub     r0, r0, #1
+    bl      ie_even
+    pop     {r4, pc}
+1:  movs    r0, #0
+    bx      lr
+
+@ The same function through its internal entry and through the table (its f_ wrapper) in one run.
+@ @test ie_both_ways r0=any r1=any r2=any r3=any
+    .global ie_both_ways
+    .type ie_both_ways, %function
+    .thumb_func
+ie_both_ways:
+    push    {r4-r7, lr}
+    mov     r4, r0
+    mov     r5, r1
+    mov     r6, r2
+    mov     r7, r3
+    bl      ie_sum4
+    mov     r1, r0
+    mov     r0, r4
+    mov     r2, r6
+    mov     r3, r7
+    ldr     r4, =ie_sum4
+    blx     r4
+    add     r0, r0, r5
+    pop     {r4-r7, pc}
+    .ltorg
+
+@ A tail-call chain into a function with an internal entry.
+    .global ie_tail_b
+    .type ie_tail_b, %function
+    .thumb_func
+ie_tail_b:
+    add     r0, r0, #2
+    b       ie_sum4
+
+    .global ie_tail_a
+    .type ie_tail_a, %function
+    .thumb_func
+ie_tail_a:
+    add     r0, r0, #1
+    b       ie_tail_b
+
+@ @test ie_tail_caller r0=any r1=any r2=any r3=any
+    .global ie_tail_caller
+    .type ie_tail_caller, %function
+    .thumb_func
+ie_tail_caller:
+    push    {r4, lr}
+    bl      ie_tail_a
+    add     r0, r0, #1
+    pop     {r4, pc}
+
+@ A jump through the runtime into ie_sum4 (its f_ wrapper) with LR another function: ie_sum4 returns there.
+@ @test ie_lr_elsewhere r0=any r1=any r2=any r3=any
+    .global ie_lr_elsewhere
+    .type ie_lr_elsewhere, %function
+    .thumb_func
+ie_lr_elsewhere:
+    push    {r4, lr}
+    ldr     lr, =ie_landing
+    ldr     r4, =ie_sum4
+    bx      r4
+    .ltorg
+
+    .global ie_landing
+    .type ie_landing, %function
+    .thumb_func
+ie_landing:
+    add     r0, r0, #0x100
+    pop     {r4, pc}
+
+@ Inlined callees (small internal entries: a static copy in each file that calls them): one that may trap (its vmsr,
+@ on an FPSCR setting not implemented; never on the test's), called twice; one the test also replaces with override_function (codegen_tests.cpp: the direct
+@ call still reaches the original, the call through psv_call the replacement).
+    .global ie_may_trap
+    .type ie_may_trap, %function
+    .thumb_func
+ie_may_trap:
+    vmrs    r2, fpscr
+    add     r0, r0, r1
+    vmsr    fpscr, r2
+    bx      lr
+
+@ @test ie_inlined_trap r0=any r1=any
+    .global ie_inlined_trap
+    .type ie_inlined_trap, %function
+    .thumb_func
+ie_inlined_trap:
+    push    {r4, lr}
+    mov     r4, r1
+    bl      ie_may_trap
+    mov     r1, r4
+    bl      ie_may_trap
+    pop     {r4, pc}
+
+    .global ie_ov_leaf
+    .type ie_ov_leaf, %function
+    .thumb_func
+ie_ov_leaf:
+    add     r0, r0, #1
+    bx      lr
+
+@ @test ie_ov_caller r0=any
+    .global ie_ov_caller
+    .type ie_ov_caller, %function
+    .thumb_func
+ie_ov_caller:
+    push    {r4, lr}
+    bl      ie_ov_leaf
+    mov     r4, r0
+    ldr     r3, =ie_ov_leaf
+    blx     r3
+    add     r0, r0, r4
+    pop     {r4, pc}
+    .ltorg

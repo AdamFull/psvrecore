@@ -266,6 +266,42 @@
   with an import or a function pointer that returns with another sp, legal only outside AAPCS, needs
   `--no-callee-saved`). `psvrecomp --registers-in-context` generates the code from before (every register in the
   context), for checking a suspected register analysis bug.
+- **Internal entries, inlining and the indirect-call tables (task 7): what is assumed and not checked**
+  (ARCHITECTURE.md, "Internal entries", "Inlining", "Indirect calls"):
+  - an internal entry's returns go back to its caller without comparing the saved LR they read with the return
+    address: that they are the same rests on the callee-saved proof's assumption above (the frame's saved words are
+    changed only by the function's own stores). Before, a return whose saved LR had been overwritten (an array overrun
+    into the frame) went through the runtime to that address, which usually stopped the program (no function there);
+    now it returns to its caller as if not overwritten. Nothing checks it, not even `PSV_CHECK_KEPT_REGISTERS`;
+  - a function entered through `f_<address>` with LR other than `ret` jumps through the runtime to LR after its
+    internal entry returns, which is what its returns did before; the diagnostic of a jump to an unknown address
+    names the function's address now, not the return instruction's;
+  - after a call of an `Inside` internal entry, `PSV_CHECK_KEPT_REGISTERS` checks only r4-r12 (the context's r0-r3,
+    sp and lr are the caller's business there);
+  - host code that reads `t->ctx` while generated code runs (the fault report, the write watch, a watch of a host
+    function by name) sees r0-r3, sp and lr as of the last time any frame on the host stack wrote them: an internal
+    call writes none of them;
+  - a game that stands in for a generated function by renaming its definition in the generated C (`HOOKS` in Gravity
+    Rush's and LittleBigPlanet's `scripts/generate_code.py`) gets direct calls around its stand-in unless the function
+    has no internal entry: psvrecomp writes such a function's `f_<address>` in another form, so the script finds
+    nothing and stops, and `psvrecomp --no-inline <address>` restores the form. Checked with this generator: Gravity
+    Rush's two hooked functions (0x81048988, 0x81155A40) get internal entries, so its script stops until it passes
+    `--no-inline` for them; LittleBigPlanet's (0x8101F266) has none (it may return elsewhere than its LR), so its
+    script works as before. Neither game's script was changed (other sessions' repositories);
+  - a module registered while guest code runs (one the game loads itself) publishes its indirect-call table before
+    its code runs; the registry's map (`find_function`, the slow path) is still not locked against that, as before;
+  - the indirect-call tables cost memory: two bytes per halfword of a module's Thumb code span (four with 65535
+    functions or more) and eight per Thumb function: 4.4 MiB for WipEout 2048's four modules, 11.8 MiB for
+    Minecraft's, 8.4 MiB for Call of Duty's;
+  - there is no per-site inline cache for indirect calls: whether one would pay (Minecraft's 86.6K virtual call
+    sites) is unmeasured, as no such game runs here. The table lookup is one function per module (`<name>_call`), so
+    all of a module's indirect calls share one host indirect branch; on the corpus that is as fast as a lookup at each
+    site (`--call-table-inline`), on a game with many polymorphic call sites it is not measured.
+  Checked: every function entered through `f_<address>` leaves the context exact (the corpus tests compare r0-r14 at
+  every exit); the whole context at calls through `psv_call` at the bottom of chains of internal calls
+  (`obs_*`); the tables against the registry (`codegen_tests.cpp`: Thumb and ARM targets, other modules, import
+  stubs, addresses no function starts at, overrides, an emptied registry). `psvrecomp --no-internal-calls
+  --no-call-table` gives the code from before byte for byte (WipEout 2048's four modules, P4D's six).
 - **Floating-point registers in locals (task 5): what is assumed and not checked.**
   - The host's floating-point environment on x64 (and arm64 without native floating point) is the default one while
     generated code runs: round to nearest, no flush-to-zero or denormals-are-zero (MXCSR's FTZ/DAZ clear). The typed

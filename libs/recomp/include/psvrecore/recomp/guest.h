@@ -100,6 +100,7 @@ enum {
 PSVRECORE_API PSV_NORETURN void psv_trap(PsvContext* ctx, uint32_t pc, uint32_t kind);
 /* Calls the function at a code address (blx rN, and calls into the middle of nowhere). */
 PSVRECORE_API void psv_call(PsvContext* ctx, uint32_t target, uint32_t ret);
+/* (psv_call_in, psv_call through the calling module's table: after PsvModuleCode) */
 /* A jump through a register that is not a return: a tail call of the function at `target`, or a diagnostic. */
 PSVRECORE_API void psv_jump(PsvContext* ctx, uint32_t target, uint32_t ret, uint32_t from);
 /* svc #imm */
@@ -167,8 +168,40 @@ typedef struct PsvModuleCode {
     uint32_t flags_given_at_entry;     /* in the context at every call or jump to code the module does not know */
     uint32_t flags_needed_at_return;   /* read after an indirect call or jump to code it does not know returns */
     uint32_t flags_given_at_return;    /* in the context when any of its functions returns (exports: all four) */
+    /* The module's table for indirect calls (PsvDispatch), which registering the module fills; 0: none (code generated
+     * before it, or with psvrecomp --no-call-table). */
+    struct PsvDispatch* dispatch;
 } PsvModuleCode;
 #define PSV_FLAG_CONTRACT 1u
+
+/* A module's table for indirect calls (psv_call_in), filled by recomp::register_module and emptied by
+ * recomp::clear_modules. Entry k of `index` stands for the code address base + 2k + 1 (Thumb): 1 + the index in
+ * `functions` of the Thumb function starting there, 0 for none; `functions` holds what psv_call would find there (the
+ * module's function, or what override_function put in its place). ARM code, other modules' code, import stubs and
+ * addresses no function starts at are not in it: psv_call_in leaves them to psv_call. A module of 65535 functions or
+ * more has a table of u32 entries that only psv_call reads (span 0 here). */
+typedef struct PsvDispatch {
+    uint32_t base;              /* the lowest Thumb function's address (bit 0 clear) */
+    uint32_t span;              /* bytes of code the table covers from base (0: none) */
+    const uint16_t* index;
+    PsvFunction* functions;
+} PsvDispatch;
+
+/* psv_call through the calling module's table: a Thumb function of the module found there without a call into the
+ * runtime; anything else through psv_call. What is called is the same either way, so the context's contract at an
+ * indirect call is unchanged. */
+PSV_INLINE void psv_call_in(const PsvDispatch* d, PsvContext* ctx, uint32_t target, uint32_t ret) {
+    const uint32_t off = target - d->base - 1u; /* (even for a Thumb target in the table's range) */
+    if (__builtin_expect(off < d->span && (off & 1u) == 0, 1)) {
+        const uint32_t i = d->index[off >> 1];
+        if (__builtin_expect(i != 0, 1)) {
+            const PsvFunction f = __atomic_load_n(&d->functions[i - 1], __ATOMIC_RELAXED); /* (override_function) */
+            f(ctx, ret);
+            return;
+        }
+    }
+    psv_call(ctx, target, ret);
+}
 
 /* ---- Guest memory ---------------------------------------------------------------------------------------------- */
 

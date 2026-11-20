@@ -470,6 +470,23 @@ match `tests/programs/<name>.expected`, and it must exit with 0. The runner logs
 (or `info`) to see more. Everything goes to `build/programs` (`--out`), which is derived from the SDK: never commit
 it.
 
+### Code generator options for calls
+
+`psvrecomp generate` (a game's `scripts/generate_code.py` runs it) takes these for the calls between generated
+functions ([ARCHITECTURE.md](ARCHITECTURE.md), "Internal entries", "Inlining", "Indirect calls"):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--no-inline <address>` (repeatable) | none | The function at that code address gets no internal entry and is never inlined: every direct call goes through `f_<address>`, whose definition keeps the form `void f_<address>(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {`. **A game that stands in for a generated function by renaming that definition (Gravity Rush's and LittleBigPlanet's `HOOKS`) must list it here**: otherwise its script finds no such definition and stops |
+| `--inline-limit <n>` | 8 | Internal entries of at most n guest instructions without a jump table are inlined (a static copy in each .c file that calls them); 0: none |
+| `--inline-in-file` | off | The internal entries not inlined may be inlined by the C compiler into the callers in their own file (by default they are `noinline`) |
+| `--no-internal-calls` | off | No internal entries: every direct call through `f_<address>` with every register in the context, as before (with `--no-call-table` the code from before byte for byte) |
+| `--call-table-inline` | off | Each indirect call site looks in the module's table itself (`psv_call_in`) instead of calling the module's `<name>_call` that does (a larger program) |
+| `--no-call-table` | off | Indirect calls through `psv_call` only, not first through the module's table |
+
+`PSVRECOMP_ENTRIES=<file>` makes `psvrecomp generate` write each function's internal entry (kind, why, arguments,
+results, what it may change and preserves) as a table.
+
 ## Debugging switches
 
 Environment variables the runtime reads, for finding what a game does; they cost nothing while unset. Where the
@@ -479,7 +496,7 @@ environment cannot be given (an Android activity, started with `am start ... --e
 | Variable | What it does |
 |---|---|
 | `PSVRECORE_FAULT_DUMP=1` | A guest memory fault also prints the 64 bytes at each register's address. |
-| `PSVRECORE_WATCH=<address>[:<size>],<function>,...` | Up to four hardware watchpoints (Windows, x86-64): a write to a guest address (1, 2, 4 or 8 bytes, 4 by default) prints the value now there, the host function that wrote, the guest thread's registers, the text registers point at, and the words at its stack pointer; a call of a host function by name (a generated `f_<address>`, called through a pointer: one called directly may be inlined) prints the time and the guest registers it gets. `f_<address>@r<n>+<offset>+...` (hex) also prints the words at those offsets from the register, as numbers and floats; `@r<n>[<offset>]...` reads through the pointer at that offset first (`[a][b]` through two), and more `@` groups read more (eight words in all): `f_8101EA62@r0[8]+1dc` prints a field of the structure the first argument's third word points to at every call. |
+| `PSVRECORE_WATCH=<address>[:<size>],<function>,...` | Up to four hardware watchpoints (Windows, x86-64): a write to a guest address (1, 2, 4 or 8 bytes, 4 by default) prints the value now there, the host function that wrote, the guest thread's registers, the text registers point at, and the words at its stack pointer; a call of a host function by name (a generated `f_<address>`, called through a pointer: one called directly may be inlined) prints the time and the guest registers it gets. A function with an internal entry is called directly as `fi_<address>`, which takes r0-r3, sp and lr in host registers: watching `fi_<address>` sees those calls, but the context it prints then holds those six as of before the call; `f_<address>` sees only the calls through the function table, with the exact context. `f_<address>@r<n>+<offset>+...` (hex) also prints the words at those offsets from the register, as numbers and floats; `@r<n>[<offset>]...` reads through the pointer at that offset first (`[a][b]` through two), and more `@` groups read more (eight words in all): `f_8101EA62@r0[8]+1dc` prints a field of the structure the first argument's third word points to at every call. |
 | `PSVRECORE_WATCH_SHOTS=1` | Each press of an input script's `watch` also saves a shot (`w<ms>_<button>.png`), to see what the watch saw. |
 | `PSVRECORE_THREADS=<seconds>` | Every so many seconds, each guest thread's state, priority, link register and what it waits for. Without it, the same goes to the log as warnings whenever the picture stands still for 3 s with the application in front (again at 10 s), with the renderer's scene counts and the host threads using the CPU. |
 | `PSVRECORE_STALL_SNAPSHOT=<file>` | The first time the picture stands still (the warnings above), every mapped page of guest memory written to the file, for reading the game's state offline: records of a guest address and a byte count (u32 each, little-endian) followed by the bytes, one record for each run of mapped pages (about 340 MiB for WipEout 2048). On Android a file in the application's folder (`/sdcard/Android/data/<package>/files/...`), pulled with adb. |

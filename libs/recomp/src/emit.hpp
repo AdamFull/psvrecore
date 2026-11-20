@@ -60,6 +60,24 @@ public:
     const nx::vector<analysis::RegisterEffect>& effects() const { return effects_; }
     // (VfpMode::Probe) What the translation of each instruction read and wrote of the floating-point registers.
     const nx::vector<analysis::VfpEffect>& vfp_effects() const { return vfp_effects_; }
+    // The module's register analysis (RegisterMode::Locals): the callees' internal entries (analysis::EntryKind).
+    void set_register_analysis(const analysis::RegisterAnalysis* all) { all_ = all; }
+    // An internal entry inlined into its callers (generate): its definition static inline, function() giving it alone and
+    // wrapper() its f_<address>.
+    void set_inline(bool on) { inline_ = on; }
+    const nx::string& wrapper() const { return wrapper_; }
+    // The functions whose internal entries the function calls (code addresses).
+    const nx::flat_hash_set<u32>& internal_callees() const { return internal_callees_; }
+    // Indirect calls through the module's table (guest.h, psv_call_in; off: psv_call, psvrecomp --no-call-table).
+    void set_call_table(bool on, bool inline_lookup) { call_table_ = on, call_table_inline_ = inline_lookup; }
+    // The statement of an indirect call of `target` returning to `next`.
+    nx::string indirect_call(nx::string_view target, nx::string_view next) const {
+        if (!call_table_) return nx::format("psv_call(ctx, {}, {});", target, next);
+        if (call_table_inline_) return nx::format("psv_call_in(&{}_dispatch, ctx, {}, {});", prefix_, target, next);
+        return nx::format("{}_call(ctx, {}, {});", prefix_, target, next);
+    }
+    // Whether the function is translated as an internal entry (fi_<address>, with f_<address> a wrapper around it).
+    bool internal_body() const { return regs_ && all_ && all_->internal_calls && regs_->entry != analysis::EntryKind::Public; }
 
     // --- used by the instruction translators ---
 
@@ -206,6 +224,8 @@ private:
     nx::string flags_line(FlagSet f, bool store) const;
 
     nx::string register_line(RegSet r, bool store) const;
+    // An internal entry's return statement (its results by value).
+    nx::string internal_return() const;
     // The context stores before a trap inside the current instruction (and it counts as one that may trap): the
     // flags and the registers, on the trapping path only.
     nx::string trap_stores();
@@ -226,6 +246,11 @@ private:
     bool sp_trap_ = false;  // a call's stack pointer check goes to the function's trap for it
     RegisterMode mode_;
     const analysis::FunctionRegisters* regs_;  // RegisterMode::Locals
+    const analysis::RegisterAnalysis* all_ = nullptr;
+    bool call_table_ = false, call_table_inline_ = false;
+    bool inline_ = false;
+    nx::string wrapper_;
+    nx::flat_hash_set<u32> internal_callees_;
     // The current instruction's register accesses so far, and (Probe) every instruction's.
     analysis::RegisterEffect access_;
     nx::vector<analysis::RegisterEffect> effects_;

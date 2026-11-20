@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 #include "psvrecore/analysis/flow.hpp"
 #include "psvrecore/analysis/image.hpp"
@@ -152,6 +153,11 @@ struct FlagArgs {
     bool vfp_calls_conservative = false;
     bool neon_in_context = false;
     bool no_q_locals = false;
+    bool no_internal_calls = false;
+    nx::vector<nx::string> no_inline;
+    bool no_call_table = false, call_table_inline = false;
+    u32 inline_limit = recomp::Options{}.inline_limit;
+    bool inline_in_file = false;
 };
 
 bool valid_identifier(nx::string_view name) {
@@ -188,6 +194,16 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     gen.vfp_calls_conservative = flag_args.vfp_calls_conservative;
     gen.neon_in_context = flag_args.neon_in_context;
     gen.no_q_locals = flag_args.no_q_locals;
+    gen.internal_calls = !flag_args.no_internal_calls;
+    gen.call_table = !flag_args.no_call_table;
+    gen.call_table_inline = flag_args.call_table_inline;
+    gen.inline_limit = flag_args.inline_limit;
+    gen.noinline_internal = !flag_args.inline_in_file;
+    {
+        const auto listed = parse_entries(flag_args.no_inline);
+        if (!listed) return nx::err(listed.error());
+        gen.no_internal = *listed;
+    }
     if (flag_args.keep_registers == "all") gen.keep_registers = analysis::KeepPolicy::All;
     else if (flag_args.keep_registers == "loops") gen.keep_registers = analysis::KeepPolicy::Loops;
     else if (flag_args.keep_registers == "none") gen.keep_registers = analysis::KeepPolicy::None;
@@ -199,6 +215,16 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
     for (const auto& f : output.files) {
         const nx::string file_path = dir / nx::fs::path_view(f.name);
         if (auto written = io::write_text_file(nx::fs::path_view(file_path), f.text); !written) return written;
+    }
+    // (PSVRECOMP_ENTRIES=<file>: each function's internal entry, for looking into the analysis)
+    if (const char* list = std::getenv("PSVRECOMP_ENTRIES")) {
+        static constexpr const char* kKinds[] = {"public", "inside", "flushed"};
+        nx::string text = "function\tentry\treason\tparams\tresults\tmodified\tpreserved\treturns_to_lr\n";
+        for (const auto& [code, r] : output.registers.functions)
+            text += nx::format("{:08x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", code, kKinds[static_cast<int>(r.entry)], analysis::entry_reason_name(r.reason),
+                               analysis::register_names(r.params), analysis::register_names(r.results), analysis::register_names(r.modified),
+                               analysis::register_names(r.preserved), r.returns_to_lr ? 1 : 0);
+        if (auto written = io::write_text_file(nx::fs::path_view(list), text); !written) return written;
     }
     const auto& st = output.stats;
     print("module      {} -> {} ({} files)\n", image->module().info.name, dir.native(), output.files.size());
@@ -234,6 +260,24 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
                   "unwinding or not decoded\n",
                   uw.entries, uw.agree, uw.disagree, uw.disagreeing.empty() ? nx::string() : nx::format(" (0x{:08x}...)", uw.disagreeing[0]),
                   uw.unproven, uw.undecoded);
+        }
+        if (gen.internal_calls) {
+            const auto reasons = [](const nx::map<nx::string, usize>& m) {
+                nx::string s;
+                for (const auto& [why, n] : m) s += nx::format("{}{} {}", s.empty() ? "" : ", ", n, why);
+                return s.empty() ? nx::string("none") : s;
+            };
+            print("calls       internal entries: {} reach nothing outside, {} may ({}); {} functions without one ({})\n",
+                  st.internal_inside, st.internal_flushed, reasons(st.flushed_reasons),
+                  st.functions - st.internal_inside - st.internal_flushed, reasons(st.public_reasons));
+            print("            direct calls: {} to internal entries without the context, {} with it ({}), {} through f_<address> ({}); "
+                  "{} returns without a compare; {} arguments, {} results\n",
+                  st.calls_inside, st.calls_flushed, reasons(st.calls_flushed_reasons), st.calls_public, reasons(st.calls_public_reasons),
+                  st.internal_returns, st.internal_params, st.internal_results);
+            print("            inlined: {} functions (at most {} instructions), {} direct calls of them, {} static copies in the .c files\n",
+                  st.functions_inlined, gen.inline_limit, st.calls_inlined, st.inline_copies);
+        } else {
+            print("calls       every direct call through f_<address> (--no-internal-calls)\n");
         }
         if (st.register_effect_mismatches) {
             print("            {} instructions' translations read or write other registers than the analysis' model says:\n",
@@ -317,6 +361,23 @@ int main(int argc, char** argv) {
         .flag("no-q-locals", flag_args.no_q_locals, "no Q register held as one vector local (each as two D locals)")
         .flag("vfp-calls-conservative", flag_args.vfp_calls_conservative,
               "every call taken to read and write all floating-point registers: none kept in locals across a call")
+        .flag("no-internal-calls", flag_args.no_internal_calls,
+              "no internal entries: every direct call through f_<address>, every register in the context before it (the "
+              "translation from before them, for checking a suspected bug in them)")
+        .option_many("no-inline", flag_args.no_inline,
+                     "a function (code address) given no internal entry and never inlined: every direct call to it goes "
+                     "through f_<address>, which a game may stand in for; repeatable", {.value_name = "ADDRESS"})
+        .option("inline-limit", flag_args.inline_limit,
+                "inline the internal entries of at most N instructions without a jump table into their callers (a static "
+                "copy in each .c file that calls them); 0: none (default 8)", {.value_name = "N"})
+        .flag("inline-in-file", flag_args.inline_in_file,
+              "let the C compiler inline the internal entries that are not inlined (by --inline-limit) into the callers in "
+              "their own .c file (by default they are noinline: a copy there would keep the out-of-line one too)")
+        .flag("call-table-inline", flag_args.call_table_inline,
+              "each indirect call site looks in the module's table itself (a larger program) instead of calling the "
+              "module's function that does")
+        .flag("no-call-table", flag_args.no_call_table,
+              "indirect calls through the runtime's lookup (psv_call) only, not first through the module's table")
         .flag("no-sp-check", flag_args.no_sp_check,
               "take calls to code outside the module to return with the stack pointer they were called with, without "
               "checking it after them")

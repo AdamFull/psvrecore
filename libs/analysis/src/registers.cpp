@@ -32,6 +32,26 @@ nx::string register_names(RegSet r) {
     return s;
 }
 
+const char* entry_reason_name(EntryReason r) {
+    switch (r) {
+        case EntryReason::None: return "none";
+        case EntryReason::Import: return "calls an import";
+        case EntryReason::Indirect: return "calls through the runtime";
+        case EntryReason::Svc: return "svc";
+        case EntryReason::Trap: return "may trap";
+        case EntryReason::PublicCallee: return "calls a function without an internal entry";
+        case EntryReason::ViaCallee: return "calls a function that reaches outside";
+        case EntryReason::Disabled: return "internal calls off";
+        case EntryReason::Excluded: return "excluded (--no-inline)";
+        case EntryReason::NoCode: return "no code";
+        case EntryReason::NoReturn: return "never returns";
+        case EntryReason::NoCallers: return "no direct callers";
+        case EntryReason::OtherReturn: return "may return elsewhere than its LR";
+        case EntryReason::TailCall: return "tail call";
+    }
+    return "?";
+}
+
 namespace {
 
 constexpr RegSet bit(u32 r) { return r < 15 ? static_cast<RegSet>(1u << r) : RegSet(0); }
@@ -270,11 +290,14 @@ namespace {
 // ---- Symbolic values ---------------------------------------------------------------------------------------------
 
 // 0: unreached; 1: unknown; 2<<56 | k: register k at entry; 3<<56 | c: the entry's sp + c; 4<<56 | site<<8 |
-// phase<<4 | k: register k in the context after the call at instruction `site` (phase 2), or stored before it (1).
+// phase<<4 | k: register k in the context after the call at instruction `site` (phase 2), or stored before it (1),
+// or the context's copy of a register an internal entry returned by value (3); 5<<56 | k: what the context held for
+// register k when an internal entry was entered without it (its argument; nothing known of the context's copy).
 using Value = u64;
 constexpr Value kBottom = 0, kTop = 1;
 constexpr Value sp_at(i32 c) { return (Value(3) << 56) | static_cast<u32>(c); }
 constexpr Value entry_value(u32 k) { return k == arm::kSp ? sp_at(0) : (Value(2) << 56) | k; }
+constexpr Value caller_ctx(u32 k) { return (Value(5) << 56) | k; }
 constexpr Value fresh(u32 site, u32 k, u32 phase) { return (Value(4) << 56) | (Value(site) << 8) | (phase << 4) | k; }
 constexpr bool is_sp(Value v) { return (v >> 56) == 3; }
 constexpr i32 sp_offset(Value v) { return static_cast<i32>(static_cast<u32>(v)); }
@@ -570,6 +593,15 @@ struct Fn {
     nx::vector<u32> callers;  // functions with a direct call or tail call to this one (indices)
     RegSet preserved = kPreservable;
     bool queued = false;
+    // Internal entries (EntryKind): every way out returns to the LR it was entered with (computed with every call as a
+    // call through f_<address>), what it and its callees may write, how it is entered, and its signature.
+    bool lr_ok = false;
+    u32 direct_callers = 0;  // (bl/blx sites calling it)
+    RegSet writes = 0;
+    EntryKind kind = EntryKind::Public;
+    EntryReason reason = EntryReason::None;
+    RegSet modified = 0, results = 0, params = 0;
+    nx::vector<RegSet> kept;  // (each call's kept registers as the forward pass gives them, before liveness narrows them)
 };
 
 class Solver {
@@ -582,9 +614,21 @@ private:
         auto it = index_.find(code);
         return it == index_.end() ? kNoIndex : it->second;
     }
-    // The forward pass over f's graph. Returns the registers its exits preserve; with `out`, the per-instruction sets.
-    RegSet forward(const Fn& f, bool sp_kept, FunctionRegisters* out) const;
+    // The callee of a direct call node as the call uses it: its internal entry's kind (Public: through f_<address>).
+    const Fn* callee_of(const CfgNode& node) const {
+        if (node.call != CallKind::Direct) return nullptr;
+        const u32 t = index(node.call_target);
+        return t == kNoIndex ? nullptr : &fns_[t];
+    }
+    EntryKind entry_of(const CfgNode& node) const {
+        const Fn* c = callee_of(node);
+        return c && options_.internal_calls ? c->kind : EntryKind::Public;
+    }
+    // The forward pass over f's graph. Returns the registers its exits preserve; with `out`, the per-instruction sets;
+    // with `lr_ok`, whether every way out goes back to the LR it was entered with.
+    RegSet forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* lr_ok_out = nullptr) const;
     void liveness(const Fn& f, FunctionRegisters& r) const;
+    void classify();
 
     const Program& program_;
     const RegisterOptions& options_;
@@ -592,13 +636,34 @@ private:
     nx::flat_hash_map<u32, u32> index_;
 };
 
-RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out) const {
+RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* lr_ok_out) const {
     const Cfg& g = f.cfg;
     const usize nb = g.blocks.size();
     nx::vector<State> at(nb);
     State init;
     init.reached = true;
-    for (u32 k = 0; k < 15; ++k) init.local[k] = init.ctx[k] = entry_value(k);
+    // (an internal entry with nothing outside in its reach is entered with its arguments in C arguments, the context's
+    // copies of them whatever its caller's context held: dirty from the start)
+    const bool internal = options_.internal_calls && f.kind != EntryKind::Public;
+    const auto ctx_at_entry = [&](u32 k) {
+        return f.kind == EntryKind::Inside && options_.internal_calls && (kArgumentRegisters & (1u << k)) ? caller_ctx(k) : entry_value(k);
+    };
+    for (u32 k = 0; k < 15; ++k) init.local[k] = entry_value(k), init.ctx[k] = ctx_at_entry(k);
+    for (u32 k = 0; k < 15; ++k)
+        if (!same(init.local[k], init.ctx[k])) init.clean &= static_cast<RegSet>(~(1u << k));
+    // What an exit writes to the context: every dirty register, as before; an internal entry's returns leave out what
+    // they return by value, and the argument registers the function neither may change nor had changed in the
+    // context by a callee (its caller has them; the context's copy is the caller's business).
+    const auto exit_set = [&](const State& s) -> RegSet {
+        RegSet d = s.dirty();
+        if (!internal) return d;
+        d &= static_cast<RegSet>(~f.results);
+        for (u32 k = 0; k < 15; ++k) {
+            const RegSet b = static_cast<RegSet>(1u << k);
+            if ((d & b) && (kArgumentRegisters & b) && !(f.modified & b) && s.ctx[k] == ctx_at_entry(k)) d &= static_cast<RegSet>(~b);
+        }
+        return d;
+    };
     const u32 entry_block = g.block_of[g.entry];
     at[entry_block] = init;
     RegSet ok = kPreservable;
@@ -654,27 +719,55 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out) const 
         apply(in, eff, post, pc);
         if (node.call != CallKind::None) {
             post.kill(i);
-            const RegSet store = post.dirty();
+            const EntryKind ck = entry_of(node);
+            const Fn* callee = ck == EntryKind::Public ? nullptr : callee_of(node);
+            // (a callee with nothing outside in its reach gets r0-r3, sp and lr as C arguments: only the other dirty
+            // registers go to the context, which it reads them from)
+            const RegSet store = ck == EntryKind::Inside ? static_cast<RegSet>(post.dirty() & ~kArgumentRegisters) : post.dirty();
             for (u32 k = 0; k < 15; ++k) {
                 if (!(store & (1u << k))) continue;
                 if (post.local[k] == kTop) post.local[k] = fresh(i, k, 1);
                 post.ctx[k] = post.local[k];
+                post.clean |= static_cast<RegSet>(1u << k);
             }
-            post.clean = kAllRegisters;
-            const RegSet kept = kept_by(node);
-            for (u32 k = 0; k < 15; ++k)
-                if (!(kept & (1u << k))) post.local[k] = post.ctx[k] = fresh(i, k, 2);
-            // (known the same either way; kept in the local, or read back, as the policy says; sp after a call to
-            // code outside the module's view always kept, and checked)
-            RegSet keep = kept;
-            if (record && node.call != CallKind::Direct && !out->checks_sp) keep = 0;
-            if (record && node.call == CallKind::Direct) {
-                if (options_.keep == KeepPolicy::None) keep = 0;
-                else if (options_.keep == KeepPolicy::Loops && !in_loop[g.block_of[i]]) keep = 0;
+            RegSet keep = 0;
+            if (ck == EntryKind::Inside) {
+                // What it returns by value is in the local (the context's copy is what it was: nothing inside writes
+                // it); what else it may change it left in the context; the rest it does not change, though where it or
+                // its callees write such a register it may have put the value it was given back into the context.
+                for (u32 k = 0; k < 15; ++k) {
+                    const RegSet b = static_cast<RegSet>(1u << k);
+                    if (callee->results & b) post.local[k] = fresh(i, k, 2);
+                    else if (callee->modified & b) post.local[k] = post.ctx[k] = fresh(i, k, 2);
+                    else if (!(post.clean & b) && (callee->writes & b)) post.ctx[k] = kTop;
+                    if (same(post.local[k], post.ctx[k]) || ((post.clean & b) && !(callee->modified & b))) post.clean |= b;
+                    else post.clean &= static_cast<RegSet>(~b);
+                }
+                keep = static_cast<RegSet>(~callee->modified & kAllRegisters);
+            } else {
+                post.clean = kAllRegisters;
+                // (an internal entry that may reach outside leaves the context exact but for what it returns by value)
+                const RegSet kept = ck == EntryKind::Flushed ? static_cast<RegSet>(~callee->modified & kAllRegisters) : kept_by(node);
+                for (u32 k = 0; k < 15; ++k)
+                    if (!(kept & (1u << k))) post.local[k] = post.ctx[k] = fresh(i, k, 2);
+                if (ck == EntryKind::Flushed)
+                    for (u32 k = 0; k < 15; ++k)
+                        if (callee->results & (1u << k)) {
+                            post.ctx[k] = fresh(i, k, 3);
+                            post.clean &= static_cast<RegSet>(~(1u << k));
+                        }
+                // (known the same either way; kept in the local, or read back, as the policy says; sp after a call to
+                // code outside the module's view always kept, and checked)
+                keep = kept;
+                if (record && node.call != CallKind::Direct && !out->checks_sp) keep = 0;
+                if (record && node.call == CallKind::Direct && ck == EntryKind::Public) {
+                    if (options_.keep == KeepPolicy::None) keep = 0;
+                    else if (options_.keep == KeepPolicy::Loops && !in_loop[g.block_of[i]]) keep = 0;
+                }
             }
-            if (record) out->call_store[i] = store, out->call_kept[i] = keep;
+            if (record) out->call_store[i] = store, out->call_kept[i] = keep, out->call_entry[i] = static_cast<u8>(ck);
         } else if (record) {
-            out->exit_store[i] = post.dirty();
+            out->exit_store[i] = exit_set(post);
         }
         // The exits inside the translation, and the continuation after it.
         const Edge* cont = nullptr;
@@ -739,6 +832,7 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out) const 
             if (at[b].reached) run_block(b, true);
         out->returns_to_lr = lr_ok;
     }
+    if (lr_ok_out) *lr_ok_out = lr_ok;
     return ok;
 }
 
@@ -748,23 +842,43 @@ void Solver::liveness(const Fn& f, FunctionRegisters& r) const {
     nx::vector<RegSet>& live = r.live_before;
     live.assign(n, 0);
     r.call_load.assign(n, 0);
+    if (f.kept.size() == n) r.call_kept = f.kept;  // (liveness may run again: from the forward pass' sets)
+    const bool internal = options_.internal_calls && f.kind != EntryKind::Public;
     for (bool changed = true; changed;) {
         changed = false;
         for (usize i = n; i-- > 0;) {
             const CfgNode& node = g.nodes[i];
-            const RegisterEffect& eff = f.effect[i];
+            RegisterEffect eff = f.effect[i];
             const auto edge_use = [&](const Edge& e, bool is_cont) -> RegSet {
                 if (e.kind == EdgeKind::Next) return live[e.to];
                 if (is_cont) return r.after_store[i];
-                return e.kind == EdgeKind::Trap ? RegSet(0) : r.exit_store[i];
+                if (e.kind == EdgeKind::Trap) return RegSet(0);
+                // (an internal entry's returns give back what it returns by value)
+                return internal ? static_cast<RegSet>(r.exit_store[i] | f.results) : r.exit_store[i];
             };
             RegSet exec = 0;
-            for (u32 k = 0; k < node.edge_count; ++k) exec |= edge_use(g.edges[node.first_edge + k], k == node.cont_edge);
+            bool returns = node.edge_count > 0;
+            for (u32 k = 0; k < node.edge_count; ++k) {
+                const Edge& e = g.edges[node.first_edge + k];
+                exec |= edge_use(e, k == node.cont_edge);
+                if (e.kind != EdgeKind::Return && e.kind != EdgeKind::IndirectJump) returns = false;
+            }
+            // (an internal entry returns to its caller without reading where to: every way out goes back to the LR it was
+            // entered with; the register a bx or mov pc reads the address from is not read)
+            if (internal && returns && node.call == CallKind::None) {
+                const arm::Instruction& in = f.fn->code[i];
+                if ((in.op == Op::Bx || in.op == Op::Bxj || (in.op == Op::Mov && in.operand_count == 2)) && in.operands[in.op == Op::Mov ? 1 : 0].kind == OperandKind::Reg)
+                    eff.uses &= static_cast<RegSet>(~bit(in.operands[in.op == Op::Mov ? 1 : 0].reg));
+            }
             if (node.call != CallKind::None) {
-                r.call_load[i] = static_cast<RegSet>(exec & ~r.call_kept[i]);
+                const EntryKind ck = static_cast<EntryKind>(r.call_entry[i]);
+                const Fn* callee = ck == EntryKind::Public ? nullptr : callee_of(node);
+                const RegSet results = callee ? callee->results : RegSet(0);
+                r.call_load[i] = static_cast<RegSet>(exec & ~r.call_kept[i] & ~results);
                 // (the stack pointer checked after a call to code outside the module's view: read there)
                 const RegSet checked = r.checks_sp && node.call != CallKind::Direct ? static_cast<RegSet>(r.call_kept[i] & kSpRegister) : RegSet(0);
-                exec = static_cast<RegSet>(r.call_store[i] | (exec & r.call_kept[i]) | checked);
+                // (an internal entry's arguments are read from the locals)
+                exec = static_cast<RegSet>(r.call_store[i] | (exec & r.call_kept[i]) | checked | (callee ? callee->params : RegSet(0)));
             }
             RegSet b = static_cast<RegSet>(eff.uses | (eff.traps ? r.trap_store[i] : RegSet(0)) |
                                            (node.conditional ? exec : RegSet(exec & ~eff.defs)));
@@ -785,11 +899,128 @@ void Solver::liveness(const Fn& f, FunctionRegisters& r) const {
         r.call_kept[i] &= exec;
     }
     r.load_at_entry = g.entry == kNoIndex ? RegSet(0) : live[g.entry];
-    RegSet touched = r.load_at_entry;
-    for (usize i = 0; i < n; ++i)
+    // (an internal entry: r0-r3, sp and lr are its C arguments, the others it reads from the context)
+    r.params = internal ? static_cast<RegSet>(r.load_at_entry & kArgumentRegisters) : RegSet(0);
+    if (internal) r.load_at_entry &= static_cast<RegSet>(~kArgumentRegisters);
+    RegSet touched = static_cast<RegSet>(r.load_at_entry | r.params);
+    for (usize i = 0; i < n; ++i) {
         touched |= static_cast<RegSet>(f.effect[i].uses | f.effect[i].defs | r.trap_store[i] | r.call_store[i] | r.call_load[i] |
                                        r.call_kept[i] | r.exit_store[i] | r.after_store[i]);
+        if (static_cast<EntryKind>(r.call_entry[i]) != EntryKind::Public)
+            if (const Fn* c = callee_of(g.nodes[i])) touched |= static_cast<RegSet>(c->params | c->results);
+    }
+    if (internal) touched |= f.results;
     r.touched = touched;
+}
+
+// Which functions get an internal entry, and of what kind (EntryKind): what each may write (a least fixed point over
+// the module's calls), whether anything it may reach is code outside the generated code's view (another least fixed
+// point), and so what it may change and returns by value.
+void Solver::classify() {
+    const u32 nf = static_cast<u32>(fns_.size());
+    nx::flat_hash_set<u32> excluded;
+    if (options_.no_internal)
+        for (u32 c : *options_.no_internal) excluded.insert(c & ~1u);
+    // What each function and its callees may write: everything when it reaches code outside the module's view.
+    for (Fn& f : fns_) {
+        RegSet w = 0;
+        for (usize i = 0; i < f.effect.size(); ++i) w |= f.effect[i].defs;
+        for (const CfgNode& node : f.cfg.nodes) {
+            if (node.call == CallKind::Import || node.call == CallKind::Indirect || node.call == CallKind::System) w = kAllRegisters;
+            const auto edge = [&](const Edge& e) {
+                if (e.kind == EdgeKind::IndirectJump || e.kind == EdgeKind::ImportTail) w = kAllRegisters;
+            };
+            for (const Edge* e = f.cfg.begin(node); e != f.cfg.end(node); ++e) edge(*e);
+            if (node.conditional) edge(node.skip);
+        }
+        if (!f.fn->code.empty() && f.cfg.entry == kNoIndex) w = kAllRegisters;
+        f.writes = w;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (Fn& f : fns_) {
+            RegSet w = f.writes;
+            const auto from = [&](u32 code) {
+                const u32 t = index(code);
+                w |= t == kNoIndex ? kAllRegisters : fns_[t].writes;
+            };
+            for (const CfgNode& node : f.cfg.nodes) {
+                if (node.call == CallKind::Direct) from(node.call_target);
+                for (const Edge* e = f.cfg.begin(node); e != f.cfg.end(node); ++e)
+                    if (e->kind == EdgeKind::TailCall) from(e->to);
+                if (node.conditional && node.skip.kind == EdgeKind::TailCall) from(node.skip.to);
+            }
+            if (w != f.writes) f.writes = w, changed = true;
+        }
+    }
+    // Which functions can have an internal entry: every way out a return to the LR it was entered with, no tail call.
+    nx::vector<u8> eligible(nf, 0);
+    for (u32 i = 0; i < nf; ++i) {
+        Fn& f = fns_[i];
+        EntryReason why = EntryReason::None;
+        if (!options_.internal_calls) why = EntryReason::Disabled;
+        else if (excluded.contains(f.code & ~1u)) why = EntryReason::Excluded;
+        else if (f.fn->code.empty() || f.cfg.entry == kNoIndex) why = EntryReason::NoCode;
+        else if (!f.fn->returns) why = EntryReason::NoReturn;
+        else if (f.direct_callers == 0) why = EntryReason::NoCallers;
+        else if (!f.lr_ok) why = EntryReason::OtherReturn;
+        if (why == EntryReason::None)
+            for (const CfgNode& node : f.cfg.nodes) {
+                const auto edge = [&](const Edge& e) {
+                    if (e.kind == EdgeKind::TailCall || e.kind == EdgeKind::ImportTail) why = EntryReason::TailCall;
+                };
+                for (const Edge* e = f.cfg.begin(node); e != f.cfg.end(node); ++e) edge(*e);
+                if (node.conditional) edge(node.skip);
+            }
+        f.reason = why;
+        eligible[i] = why == EntryReason::None;
+    }
+    // What reaches code outside the generated code's view: its own calls to imports, through the runtime, svc, traps;
+    // a call to a function without an internal entry (entered with every register in the context); a callee that does.
+    nx::vector<u8> outside(nf, 0);
+    for (u32 i = 0; i < nf; ++i) {
+        if (!eligible[i]) continue;
+        Fn& f = fns_[i];
+        EntryReason why = EntryReason::None;
+        for (usize k = 0; k < f.cfg.nodes.size() && why == EntryReason::None; ++k) {
+            const CfgNode& node = f.cfg.nodes[k];
+            if (node.call == CallKind::Import) why = EntryReason::Import;
+            else if (node.call == CallKind::Indirect) why = EntryReason::Indirect;
+            else if (node.call == CallKind::System) why = EntryReason::Svc;
+            else if (f.effect[k].traps) why = EntryReason::Trap;
+            else if (node.call == CallKind::Direct) {
+                const u32 t = index(node.call_target);
+                if (t == kNoIndex || !eligible[t]) why = EntryReason::PublicCallee;
+            }
+            const auto edge = [&](const Edge& e) {
+                if (e.kind == EdgeKind::Trap && why == EntryReason::None) why = EntryReason::Trap;
+            };
+            for (const Edge* e = f.cfg.begin(node); e != f.cfg.end(node); ++e) edge(*e);
+            if (node.conditional) edge(node.skip);
+        }
+        if (why != EntryReason::None) outside[i] = 1, f.reason = why;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (u32 i = 0; i < nf; ++i) {
+            if (!eligible[i] || outside[i]) continue;
+            for (const CfgNode& node : fns_[i].cfg.nodes) {
+                if (node.call != CallKind::Direct) continue;
+                const u32 t = index(node.call_target);
+                if (t != kNoIndex && outside[t]) {
+                    outside[i] = 1, fns_[i].reason = EntryReason::ViaCallee, changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    for (u32 i = 0; i < nf; ++i) {
+        Fn& f = fns_[i];
+        f.kind = !eligible[i] ? EntryKind::Public : outside[i] ? EntryKind::Flushed : EntryKind::Inside;
+        f.modified = f.kind == EntryKind::Public ? kAllRegisters : static_cast<RegSet>(f.writes & ~f.preserved & kAllRegisters);
+        f.results = f.kind == EntryKind::Public ? RegSet(0) : static_cast<RegSet>(f.modified & kResultRegisters);
+        f.params = 0;
+    }
 }
 
 RegisterAnalysis Solver::run() {
@@ -817,7 +1048,10 @@ RegisterAnalysis Solver::run() {
         const Fn& f = fns_[i];
         nx::flat_hash_set<u32> callees;
         for (const CfgNode& node : f.cfg.nodes) {
-            if (node.call == CallKind::Direct) callees.insert(index(node.call_target));
+            if (node.call == CallKind::Direct) {
+                callees.insert(index(node.call_target));
+                if (const u32 t = index(node.call_target); t != kNoIndex) ++fns_[t].direct_callers;
+            }
             for (const Edge* e = f.cfg.begin(node); e != f.cfg.end(node); ++e)
                 if (e->kind == EdgeKind::TailCall) callees.insert(index(e->to));
             if (node.conditional && node.skip.kind == EdgeKind::TailCall) callees.insert(index(node.skip.to));
@@ -847,7 +1081,23 @@ RegisterAnalysis Solver::run() {
     } else {
         for (Fn& f : fns_) f.preserved = 0;
     }
-    for (const Fn& f : fns_) {
+    // (a function others rely on checks what its own proof assumed of code outside the module's view; without the
+    // check, its proof assumes it all the same and its own code reads sp back)
+    // (with internal entries, also a function with an internal entry: its returns find the LR in its frame through sp)
+    const auto checks_sp = [&](const Fn& f) {
+        return options_.check_sp && options_.callee_saved && !f.callers.empty() &&
+               (f.preserved != 0 || (options_.internal_calls && f.kind != EntryKind::Public));
+    };
+    const auto sp_kept = [&](const Fn& f) { return options_.check_sp ? checks_sp(f) : options_.callee_saved; };
+    // Whether every way out goes back to the LR it was entered with, every call taken as a call through f_<address>
+    // and sp kept across calls to code outside the module's view where it may be checked (a function given an internal
+    // entry on this checks it); then the entries.
+    out.internal_calls = options_.internal_calls;
+    for (Fn& f : fns_)
+        if (!f.fn->code.empty() && f.cfg.entry != kNoIndex)
+            (void)forward(f, options_.check_sp ? options_.callee_saved && !f.callers.empty() : options_.callee_saved, nullptr, &f.lr_ok);
+    classify();
+    for (Fn& f : fns_) {
         FunctionRegisters& r = out.functions[f.code];
         const usize n = f.fn->code.size();
         r.preserved = f.preserved;
@@ -856,16 +1106,37 @@ RegisterAnalysis Solver::run() {
         r.call_kept.assign(n, 0);
         r.exit_store.assign(n, 0);
         r.after_store.assign(n, 0);
+        r.call_entry.assign(n, 0);
+        r.entry = f.kind;
+        r.reason = f.reason;
+        r.modified = f.modified;
+        r.results = f.results;
+        r.writes = f.writes;
         if (n == 0 || f.cfg.entry == kNoIndex) {
             r.call_load.assign(n, 0);
             r.live_before.assign(n, 0);
             continue;
         }
-        // (a function others rely on checks what its own proof assumed of code outside the module's view; without
-        // the check, its proof assumes it all the same and its own code reads sp back)
-        r.checks_sp = options_.check_sp && options_.callee_saved && f.preserved != 0 && !f.callers.empty();
-        forward(f, options_.check_sp ? r.checks_sp : options_.callee_saved, &r);
+        r.checks_sp = checks_sp(f);
+        forward(f, sp_kept(f), &r);
+        f.kept = r.call_kept;
+    }
+    // The registers live in each function; an internal entry's arguments are those of r0-r3, sp and lr live at its
+    // entry, which its callers' liveness reads: a least fixed point over the module's calls.
+    nx::vector<u32> work;
+    for (u32 i = fns_.size(); i-- > 0;) work.push_back(i), fns_[i].queued = true;
+    while (!work.empty()) {
+        const u32 i = work.back();
+        work.pop_back();
+        Fn& f = fns_[i];
+        f.queued = false;
+        if (f.fn->code.empty() || f.cfg.entry == kNoIndex) continue;
+        FunctionRegisters& r = out.functions[f.code];
         liveness(f, r);
+        if (r.params == f.params) continue;
+        f.params = r.params;
+        for (u32 c : f.callers)
+            if (!fns_[c].queued) fns_[c].queued = true, work.push_back(c);
     }
     return out;
 }

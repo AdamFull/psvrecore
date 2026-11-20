@@ -53,6 +53,24 @@ struct Options {
     // as one vector local (psvrecomp --no-q-locals).
     bool neon_in_context = false;
     bool no_q_locals = false;
+    // Internal entries (analysis/registers.hpp, EntryKind): direct calls between the module's functions pass r0-r3, sp
+    // and lr as C arguments of fi_<address> and get r0/r1 back by value; off, every call through f_<address> as before
+    // (psvrecomp --no-internal-calls). Functions given none, so that every direct call goes through f_<address> (a
+    // game's stand-in for it, task 8's replacements: psvrecomp --no-inline).
+    bool internal_calls = true;
+    nx::vector<u32> no_internal;
+    // Indirect calls through the module's table (guest.h, PsvDispatch, psv_call_in), Thumb functions of the module found
+    // there without a call into the runtime; off, all through psv_call (psvrecomp --no-call-table).
+    bool call_table = true;
+    // With call_table: each indirect call site looks in the table itself (inline: psv_call_in at the site, a larger
+    // program) or calls the module's one function that does (<name>_call, the default; psvrecomp --call-table-inline).
+    bool call_table_inline = false;
+    // Internal entries of at most this many instructions and no jump table are inlined: static in each .c file whose
+    // functions call them (psvrecomp --inline-limit; 0: none).
+    u32 inline_limit = 8;
+    // The internal entries not inlined are marked noinline (the C compiler would otherwise copy them into the callers
+    // in their own file and their wrapper, beside the out-of-line copy; psvrecomp --inline-in-file lets it).
+    bool noinline_internal = true;
 };
 
 struct GeneratedFile {
@@ -125,6 +143,26 @@ struct Stats {
     usize vfp_fused_conditions = 0;
     // Instructions translated to a trap, by mnemonic (undefined, unimplemented, privileged...).
     nx::map<nx::string, usize> traps;
+    // Internal entries: functions with one that reaches nothing outside (Inside) and that may (Flushed); functions
+    // without one, by why (analysis::EntryReason), and Flushed ones by why; direct calls to Inside entries, to Flushed
+    // ones, through f_<address> (by why the callee has no internal entry); returns of internal entries (no compare with
+    // ret); their C arguments and results.
+    usize internal_inside = 0;
+    usize internal_flushed = 0;
+    nx::map<nx::string, usize> public_reasons;
+    nx::map<nx::string, usize> flushed_reasons;
+    usize calls_inside = 0;
+    usize calls_flushed = 0;
+    usize calls_public = 0;
+    nx::map<nx::string, usize> calls_public_reasons;
+    nx::map<nx::string, usize> calls_flushed_reasons;
+    usize internal_returns = 0;
+    // Inlining: functions inlined, the direct calls of them, the static copies the .c files hold.
+    usize functions_inlined = 0;
+    usize calls_inlined = 0;
+    usize inline_copies = 0;
+    usize internal_params = 0;
+    usize internal_results = 0;
 };
 
 struct Output {

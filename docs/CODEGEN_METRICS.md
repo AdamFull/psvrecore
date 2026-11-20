@@ -1067,3 +1067,264 @@ CPU time of each thread was sampled at the shot mark (`build/t6/run_game_cpu.ps1
   scenes a few frames apart. Frames drawn are 1661 and 1660 (base) and 1659 and 1659 (new). The same two warnings
   appear (audio, the mask bit of DF32M_S8) and there are no traps. In this phase the game's main thread uses about
   0.5 s of CPU (the movie decoder thread about 7 s), so the run shows no CPU difference.
+
+## Call cost: internal entries, inlining, indirect-call tables
+
+Measured 2026-11-20 with the same compilers and options. Direct calls between a module's functions use internal
+entries (`fi_<address>`: r0-r3, sp and lr as C arguments, r0/r1 returned by value, no write of the context for callees
+with nothing outside in their reach), internal entries of up to 16 instructions are inlined into every .c file that
+calls them, and indirect calls look in their module's table before the runtime ([ARCHITECTURE.md](ARCHITECTURE.md),
+"Internal entries", "Inlining", "Indirect calls"). "Before" is the generator at 693bfb3 (its psvrecomp, corpusgen and
+script, `build/psv-base`); the corpus gained 11 functions in `regs` (the internal-entry cases) and corpusgen finds the
+modules' flag contracts as a fixed point (the new cases made one module's reads depend on what it is given), both on
+the "before" side too. `docs/codegen_metrics_synthetic.json` now holds this change's synthetic numbers (x64 and arm64, with the
+wrappers' instructions apart: `wrapper_instructions`), the baseline for the next change (task 8). The script now
+counts a function's internal entry `fi_<address>` with it, and static copies of inlined functions in other files apart.
+
+### Where the cost was (measured first)
+
+Static, from each game's generated C at 693bfb3 (`build/t7/callcost.py`): context stores before and loads after each
+direct call, by register class; context loads at each function's entry; how many direct calls go to callees that
+reach nothing outside the generated code's view (no import, indirect call, svc, trap, or call of a function without
+the same property, transitively); callee sizes and call graph shape; indirect calls by kind (from the disassembly
+before each `blx`).
+
+| | WipEout 2048 | P4D | Minecraft | CoD Declassified | Resistance | LittleBigPlanet |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| functions / guest instructions | 16658 / 1.48M | 16704 / 1.16M | 43829 / 3.75M | 45135 / 2.92M | 43818 / 2.71M | 32014 / 2.77M |
+| direct call sites (per 1000 guest) | 104956 (71) | 66641 (57) | 167094 (45) | 142051 (49) | 128867 (48) | 167153 (60) |
+| context stores per direct call: r0-r3 | 1.99 | 2.16 | 2.16 | 2.26 | 2.27 | 2.38 |
+|   r4-r11 | 0.85 | 1.22 | 1.37 | 1.36 | 1.40 | 1.33 |
+|   sp / lr / r12 | 0.13 / 1.00 / 0.02 | 0.22 / 1.00 / 0.03 | 0.14 / 1.00 / 0.02 | 0.24 / 1.00 / 0.02 | 0.26 / 1.00 / 0.02 | 0.22 / 1.00 / 0.03 |
+|   VFP / flags | 0.31 / 0.00 | 0.83 / 0.00 | 0.42 / 0.00 | 0.41 / 0.00 | 0.40 / 0.00 | 0.64 / 0.00 |
+| loads after a direct call: r0-r3 / r4-r11 / other | 0.87 / 0.45 / 0.11 | 0.69 / 0.55 / 0.09 | 0.52 / 0.39 / 0.07 | 0.89 / 0.59 / 0.14 | 0.90 / 0.61 / 0.14 | 0.95 / 0.73 / 0.20 |
+|   VFP / flags | 0.30 / 0.03 | 0.76 / 0.02 | 0.26 / 0.01 | 0.41 / 0.02 | 0.42 / 0.02 | 0.60 / 0.02 |
+| context loads at a function's entry: r0-r3 / r4-r11 / sp / lr | 1.47 / 2.66 / 0.79 / 1.00 | 1.58 / 2.78 / 0.81 / 1.00 | 1.51 / 3.01 / 0.76 / 0.97 | 1.60 / 2.48 / 0.78 / 1.00 | 1.60 / 2.43 / 0.78 / 1.00 | 1.83 / 3.01 / 0.90 / 1.00 |
+|   VFP | 0.67 | 0.80 | 0.44 | 0.63 | 0.61 | 1.06 |
+| direct calls to callees reaching nothing outside (traps not / counted) | 56% / 56% | 27% / 26% | 30% / 30% | 30% / 29% | 31% / 29% | 24% / 23% |
+| functions reaching nothing outside | 34% | 31% | 28% | 30% | 31% | 24% |
+| direct calls within one .c file | 15% | 28% | 12% | 19% | 20% | 14% |
+| direct calls to leaves | 47% | 18% | 26% | 21% | 21% | 14% |
+| direct calls to callees of <=4 / 5-16 / 17-64 / >64 instructions | 10 / 14 / 60 / 16% | 12 / 24 / 40 / 24% | 18 / 23 / 27 / 32% | 8 / 22 / 38 / 32% | 8 / 23 / 35 / 33% | 7 / 27 / 44 / 21% |
+| functions of <=8 instructions | 23% | 28% | 32% | 26% | 27% | 16% |
+| functions with 0 / 1 / 2-16 / >16 direct callers | 50/22/24/4% | 43/26/28/3% | 62/17/18/3% | 62/19/17/2% | 63/19/16/2% | 32/37/28/3% |
+| import calls | 16748 | 11951 | 129647 | 16340 | 15540 | 15607 |
+| indirect calls (per 1000 guest) | 5497 (3.7) | 4996 (4.3) | 86608 (23.1) | 46362 (15.9) | 45429 (16.8) | 8366 (3.0) |
+|   virtual (ldr vtable; ldr fn, [vtable, #k]) | 2976 | 491 | 79756 | 33353 | 32546 | 6466 |
+|   pointer loaded from memory / the stack | 1607 / 55 | 3507 / 286 | 5660 / 242 | 3269 / 149 | 3102 / 148 | 964 / 185 |
+|   pointer from a register (callback argument) | 541 | 327 | 530 | 2309 | 2371 | 428 |
+|   constant (bl/movw-movt to no function start: veneers) | 291 | 356 | 399 | 7231 | 7228 | 283 |
+| indirect jumps other than returns | 0 | 0 | 0 | 0 | 0 | 0 |
+| returns with a ret compare and a psv_jump fallback | 19715 | 16672 | 43795 | 51991 | 50413 | 40366 |
+
+WipEout 2048 main thread (Odin 3 profile x-P): 50.3% of samples in functions reaching nothing outside, 15.5% in leaves; weighting each function's samples by the share of its direct calls that go to such callees: 48.0%
+
+
+What the numbers said, and the order they gave:
+
+- Direct calls are the cost everywhere: one per 14-22 guest instructions, each with about 4 context stores before it
+  (r0-r3 2.0-2.4, r4-r11 0.9-1.4, `lr = next` always 1.0, sp 0.1-0.3), 1.0-1.9 loads after it and, at every callee's
+  entry, 5.8-6.8 loads (r4-r11 2.4-3.0, lr 1.0, sp 0.8, r0-r3 1.5-1.8); every function also has a return compare with
+  `ret` and its `psv_jump` fallback. 56% of WipEout 2048's direct calls (24-31% in the others) go to callees that reach
+  nothing outside the generated code's view, and those functions hold 50% of WipEout's main-thread samples on the Odin 3:
+  so internal entries came first (part 1).
+- Indirect calls are second, and matter only in the C++-heavy games: 23 per 1000 instructions in Minecraft (92% of
+  them virtual calls through a vtable), 16-17 in CoD and Resistance, 3-4 in WipEout, P4D and LittleBigPlanet. Each goes
+  through `psv_call` (a call into the DLL and a hash-map lookup): part 3, which is cheap to do, second.
+- Inlining (part 2) builds on part 1's internal entries: 16-32% of the functions have at most 8 instructions, but only
+  10-18% of the direct calls go to callees of at most 4 (72-88% of direct calls cross a file).
+- noreturn (part 4): already used since task 3 (calls of functions that never return end the flow, nothing is read back
+  after them, a trap follows); 165 such call sites in WipEout, 14738 in Minecraft (its assert helpers). Nothing left to
+  gain at run time: declaring the C functions `noreturn` would only turn the trap that checks a "never returns"
+  function that returns after all into undefined behaviour. Not done.
+- Monomorphic inline caches: not measured (no dynamic data: Minecraft has never been built, CoD and Resistance were not
+  run here); not done.
+- The ret compares (19715 in WipEout) and the lr stores (one per direct call) go away with part 1 for internal entries.
+
+### What the generator now does with them
+
+`psvrecomp generate`'s counts for the executables (the libraries' are in their logs under `build/t7/gen-final`):
+
+| | WipEout 2048 | Minecraft | CoD Declassified |
+| --- | ---: | ---: | ---: |
+| functions with an internal entry: Inside / Flushed | 2757 / 3467 | 3348 / 11565 | 4635 / 9203 |
+| without one: no direct caller / may return elsewhere / never returns | 7219 / 1338 / 11 | 25946 / 589 / 32 | 26980 / 2585 / 11 |
+| direct calls without the context / with it / through `f_<address>` | 56597 / 34938 / 7639 | 47867 / 109166 / 2599 | 39196 / 87054 / 10403 |
+| why calls write the context: callee calls an import / through the runtime / reaches outside through a callee / may trap | 16940 / 4317 / 12619 / 1043 | 68135 / 20362 / 19346 / 1286 | 18006 / 34741 / 25793 / 8514 |
+| inlined functions (at most 8 instructions) / direct calls of them / static copies | 1421 / 8174 / 3979 | 2864 / 21897 / 11269 | 1874 / 12521 / 5181 |
+| returns without a compare with `ret` | 8215 | 14920 | 17691 |
+| indirect call sites through the module's table | 4930 | 85704 | 45822 |
+| context loads at entries in the generated C, before -> after | 87219 -> 69569 | 259322 -> 205869 | 254599 -> 210871 |
+| context stores, before -> after | 571241 -> 431120 | 2104654 -> 2007558 | 1291726 -> 1198903 |
+| context loads after calls, before -> after | 212191 -> 226008 | 1057828 -> 1053441 | 489224 -> 482658 |
+
+The loads after calls do not fall: the registers an internal entry may change other than r0/r1 (r2, r3, r12, lr: it
+writes them to the context so that every function's exit stays exact) are read back where live, as before.
+The tables' memory (from the function tables): WipEout 2048 4.4 MiB, P4D 3.5 MiB, Minecraft 11.8 MiB, CoD 8.4 MiB,
+Resistance 7.8 MiB, LittleBigPlanet 8.0 MiB.
+
+### Time: the corpus' timed benchmark
+
+`CODEGEN_BENCH` (each test function from its first state, 2000 calls a round, the fastest round of 8, the builds
+alternated, one logical CPU of a performance core; `build/t7/bench2.py`), x64 release. The geometric mean over the
+148 functions (most have no call, and do not move); "before" is 693bfb3 on the same corpus. Noise: the same build
+measured in two series differs by 0.1% in the mean and up to 2% in single functions.
+
+| One .c file per module | Mean | `vec_sum` (getters in a loop) | `virtual_calls` | `fold_all` (callbacks) | `fib` | `ie_chain_top` | `ie_even` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 29.02 ns | 159.7 | 405.1 | 119.5 | 336.9 | 85.5 | 109.4 |
+| tables only (`--no-internal-calls`) | -6.2% | 161.1 | 173.9 | 69.9 | 336.3 | 41.1 | 110.7 |
+| internal entries only (`--no-call-table`) | -1.7% | 105.1 | 414.2 | 123.1 | 299.9 | 79.3 | 64.8 |
+| both, lookup at each site (`--call-table-inline`) | -7.5% | 105.2 | 171.5 | 70.3 | 303.4 | 38.4 | 65.0 |
+| both, the module's `_call` (the default) | -7.8% | 105.6 | 171.9 | 71.3 | 300.1 | 28.0 | 64.8 |
+
+| Each module in 32 .c files (`PSVRECORE_CODEGEN_TEST_SPLIT=32`: calls across files) | Mean | `vec_sum` | `arm_caller` | `loop_kept` | `thumb_calls_arm` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| before | 30.04 ns | 243.4 | 53.4 | 18.9 | 32.6 |
+| no inlining (`--inline-limit 0`) | -8.1% | 213.2 | 48.2 | 16.9 | 29.4 |
+| inlined up to 16, also into callers in the same file (`--inline-limit 16 --inline-in-file`) | -11.1% | 105.3 | 30.1 | 14.3 | 20.9 |
+| inlined up to 8, the rest noinline (the default) | -10.8% | 105.5 | 30.2 | 14.3 | 20.9 |
+
+Inlining limits 8, 16 and 32 measured -10.8%, -10.9% and -11.1% across files, against a larger program (WipEout 2048's
+generated C +1.1%, +2.6%, +8% for 8, 16, 32): 8 is the default. The lookup at each call site and the module's shared
+function measured the same on the corpus; the shared one is the default because the lookup at each site made
+Minecraft's program 14% larger (below).
+
+### Size: host instructions per guest instruction
+
+The wrappers (`f_<address>` of the functions with an internal entry, entered only through the function table) are
+counted with their functions in the ratios; the last column of each target leaves them out. Static copies of inlined
+functions outside their own file are counted apart (in no function). WipEout 2048's executable: 24.03 -> 25.18 MB
+(x64), P4D's 19.88 -> 21.81 MB; the generated C +3.2% (WipEout, Minecraft), +2.9% (CoD).
+
+#### Synthetic corpus
+
+| | Functions | Guest | x64 before | x64 after | | x64 w/o wrappers | arm64 before | arm64 after | | arm64 w/o wrappers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 221 | 2872 | 9.89 | 9.86 | -0.3% | 9.20 (-7.0%) | 7.42 | 7.43 | +0.2% | 6.87 (-7.4%) |
+| Module `syn_calls` | 31 | 377 | 5.77 | 5.93 | +2.8% | 5.25 (-9.0%) | 4.17 | 4.31 | +3.4% | 3.68 (-11.7%) |
+| Module `syn_control` | 16 | 134 | 9.53 | 9.13 | -4.2% | 8.18 (-14.2%) | 6.65 | 6.51 | -2.1% | 5.76 (-13.4%) |
+| Module `syn_flags` | 19 | 146 | 8.22 | 8.15 | -0.8% | 7.63 (-7.2%) | 5.97 | 5.95 | -0.4% | 5.55 (-6.9%) |
+| Module `syn_integer` | 18 | 605 | 4.83 | 4.83 | +0.0% | 4.83 (+0.0%) | 3.03 | 3.03 | +0.0% | 3.03 (+0.0%) |
+| Module `syn_integer_arm` | 6 | 151 | 6.20 | 6.20 | +0.0% | 6.20 (+0.0%) | 3.98 | 3.98 | +0.0% | 3.98 (+0.0%) |
+| Module `syn_neon` | 13 | 194 | 11.32 | 11.32 | +0.0% | 11.32 (+0.0%) | 5.70 | 5.70 | +0.0% | 5.70 (+0.0%) |
+| Module `syn_neon_locals` | 14 | 201 | 19.06 | 19.08 | +0.1% | 18.72 (-1.8%) | 11.73 | 11.72 | -0.0% | 11.39 (-2.9%) |
+| Module `syn_regs` | 76 | 504 | 9.28 | 9.15 | -1.4% | 6.73 (-27.4%) | 7.44 | 7.18 | -3.5% | 5.17 (-30.5%) |
+| Module `syn_vfp` | 12 | 264 | 14.53 | 14.53 | +0.0% | 14.53 (+0.0%) | 13.14 | 13.14 | +0.0% | 13.14 (+0.0%) |
+| Module `syn_vfp_locals` | 16 | 296 | 18.13 | 18.04 | -0.5% | 17.50 (-3.5%) | 16.39 | 16.89 | +3.0% | 16.36 (-0.2%) |
+| Class integer | 115 | 1135 | 6.25 | 6.27 | +0.3% | 5.25 (-16.0%) | 4.51 | 4.55 | +1.0% | 3.69 (-18.1%) |
+| Class vfp | 35 | 603 | 16.38 | 16.30 | -0.5% | 15.74 (-3.9%) | 14.74 | 14.98 | +1.6% | 14.47 (-1.9%) |
+| Class neon | 32 | 733 | 10.32 | 10.33 | +0.1% | 10.31 (-0.1%) | 5.85 | 5.84 | -0.1% | 5.82 (-0.5%) |
+| Class call-heavy | 39 | 401 | 9.69 | 9.50 | -1.9% | 8.53 (-11.9%) | 7.50 | 7.14 | -4.8% | 6.32 (-15.7%) |
+
+x64: wrappers 1907 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 0 (not in the ratios); helpers 2759 -> 2759.
+
+arm64: wrappers 1630 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 0 (not in the ratios); helpers 2038 -> 2038.
+
+#### WipEout 2048 (whole program)
+
+| | Functions | Guest | x64 before | x64 after | | x64 w/o wrappers | arm64 before | arm64 after | | arm64 w/o wrappers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 16658 | 1479360 | 3.56 | 3.71 | +4.2% | 3.57 (+0.5%) | 3.17 | 3.30 | +4.2% | 3.18 (+0.3%) |
+| Module `wo_eboot` | 14792 | 1350786 | 3.54 | 3.69 | +4.2% | 3.56 (+0.5%) | 3.16 | 3.29 | +3.9% | 3.17 (+0.0%) |
+| Module `wo_libc` | 1201 | 65672 | 4.43 | 4.53 | +2.2% | 4.35 (-1.9%) | 3.83 | 3.96 | +3.5% | 3.80 (-0.8%) |
+| Module `wo_libfios2` | 520 | 39042 | 3.04 | 3.40 | +11.7% | 3.21 (+5.4%) | 2.62 | 3.11 | +18.6% | 2.93 (+11.8%) |
+| Module `wo_libult` | 145 | 23860 | 2.80 | 2.87 | +2.5% | 2.79 (-0.3%) | 2.64 | 2.71 | +2.7% | 2.64 (+0.0%) |
+| Class integer | 10290 | 757832 | 2.82 | 2.97 | +5.3% | 2.80 (-0.6%) | 2.50 | 2.66 | +6.5% | 2.51 (+0.3%) |
+| Class vfp | 1444 | 224442 | 5.24 | 5.37 | +2.4% | 5.28 (+0.6%) | 5.00 | 5.15 | +3.1% | 5.07 (+1.4%) |
+| Class neon | 663 | 122161 | 7.87 | 7.91 | +0.5% | 7.83 (-0.6%) | 6.00 | 6.06 | +0.9% | 5.98 (-0.4%) |
+| Class call-heavy | 4261 | 374925 | 2.62 | 2.83 | +8.0% | 2.72 (+3.7%) | 2.51 | 2.59 | +3.4% | 2.49 (-0.7%) |
+| `f_8311A9C8` | 1 | 383 | 3.52 | 3.50 | -0.5% | 3.50 (-0.5%) | 2.42 | 2.48 | +2.4% | 2.48 (+2.4%) |
+| `f_8128DB48` | 1 | 443 | 6.70 | 6.70 | +0.0% | 6.62 (-1.1%) | 5.18 | 5.07 | -2.2% | 5.00 (-3.4%) |
+| `f_813BAC40` | 1 | 408 | 4.83 | 3.50 | -27.5% | 3.41 (-29.3%) | 3.56 | 3.01 | -15.4% | 2.94 (-17.3%) |
+| `f_812FC59A` | 1 | 1125 | 7.63 | 7.60 | -0.4% | 7.60 (-0.4%) | 5.61 | 5.68 | +1.2% | 5.68 (+1.2%) |
+| `f_812FC39E` | 1 | 117 | 24.48 | 23.78 | -2.9% | 23.51 (-3.9%) | 17.02 | 16.28 | -4.3% | 16.04 (-5.7%) |
+| `f_81276E14` | 1 | 112 | 12.14 | 12.22 | +0.7% | 11.97 (-1.4%) | 7.48 | 7.60 | +1.6% | 7.36 (-1.7%) |
+| `f_8127A712` | 1 | 123 | 11.44 | 9.89 | -13.6% | 9.65 (-15.6%) | 8.20 | 7.14 | -13.0% | 6.91 (-15.8%) |
+| `f_8118C300` | 1 | 716 | 8.33 | 8.33 | +0.0% | 8.33 (+0.0%) | 6.40 | 6.88 | +7.4% | 6.88 (+7.4%) |
+| `f_813C32DC` | 1 | 31 | 4.84 | 5.71 | +18.0% | 4.61 (-4.7%) | 3.65 | 4.26 | +16.8% | 3.35 (-8.0%) |
+| `f_812A7EDC` | 1 | 475 | 6.25 | 6.30 | +0.8% | 6.30 (+0.8%) | 5.74 | 5.97 | +4.1% | 5.97 (+4.1%) |
+
+x64: wrappers 198769 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 4984 (not in the ratios); helpers 30732 -> 30732.
+
+arm64: wrappers 185547 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 4939 (not in the ratios); helpers 23513 -> 23513.
+
+#### Minecraft (whole program)
+
+| | Functions | Guest | x64 before | x64 after | | x64 w/o wrappers | arm64 before | arm64 after | | arm64 w/o wrappers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 43829 | 3752048 | 3.65 | 3.84 | +5.1% | 3.71 (+1.7%) | 3.36 | 3.53 | +5.2% | 3.42 (+1.8%) |
+| Module `mcv_eboot` | 41480 | 3604539 | 3.64 | 3.83 | +5.1% | 3.71 (+1.7%) | 3.36 | 3.53 | +5.2% | 3.42 (+1.8%) |
+| Module `mcv_libc` | 1604 | 84793 | 4.34 | 4.49 | +3.5% | 4.29 (-1.0%) | 3.80 | 3.97 | +4.4% | 3.79 (-0.3%) |
+| Module `mcv_libccs` | 157 | 13095 | 3.52 | 3.66 | +3.7% | 3.53 (+0.2%) | 2.83 | 2.94 | +3.8% | 2.83 (-0.1%) |
+| Module `mcv_libfios2` | 588 | 49621 | 3.26 | 3.59 | +10.0% | 3.41 (+4.4%) | 2.80 | 3.22 | +15.1% | 3.06 (+9.1%) |
+| Class integer | 28011 | 2001208 | 3.25 | 3.35 | +3.3% | 3.21 (-1.1%) | 2.92 | 3.01 | +3.2% | 2.88 (-1.4%) |
+| Class vfp | 3567 | 514508 | 5.72 | 6.04 | +5.6% | 5.94 (+3.8%) | 5.31 | 5.65 | +6.5% | 5.55 (+4.7%) |
+| Class neon | 31 | 7052 | 4.84 | 5.01 | +3.5% | 4.97 (+2.7%) | 3.59 | 3.76 | +4.7% | 3.73 (+3.8%) |
+| Class call-heavy | 12220 | 1229280 | 3.44 | 3.70 | +7.4% | 3.60 (+4.4%) | 3.25 | 3.49 | +7.3% | 3.40 (+4.4%) |
+
+x64: wrappers 469140 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 9464 (not in the ratios); helpers 118696 -> 119917.
+
+arm64: wrappers 433548 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 11782 (not in the ratios); helpers 87668 -> 88537.
+
+#### Call of Duty Declassified (whole program)
+
+| | Functions | Guest | x64 before | x64 after | | x64 w/o wrappers | arm64 before | arm64 after | | arm64 w/o wrappers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **All** | 45135 | 2921654 | 4.22 | 4.39 | +4.1% | 4.24 (+0.6%) | 3.73 | 3.90 | +4.4% | 3.76 (+0.8%) |
+| Module `cod_eboot` | 43414 | 2816940 | 4.23 | 4.40 | +4.1% | 4.25 (+0.6%) | 3.74 | 3.91 | +4.3% | 3.77 (+0.7%) |
+| Module `cod_libc` | 1201 | 65672 | 4.43 | 4.53 | +2.2% | 4.35 (-1.9%) | 3.83 | 3.96 | +3.5% | 3.80 (-0.8%) |
+| Module `cod_libfios2` | 520 | 39042 | 3.04 | 3.40 | +11.7% | 3.21 (+5.4%) | 2.62 | 3.11 | +18.6% | 2.93 (+11.8%) |
+| Class integer | 30759 | 1829281 | 3.02 | 3.19 | +5.5% | 3.03 (+0.3%) | 2.59 | 2.77 | +6.6% | 2.62 (+1.0%) |
+| Class vfp | 3987 | 444523 | 7.01 | 7.15 | +1.9% | 7.04 (+0.4%) | 7.24 | 7.35 | +1.5% | 7.25 (+0.1%) |
+| Class neon | 1524 | 309600 | 7.98 | 7.99 | +0.2% | 7.93 (-0.6%) | 5.90 | 5.92 | +0.4% | 5.87 (-0.6%) |
+| Class call-heavy | 8865 | 338250 | 3.56 | 3.98 | +11.9% | 3.76 (+5.6%) | 3.28 | 3.62 | +10.2% | 3.41 (+4.0%) |
+
+x64: wrappers 432846 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 5073 (not in the ratios); helpers 63865 -> 63906.
+
+arm64: wrappers 397977 instructions (in the ratios; without them in the last column); out-of-line static copies of inlined functions in other files 5063 (not in the ratios); helpers 48599 -> 48635.
+
+
+Compile time (WipEout 2048's generated code, x64 objects with 12 jobs, back to back, twice each): 43 and 44 s before,
+48 and 44 s after (with the lookup at each call site; the shared lookup is smaller). Whole-program x64 + arm64 compile
+and disassembly of the final trees, on a machine other sessions also used: WipEout 76 s, Minecraft 218 s, CoD 187 s
+(before, first runs with the same load: 111, 219, 181 s).
+
+### Checks
+
+- The corpus: 0 disagreements in 7104 runs in each of the three configurations (148 functions), the whole context
+  equal to the interpreter's at 144 calls through `psv_call` a run (`obs_*`); the indirect-call table test and the
+  override test pass. `--no-internal-calls --no-call-table` gives 693bfb3's code byte for byte (WipEout's 4 modules,
+  P4D's 6).
+- Faults put in by hand, each caught: no exit write of r2/r3/lr (1009-1044 disagreements), a call of an Inside entry
+  writing nothing to the context (373-1356), no putting back of a register a callee changed (262-355), a caller
+  keeping every register across an Inside call (251), the wrapper never jumping to an LR other than ret (48), an Inside
+  entry taken to find r0-r3/sp/lr exact in the context, a caller dropping r1 of a 64-bit result, `--no-inline` ignored
+  by the analysis (`registers_tests.cpp`), the table's lookup ignoring the instruction set (an ARM address finding the
+  Thumb function there), `override_function` not updating the tables, `clear_modules` keeping them. Two faults are not
+  caught, and are not faults: taking a function that reaches an import to be Inside (its r0-r3, sp and lr start dirty,
+  so it writes them from its arguments where it calls outside: the kinds only choose where to write), and returning
+  only r0 by value (the callee then writes r1 to the context and the caller reads it back).
+
+### Games
+
+Hidden runs (`--hidden`), each with its own data, settings and shots; the build from 693bfb3's generator and this one
+back to back as Windows x64 release builds; CPU times sampled at the shot mark (`build/t7/run_game_cpu.ps1`). Three
+sets of two pairs, as the defaults were chosen (16 instructions inlined and copies in the same file allowed; then 8
+and noinline with the lookup at each site; then the shared lookup, the final code):
+
+- WipEout 2048, the race script: every run of every set is on lap 1/3 in 8th place at the 199 s shot, shield 89%, race
+  time 1:47.68-1:47.72 (both builds in that range), 11943-11962 frames, the same three warnings (an untranslated GXP
+  program twice, depthf, system module 0x002d), no traps. The main game thread's CPU time at the mark, before / after:
+  15.6 and 15.4 s / 14.8 and 14.4 s (first set), 15.0 and 15.3 / 14.6 and 14.3 (second), 16.3 and 16.0 / 16.5 and 16.8
+  (final code; every thread of these four runs used more CPU, the render thread 29-33 s against 29-31: other load on
+  the machine). Between sets the same build moves by up to 1.3 s; so the first two sets show about -5%, the last
+  +3%, and no change outside that noise can be claimed for the final code on this machine.
+- Persona 4 Dancing All Night, the fixed-time run: all twelve runs reach the opening movie; the 8 s shot is identical in
+  all, the later ones show the same scenes a few frames apart, with identical shots across the builds (the same frame
+  in a before run and an after run); 1661-1663 frames; the same warning (the mask bit of DF32M_S8); no traps. The main
+  thread uses under 0.5 s of CPU in this phase.
+- Call of Duty and Resistance (the call-heavy targets) were not run: neither has a Windows scripted run that reaches
+  gameplay without other sessions' set-up (Resistance's level is reached by a timed touch script but its lighting is
+  black; CoD's notes record boots and menus), and each needs about 450-550 MB of generated C built twice; their
+  measurements here are static.

@@ -104,11 +104,13 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     load time, never at generation time.
 - **Generated code** (`recomp/guest.h` is the contract between the generator, the runtime and the tests).
   - Each guest function becomes `void f_<address>(PsvContext*, uint32_t ret)`. `ret` is the guest return address
-    the caller expects.
+    the caller expects. A function the module's code calls directly also gets an internal entry `fi_<address>` that
+    takes r0-r3, sp and lr as C arguments and returns r0/r1 by value; direct calls between the module's functions use
+    it, and `f_<address>` becomes a wrapper around it (below, "Internal entries").
   - A call sets LR and calls the C function. A return is an indirect branch whose target equals `ret`. A tail call
     passes its own `ret` on.
-  - Other indirect branches look the target up among the registered modules' functions. An unknown target stops
-    with a diagnostic. Jump tables become `switch` statements on the index register (the tables are in read-only
+  - Other indirect branches look the target up among the registered modules' functions: a call first in its own
+    module's table (below, "Indirect calls"), then through the runtime. An unknown target stops with a diagnostic. Jump tables become `switch` statements on the index register (the tables are in read-only
     memory the loader does not patch, so each index's target is known). An index outside the table goes where the
     entry the guest reads there leads, if that is one of the table's targets, and traps otherwise.
   - Generated code is compiled with its own options (`psvrecore_generated_code` in
@@ -218,10 +220,10 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
       thread and fiber entries, `module_start`, a function watch, `override_function`'s replacement): the context
       holds every register. The function reads into its locals those it reads before writing them; the others start
       at 0 and are never read before written.
-    - A direct call to a function of the module (bl/blx to its entry): before it, the context holds every register
-      (each dirty one written). After it, the registers the callee preserves (below) stay in the caller's locals,
-      which equal the context's; the others live after the call are read back. LR is written as before
-      (`lr = next`), and the callee gets `ret = next`.
+    - A direct call to a function of the module without an internal entry (bl/blx to its entry): before it, the
+      context holds every register (each dirty one written). After it, the registers the callee preserves (below) stay
+      in the caller's locals, which equal the context's; the others live after the call are read back. LR is written as
+      before (`lr = next`), and the callee gets `ret = next`. A call of an internal entry: below, "Internal entries".
     - An indirect call (`psv_call`), an import (`psv_call_import`: a system library or another module's export),
       svc: before it, the context holds every register. After it, every live register is read back, except sp in a
       function that has direct callers and preserves something (they rely on it): there sp stays in the local and
@@ -283,6 +285,104 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     byte what the generator gave before: checked on WipEout 2048's four modules); `--no-callee-saved` keeps the
     locals and reads every live register back after every call (stage A alone), for chasing a suspected bug in a
     game.
+- **Internal entries** (`analysis/registers.hpp`, `EntryKind`). The context is the calling convention of
+  `f_<address>`: every register is in it at a call and back in it at the return. Direct calls between the module's
+  functions need not pay that: they use an internal entry.
+  - **Which functions.** A function with direct callers (bl/blx), that may return, whose every way out returns to
+    the LR it was entered with (`returns_to_lr`, shown with sp kept across calls to code outside the module's view, which
+    such a function then checks after them, as callers of a preserving function rely on), and that ends in no tail
+    call (no branch, table entry, veneer or running into another function, no import's tail call). Not one listed by
+    `psvrecomp --no-inline` (a function a game stands in for by renaming its definition, task 8's replacements).
+    WipEout 2048's executable: 6224 of its 14792 functions; 7219 have no direct caller, 1338 may return elsewhere than
+    their LR (most of them: a store at a register offset from sp, which ends what the analysis knows of the frame and
+    so of the saved LR, or a call of such a function, which then loses sp), 11 never return.
+  - **Its signature.** `RT fi_<address>(PsvContext* ctx, uint32_t g<k>...)`: the registers of r0-r3, sp and lr it
+    reads at entry, in that order (`kArgumentRegisters`; its liveness, a least fixed point over the module's calls:
+    what its callees read at entry is read at the call). It reads r4-r12 from the context. RT returns r0 and r1 where
+    it may change them: `uint64_t` (r0 | r1 << 32: one register on x64 and arm64), `uint32_t` or `void`. What it may
+    change (`modified`) is what its code and its callees' may write (`writes`, everything when it reaches code outside
+    the module's view) less what it preserves (r4-r11 and sp, the callee-saved proof). The returns compare nothing
+    with `ret`: every way out goes back to the LR it was entered with, which its caller set.
+  - **Two kinds.** `Inside`: nothing it may reach is outside the generated code's view: no import, no call through the
+    runtime, no svc, nothing that may trap, no call of a function without an internal entry, transitively over its
+    direct calls. `Flushed`: the others.
+  - **The contract at a direct call of G** (what the context holds; the condition flags and the floating-point
+    registers keep their contracts, through the context, unchanged):
+    - G `Inside`: the caller writes to the context only its dirty r4-r12 (not r0-r3, sp, lr: no `ctx->r[14] = next`),
+      passes G's arguments from its locals (lr = the return address when G reads it: it pushes it, so the guest's
+      stack holds what it always did), and takes the results. At G's entry r4-r12 are exact in the context, r0-r3, sp
+      and lr hold whatever the caller's context held: G's analysis starts with them dirty (`caller_ctx`).
+    - G `Flushed`: the caller writes every dirty register first, lr included, as before; G's entry finds the context
+      exact. It passes the arguments as well (G need not read them again).
+    - G's returns: the results by value; every other register G may change written to the context where its local
+      differs (so the context holds G's value for it); a register G does not change but whose context copy a callee
+      changed (one G saved and restored) put back; the argument registers G neither may change nor had changed left as
+      they are (the caller has them in locals). After the call the caller has the results in locals, reads back from
+      the context the other registers G may change that are live, and keeps the rest in its locals (no reload of
+      r0-r3, sp or lr from a context that does not hold them).
+    - `f_<address>` (the wrapper; its definition is `void f_<address>(PsvContext* PSV_RESTRICT ctx, uint32_t ret)`
+      with the brace on the next line): reads the arguments from the context, calls the internal entry, writes the
+      results back, and when it was entered with LR other than `ret` makes the jump through the runtime to LR that the
+      function's returns made before (`psv_jump(ctx, lr, ret, <function>)`: the diagnostic's address is the function's
+      now, not the return instruction's). Where a return is a branch through another register than lr (a copy of the
+      LR: an indirect jump in the graph), the internal entry leaves the flags such a jump through the runtime would (the
+      module's `given_at_entry` too), as the returns did on that path before. So entering a
+      function through `f_<address>` (the function table, `psv_call`, `psv_jump`, `call_guest`, thread entries,
+      imports from other modules, `override_function`'s callers) sees what it saw before: an exact context in, an
+      exact context out; the differential tests compare every register at every function's exit through it.
+  - **Why code outside the view still sees an exact context.** Callers up the host stack keep registers in locals
+    across internal calls, so the context alone is no longer exact at any depth. What makes it exact where something
+    reads it: r4-r12 are written before every internal call where dirty (as before); r0-r3, sp and lr enter an
+    `Inside` entry dirty, so wherever its code writes registers to the context (a trap, a call through the runtime,
+    an import: places an `Inside` entry has none of, by its kind, but the property does not rest on that) it writes
+    them from its arguments, which its liveness then makes it take; and every call of a `Flushed` entry or a function
+    without one writes everything first. So the kinds are a choice of where to write, not a proof obligation: taking
+    a function that reaches an import to be `Inside` (checked: a mutation that does so passes every test, and why)
+    only moves the writes down to where the import is called. The test that checks it: the corpus' `obs_*` functions,
+    reached only through `psv_call` at the bottom of chains of internal calls, have the whole context compared with
+    the interpreter's at their entry (`codegen_tests.cpp`).
+  - Guest memory: unchanged. The pushes store the same words (lr is the return address its caller passed); returns
+    read the saved LR from the frame as before (and do not use it: it is the address the caller gave, by the proof).
+  - What is assumed and not checked (KNOWN_ISSUES): the frame's saved LR is changed by nothing but the function's own
+    stores, the assumption the callee-saved proof already makes; before, a return to an overwritten saved LR became a
+    jump through the runtime (usually a trap: no function there), now it returns to the caller.
+  - Builds with `PSV_CHECK_KEPT_REGISTERS` check after a call of an `Inside` entry only r4-r12 against the context.
+  - `override_function` replaces a function for table lookups only, as before: direct calls (internal entries,
+    inlined copies) are compiled in. A game that stands in for a function by renaming its generated definition (a
+    script matching `void f_<address>(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {`) must give it
+    `psvrecomp --no-inline <address>`: the script then finds the definition as before; without it the script finds
+    nothing and stops, rather than direct calls silently going around the stand-in.
+  - Watches and fault reports (`PSVRECORE_WATCH`, the guest memory fault report) print the context, which now holds
+    a register as of the last time any frame on the host stack wrote it (an internal call writes nothing of r0-r3, sp
+    and lr), no longer of the current function's last call.
+  - `psvrecomp --no-internal-calls` (with `--no-call-table`) gives the code from before byte for byte (checked on
+    WipEout 2048's four modules and P4D's six). Statistics: `psvrecomp generate` prints the kinds, why functions have
+    no internal entry, the direct calls of each kind and why calls write the context; `PSVRECOMP_ENTRIES=<file>` lists
+    every function's entry.
+- **Inlining.** An internal entry of at most `--inline-limit` instructions (8 by default; 0: none) with no jump table
+  is `static inline` and has a copy in each .c file whose functions call it (with those it calls), so that the C
+  compiler can inline it where it is called across files; its wrapper stays in its own file. Not a function given
+  `--no-inline`. The other internal entries are declared `noinline`: the C compiler would otherwise copy them into
+  their wrapper and the callers in their own file while keeping the out-of-line copy the other files call (measured: a
+  larger program for no measured gain; `--inline-in-file` allows it). What the copies cost and buy is in CODEGEN_METRICS.md; ThinLTO
+  (`PSVRECORE_GENERATED_CODE_LTO`) inlines across files as well, at a link time unacceptable as a default.
+- **Indirect calls** (`guest.h`, `PsvDispatch`, `psv_call_in`). Each module has a table that registering it fills
+  (`recomp::register_module`): by the halfword of code from its lowest Thumb function, the u16 index of the Thumb
+  function starting there, and an array of what the registry gives for each (a module of 65535 functions or more gets
+  u32 entries, which only `psv_call` reads). Generated code's indirect calls (`blx rN`, `bl` to an address no function
+  starts at) call the module's `<name>_call` (in its `_module.c`), which looks in the table and calls what it finds,
+  without a call into the runtime; anything else (ARM code, other modules, import stubs, addresses no function starts
+  at) goes to `psv_call`, which looks in every registered module's table, then
+  in the registry's map and the import stubs. What is called is what `psv_call` would call: the context's contract
+  at an indirect call (flags, registers) is unchanged. `override_function` updates the tables (an atomic store) and
+  `clear_modules` empties them; a module registered while guest code runs (one the game loads itself) publishes its
+  table complete before its span. Memory: two (four) bytes per halfword of the module's Thumb code span plus eight
+  per Thumb function (WipEout 2048's executable: 5.3 MB of code, below). `psvrecomp --call-table-inline` puts the
+  lookup at each call site instead (`psv_call_in`): as fast on the corpus, but Minecraft's 85704 sites made its
+  program 14% larger (x64), against a call of the shared function; with the shared one, every indirect call of a module
+  goes through one indirect branch in `<name>_call`, whose prediction on a game with many virtual call targets is not
+  measured. `psvrecomp --no-call-table` gives the calls through `psv_call` alone. A per-site inline cache was not added: no game with many virtual calls runs here to
+  measure one (Minecraft has never been built).
 - **VFP registers** (`analysis/vfp.hpp`). The floating-point registers and the FPSCR are typed locals of each generated
   function: d0-d15 as two `float` locals `s<2n>`, `s<2n+1>` or as one `double` `d<n>` (by how the function's
   instructions access them: a word at a time at least as often as whole, two floats), d16-d31 as doubles, the FPSCR as

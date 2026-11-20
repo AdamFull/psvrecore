@@ -131,7 +131,10 @@ TEST_CASE("analysis: registers read at entry, dirty at exits, kept across calls"
     const auto img = image();
     const auto p = discover(img);
     REQUIRE(p.functions.size() == 10);
-    const auto regs = analysis::register_analysis(p);
+    // (every call through f_<address>, as before internal entries: their test is below)
+    analysis::RegisterOptions legacy;
+    legacy.internal_calls = false;
+    const auto regs = analysis::register_analysis(p, legacy);
     const auto& A = *regs.at(kA);
     const auto& fa = *p.function_at(kA);
     // A leaf: reads r0, r1 (and lr, its return's target); writes r0 back.
@@ -186,7 +189,7 @@ TEST_CASE("analysis: registers read at entry, dirty at exits, kept across calls"
     const usize in_loop = at(fj, 0x62), after_loop = at(fj, 0x6C);
     CHECK((regs.at(kJ)->call_kept[in_loop] & (r({4, 5}) | kSp)) == (r({4, 5}) | kSp));
     CHECK((regs.at(kJ)->call_kept[after_loop] & (r({4}) | kSp)) == (r({4}) | kSp));
-    analysis::RegisterOptions loops;
+    analysis::RegisterOptions loops = legacy;
     loops.keep = analysis::KeepPolicy::Loops;
     const auto in_loops = analysis::register_analysis(p, loops);
     CHECK((in_loops.at(kJ)->call_kept[in_loop] & (r({4, 5}) | kSp)) == (r({4, 5}) | kSp));
@@ -196,7 +199,7 @@ TEST_CASE("analysis: registers read at entry, dirty at exits, kept across calls"
     CHECK(in_loops.at(kD)->call_kept[call_b] == 0);
 
     // Without callee-saved knowledge: nothing kept, everything live read back.
-    analysis::RegisterOptions off;
+    analysis::RegisterOptions off = legacy;
     off.callee_saved = false;
     const auto conservative = analysis::register_analysis(p, off);
     CHECK(conservative.at(kD)->call_kept[call_b] == 0);
@@ -204,6 +207,70 @@ TEST_CASE("analysis: registers read at entry, dirty at exits, kept across calls"
     CHECK((conservative.at(kD)->call_load[call_c] & (r({0, 4, 5}) | kSp)) == (r({0, 4, 5}) | kSp));
     CHECK(!conservative.at(kF)->checks_sp);
     CHECK(conservative.at(kB)->preserved == 0);
+}
+
+TEST_CASE("analysis: internal entries: kinds, arguments, results, and what calls of them write to the context") {
+    using analysis::EntryKind;
+    using analysis::EntryReason;
+    const auto img = image();
+    const auto p = discover(img);
+    const auto regs = analysis::register_analysis(p);
+    REQUIRE(regs.internal_calls);
+    // No direct caller: no internal entry (f_<address> as before).
+    CHECK(regs.at(kA)->entry == EntryKind::Public);
+    CHECK(regs.at(kA)->reason == EntryReason::NoCallers);
+    // push/pop: r4 read from the context (only r0-r3, sp and lr are arguments), r4 and sp preserved; lr is an argument
+    // (pushed), the address its return goes to is not read.
+    const auto& B = *regs.at(kB);
+    CHECK(B.entry == EntryKind::Inside);
+    CHECK(B.params == (r({0}) | kSp | kLr));
+    CHECK(B.load_at_entry == r({4}));
+    CHECK(B.modified == r({0}));
+    // A callee that changes r4: not returned by value, written to the context at its return; r0 its argument (its
+    // return reads no address: not lr).
+    const auto& C = *regs.at(kC);
+    CHECK(C.entry == EntryKind::Inside);
+    CHECK(C.params == r({0}));
+    CHECK(C.modified == r({4}));
+    CHECK(C.results == 0);
+    CHECK(C.exit_store[at(*p.function_at(kC), 0x0E)] == r({4}));
+    // The caller of both: its dirty r4 and r5 go to the context before them, not r0-r3, sp or lr; after c_clobber r4 is
+    // read back from the context.
+    const auto& D = *regs.at(kD);
+    const auto& fd = *p.function_at(kD);
+    const usize call_b = at(fd, 0x16), call_c = at(fd, 0x1A);
+    CHECK(D.call_entry[call_b] == static_cast<u8>(EntryKind::Inside));
+    CHECK(D.call_store[call_b] == r({4, 5}));
+    CHECK((D.call_load[call_c] & r({4})) != 0);
+    CHECK((D.call_load[call_b] & r({0})) == 0);  // (b_keep's result: by value)
+    CHECK((D.call_kept[call_b] & (r({5}) | kSp)) == (r({5}) | kSp));
+    // Through psv_call: an internal entry that reaches outside, whose callers put every register in the context.
+    const auto& F = *regs.at(kF);
+    CHECK(F.entry == EntryKind::Flushed);
+    CHECK(F.reason == EntryReason::Indirect);
+    const auto& G = *regs.at(kG);
+    CHECK(G.entry == EntryKind::Public);
+    CHECK(G.reason == EntryReason::NoCallers);
+    const usize call_f = at(*p.function_at(kG), 0x38);
+    CHECK(G.call_entry[call_f] == static_cast<u8>(EntryKind::Flushed));
+    CHECK((G.call_store[call_f] & kLr) != 0);
+    // Recursion: an internal entry calling itself.
+    CHECK(regs.at(kI)->entry == EntryKind::Inside);
+    CHECK(regs.at(kI)->params == (r({0}) | kSp | kLr));
+    // --no-inline: b_keep given none; its callers call f_<address>, every register in the context first.
+    analysis::RegisterOptions excluded;
+    const nx::vector<u32> list = {kB & ~1u};
+    excluded.no_internal = &list;
+    const auto ex = analysis::register_analysis(p, excluded);
+    CHECK(ex.at(kB)->entry == EntryKind::Public);
+    CHECK(ex.at(kB)->reason == EntryReason::Excluded);
+    CHECK(ex.at(kD)->call_entry[call_b] == static_cast<u8>(EntryKind::Public));
+    CHECK(ex.at(kD)->call_store[call_b] == (r({4, 5}) | kSp | kLr));
+    // Off: every function public, every call as before.
+    analysis::RegisterOptions off;
+    off.internal_calls = false;
+    const auto none = analysis::register_analysis(p, off);
+    for (const auto& [code, f] : none.functions) CHECK(f.entry == EntryKind::Public);
 }
 
 TEST_CASE("recomp: modules whose condition-flag contracts do not fit are refused") {

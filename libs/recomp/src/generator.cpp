@@ -12,6 +12,7 @@ namespace psvrecore::recomp {
 using namespace detail;
 
 nx::string function_name(u32 code) { return nx::format("f_{:08X}", code & ~1u); }
+nx::string internal_function_name(u32 code) { return nx::format("fi_{:08X}", code & ~1u); }
 
 namespace detail {
 
@@ -65,7 +66,34 @@ namespace {
 
 constexpr RegSet reg_bit(u32 r) { return r < 15 ? static_cast<RegSet>(1u << r) : RegSet(0); }
 
+// An internal entry's C arguments, in this order (analysis::kArgumentRegisters), and its result type.
+constexpr u32 kParamOrder[] = {0, 1, 2, 3, 13, 14};
+const char* result_type(RegSet results) { return results == 3 ? "uint64_t" : results ? "uint32_t" : "void"; }
+
 }  // namespace
+
+nx::string internal_signature(u32 code, const analysis::FunctionRegisters& r) {
+    nx::string s = nx::format("{} {}(PsvContext* PSV_RESTRICT ctx", result_type(r.results), internal_function_name(code));
+    for (u32 k : kParamOrder)
+        if (r.params & (1u << k)) s += nx::format(", uint32_t g{}", k);
+    return s + ")";
+}
+
+// A call of it with each argument the register's `prefix`<k> ("g": the caller's locals; "ctx->r[" ... "]").
+nx::string internal_call(u32 code, const analysis::FunctionRegisters& r, nx::string_view prefix, nx::string_view suffix) {
+    nx::string s = nx::format("{}(ctx", internal_function_name(code));
+    for (u32 k : kParamOrder)
+        if (r.params & (1u << k)) s += nx::format(", {}{}{}", prefix, k, suffix);
+    return s + ")";
+}
+
+nx::string Emitter::internal_return() const {
+    const RegSet res = regs_ ? regs_->results : RegSet(0);
+    if (res == 3) return "return (uint64_t)g0 | ((uint64_t)g1 << 32);";
+    if (res == 1) return "return g0;";
+    if (res == 2) return "return g1;";
+    return "return;";
+}
 
 nx::string Emitter::register_line(RegSet r, bool store) const {
     nx::string out;
@@ -394,7 +422,11 @@ void Emitter::call_registers_after(const Instruction& in) {
     call_vfp_after(in);
     if (!regs_ || noreturn_call(in)) return;
     const auto& node = cfg_.nodes[index_];
-    const RegSet kept = regs_->call_kept[index_];
+    RegSet kept = regs_->call_kept[index_];
+    // (after a call of an Inside internal entry the context's r0-r3, sp and lr are not the callee's to make exact)
+    if (internal_body() || (all_ && all_->internal_calls))
+        if (!regs_->call_entry.empty() && regs_->call_entry[index_] == static_cast<u8>(analysis::EntryKind::Inside))
+            kept &= static_cast<RegSet>(~analysis::kArgumentRegisters);
     if (node.call == analysis::CallKind::Direct) {
         if (kept) {
             // (the callee preserves them: builds with PSV_CHECK_KEPT_REGISTERS check that it did)
@@ -596,6 +628,17 @@ void Emitter::branch_to_value(const Instruction& in, nx::string_view target) {
     for (const auto* e = cfg_.begin(node); e != cfg_.end(node); ++e) jump |= flags_.at_exit(*flags_fn_, *e);
     ++stats_.return_sites;
     if (out) ++stats_.return_sites_store;
+    if (internal_body()) {
+        // An internal entry's every way out goes back to the LR it was entered with (analysis::EntryKind): a return to
+        // its caller, with no compare. The flags a jump through the runtime would leave are left (its wrapper makes
+        // that jump when entered with an LR other than ret).
+        store_flags(jump);
+        exit_registers();
+        ++stats_.internal_returns;
+        line(nx::format("(void){};", t));
+        line(internal_return());
+        return;
+    }
     store_flags(out);
     exit_registers();
     line(nx::format("if ({} == ret) return;", t));
@@ -638,10 +681,32 @@ void Emitter::call(const Instruction& in, u32 target_code) {
         ++stats_.import_calls;
         line(nx::format("psv_call_import(ctx, &{}_imports[{}], {});", prefix_, stub->second, hex(next)));
     } else if (program_.function_at(target_code)) {
-        line(nx::format("{}(ctx, {});", function_name(target_code), hex(next)));
+        const analysis::EntryKind ck = all_ && all_->internal_calls && regs_ && !regs_->call_entry.empty()
+                                           ? static_cast<analysis::EntryKind>(regs_->call_entry[index_])
+                                           : analysis::EntryKind::Public;
+        const analysis::FunctionRegisters* callee = ck != analysis::EntryKind::Public ? all_->at(target_code) : nullptr;
+        if (callee) {
+            // (an internal entry: r0-r3, sp and lr it reads as arguments, r0/r1 it may change returned)
+            const nx::string c = internal_call(target_code, *callee, "g", "");
+            internal_callees_.insert(target_code);
+            if (callee->results == 3)
+                line(nx::format("{{ const uint64_t rv = {}; g0 = (uint32_t)rv; g1 = (uint32_t)(rv >> 32); }}", c));
+            else if (callee->results == 1) line(nx::format("g0 = {};", c));
+            else if (callee->results == 2) line(nx::format("g1 = {};", c));
+            else line(c + ";");
+            if (ck == analysis::EntryKind::Inside) ++stats_.calls_inside;
+            else ++stats_.calls_flushed, ++stats_.calls_flushed_reasons[analysis::entry_reason_name(callee->reason)];
+        } else {
+            line(nx::format("{}(ctx, {});", function_name(target_code), hex(next)));
+            if (all_ && all_->internal_calls) {
+                const analysis::FunctionRegisters* c = all_->at(target_code);
+                ++stats_.calls_public;
+                ++stats_.calls_public_reasons[c ? analysis::entry_reason_name(c->reason) : "unknown"];
+            }
+        }
     } else {
         ++stats_.indirect_calls;
-        line(nx::format("psv_call(ctx, {}, {});", hex(target_code), hex(next)));
+        line(indirect_call(hex(target_code), hex(next)));
     }
     call_registers_after(in);
     call_flags_after(in);
@@ -856,8 +921,9 @@ nx::string Emitter::function() {
     // others 0 (never read before they are written).
     nx::string registers;
     if (regs_) {
+        const RegSet params = internal_body() ? regs_->params : RegSet(0);
         for (u32 k = 0; k < 15; ++k) {
-            if (!(regs_->touched & (1u << k))) continue;
+            if (!(regs_->touched & (1u << k)) || (params & (1u << k))) continue;
             const bool load = regs_->load_at_entry & (1u << k);
             registers += nx::format("{}g{} = {}", registers.empty() ? "    uint32_t " : ", ", k, load ? nx::format("ctx->r[{}]", k) : nx::string("0"));
         }
@@ -909,9 +975,31 @@ nx::string Emitter::function() {
         stats_.vfp_calls_keeping += vfp_->calls_keeping;
     }
     if (sp_trap_) out += nx::format("L_SP_MOVED:;\n    psv_trap(ctx, {}, PSV_TRAP_STACK_POINTER);\n", hex(fn_.start()));
-    return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n{}    PsvFlags fl = {{{}}};\n{}{}", function_name(fn_.entry),
-                      memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags, registers, vfp) +
-           out + "}\n";
+    const nx::string locals = nx::format("{}    PsvFlags fl = {{{}}};\n{}{}", memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags, registers, vfp);
+    if (!internal_body())
+        return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n", function_name(fn_.entry)) + locals + out + "}\n";
+    // An internal entry (analysis::EntryKind), then f_<address> around it: from the context's registers, its results
+    // back into it, and a jump through the runtime to the LR it was entered with when that is not ret (what the
+    // function's own returns did before). Every way through the code ends in a return or a trap; one more trap at the end
+    // (never reached) keeps C from running off a function that returns a value.
+    ++(regs_->entry == analysis::EntryKind::Inside ? stats_.internal_inside : stats_.internal_flushed);
+    stats_.internal_params += static_cast<usize>(std::popcount(regs_->params));
+    stats_.internal_results += static_cast<usize>(std::popcount(regs_->results));
+    // (a small one inlined: a static copy in each file that calls it, the wrapper apart; generate)
+    nx::string text = nx::format("\n{}{} {{\n", inline_ ? "static inline " : "", internal_signature(fn_.entry, *regs_)) + locals + out;
+    text += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n}}\n", hex(fn_.start()));
+    nx::string& w = inline_ ? wrapper_ : text;
+    // (the definition's text differs from that of a function without an internal entry, so that a game's script that
+    // renames that definition to stand in for the function finds nothing: direct calls reach the internal entry, so such
+    // a function must be given none, psvrecomp --no-inline)
+    w += nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret)\n{{\n    const uint32_t lr = ctx->r[14];\n", function_name(fn_.entry));
+    const nx::string c = internal_call(fn_.entry, *regs_, "ctx->r[", "]");
+    if (regs_->results == 3) w += nx::format("    const uint64_t rv = {};\n    ctx->r[0] = (uint32_t)rv; ctx->r[1] = (uint32_t)(rv >> 32);\n", c);
+    else if (regs_->results == 1) w += nx::format("    ctx->r[0] = {};\n", c);
+    else if (regs_->results == 2) w += nx::format("    ctx->r[1] = {};\n", c);
+    else w += nx::format("    {};\n", c);
+    w += nx::format("    if (__builtin_expect(lr != ret, 0)) psv_jump(ctx, lr, ret, {});\n}}\n", hex(fn_.start()));
+    return text;
 }
 
 }  // namespace detail
@@ -952,12 +1040,16 @@ nx::string module_source(const analysis::Program& program, const Options& option
     out += " };\n\n";
     nx::string fingerprint;
     for (u8 b : program.image->fingerprint()) fingerprint += nx::format("0x{:02X},", b);
-    // (the condition flags' contract at the module's boundaries: guest.h, PsvModuleCode)
+    // (the condition flags' contract at the module's boundaries: guest.h, PsvModuleCode; the indirect-call table, which
+    // registering the module fills: PsvDispatch)
+    if (options.call_table)
+        out += nx::format("PsvDispatch {0}_dispatch;\n\n/* (indirect calls: guest.h, psv_call_in) */\nvoid {0}_call(PsvContext* PSV_RESTRICT ctx, uint32_t target, "
+                          "uint32_t ret) {{ psv_call_in(&{0}_dispatch, ctx, target, ret); }}\n\n", p);
     out += nx::format("const PsvModuleCode {}_module = {{\"{}\", {}_function_table, {}u, {}_imports, {}u, {}_import_stubs, {}_variables, {}u,\n"
-                      "    {{{}}}, {}_segment_bases, {}_segment_sizes, {}u,\n    PSV_FLAG_CONTRACT, 0x{:X}u, 0x{:X}u, 0x{:X}u, 0x{:X}u}};\n",
+                      "    {{{}}}, {}_segment_bases, {}_segment_sizes, {}u,\n    PSV_FLAG_CONTRACT, 0x{:X}u, 0x{:X}u, 0x{:X}u, 0x{:X}u{}}};\n",
                       p, program.image->module().info.name, p, program.functions.size(), p, program.imports.size(), p, p,
                       program.variable_imports.size(), fingerprint, p, p, segments.size(), flags.needed_at_entry, flags.given_at_entry,
-                      flags.needed_at_return, flags.given_at_return);
+                      flags.needed_at_return, flags.given_at_return, options.call_table ? nx::format(", &{}_dispatch", p) : nx::string());
     return out;
 }
 
@@ -968,18 +1060,25 @@ Output generate(const analysis::Program& program, const Options& options) {
     const nx::string& p = options.name;
     nx::string header = nx::format(
         "/* Generated by psvrecomp: module {}. */\n#pragma once\n#include \"psvrecore/recomp/guest.h\"\n\n"
-        "extern PsvImport {}_imports[];\nextern PsvVariable {}_variables[];\nextern const PsvModuleCode {}_module;\n\n",
-        program.image->module().info.name, p, p, p);
+        "extern PsvImport {}_imports[];\nextern PsvVariable {}_variables[];\nextern const PsvModuleCode {}_module;\n{}\n",
+        program.image->module().info.name, p, p, p, options.call_table ? nx::format("extern PsvDispatch {0}_dispatch;\nvoid {0}_call(PsvContext* PSV_RESTRICT ctx, uint32_t target, uint32_t ret);\n", p) : nx::string());
     for (const auto& [code, fn] : program.functions) header += nx::format("void {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret);\n", function_name(code));
-    result.files.push_back(GeneratedFile{p + "_functions.h", std::move(header)});
+    result.files.push_back(GeneratedFile{p + "_functions.h", nx::string()});
 
-    nx::string chunk;
-    u32 chunk_instructions = 0, chunk_index = 0;
+    // The .c files: each function's definition (a small internal entry's wrapper alone), and the functions inlined
+    // whose internal entries the file's functions call, a static copy each (with those they call), put in front at the
+    // end, when every function's text is known.
+    struct Chunk {
+        nx::string text;
+        nx::flat_hash_set<u32> uses;  // inlined functions it calls
+    };
+    nx::vector<Chunk> chunks;
+    Chunk chunk;
+    u32 chunk_instructions = 0;
     const auto flush = [&] {
-        if (chunk.empty()) return;
-        result.files.push_back(GeneratedFile{nx::format("{}_code_{}.c", p, chunk_index++),
-                                             nx::format("/* Generated by psvrecomp. */\n#include \"{}_functions.h\"\n", p) + chunk});
-        chunk.clear();
+        if (chunk.text.empty()) return;
+        chunks.push_back(std::move(chunk));
+        chunk = Chunk{};
         chunk_instructions = 0;
     };
     analysis::FlagOptions flag_options;
@@ -994,6 +1093,8 @@ Output generate(const analysis::Program& program, const Options& options) {
     // then their analysis (on the registers', which says which functions return where they were called from).
     const bool locals = !options.registers_in_context;
     const bool vfp_locals = !options.vfp_in_context;
+    nx::map<u32, nx::flat_hash_set<u32>> inline_callees;  // (an inlined function: the internal entries it calls)
+    nx::map<u32, nx::string> inline_bodies;
     analysis::RegisterAnalysis registers;
     analysis::VfpAnalysis vfp;
     nx::map<u32, nx::vector<analysis::VfpEffect>> vfp_effects;
@@ -1037,6 +1138,8 @@ Output generate(const analysis::Program& program, const Options& options) {
         register_options.keep = options.keep_registers;
         register_options.check_sp = options.check_sp;
         register_options.effects = &effects;
+        register_options.internal_calls = options.internal_calls;
+        register_options.no_internal = &options.no_internal;
         registers = analysis::register_analysis(program, register_options);
         for (const auto& [code, r] : registers.functions) {
             const auto* fn = program.function_at(code);
@@ -1045,8 +1148,26 @@ Output generate(const analysis::Program& program, const Options& options) {
                 if (r.preserved & (1u << k)) ++st.functions_preserving[k];
             if ((r.preserved & analysis::kPreservable) == analysis::kPreservable) ++st.functions_preserving_all;
             if (r.checks_sp) ++st.functions_checking_sp;
+            if (r.entry == analysis::EntryKind::Public) ++st.public_reasons[analysis::entry_reason_name(r.reason)];
+            else if (r.entry == analysis::EntryKind::Flushed) ++st.flushed_reasons[analysis::entry_reason_name(r.reason)];
         }
     }
+    // Small internal entries are inlined: no jump table, at most inline_limit instructions (analysis::EntryKind; not the
+    // functions given no internal entry, psvrecomp --no-inline).
+    nx::flat_hash_set<u32> inlined;
+    if (locals && registers.internal_calls)
+        for (const auto& [code, fn] : program.functions) {
+            const auto* r = registers.at(code);
+            if (r && r->entry != analysis::EntryKind::Public && fn.tables.empty() && fn.code.size() <= options.inline_limit) inlined.insert(code);
+        }
+    // (the other internal entries' prototypes; the inlined ones are static in each file. The others are not inlined by
+    // the C compiler into the callers and the wrapper of their own file: a copy there keeps the out-of-line one too,
+    // which the other files call)
+    if (registers.internal_calls)
+        for (const auto& [code, r] : registers.functions)
+            if (r.entry != analysis::EntryKind::Public && !inlined.contains(code))
+                header += nx::format("{}{};\n", options.noinline_internal ? "__attribute__((noinline)) " : "", internal_signature(code, r));
+    result.files.front().text = std::move(header);
     if (vfp_locals) {
         analysis::VfpOptions vfp_options;
         vfp_options.summaries = !options.vfp_calls_conservative;
@@ -1059,11 +1180,45 @@ Output generate(const analysis::Program& program, const Options& options) {
         Emitter e(program, fn, flags, p, st, locals ? RegisterMode::Locals : RegisterMode::Context, registers.at(code),
                   vfp_locals ? VfpMode::Locals : VfpMode::Context, vfp.at(code));
         e.set_neon_locals(!options.neon_in_context);
-        chunk += e.function();
+        e.set_call_table(options.call_table, options.call_table_inline);
+        if (locals) e.set_register_analysis(&registers);
+        const bool small = inlined.contains(code);
+        e.set_inline(small);
+        nx::string text = e.function();
+        for (u32 c : e.internal_callees())
+            if (inlined.contains(c)) chunk.uses.insert(c), ++st.calls_inlined;
+        if (small) {
+            inline_callees[code] = e.internal_callees();
+            inline_bodies[code] = std::move(text);
+            chunk.text += e.wrapper();
+            chunk.uses.insert(code);
+        } else {
+            chunk.text += text;
+        }
         chunk_instructions += static_cast<u32>(fn.code.size());
         if (chunk_instructions >= options.instructions_per_file) flush();
     }
     flush();
+    st.functions_inlined = inlined.size();
+    for (usize k = 0; k < chunks.size(); ++k) {
+        // (the inlined functions the file calls, and those they call)
+        nx::vector<u32> work(chunks[k].uses.begin(), chunks[k].uses.end());
+        nx::flat_hash_set<u32> all(chunks[k].uses.begin(), chunks[k].uses.end());
+        while (!work.empty()) {
+            const u32 c = work.back();
+            work.pop_back();
+            for (u32 d : inline_callees[c])
+                if (inlined.contains(d) && all.insert(d).second) work.push_back(d);
+        }
+        nx::vector<u32> sorted(all.begin(), all.end());
+        std::sort(sorted.begin(), sorted.end());
+        nx::string front;
+        for (u32 c : sorted) front += "static inline " + internal_signature(c, *registers.at(c)) + ";\n";
+        for (u32 c : sorted) front += inline_bodies[c];
+        st.inline_copies += sorted.size();
+        result.files.push_back(GeneratedFile{nx::format("{}_code_{}.c", p, k), nx::format("/* Generated by psvrecomp. */\n#include \"{}_functions.h\"\n", p) +
+                                                                                 front + chunks[k].text});
+    }
     result.files.push_back(GeneratedFile{p + "_module.c", module_source(program, options, flags)});
     // (the summaries only: the per-instruction sets are the generator's business)
     for (auto& [code, f] : flags.functions) {
@@ -1076,6 +1231,7 @@ Output generate(const analysis::Program& program, const Options& options) {
     for (auto& [code, r] : registers.functions) {
         for (auto* v : {&r.trap_store, &r.call_store, &r.call_load, &r.call_kept, &r.exit_store, &r.after_store, &r.live_before})
             nx::vector<RegSet>().swap(*v);
+        nx::vector<u8>().swap(r.call_entry);
     }
     result.registers = std::move(registers);
     return result;

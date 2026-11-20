@@ -9,6 +9,12 @@
 // VLD1/VST1 accesses are one host access each), and with CODEGEN_TEST_MASK, the code compiled with
 // PSV_ADDRESS_MASK as the random-block test's is (accesses folded into a buffer, element by element).
 //
+// Functions named obs_* are reached only through psv_call (code outside the generated code's view, which reads the
+// whole context): the test also compares the context at each of their entries with the interpreter's state there,
+// r0-r14, Q, GE, d0-d31 and the FPSCR (the condition flags there are only those the module gives at entry). That is the
+// property internal entries put at risk: callers up the host stack keep registers in locals (ARCHITECTURE.md,
+// "Internal entries").
+//
 // The condition flags at exit: a function is called here as the runtime calls it (call_guest, an indirect call),
 // and its returns leave in the context the flags its callers in the module read (ARCHITECTURE.md, "Condition
 // flags"); the others are unspecified, and are not compared. In the production configuration that is what the
@@ -284,6 +290,72 @@ recomp::TrapInfo g_trap;
     std::longjmp(g_trap_jump, 1);
 }
 
+// The obs_* functions: each replaced (override_function: what psv_call finds) by a stand-in that records the context
+// and calls the generated function.
+constexpr usize kMaxObserved = 8;
+struct Observed {
+    u32 address = 0;
+    PsvFunction original = nullptr;
+    const char* name = nullptr;
+};
+Observed g_observed[kMaxObserved];
+usize g_observed_count = 0;
+bool g_recording = false;
+struct Seen {
+    u32 address;
+    PsvContext ctx;
+};
+nx::vector<Seen> g_seen;
+template <usize N>
+void observe(PsvContext* ctx, uint32_t ret) {
+    if (g_recording) g_seen.push_back(Seen{g_observed[N].address, *ctx});
+    g_observed[N].original(ctx, ret);
+}
+using Observer = void (*)(PsvContext*, uint32_t);
+constexpr Observer kObservers[kMaxObserved] = {observe<0>, observe<1>, observe<2>, observe<3>,
+                                               observe<4>, observe<5>, observe<6>, observe<7>};
+
+void install_observers() {
+    g_observed_count = 0;
+    for (const CorpusModule& m : kCorpusModules)
+        for (u32 i = 0; i < m.function_count; ++i) {
+            if (std::strncmp(m.functions[i].name, "obs_", 4) != 0 || g_observed_count == kMaxObserved) continue;
+            Observed& o = g_observed[g_observed_count];
+            o.address = m.functions[i].address;
+            o.name = m.functions[i].name;
+            o.original = recomp::find_function(o.address);
+            if (!o.original) continue;
+            recomp::override_function(o.address, kObservers[g_observed_count++]);
+        }
+}
+
+const char* observed_name(u32 address) {
+    for (usize i = 0; i < g_observed_count; ++i)
+        if (g_observed[i].address == address) return g_observed[i].name;
+    return "?";
+}
+
+// The contexts at the obs_* entries, the generated code's against the interpreter's.
+nx::string observed_differences(const nx::vector<Seen>& a, const nx::vector<Seen>& b) {
+    if (a.size() != b.size()) return nx::format(" calls through psv_call to obs_*: {} vs {};", a.size(), b.size());
+    nx::string out;
+    for (usize k = 0; k < a.size() && out.empty(); ++k) {
+        const PsvContext& x = a[k].ctx;
+        const PsvContext& y = b[k].ctx;
+        nx::string d;
+        if (a[k].address != b[k].address) d += nx::format(" called 0x{:08x} vs 0x{:08x};", a[k].address, b[k].address);
+        for (int r = 0; r < 15; ++r)
+            if (x.r[r] != y.r[r]) d += nx::format(" r{}: {:08x} vs {:08x};", r, x.r[r], y.r[r]);
+        if (x.q != y.q) d += " q differs;";
+        if (x.ge != y.ge) d += " ge differs;";
+        if (x.fpscr != y.fpscr) d += nx::format(" fpscr: {:08x} vs {:08x};", x.fpscr, y.fpscr);
+        for (int r = 0; r < 32; ++r)
+            if (x.vfp.d[r] != y.vfp.d[r]) d += nx::format(" d{}: {:016x} vs {:016x};", r, x.vfp.d[r], y.vfp.d[r]);
+        if (!d.empty()) out = nx::format(" context at {} (call {} through psv_call):{}", observed_name(a[k].address), k, d);
+    }
+    return out;
+}
+
 // The condition flags a function's returns leave in the context (bit 3 N, 2 Z, 1 C, 0 V): what the runtime may read
 // after calling it, and what is compared at its exit. The others are unspecified there (see ARCHITECTURE.md).
 u32 exit_flags_of(u32 address) {
@@ -352,6 +424,10 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
     if (!problems.empty()) std::printf("%s", problems.c_str());
     REQUIRE(problems.empty());
     const auto previous = recomp::set_trap_handler(on_trap);
+    install_observers();
+    std::printf("observed through psv_call: %zu functions\n", g_observed_count);
+    nx::vector<Seen> interp_seen;
+    usize observed_calls = 0;
 
     nx::vector<u8> pristine(kBufferSize, 0), initial, generated, interpreted;
     for (const CorpusModule& m : kCorpusModules) std::memcpy(pristine.data() + offset_of(m.base), m.bytes, m.size);
@@ -395,8 +471,11 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             bool trapped = false;
             // (native floating point: the FPCR mirrors the FPSCR the function starts with, as the runtime keeps it)
             mirror_fpscr(start.fpscr);
+            g_seen.clear();
+            g_recording = true;
             if (setjmp(g_trap_jump) == 0) function(&g, kReturn);
             else trapped = true;
+            g_recording = false;
             mirror_fpscr(0);
             after_run(generated);
 
@@ -410,7 +489,12 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             it.pc = test.address & ~1u;
             bool interp_trapped = false, timed_out = false;
             u64 steps = 0;
+            interp_seen.clear();
             while (!(it.pc == (kReturn & ~1u) && it.thumb)) {
+                // (at an obs_* function's first instruction: its context)
+                const u32 code = it.pc | (it.thumb ? 1u : 0u);
+                for (usize k = 0; k < g_observed_count; ++k)
+                    if (g_observed[k].address == code) interp_seen.push_back(Seen{code, s});
                 if (++steps > kMaxSteps) {
                     timed_out = true;
                     break;
@@ -428,7 +512,8 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
             else if (trapped || interp_trapped)
                 diff = nx::format(" trapped: generated {} ({}), interpreter {} (kind {} at 0x{:08x})", trapped, trapped ? recomp::describe(g_trap) : "",
                                   interp_trapped, it.trap_kind, it.pc);
-            else diff = differences(g, s, generated, interpreted, exit_flags);
+            else diff = differences(g, s, generated, interpreted, exit_flags) + observed_differences(g_seen, interp_seen);
+            observed_calls += interp_seen.size();
             if (!diff.empty()) {
                 ++failures;
                 if (++function_failures <= 3) {
@@ -487,6 +572,8 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
     std::printf("%s\n", nx::format("generator vs interpreter ({}): {} functions, {} runs, {} interpreted instructions, {} disagreements, {} skipped",
                                    kConfig, sizeof kCorpusTests / sizeof kCorpusTests[0], runs, steps_total, failures, skipped)
                             .c_str());
+    std::printf("%s\n", nx::format("contexts compared at calls through psv_call to obs_*: {}", observed_calls).c_str());
+    CHECK((g_observed_count == 0 || observed_calls > 0));
     std::printf("%s\n", nx::format("flags compared at exit: all four in {} functions, some in {}, none in {} (those no caller reads)", all_flags,
                                    some_flags, sizeof kCorpusTests / sizeof kCorpusTests[0] - all_flags - some_flags)
                             .c_str());
@@ -545,6 +632,107 @@ TEST_CASE("recomp: a call that returns with another stack pointer stops where ca
     CHECK(g_trap.pc == (fold & ~1u));
 #endif
     recomp::set_trap_handler(previous);
+    recomp::clear_modules();
+    psv_membase = nullptr;
+}
+
+namespace {
+
+// Stand-ins for the indirect-call table's test: each leaves its number in r0.
+void t_thumb_a(PsvContext* ctx, uint32_t) { ctx->r[0] = 1; }
+void t_thumb_b(PsvContext* ctx, uint32_t) { ctx->r[0] = 2; }
+void t_arm(PsvContext* ctx, uint32_t) { ctx->r[0] = 3; }
+void t_other(PsvContext* ctx, uint32_t) { ctx->r[0] = 4; }
+void t_override(PsvContext* ctx, uint32_t) { ctx->r[0] = 5; }
+void t_import(PsvContext* ctx, uint32_t) { ctx->r[0] = 6; }
+
+}  // namespace
+
+TEST_CASE("recomp: indirect calls through a module's table find what the registry finds") {
+    recomp::clear_modules();
+    const auto previous = recomp::set_trap_handler(on_trap);
+    // Module a: Thumb functions at 0x81000000 and 0x81000100, an ARM one at 0x81000010, an import stub at 0x81000200;
+    // module b: a Thumb function at 0x83000000.
+    static const PsvFunctionEntry fa[] = {{0x81000001u, t_thumb_a}, {0x81000010u, t_arm}, {0x81000101u, t_thumb_b}};
+    static PsvImport ia[] = {{1, 2, "lib", t_import}};
+    static const uint32_t sa[] = {0x81000200u};
+    static PsvDispatch da, db;
+    const PsvModuleCode ma = {"a", fa, 3, ia, 1, sa, nullptr, 0, {}, nullptr, nullptr, 0, PSV_FLAG_CONTRACT, 0, 0, 0, 0, &da};
+    static const PsvFunctionEntry fb[] = {{0x83000001u, t_other}};
+    const PsvModuleCode mb = {"b", fb, 1, nullptr, 0, nullptr, nullptr, 0, {}, nullptr, nullptr, 0, PSV_FLAG_CONTRACT, 0, 0, 0, 0, &db};
+    recomp::register_module(ma);
+    recomp::register_module(mb);
+    CHECK(da.span == 0x102u);
+    CHECK(da.base == 0x81000000u);
+    CHECK(da.index != nullptr);
+    const auto call = [&](u32 target) -> u32 {
+        PsvContext c;
+        std::memset(&c, 0, sizeof c);
+        c.r[0] = 0xFFFFFFFFu;
+        g_trap = {};
+        if (setjmp(g_trap_jump) == 0) psv_call_in(&da, &c, target, 0x81000301u);
+        else return 0xDEADu;  // (trapped)
+        return c.r[0];
+    };
+    CHECK(call(0x81000001u) == 1);  // the table
+    CHECK(call(0x81000101u) == 2);
+    CHECK(call(0x81000010u) == 3);  // ARM code: psv_call
+    CHECK(call(0x83000001u) == 4);  // another module: psv_call, through that module's table
+    CHECK(call(0x81000200u) == 6);  // an import stub: psv_call
+    // Not function starts: an ARM address where a Thumb function starts, a Thumb address inside one, outside the code.
+    CHECK(call(0x81000000u) == 0xDEADu);
+    CHECK(g_trap.kind == recomp::kTrapUnknownTarget);
+    CHECK(call(0x81000003u) == 0xDEADu);
+    CHECK(call(0x81000201u) == 0xDEADu);
+    CHECK(call(0x80FFFFFFu) == 0xDEADu);
+    CHECK(call(0x81000103u) == 0xDEADu);
+    // override_function replaces the function in the table as in the registry; an address no function starts at is
+    // found through the registry.
+    recomp::override_function(0x81000101u, t_override);
+    CHECK(call(0x81000101u) == 5);
+    recomp::override_function(0x81000081u, t_override);
+    CHECK(call(0x81000081u) == 5);
+    CHECK(recomp::call_table_bytes() > 0);
+    recomp::clear_modules();
+    CHECK(da.span == 0);
+    CHECK(db.span == 0);
+    CHECK(call(0x81000001u) == 0xDEADu);
+    recomp::set_trap_handler(previous);
+}
+
+namespace {
+
+void ov_replacement(PsvContext* ctx, uint32_t) { ctx->r[0] += 100; }
+
+}  // namespace
+
+TEST_CASE("recomp: override_function replaces a function for calls through the runtime only, inlined or not") {
+    recomp::clear_modules();
+    for (unsigned i = 0; i < corpus_module_count; ++i) recomp::register_module(*corpus_modules[i]);
+    u32 caller = 0, leaf = 0;
+    for (const CorpusModule& m : kCorpusModules)
+        for (u32 i = 0; i < m.function_count; ++i) {
+            if (std::strcmp(m.functions[i].name, "ie_ov_caller") == 0) caller = m.functions[i].address;
+            if (std::strcmp(m.functions[i].name, "ie_ov_leaf") == 0) leaf = m.functions[i].address;
+        }
+    REQUIRE(caller != 0);
+    REQUIRE(leaf != 0);
+    nx::vector<u8> memory(kBufferSize, 0);
+    for (const CorpusModule& m : kCorpusModules) std::memcpy(memory.data() + offset_of(m.base), m.bytes, m.size);
+    psv_membase = membase_for(memory);
+    const auto run = [&](u32 x) {
+        PsvContext c;
+        std::memset(&c, 0, sizeof c);
+        c.r[0] = x;
+        c.r[13] = kCorpusStackBase + kCorpusStackSize - 256;
+        c.r[14] = kReturn;
+        recomp::find_function(caller)(&c, kReturn);
+        return c.r[0];
+    };
+    // ie_ov_caller: r4 = leaf(x) directly, then leaf(r4) through psv_call, r0 = that + r4.
+    CHECK(run(5) == 6u + 7u);
+    recomp::override_function(leaf, ov_replacement);
+    CHECK(run(5) == 6u + 106u);  // (the direct call: the generated function, as before overrides; through psv_call: it)
     recomp::clear_modules();
     psv_membase = nullptr;
 }

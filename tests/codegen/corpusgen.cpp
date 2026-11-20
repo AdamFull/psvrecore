@@ -15,6 +15,7 @@
 // functions do, so that the test compares every flag at exit. --no-callee-saved and --registers-in-context: as
 // psvrecomp's (for measuring the register stages apart, and for chasing a register analysis bug).
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,7 +53,10 @@ int main(int argc, char** argv) {
     bool full_exit = false, no_callee_saved = false, registers_in_context = false;
     nx::string keep = "all";
     bool no_sp_check = false, vfp_in_context = false, vfp_calls_conservative = false, neon_in_context = false, no_q_locals = false;
+    bool no_internal_calls = false, no_call_table = false, inline_in_file = false, call_table_inline = false;
+    u32 inline_limit = recomp::Options{}.inline_limit;
     nx::vector<const char*> args;
+    u32 split = 0;  // (--split K: each module's code in exactly K files, the last ones empty when it has less)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--full-exit") == 0) full_exit = true;
         else if (std::strcmp(argv[i], "--no-callee-saved") == 0) no_callee_saved = true;
@@ -63,6 +67,13 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--vfp-calls-conservative") == 0) vfp_calls_conservative = true;
         else if (std::strcmp(argv[i], "--neon-in-context") == 0) neon_in_context = true;
         else if (std::strcmp(argv[i], "--no-q-locals") == 0) no_q_locals = true;
+        else if (std::strcmp(argv[i], "--no-internal-calls") == 0) no_internal_calls = true;
+        else if (std::strcmp(argv[i], "--no-call-table") == 0) no_call_table = true;
+        else if (std::strcmp(argv[i], "--call-table-inline") == 0) call_table_inline = true;
+        else if (std::strcmp(argv[i], "--inline-in-file") == 0) inline_in_file = true;
+        else if (std::strcmp(argv[i], "--inline-limit") == 0 && i + 1 < argc) inline_limit = static_cast<u32>(std::strtoul(argv[++i], nullptr, 0));
+        else if (std::strcmp(argv[i], "--per-file") == 0 && i + 1 < argc) ++i;
+        else if (std::strcmp(argv[i], "--split") == 0 && i + 1 < argc) split = static_cast<u32>(std::strtoul(argv[++i], nullptr, 0));
         else args.push_back(argv[i]);
     }
     if (args.size() != 1 && args.size() != 2) {
@@ -70,7 +81,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     const nx::fs::path_view dir(args[0]);
-    const u32 per_file = args.size() == 2 ? static_cast<u32>(std::strtoul(args[1], nullptr, 0)) : recomp::Options{}.instructions_per_file;
+    u32 per_file = args.size() == 2 ? static_cast<u32>(std::strtoul(args[1], nullptr, 0)) : recomp::Options{}.instructions_per_file;
+    // (--per-file N: instead of the positional one, for a build's PSVRECORE_CODEGEN_TEST_ARGS: functions in files of
+    // their own, to measure calls across files)
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], "--per-file") == 0) per_file = static_cast<u32>(std::strtoul(argv[i + 1], nullptr, 0));
     if (per_file == 0) {
         std::fprintf(stderr, "corpusgen: instructions-per-file must be at least 1\n");
         return 2;
@@ -84,13 +99,20 @@ int main(int argc, char** argv) {
                 if (std::strcmp(t.module, m.name) == 0) out.push_back(t.address);
         return out;
     };
-    for (const CorpusModule& m : kCorpusModules) {
-        const auto image = image_of(m);
-        analysis::FlagOptions options;
-        options.full_exit = full_exit_of(m);
-        const auto flags = analysis::flag_liveness(discover(image, m), options);
-        needed_at_entry |= flags.needed_at_entry;
-        needed_at_return |= flags.needed_at_return;
+    // (what a module reads can depend on what it is given: what the flags given at entry make live; to a fixed point)
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const CorpusModule& m : kCorpusModules) {
+            const auto image = image_of(m);
+            analysis::FlagOptions options;
+            options.full_exit = full_exit_of(m);
+            options.given_at_entry = needed_at_entry;
+            options.given_at_return = needed_at_return;
+            const auto flags = analysis::flag_liveness(discover(image, m), options);
+            if ((flags.needed_at_entry & ~needed_at_entry) || (flags.needed_at_return & ~needed_at_return)) changed = true;
+            needed_at_entry |= flags.needed_at_entry;
+            needed_at_return |= flags.needed_at_return;
+        }
     }
     const auto write = [](nx::string_view path, nx::string_view text) {
         if (auto ok = io::write_text_file(nx::fs::path_view(path), text); !ok) {
@@ -112,6 +134,11 @@ int main(int argc, char** argv) {
         recomp::Options gen;
         gen.name = nx::format("syn_{}", m.name);
         gen.instructions_per_file = per_file;
+        if (split) {
+            u32 total = 0;
+            for (const auto& [code, fn] : program.functions) total += static_cast<u32>(fn.code.size());
+            gen.instructions_per_file = std::max<u32>(1, (total + split - 1) / split);
+        }
         gen.flags_given_at_entry = needed_at_entry;
         gen.flags_given_at_return = needed_at_return;
         gen.full_exit_flags = full_exit_of(m);
@@ -122,6 +149,11 @@ int main(int argc, char** argv) {
         gen.vfp_calls_conservative = vfp_calls_conservative;
         gen.neon_in_context = neon_in_context;
         gen.no_q_locals = no_q_locals;
+        gen.internal_calls = !no_internal_calls;
+        gen.call_table = !no_call_table;
+        gen.call_table_inline = call_table_inline;
+        gen.inline_limit = inline_limit;
+        gen.noinline_internal = !inline_in_file;
         gen.keep_registers = keep == "loops" ? analysis::KeepPolicy::Loops : keep == "none" ? analysis::KeepPolicy::None : analysis::KeepPolicy::All;
         const auto output = recomp::generate(program, gen);
         if (output.stats.register_effect_mismatches) {
@@ -143,6 +175,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         for (const auto& f : output.files) write(nx::fs::path_view(sub) / nx::fs::path_view(f.name), f.text);
+        usize chunks = 0;
+        for (const auto& f : output.files) chunks += f.name.find("_code_") != nx::string::npos;
+        if (split && chunks > split) {
+            std::fprintf(stderr, "corpusgen: %s: %zu files, more than --split %u\n", m.name, chunks, split);
+            return 1;
+        }
+        for (usize k = chunks; k < split; ++k)
+            write(nx::fs::path_view(sub) / nx::fs::path_view(nx::format("{}_code_{}.c", gen.name, k)), "/* Generated by corpusgen: no code. */\n");
         for (u32 i = 0; i < m.function_count; ++i)
             names += nx::format("{}\t{}\t{}\n", gen.name, recomp::function_name(m.functions[i].address), m.functions[i].name);
         table += nx::format("extern const PsvModuleCode {}_module;\n", gen.name);

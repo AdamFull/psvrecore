@@ -410,7 +410,7 @@ bool branches(Emitter& e, const Instruction& in) {
                 e.line(e.assignment(arm::kLr, hex(e.next_code(in))));
                 e.call_registers_before();
                 e.call_flags_before();
-                e.line(nx::format("psv_call(ctx, {}, {});", t, hex(e.next_code(in))));
+                e.line(e.indirect_call(t, hex(e.next_code(in))));
                 e.call_registers_after(in);
                 e.call_flags_after(in);
                 ++e.stats().indirect_calls;

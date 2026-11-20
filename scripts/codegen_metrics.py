@@ -63,6 +63,10 @@ FUNCTION_SETS = {"wipeout-hot": WIPEOUT_HOT}
 # ---- guest side -------------------------------------------------------------------------------------------------
 
 RE_FUNC = re.compile(r"^void (f_[0-9A-F]{8})\(PsvContext\* (?:PSV_RESTRICT |restrict )?ctx, uint32_t ret\) \{(.*)$")
+# A function with an internal entry: its code in fi_<ADDR> (static inline when it is inlined: a copy in each file whose
+# functions call it), f_<ADDR> a wrapper, its brace on the next line.
+RE_WRAPPER = re.compile(r"^void (f_[0-9A-F]{8})\(PsvContext\* (?:PSV_RESTRICT |restrict )?ctx, uint32_t ret\)$")
+RE_INTERNAL = re.compile(r"^(static inline )?(?:void|uint32_t|uint64_t) fi_([0-9A-F]{8})\(PsvContext\* (?:PSV_RESTRICT |restrict )?ctx[^)]*\) \{$")
 RE_INSN = re.compile(r"^    (?:if \(.+\) )?\{ /\* ([0-9a-f]{8}): (.*) \*/$")
 CONDS = {"eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"}
 NEON_ONLY = {
@@ -134,17 +138,28 @@ def function_class(n, neon, vfp, calls):
 
 
 def scan_source(path):
-    """{function: {guest, neon, vfp, calls}} of one generated .c file."""
-    out = {}
+    """{function: {guest, neon, vfp, calls}} of the functions one generated .c file defines (f_<ADDR>: a function's
+    own code, or the wrapper of its internal entry fi_<ADDR>, whose code is counted for it when the file has it)."""
+    out, bodies, defined = {}, {}, set()
     cur = None
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             if cur is None:
                 m = RE_FUNC.match(line)
                 if m:
+                    defined.add(m.group(1))
                     cur = out.setdefault(m.group(1), {"guest": 0, "neon": 0, "vfp": 0, "calls": 0})
                     if m.group(2).rstrip().endswith("}"):  # (a placeholder written on one line)
                         cur = None
+                    continue
+                m = RE_WRAPPER.match(line)
+                if m:
+                    defined.add(m.group(1))
+                    out.setdefault(m.group(1), {"guest": 0, "neon": 0, "vfp": 0, "calls": 0})["wrapper"] = 1
+                    continue
+                m = RE_INTERNAL.match(line)
+                if m:
+                    cur = bodies.setdefault("f_" + m.group(2), {"guest": 0, "neon": 0, "vfp": 0, "calls": 0})
                 continue
             if line.startswith("}"):
                 cur = None
@@ -159,6 +174,10 @@ def scan_source(path):
                     cur["vfp"] += 1
                 elif k == "call":
                     cur["calls"] += 1
+    for name, body in bodies.items():
+        if name in defined:
+            for k, v in body.items():
+                out[name][k] += v
     return out
 
 
@@ -372,6 +391,11 @@ def summarize(rows):
             hi = sum(r[t][0] for r in hs)
             hb = sum(r[t][1] for r in hs)
             out[t] = {"host_instructions": hi, "host_bytes": hb, "per_guest": ratio(hi, g), "bytes_per_guest": ratio(hb, g)}
+            # (the wrappers f_<ADDR> of internal entries, entered only through the function table: apart as well)
+            wi = sum(r[t + "_wrapper"][0] for r in hs if t + "_wrapper" in r)
+            if wi:
+                out[t]["wrapper_instructions"] = wi
+                out[t]["per_guest_without_wrappers"] = ratio(hi - wi, g)
     return out
 
 
@@ -415,7 +439,11 @@ def compare(old, new, targets):
         for t in targets:
             x, y = a[label].get(t), b[label].get(t)
             if x and y and x.get("per_guest") and y.get("per_guest"):
-                cells.append(f"{t} {x['per_guest']:.2f} -> {y['per_guest']:.2f} ({100 * (y['per_guest'] / x['per_guest'] - 1):+.1f}%)")
+                cell = f"{t} {x['per_guest']:.2f} -> {y['per_guest']:.2f} ({100 * (y['per_guest'] / x['per_guest'] - 1):+.1f}%)"
+                if y.get("per_guest_without_wrappers") is not None:
+                    w = y["per_guest_without_wrappers"]
+                    cell += f" [{w:.2f} ({100 * (w / x['per_guest'] - 1):+.1f}%) without the wrappers]"
+                cells.append(cell)
         if cells:
             print(f"  {label:<28} " + "   ".join(cells))
 
@@ -526,7 +554,7 @@ def main():
     targets, notes = make_targets(names, args.debug_info, args.flags_x64, args.flags_arm64)
     for n in notes:
         print(f"note: {n}")
-    helpers = {}
+    helpers, copies = {}, {}
     for target in targets:
         binary = getattr(args, f"binary_{target.name}", None)
         if binary:
@@ -536,10 +564,12 @@ def main():
                     by_name[key.split(":", 1)[1]].append(key)
             hi = hb = 0
             for sym, (n, b) in disassemble(target, Path(binary)).items():
-                keys = by_name.get(sym, [])
+                keys = by_name.get("f_" + sym[3:] if sym.startswith("fi_") else sym, [])
                 if len(keys) == 1:
-                    functions[keys[0]][target.name] = [n, b]
-                elif not sym.startswith("f_"):
+                    cnt = functions[keys[0]].setdefault(target.name, [0, 0])
+                    cnt[0] += n
+                    cnt[1] += b
+                elif not sym.startswith("f_") and not sym.startswith("fi_"):
                     hi += n
                     hb += b
             helpers[target.name] = {"host_instructions": hi, "host_bytes": hb}
@@ -573,16 +603,26 @@ def main():
                 raise SystemExit("\n".join(errors))
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             dis = list(pool.map(lambda o: disassemble(target, o[2]), objects))
-        hi = hb = 0
+        hi = hb = ci = cb = 0
         for (mod, src, obj), syms in zip(objects, dis):
             for sym, (n, b) in syms.items():
-                key = f"{mod}:{sym}"
+                # (an internal entry's code counts for its function, f_ and fi_ together; a static copy of an inlined
+                # one in a file other than its function's is counted apart)
+                key = f"{mod}:{'f_' + sym[3:] if sym.startswith('fi_') else sym}"
                 if key in functions and functions[key]["file"] == src.name:
-                    functions[key][target.name] = [n, b]
+                    cnt = functions[key].setdefault(target.name, [0, 0])
+                    cnt[0] += n
+                    cnt[1] += b
+                    if functions[key].get("wrapper") and sym.startswith("f_"):
+                        functions[key][target.name + "_wrapper"] = [n, b]
+                elif sym.startswith("fi_"):
+                    ci += n
+                    cb += b
                 elif not sym.startswith("f_"):
                     hi += n
                     hb += b
         helpers[target.name] = {"host_instructions": hi, "host_bytes": hb}
+        copies[target.name] = {"host_instructions": ci, "host_bytes": cb}
         lost = [k for k, r in functions.items() if (r["module"], r["file"]) in in_scope and target.name not in r]
         if lost:
             print(f"warning: {target.name}: {len(lost)} functions have no symbol in the objects (first: {lost[0]})")
@@ -592,7 +632,7 @@ def main():
     here = lambda s: s.replace(str(ROOT), "<psvrecore>")  # (the record says where the checkout was only as this)
     result = {"tree": label, "scope": scope,
               "targets": {t.name: {"compiler": t.compiler, "flags": [here(f) for f in t.flags]} for t in targets},
-              "overall": summarize(rows), "helpers": helpers}
+              "overall": summarize(rows), "helpers": helpers, "inline_copies": copies}
     result["modules"] = {m: summarize([r for r in rows if r["module"] == m]) for m in sorted({r["module"] for r in rows})}
     result["classes"] = {c: summarize([r for r in rows if r["class"] == c]) for c in ("integer", "vfp", "neon", "call-heavy")}
     named = {}
@@ -616,6 +656,10 @@ def main():
         print_table("Named functions", [(f"{k} ({v['class']})", v) for k, v in named.items()], tnames)
     for t, h in helpers.items():
         print(f"{t}: out-of-line helpers and other symbols: {h['host_instructions']} instructions, {h['host_bytes']} bytes (not in the ratios)")
+    for t, h in copies.items():
+        if h["host_instructions"]:
+            print(f"{t}: out-of-line static copies of inlined functions in other files than their own: {h['host_instructions']} instructions, "
+                  f"{h['host_bytes']} bytes (not in the ratios)")
     if args.json:
         with open(args.json, "w", newline="\n") as f:
             json.dump(result, f, indent=1)

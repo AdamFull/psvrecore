@@ -77,7 +77,38 @@ struct RegisterOptions {
     // The instructions' effects by function (code address) and instruction index, instead of register_effect: the
     // code generator gives what its translation of each instruction reads and writes.
     const nx::map<u32, nx::vector<RegisterEffect>>* effects = nullptr;
+    // Internal entries (EntryKind): direct calls between the module's functions pass r0-r3, sp and lr as C arguments
+    // and get r0/r1 back by value (off: psvrecomp --no-internal-calls, every call through f_<address> as before).
+    bool internal_calls = true;
+    // Functions given no internal entry (code addresses): every direct call to them goes through f_<address>, the
+    // symbol a game may stand in for (psvrecomp --no-inline).
+    const nx::vector<u32>* no_internal = nullptr;
 };
+
+// The registers an internal entry takes as C arguments when it reads them at entry; the others (r4-r12) it reads
+// from the context, where its callers put them.
+inline constexpr RegSet kArgumentRegisters = 0x000F | kSpRegister | kLrRegister;
+// The registers an internal entry returns by value when it may change them.
+inline constexpr RegSet kResultRegisters = 0x0003;
+
+// How a function is entered by the module's direct calls (ARCHITECTURE.md, "Internal entries").
+enum class EntryKind : u8 {
+    Public,   // only f_<address>(ctx, ret): its callers put every register in the context first, as before
+    Inside,   // an internal entry; neither it nor anything it calls reaches code outside the generated code's view:
+              // callers put only their dirty r4-r12 in the context and pass r0-r3, sp and lr as arguments
+    Flushed,  // an internal entry, but it may reach code outside (an import, an indirect call...): callers put every
+              // register in the context first, and pass the arguments as well
+};
+
+// Why a function reaches code outside the generated code's view (EntryKind::Flushed), or has no internal entry.
+enum class EntryReason : u8 {
+    None,
+    // reaches outside
+    Import, Indirect, Svc, Trap, PublicCallee, ViaCallee,
+    // no internal entry
+    Disabled, Excluded, NoCode, NoReturn, NoCallers, OtherReturn, TailCall,
+};
+const char* entry_reason_name(EntryReason r);
 
 struct FunctionRegisters {
     RegSet load_at_entry = 0;  // read from the context at entry
@@ -88,7 +119,15 @@ struct FunctionRegisters {
     // returns branch to that LR, its tail calls pass it on (to functions that may not, themselves); no jump through
     // the runtime, no import's tail call. (What the floating-point registers' summaries rely on: analysis/vfp.hpp.)
     bool returns_to_lr = false;
+    // Its internal entry (EntryKind), and why it is not Inside (EntryReason).
+    EntryKind entry = EntryKind::Public;
+    EntryReason reason = EntryReason::None;
+    RegSet params = 0;    // internal entry: the C arguments (of kArgumentRegisters, those it reads at entry)
+    RegSet results = 0;   // internal entry: returned by value (r0, r1: those it may change)
+    RegSet modified = 0;  // may differ at its returns from what they were at entry (its writes but what it preserves)
+    RegSet writes = 0;    // its code and what it calls may write
     // By instruction index (Function::code):
+    nx::vector<u8> call_entry;       // a direct call: how (EntryKind of the callee as this call uses it)
     nx::vector<RegSet> trap_store;   // dirty before the instruction: written to the context by a trap inside it
                                      // (with what the instruction has written so far)
     nx::vector<RegSet> call_store;   // a call: written to the context before it
@@ -119,6 +158,7 @@ nx::map<u32, RegSet> unwind_restored(const Image& image, usize* undecoded = null
 
 struct RegisterAnalysis {
     bool callee_saved = true;
+    bool internal_calls = false;
     UnwindCheck unwind;
     nx::map<u32, FunctionRegisters> functions;  // by code address
     const FunctionRegisters* at(u32 code) const {
