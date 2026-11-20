@@ -57,6 +57,11 @@ $ErrorActionPreference = 'Continue'
 Push-Location $root
 try {
     $defines = @($Define | Where-Object { $_ } | ForEach-Object { "-D$_" })
+    # (a game: this checkout is its psvrecore, cmake/UsePsvrecore.cmake)
+    $self = Split-Path -Parent $PSScriptRoot
+    if ((Resolve-Path $root).Path -ne (Resolve-Path $self).Path -and -not ($Define -match '^PSVRECORE_ROOT=')) {
+        $defines += "-DPSVRECORE_ROOT=$($self -replace '\\', '/')"
+    }
     if ($BuildDir) {
         # (the preset's settings in another folder: the build and test presets name the preset's own folder)
         cmake --preset $Preset -B $BuildDir @defines

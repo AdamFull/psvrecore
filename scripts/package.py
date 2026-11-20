@@ -17,9 +17,10 @@ Steps:
      sce_sys/livearea folder), sce_sys.json (what was read). The game's CMakeLists.txt calls
      psvrecore_game_package(<name>), which compiles <name>.rc into the Windows program and copies launch.png beside
      the program in the build folder.
-  2. code: when <root>/generated/code is empty (or --generate always), psvrecomp is built (the host's release preset)
-     and the game's scripts/generate_code.py recompiles the game.
-  3. build: the platform's preset (release unless --preset), only the game's target.
+  2. code: when <root>/generated/code is empty (or --generate always), the game's scripts/generate_code.py recompiles
+     the game with the psvrecomp of psvrecore's package for the host's release preset (install/<preset>/bin).
+  3. build: the platform's preset (release unless --preset), only the game's target, against psvrecore's package for
+     that preset. A missing package is built and installed from this checkout first.
   4. package:
      - windows: a folder to copy anywhere: the program, psvrecore.dll, launch.png, install.ps1 (a Start menu shortcut;
        -Uninstall removes it).
@@ -56,6 +57,9 @@ def run(cmd, **kwargs):
         raise SystemExit(f"failed ({result.returncode}): {cmd[0]}")
 
 
+PSVRECORE = HERE.parent
+
+
 def build(root, preset, build_dir, targets):
     """Configures and builds a preset of the game's repository into build_dir (Windows: through build.ps1, which
     brings in the Visual Studio environment)."""
@@ -63,8 +67,26 @@ def build(root, preset, build_dir, targets):
         run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", HERE / "build.ps1", "-Root", root,
              "-Preset", preset, "-BuildDir", build_dir, "-NoTest", "-Target", ",".join(targets)])
     else:
-        run(["cmake", "--preset", preset, "-B", build_dir], cwd=root)
+        run(["cmake", "--preset", preset, "-B", build_dir, f"-DPSVRECORE_ROOT={PSVRECORE}"], cwd=root)
         run(["cmake", "--build", build_dir, "--target", *targets], cwd=root)
+
+
+def package_dir(preset):
+    return PSVRECORE / "install" / preset
+
+
+def ensure_package(preset):
+    """psvrecore's package for a preset (install/<preset>): built and installed from this checkout when missing."""
+    if (package_dir(preset) / "lib" / "cmake" / "psvrecore" / "psvrecoreConfig.cmake").is_file():
+        return
+    print(f"psvrecore: no package for {preset}: building and installing it", flush=True)
+    if os.name == "nt":
+        run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", HERE / "build.ps1",
+             "-Preset", preset, "-NoTest", "-Install"])
+    else:
+        run(["cmake", "--preset", preset], cwd=PSVRECORE)
+        run(["cmake", "--build", "--preset", preset], cwd=PSVRECORE)
+        run(["cmake", "--install", PSVRECORE / "build" / preset, "--component", "psvrecore"], cwd=PSVRECORE)
 
 
 # --- 1. sce_sys -----------------------------------------------------------------------------------------------------
@@ -272,9 +294,10 @@ def main():
     empty = not (code.is_dir() and any(code.iterdir()))
     if not args.no_build and (args.generate == "always" or (args.generate == "auto" and empty)):
         host_preset = f"{HOST}-x64-release"
-        build(root, host_preset, root / "build" / host_preset, ["psvrecomp"])
+        ensure_package(host_preset)  # (psvrecomp: the package's bin/)
         run([sys.executable, root / "scripts" / "generate_code.py", "--game", game, "--preset", host_preset])
     if not args.no_build:
+        ensure_package(preset)
         build(root, preset, build_dir, [args.name])
 
     out = Path(args.out).resolve() if args.out else root / "build" / "package" / args.platform
