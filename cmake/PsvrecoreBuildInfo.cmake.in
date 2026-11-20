@@ -1,0 +1,14 @@
+# Run by cmake --install (cmake/PsvrecoreInstall.cmake): the commit the package is installed from, and whether the
+# checkout had uncommitted changes, for psvrecoreConfig.cmake to report.
+execute_process(COMMAND git -C "@PSVRECORE_PACKAGE_SOURCE_DIR@" rev-parse HEAD
+                OUTPUT_VARIABLE _commit OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git -C "@PSVRECORE_PACKAGE_SOURCE_DIR@" status --porcelain --untracked-files=no
+                OUTPUT_VARIABLE _changes OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(_changes)
+    set(_dirty TRUE)
+else()
+    set(_dirty FALSE)
+endif()
+set(_file "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/cmake/psvrecore/psvrecoreBuildInfo.cmake")
+message(STATUS "Installing: ${_file} (${_commit})")
+file(WRITE "${_file}" "set(PSVRECORE_GIT_COMMIT \"${_commit}\")\nset(PSVRECORE_GIT_DIRTY ${_dirty})\n")

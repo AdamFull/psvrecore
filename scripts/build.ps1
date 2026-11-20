@@ -5,6 +5,8 @@
 #   scripts\build.ps1 -Preset android-arm64-release    # ANDROID_NDK_HOME, or the newest NDK in the Android SDK
 #   scripts\build.ps1 -Define PSVRECORE_FUZZ_BLOCKS=20000  # cache variables for the configure step
 #   scripts\build.ps1 -Preset windows-x64-release -BuildDir build-mine  # the preset in another folder than its own
+#   scripts\build.ps1 -Preset windows-x64-release -NoTest -Install     # and install the package games build against
+#                                                                       # (install/<preset>, cmake/PsvrecoreInstall.cmake)
 #
 # -Root builds another project with the same presets: a game repository calls this script with its own root.
 param(
@@ -13,7 +15,8 @@ param(
     [string[]]$Target,
     [string]$Root = (Split-Path -Parent $PSScriptRoot),
     [string[]]$Define,
-    [string]$BuildDir
+    [string]$BuildDir,
+    [switch]$Install
 )
 $ErrorActionPreference = 'Stop'
 $root = $Root
@@ -71,6 +74,13 @@ try {
         if ($BuildDir) { ctest --test-dir $BuildDir --output-on-failure }
         else { ctest --preset $Preset }
         if ($LASTEXITCODE) { throw "tests failed ($LASTEXITCODE)" }
+    }
+    if ($Install) {
+        # (into the preset's installDir, install/<preset>; with -BuildDir, that folder's CMAKE_INSTALL_PREFIX)
+        $dir = if ($BuildDir) { $BuildDir } else { Join-Path $root "build\$Preset" }
+        # (psvrecore's own component: the third-party projects' install rules are not the package's)
+        cmake --install $dir --component psvrecore
+        if ($LASTEXITCODE) { throw "install failed ($LASTEXITCODE)" }
     }
 } finally {
     Pop-Location

@@ -111,3 +111,10 @@ endif()
 if(PSVRECORE_DEVICE_TESTS)
     add_subdirectory(tests/device)
 endif()
+
+# The package games build against (cmake --install <build folder>; find_package(psvrecore) in the game):
+# cmake/PsvrecoreInstall.cmake. Only when psvrecore is the project being built, not a game's subdirectory.
+option(PSVRECORE_INSTALL "Make the installable package games build against" ${PROJECT_IS_TOP_LEVEL})
+if(PSVRECORE_INSTALL)
+    include(PsvrecoreInstall)
+endif()

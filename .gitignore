@@ -24,6 +24,7 @@ PARAM.SFO
 
 # --- Build output ---
 /build/
+/install/
 /out/
 *.o
 *.obj

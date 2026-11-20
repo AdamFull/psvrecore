@@ -35,6 +35,13 @@ function(psvrecore_game_package target)
         # (the build folder's own paths made relative to the program: $ORIGIN, where the library is beside it)
         set_target_properties(${target} PROPERTIES BUILD_RPATH_USE_ORIGIN ON INSTALL_RPATH "\$ORIGIN")
     endif()
+    # (built against the installed package: the runtime library copied beside the program, where a build of psvrecore
+    # in the game's own build folder puts it)
+    if(PSVRECORE_RUNTIME_FILES)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${PSVRECORE_RUNTIME_FILES} "$<TARGET_FILE_DIR:${target}>"
+            VERBATIM)
+    endif()
     if(NOT ANDROID AND EXISTS "${_folder}/launch.png")
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${_folder}/launch.png" "$<TARGET_FILE_DIR:${target}>/launch.png"

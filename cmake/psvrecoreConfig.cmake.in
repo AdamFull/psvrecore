@@ -1,0 +1,86 @@
+# psvrecore, installed (cmake/PsvrecoreInstall.cmake): find_package(psvrecore CONFIG REQUIRED) gives a game
+# psvrecore::game, psvrecore::generated_code and the functions it calls (psvrecore_target_defaults,
+# psvrecore_generated_code, psvrecore_game_package), as add_subdirectory(psvrecore) did.
+
+if(CMAKE_VERSION VERSION_LESS 3.27)
+    message(FATAL_ERROR "psvrecore's package needs CMake 3.27 or newer ($<COMPILE_ONLY>)")
+endif()
+
+get_filename_component(_IMPORT_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set(PSVRECORE_PREFIX "${_IMPORT_PREFIX}")
+# (what the functions take their files from: cmake/utf8.manifest)
+set(PSVRECORE_DIR "${_IMPORT_PREFIX}/share/psvrecore")
+# The checkout the package was built from: its scripts (packaging, the Android project) and NID database.
+set(PSVRECORE_SOURCE_DIR "@PSVRECORE_PACKAGE_SOURCE_DIR@")
+set(PSVRECORE_ABI_VERSION @PSVRECORE_ABI_VERSION@)
+set(PSVRECORE_SHARED @PSVRECORE_SHARED@)
+set(PSVRECORE_TRACY @PSVRECORE_TRACY@)
+set(PSVRECORE_GUEST_FIBERS @PSVRECORE_GUEST_FIBERS@)
+set(PSVRECORE_TOOLS_DIR "${_IMPORT_PREFIX}/bin")
+set(PSVRECORE_PACKAGE_BUILD_TYPE "@CMAKE_BUILD_TYPE@")
+# (the commit and whether the checkout had changes, when installed)
+set(PSVRECORE_GIT_COMMIT "")
+set(PSVRECORE_GIT_DIRTY FALSE)
+include("${CMAKE_CURRENT_LIST_DIR}/psvrecoreBuildInfo.cmake" OPTIONAL)
+
+# A game builds for what the package was built for: the same system and processor, compiler and configuration (the
+# C runtime and the build signature, abi.h, depend on them).
+foreach(_psvrecore_check
+        "CMAKE_SYSTEM_NAME|@CMAKE_SYSTEM_NAME@"
+        "CMAKE_SYSTEM_PROCESSOR|@CMAKE_SYSTEM_PROCESSOR@"
+        "CMAKE_CXX_COMPILER_ID|@CMAKE_CXX_COMPILER_ID@"
+        "CMAKE_BUILD_TYPE|@CMAKE_BUILD_TYPE@")
+    string(REPLACE "|" ";" _psvrecore_check "${_psvrecore_check}")
+    list(GET _psvrecore_check 0 _psvrecore_var)
+    list(GET _psvrecore_check 1 _psvrecore_want)
+    if(NOT "${${_psvrecore_var}}" STREQUAL "${_psvrecore_want}")
+        message(FATAL_ERROR "psvrecore's package at ${_IMPORT_PREFIX} was built with ${_psvrecore_var} "
+                            "'${_psvrecore_want}', this build has '${${_psvrecore_var}}': install psvrecore with the "
+                            "preset of the same name as this one")
+    endif()
+endforeach()
+if(NOT CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL "@CMAKE_CXX_COMPILER_VERSION@")
+    message(WARNING "psvrecore's package was built with @CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@, this "
+                    "build has ${CMAKE_CXX_COMPILER_VERSION}")
+endif()
+
+# Generated code's floating point and the runtime's must agree (runtime/float_env.hpp): the package decides.
+set(PSVRECORE_GENERATED_CODE_NATIVE_FLOAT @PSVRECORE_GENERATED_CODE_NATIVE_FLOAT@ CACHE BOOL
+    "arm64: generated code's floating point as host instructions (fixed by the psvrecore package)" FORCE)
+
+list(APPEND CMAKE_MODULE_PATH "${PSVRECORE_DIR}/cmake")
+include(PsvrecoreCompilerOptions)
+include(PsvrecorePackage)
+
+set(_psvrecore_externals "@PSVRECORE_PACKAGE_EXTERNALS@")
+if("Threads::Threads" IN_LIST _psvrecore_externals)
+    include(CMakeFindDependencyMacro)
+    find_dependency(Threads)
+endif()
+
+if(NOT TARGET psvrecore::game)
+    include("${CMAKE_CURRENT_LIST_DIR}/psvrecoreLocations.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/psvrecoreTargets.cmake")
+endif()
+
+# The runtime library's files, copied beside a game's program by psvrecore_game_package.
+set(PSVRECORE_RUNTIME_FILES "")
+if(PSVRECORE_SHARED)
+    get_target_property(_psvrecore_location psvrecore::shared IMPORTED_LOCATION)
+    list(APPEND PSVRECORE_RUNTIME_FILES "${_psvrecore_location}")
+    get_filename_component(_psvrecore_pdb "${_psvrecore_location}" NAME_WLE)
+    get_filename_component(_psvrecore_location_dir "${_psvrecore_location}" DIRECTORY)
+    if(EXISTS "${_psvrecore_location_dir}/${_psvrecore_pdb}.pdb")
+        list(APPEND PSVRECORE_RUNTIME_FILES "${_psvrecore_location_dir}/${_psvrecore_pdb}.pdb")
+    endif()
+endif()
+
+if(PSVRECORE_GIT_COMMIT)
+    set(_psvrecore_commit " ${PSVRECORE_GIT_COMMIT}")
+    if(PSVRECORE_GIT_DIRTY)
+        string(APPEND _psvrecore_commit " (with uncommitted changes)")
+    endif()
+endif()
+message(STATUS "psvrecore: package ${_IMPORT_PREFIX}${_psvrecore_commit}")
+unset(_psvrecore_commit)
+unset(_IMPORT_PREFIX)
