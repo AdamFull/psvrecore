@@ -308,6 +308,7 @@ constexpr bool same(Value a, Value b) { return a == b && a > kTop; }
 struct Slot {
     i32 offset;
     Value value;
+    bool saved = false;  // (written by a push or an stmdb sp!: a register's save, which no other code writes)
 };
 
 struct State {
@@ -318,8 +319,15 @@ struct State {
     // a register clean on both sides with different values on each).
     RegSet clean = kAllRegisters;
     nx::vector<Slot> slots;  // words at offsets from the entry's sp, by offset
+    // A stack address went where the analysis does not follow it (to a callee, into memory, through an operation it
+    // does not model): a callee, or a store through a base it does not know, may then write the frame's words. The
+    // saves of registers (Slot::saved) are no object's: nothing writes them through such an address.
+    bool escaped = false;
 
     RegSet dirty() const { return static_cast<RegSet>(~clean & kAllRegisters); }
+    void forget_frame() {
+        std::erase_if(slots, [](const Slot& s) { return !s.saved; });
+    }
     void set_local(u32 k, Value v) {
         local[k] = v;
         if (same(v, ctx[k])) clean |= static_cast<RegSet>(1u << k);
@@ -328,14 +336,18 @@ struct State {
     void invalidate(i64 lo, i64 hi) {
         std::erase_if(slots, [&](const Slot& s) { return s.offset < hi && s.offset + 4 > lo; });
     }
-    void store(i32 offset, Value v) {
+    void store(i32 offset, Value v, bool saved = false) {
         invalidate(offset, i64(offset) + 4);
         const auto it = std::lower_bound(slots.begin(), slots.end(), offset, [](const Slot& s, i32 o) { return s.offset < o; });
-        slots.insert(it, Slot{offset, v});
+        slots.insert(it, Slot{offset, v, saved});
+    }
+    const Slot* find(i32 offset) const {
+        const auto it = std::lower_bound(slots.begin(), slots.end(), offset, [](const Slot& s, i32 o) { return s.offset < o; });
+        return it != slots.end() && it->offset == offset ? &*it : nullptr;
     }
     Value load(i32 offset) const {
-        const auto it = std::lower_bound(slots.begin(), slots.end(), offset, [](const Slot& s, i32 o) { return s.offset < o; });
-        return it != slots.end() && it->offset == offset ? it->value : kTop;
+        const Slot* s = find(offset);
+        return s ? s->value : kTop;
     }
     void kill(u32 site) {
         for (u32 k = 0; k < 15; ++k) {
@@ -361,12 +373,68 @@ bool join_into(State& a, const State& b) {
         a.local[k] = l, a.ctx[k] = c;
     }
     if (const RegSet clean = a.clean & b.clean; clean != a.clean) a.clean = clean, changed = true;
-    // (a word known on one side only, or different, is unknown: dropped)
+    if (b.escaped && !a.escaped) a.escaped = changed = true;
+    // (a word known on one side only, or different, is unknown: dropped; a save only if it is one on both sides)
     nx::vector<Slot> kept;
-    for (const Slot& s : a.slots)
-        if (b.load(s.offset) == s.value) kept.push_back(s);
-    if (kept.size() != a.slots.size()) changed = true, a.slots = std::move(kept);
+    for (const Slot& s : a.slots) {
+        if (b.load(s.offset) != s.value) continue;
+        const Slot* o = b.find(s.offset);
+        const bool saved = s.saved && o && o->saved;
+        changed |= saved != s.saved;
+        kept.push_back(Slot{s.offset, s.value, saved});
+    }
+    if (kept.size() != a.slots.size()) changed = true;
+    a.slots = std::move(kept);
     return changed;
+}
+
+// Whether a register other than sp holds a stack address (one a callee, or the kernel, may be given).
+bool holds_stack_address(const State& st) {
+    for (u32 k = 0; k < 15; ++k)
+        if (k != arm::kSp && is_sp(st.local[k])) return true;
+    return false;
+}
+
+// The register a memory access takes its address from; 16 for an instruction that accesses no memory.
+u32 memory_base(const arm::Instruction& in) {
+    const auto& o = in.operands;
+    switch (in.op) {
+        case Op::Ldr: case Op::Str: case Op::Ldrb: case Op::Ldrh: case Op::Ldrsb: case Op::Ldrsh: case Op::Strb: case Op::Strh:
+        case Op::Ldrt: case Op::Ldrbt: case Op::Ldrht: case Op::Ldrsbt: case Op::Ldrsht: case Op::Strt: case Op::Strbt: case Op::Strht:
+        case Op::Ldrex: case Op::Ldrexb: case Op::Ldrexh: case Op::Vldr: case Op::Vstr:
+        case Op::Vld1: case Op::Vld2: case Op::Vld3: case Op::Vld4: case Op::Vst1: case Op::Vst2: case Op::Vst3: case Op::Vst4:
+            return o[1].reg;
+        case Op::Ldrd: case Op::Strd: case Op::Ldrexd: case Op::Strex: case Op::Strexb: case Op::Strexh: case Op::Swp: case Op::Swpb:
+            return o[2].reg;
+        case Op::Strexd: return o[3].reg;
+        case Op::Push: case Op::Pop: case Op::Vpush: case Op::Vpop: return arm::kSp;
+        case Op::Ldm: case Op::Ldmib: case Op::Ldmda: case Op::Ldmdb: case Op::Stm: case Op::Stmib: case Op::Stmda: case Op::Stmdb:
+        case Op::Vldmia: case Op::Vldmdb: case Op::Vstmia: case Op::Vstmdb: case Op::Pld: case Op::Pldw: case Op::Pli:
+            return o[0].reg;
+        default: return 16;
+    }
+}
+
+// Whether the instruction takes a stack address where the analysis stops following it: stores it to memory, uses it
+// as an index, or computes from it what is not a stack address the analysis knows. (One kept in a register is
+// followed; given to a call or the kernel there, it escapes: Solver::forward, apply's svc.)
+bool escapes(const arm::Instruction& in, const RegisterEffect& eff, const State& st, const Value* nv) {
+    RegSet stack = kSpRegister;
+    for (u32 k = 0; k < 15; ++k)
+        if (is_sp(st.local[k])) stack |= static_cast<RegSet>(1u << k);
+    stack &= eff.uses;
+    if (!stack) return false;
+    if (const u32 base = memory_base(in); base != 16) return (stack & ~(1u << base)) != 0;
+    switch (in.op) {
+        case Op::Cmp: case Op::Cmn: case Op::Tst: case Op::Teq: case Op::Cbz: case Op::Cbnz: return false;  // (flags, a branch)
+        default: break;
+    }
+    const RegSet defs = static_cast<RegSet>(eff.defs & ~kSpRegister);
+    // (sp alone moved: still in the frame; nothing written: into a register the analysis does not see, a VFP one)
+    if (!defs) return eff.defs == 0;
+    for (u32 k = 0; k < 15; ++k)
+        if ((defs & (1u << k)) && !is_sp(nv[k])) return true;
+    return false;
 }
 
 // The instruction's own effect on the symbolic state: the registers it writes (those it is not modeled for become
@@ -403,6 +471,11 @@ void apply(const arm::Instruction& in, const RegisterEffect& eff, State& st, Val
         if (!(m.flags & (arm::kMemWriteBack | arm::kMemPostReg)) || m.reg == arm::kPc) return;
         nv[m.reg] = a.known ? sp_at(a.after) : kTop;
     };
+    // A store through a base that is not a stack address the analysis knows: once one has escaped, it may be one of
+    // the frame's words (not a register's save).
+    const auto unknown_store = [&] {
+        if (st.escaped) st.forget_frame();
+    };
     switch (in.op) {
         case Op::Mov:
             if (n == 2 && o[1].kind == OperandKind::Reg && o[1].reg != arm::kPc) {
@@ -434,6 +507,8 @@ void apply(const arm::Instruction& in, const RegisterEffect& eff, State& st, Val
             const bool wb = pp || (in.flags & arm::kWriteBack);
             const i32 count = std::popcount(list);
             const Value b = value(rn);
+            // (push, stmdb sp!: the saves of registers)
+            const bool saves = !load && rn == arm::kSp && wb && !increment && before;
             if (is_sp(b)) {
                 const i32 base = sp_offset(b);
                 const i32 first = increment ? (before ? base + 4 : base) : (before ? base - 4 * count : base - 4 * count + 4);
@@ -446,14 +521,15 @@ void apply(const arm::Instruction& in, const RegisterEffect& eff, State& st, Val
                         if (r == arm::kPc) pc = v;
                         else nv[r] = v;  // (a loaded base overrides its writeback, as the translation does)
                     } else {
-                        st.store(at, r == rn ? b : value(r));
+                        st.store(at, r == rn ? b : value(r), saves);
                     }
                     at += 4;
                 }
             } else if (!load && rn == arm::kSp) {
                 st.slots.clear();  // (the stack pointer at an unknown offset from the entry's)
+            } else if (!load) {
+                unknown_store();
             }
-            // (else a store through a base that is not a known stack address: taken not to touch the saved words)
             break;
         }
         case Op::Ldr: case Op::Str: case Op::Ldrb: case Op::Ldrh: case Op::Ldrsb: case Op::Ldrsh: case Op::Strb: case Op::Strh:
@@ -476,6 +552,8 @@ void apply(const arm::Instruction& in, const RegisterEffect& eff, State& st, Val
                 else st.invalidate(a.at, i64(a.at) + size);
             } else if (a.stack) {
                 st.slots.clear();  // (a store at an unknown place in the frame)
+            } else {
+                unknown_store();
             }
             break;
         }
@@ -492,6 +570,8 @@ void apply(const arm::Instruction& in, const RegisterEffect& eff, State& st, Val
                 st.store(a.at + 4, hi);
             } else if (a.stack) {
                 st.slots.clear();
+            } else {
+                unknown_store();
             }
             break;
         }
@@ -499,6 +579,7 @@ void apply(const arm::Instruction& in, const RegisterEffect& eff, State& st, Val
             const Address a = address(o[1]);
             if (a.known) st.invalidate(a.at, i64(a.at) + (o[0].kind == OperandKind::DReg ? 8 : 4));
             else if (a.stack) st.slots.clear();
+            else unknown_store();
             break;
         }
         case Op::Vldmia: case Op::Vldmdb: case Op::Vstmia: case Op::Vstmdb: case Op::Vpush: case Op::Vpop: {
@@ -516,20 +597,30 @@ void apply(const arm::Instruction& in, const RegisterEffect& eff, State& st, Val
                 if (pp || (in.flags & arm::kWriteBack)) nv[rn] = sp_at(increment ? base + bytes : base - bytes);
             } else if (!load && rn == arm::kSp) {
                 st.slots.clear();
+            } else if (!load) {
+                unknown_store();
             }
             break;
         }
         case Op::Vst1: case Op::Vst2: case Op::Vst3: case Op::Vst4:
             if (is_sp(value(o[1].reg)) || o[1].reg == arm::kSp) st.slots.clear();
+            else unknown_store();
             break;
         case Op::Strex: case Op::Strexb: case Op::Strexh: case Op::Swp: case Op::Swpb:
             if (is_sp(value(o[2].reg)) || o[2].reg == arm::kSp) st.slots.clear();
+            else unknown_store();
             break;
         case Op::Strexd:
             if (is_sp(value(o[3].reg)) || o[3].reg == arm::kSp) st.slots.clear();
+            else unknown_store();
+            break;
+        case Op::Svc:  // (a call into the kernel, with its arguments in registers)
+            if (holds_stack_address(st)) st.escaped = true;
+            if (st.escaped) st.forget_frame();
             break;
         default: break;
     }
+    if (escapes(in, eff, st, nv)) st.escaped = true;
     for (u32 k = 0; k < 15; ++k)
         if (eff.defs & (1u << k)) st.set_local(k, nv[k]);
 }
@@ -718,6 +809,14 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* 
         Value pc = kTop;
         apply(in, eff, post, pc);
         if (node.call != CallKind::None) {
+            // (a stack address in a register the callee is given, or one it saves: it may write the frame through it,
+            // or through one given before; below sp is the callee's own frame)
+            if (holds_stack_address(post)) post.escaped = true;
+            if (post.escaped) post.forget_frame();
+            if (is_sp(post.local[arm::kSp])) {
+                const i32 top = sp_offset(post.local[arm::kSp]);
+                std::erase_if(post.slots, [&](const Slot& s) { return s.offset < top; });
+            }
             post.kill(i);
             const EntryKind ck = entry_of(node);
             const Fn* callee = ck == EntryKind::Public ? nullptr : callee_of(node);

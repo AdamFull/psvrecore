@@ -273,6 +273,47 @@ TEST_CASE("analysis: internal entries: kinds, arguments, results, and what calls
     for (const auto& [code, f] : none.functions) CHECK(f.entry == EntryKind::Public);
 }
 
+TEST_CASE("analysis: a stack word a callee may write through an address it was given is not known after the call") {
+    // At kBase (Thumb):
+    //   m_writer 00 movs r1, #6; str r1, [r0]; bx lr                       (writes through its argument, keeps r4)
+    //   k_escape 06 push {r4, lr}; sub sp, #8; str r4, [sp]; mov r0, sp; bl m_writer; ldr r4, [sp]; blx r1;
+    //               add r0, r4; add sp, #8; pop {r4, pc}
+    //   n_kept   1c the same with movs r0, #0 for mov r0, sp                (the frame's address given to no one)
+    // k: the word at sp is m_writer's to change, so the r4 loaded from it is not the context's r4 (which the call
+    // kept): it goes to the context before blx r1. n: the word is still r4's, loaded back clean.
+    static constexpr u16 code[] = {
+        0x2106, 0x6001, 0x4770,                                                          // m_writer
+        0xB510, 0xB082, 0x9400, 0x4668, 0xF7FF, 0xFFF7, 0x9C00, 0x4788, 0x4420, 0xB002, 0xBD10,  // k_escape
+        0xB510, 0xB082, 0x9400, 0x2000, 0xF7FF, 0xFFEC, 0x9C00, 0x4788, 0x4420, 0xB002, 0xBD10,  // n_kept
+    };
+    constexpr u32 m = kBase + 0x00 + 1, k = kBase + 0x06 + 1, nk = kBase + 0x1C + 1;
+    analysis::Segment seg;
+    seg.base = seg.linked = kBase;
+    seg.flags = elf::kSegmentRead | elf::kSegmentExecute;
+    for (u16 h : code) {
+        seg.bytes.push_back(static_cast<u8>(h));
+        seg.bytes.push_back(static_cast<u8>(h >> 8));
+    }
+    seg.file_size = seg.size();
+    const auto img = analysis::Image::from_segments({seg});
+    analysis::Options options;
+    options.extra_entries = {m, k, nk};
+    options.use_exidx = false;
+    const auto p = analysis::analyze(img, options);
+    REQUIRE(p.functions.size() == 3);
+    const usize blx_k = at(*p.function_at(k), 0x14), blx_n = at(*p.function_at(nk), 0x2A);
+    analysis::RegisterOptions legacy;
+    legacy.internal_calls = false;
+    const auto check = [&](const analysis::RegisterOptions& o) {
+        const auto regs = analysis::register_analysis(p, o);
+        CHECK((regs.at(m)->preserved & r({4})) != 0);
+        CHECK((regs.at(k)->call_store[blx_k] & r({4})) != 0);
+        CHECK((regs.at(nk)->call_store[blx_n] & r({4})) == 0);
+    };
+    check(legacy);
+    check(analysis::RegisterOptions{});
+}
+
 TEST_CASE("recomp: modules whose condition-flag contracts do not fit are refused") {
     static const PsvFunctionEntry functions[] = {{0x81000001u, nullptr}};
     PsvModuleCode reader{};
