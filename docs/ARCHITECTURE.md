@@ -292,7 +292,8 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     the LR it was entered with (`returns_to_lr`, shown with sp kept across calls to code outside the module's view, which
     such a function then checks after them, as callers of a preserving function rely on), and that ends in no tail
     call (no branch, table entry, veneer or running into another function, no import's tail call). Not one listed by
-    `psvrecomp --no-inline` (a function a game stands in for by renaming its definition, task 8's replacements).
+    `psvrecomp --no-inline` (a function a game stands in for by renaming its definition), and not one replaced by a
+    host implementation (`--replace`, "Host implementations of guest functions" below).
     WipEout 2048's executable: 6224 of its 14792 functions; 7219 have no direct caller, 1338 may return elsewhere than
     their LR (most of them: a store at a register offset from sp, which ends what the analysis knows of the frame and
     so of the saved LR, or a call of such a function, which then loses sp), 11 never return.
@@ -366,6 +367,53 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
   their wrapper and the callers in their own file while keeping the out-of-line copy the other files call (measured: a
   larger program for no measured gain; `--inline-in-file` allows it). What the copies cost and buy is in CODEGEN_METRICS.md; ThinLTO
   (`PSVRECORE_GENERATED_CODE_LTO`) inlines across files as well, at a link time unacceptable as a default.
+- **Host implementations of guest functions** (task 8: `psvrecomp generate --replace <target>=<symbol>[/<guard>]`,
+  `--replace-table <file>`; `recomp::Options::replacements`; the functions in `recomp/src/host_functions.cpp`, the
+  table `tools/psvrecomp/host_functions.tsv`, installed as `share/psvrecore/host_functions.tsv`). A target is an
+  address or `nid:[<library NID>:]<function NID>`, resolved against the module's own export; a table line is
+  `<module fingerprint or *> <target> <symbol> [<guard>]`, the fingerprint the SHA-256 of the module's ELF
+  (`Image::fingerprint`), so another build of the same library is another module and gets none of its lines.
+  - **What the analyses see.** The program is analysed as it is: the replaced function stays a function, its
+    callers' calls stay direct calls of it. It gets no internal entry and no inlined copy (`no_internal`), and the
+    register solver gives its callers a contract in place of what its code proves (`RegisterOptions::hosts`,
+    `kHostWrites`/`kHostPreserved`): it writes r0-r3, r12 and lr, keeps r4-r11 and sp (with a guard: also what the
+    guest code writes, and of r4-r11/sp only what that code is shown to keep), and is called as a Flushed callee (every
+    dirty register in the context before the call; a caller keeps r4-r11 and sp in its locals across it). It is not
+    "outside" for that: its callers are not made to read the context back as after a call of unknown code. Flags and
+    VFP registers follow the guest code at its calls (the flag analysis' `into`), which the host function's contract
+    covers: the flags are dead after an AAPCS call (a caller that reads them is counted, below). A function whose code
+    reads flags at entry (`FunctionFlags::need`) is not a C function and is not replaced, nor one at an address no
+    function starts at, nor an import's stub; each is listed (`replacement_notes`), and the module is translated as
+    without it. (An earlier version made the entry an import's stub; P4D libc measured both ways in CODEGEN_METRICS.md,
+    task 8: the stub made every caller write the whole context at the call and lose r4-r11 across it.)
+  - **What it writes.** Where the guest's code reaches the function (a direct call, a tail branch, a table case,
+    running into it), a call of the host function `void S(PsvContext*, uint32_t ret)` with the return address the guest's call has (a
+    tail branch and a table case pass their own `ret` and return). `f_<address>`, the module table's entry, is
+    `{ S(ctx, ret); }`: indirect calls, `psv_call`, and other modules' imports resolved to the function's export find
+    it there. With a guard `int G(const PsvContext*)`, callers call `f_<address>`, which is
+    `if (G(ctx)) { S(ctx, ret); return; } fo_<address>(ctx, ret);`, `fo_<address>` the guest code's translation.
+    The generated header declares S, G and fo_. A jump to a constant address (`ldr pc, =A`) goes through `psv_jump`
+    to `f_<address>`; in `fo_`, the guest code's branch to its own entry is a loop and its call of itself calls
+    `f_<address>` (the guard again); calls of inlined callees are inlined as in any function. Tests:
+    `tests/replace_tests.cpp` (the text) and `psvrecore_host_functions_tests` (replace_module.hpp's ten callers, run
+    against the interpreter).
+  - **The host function's contract.** It leaves what a C caller may read after the call as the guest's code does:
+    r0 (and r1 of a 64-bit result), r4-r11, sp, d8-d15, memory, and for the atomics the exclusive monitor as the
+    guest's strex leaves it. r1-r3, r12, lr, the flags and the other VFP registers are the callee's by the AAPCS and
+    need not hold what the guest's code leaves there. A caller that reads one of those after the call anyway (hand
+    assembly, or a compiler that knew the callee) is counted and listed (`replaced_relying`; a forward scan of each
+    call's return along the CFG to the next call, return or jump): none of P4D libc's 267 calls of its replaced
+    functions. It is not checked across modules (another module's call through an import is not scanned).
+  - **The table's lines.** Only modules whose functions were read instruction by instruction and compared with the
+    host function on random inputs in the interpreter (`PSVRECORE_TEST_LIBC`, CODEGEN_METRICS.md, task 8): P4D's
+    libc.suprx (memcpy where the forward copy gives memmove's result: `psv_host_memcpy_exact`; memmove, memset,
+    memcmp, strlen, strcmp, strncpy, wcslen; `_Atomic_fetch_add_4`/`_sub_4` for memory orders 0-5:
+    `psv_host_atomic_order_valid`, the guest's code asserts beyond). That comparison is local only (the module is
+    Sony's and is not in the repository; without the variable the test case is skipped): `PSVRECORE_TEST_LIBC=<path
+    to libc.suprx> build/windows-x64-release/tests/psvrecore_host_functions_tests.exe`; last run 2026-11-21 with P4D's
+    libc.suprx: 14906 runs, 0 failures. psvrecomp prints `N of M table lines apply to this module (fingerprint ...)`
+    whenever a table is passed, and rejects a `psv_host_*` symbol or guard the runtime does not define
+    (`recomp::kRuntimeHostFunctions`, checked against guest.h by a test).
 - **Indirect calls** (`guest.h`, `PsvDispatch`, `psv_call_in`). Each module has a table that registering it fills
   (`recomp::register_module`): by the halfword of code from its lowest Thumb function, the u16 index of the Thumb
   function starting there, and an array of what the registry gives for each (a module of 65535 functions or more gets

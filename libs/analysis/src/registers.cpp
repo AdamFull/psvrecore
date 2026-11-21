@@ -693,6 +693,8 @@ struct Fn {
     EntryReason reason = EntryReason::None;
     RegSet modified = 0, results = 0, params = 0;
     nx::vector<RegSet> kept;  // (each call's kept registers as the forward pass gives them, before liveness narrows them)
+    // A host implementation stands in for it (RegisterOptions::hosts); `guarded`: its code may run instead.
+    bool host = false, guarded = false;
 };
 
 class Solver {
@@ -709,7 +711,20 @@ private:
     const Fn* callee_of(const CfgNode& node) const {
         if (node.call != CallKind::Direct) return nullptr;
         const u32 t = index(node.call_target);
-        return t == kNoIndex ? nullptr : &fns_[t];
+        if (t == kNoIndex) return nullptr;
+        if (auto c = contracts_.find(t); c != contracts_.end()) return &c->second;
+        return &fns_[t];
+    }
+    // What a call or tail call of function t may write and preserves: a host implementation's contract (with a guarded
+    // one's code's), else its code's.
+    RegSet preserved_of(u32 t) const {
+        const Fn& f = fns_[t];
+        if (!f.host || !options_.callee_saved) return f.preserved;
+        return f.guarded ? static_cast<RegSet>(f.preserved & kHostPreserved) : kHostPreserved;
+    }
+    RegSet writes_of(u32 t) const {
+        const Fn& f = fns_[t];
+        return !f.host ? f.writes : static_cast<RegSet>(kHostWrites | (f.guarded ? f.writes : RegSet(0)));
     }
     EntryKind entry_of(const CfgNode& node) const {
         const Fn* c = callee_of(node);
@@ -725,6 +740,8 @@ private:
     const RegisterOptions& options_;
     nx::vector<Fn> fns_;
     nx::flat_hash_map<u32, u32> index_;
+    // (the host implementations as their callers see them, from classify on: EntryKind::Flushed, no results by value)
+    nx::flat_hash_map<u32, Fn> contracts_;
 };
 
 RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* lr_ok_out) const {
@@ -766,7 +783,7 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* 
         if (!options_.callee_saved) return 0;
         if (node.call == CallKind::Direct) {
             const u32 t = index(node.call_target);
-            return t == kNoIndex ? RegSet(0) : fns_[t].preserved;
+            return t == kNoIndex ? RegSet(0) : preserved_of(t);
         }
         return sp_kept ? kSpRegister : RegSet(0);
     };
@@ -789,7 +806,7 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* 
                 break;
             case EdgeKind::TailCall: {
                 const u32 t = index(e.to);
-                ok &= t != kNoIndex && s.local[arm::kLr] == entry_value(arm::kLr) ? static_cast<RegSet>(entry_values() & fns_[t].preserved)
+                ok &= t != kNoIndex && s.local[arm::kLr] == entry_value(arm::kLr) ? static_cast<RegSet>(entry_values() & preserved_of(t))
                                                                                  : RegSet(0);
                 lr_ok &= t != kNoIndex && s.local[arm::kLr] == entry_value(arm::kLr);
                 break;
@@ -1041,7 +1058,7 @@ void Solver::classify() {
             RegSet w = f.writes;
             const auto from = [&](u32 code) {
                 const u32 t = index(code);
-                w |= t == kNoIndex ? kAllRegisters : fns_[t].writes;
+                w |= t == kNoIndex ? kAllRegisters : writes_of(t);
             };
             for (const CfgNode& node : f.cfg.nodes) {
                 if (node.call == CallKind::Direct) from(node.call_target);
@@ -1076,6 +1093,8 @@ void Solver::classify() {
     }
     // What reaches code outside the generated code's view: its own calls to imports, through the runtime, svc, traps;
     // a call to a function without an internal entry (entered with every register in the context); a callee that does.
+    // Not a host implementation's (RegisterOptions::hosts): its callers write everything first, as for a Flushed entry,
+    // and it calls nothing of the guest's (a guarded one's code is entered as from outside, through f_<address>).
     nx::vector<u8> outside(nf, 0);
     for (u32 i = 0; i < nf; ++i) {
         if (!eligible[i]) continue;
@@ -1089,7 +1108,7 @@ void Solver::classify() {
             else if (f.effect[k].traps) why = EntryReason::Trap;
             else if (node.call == CallKind::Direct) {
                 const u32 t = index(node.call_target);
-                if (t == kNoIndex || !eligible[t]) why = EntryReason::PublicCallee;
+                if (t == kNoIndex || (!eligible[t] && !fns_[t].host)) why = EntryReason::PublicCallee;
             }
             const auto edge = [&](const Edge& e) {
                 if (e.kind == EdgeKind::Trap && why == EntryReason::None) why = EntryReason::Trap;
@@ -1106,7 +1125,7 @@ void Solver::classify() {
             for (const CfgNode& node : fns_[i].cfg.nodes) {
                 if (node.call != CallKind::Direct) continue;
                 const u32 t = index(node.call_target);
-                if (t != kNoIndex && outside[t]) {
+                if (t != kNoIndex && outside[t] && !fns_[t].host) {
                     outside[i] = 1, fns_[i].reason = EntryReason::ViaCallee, changed = true;
                     break;
                 }
@@ -1119,6 +1138,17 @@ void Solver::classify() {
         f.modified = f.kind == EntryKind::Public ? kAllRegisters : static_cast<RegSet>(f.writes & ~f.preserved & kAllRegisters);
         f.results = f.kind == EntryKind::Public ? RegSet(0) : static_cast<RegSet>(f.modified & kResultRegisters);
         f.params = 0;
+    }
+    for (u32 i = 0; i < nf; ++i) {
+        if (!fns_[i].host) continue;
+        Fn c;
+        c.code = fns_[i].code;
+        c.fn = fns_[i].fn;
+        c.kind = EntryKind::Flushed;
+        c.preserved = preserved_of(i);
+        c.writes = writes_of(i);
+        c.modified = static_cast<RegSet>(c.writes & ~c.preserved & kAllRegisters);
+        contracts_[i] = std::move(c);
     }
 }
 
@@ -1142,6 +1172,8 @@ RegisterAnalysis Solver::run() {
         for (usize k = 0; k < n; ++k) f.effect[k] = given ? (*given)[k] : register_effect(f.fn->code[k]);
         // (no code: a function that changes nothing; code without its entry: nothing known)
         f.preserved = n == 0 ? kPreservable : f.cfg.entry == kNoIndex ? RegSet(0) : kPreservable;
+        if (options_.hosts)
+            if (auto h = options_.hosts->find(f.code); h != options_.hosts->end()) f.host = true, f.guarded = h->second;
     }
     for (u32 i = 0; i < fns_.size(); ++i) {
         const Fn& f = fns_[i];

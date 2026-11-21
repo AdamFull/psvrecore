@@ -71,6 +71,36 @@ struct Options {
     // The internal entries not inlined are marked noinline (the C compiler would otherwise copy them into the callers
     // in their own file and their wrapper, beside the out-of-line copy; psvrecomp --inline-in-file lets it).
     bool noinline_internal = true;
+    // Host implementations of guest functions (psvrecomp --replace, --replace-table; ARCHITECTURE.md, "Host
+    // implementations of guest functions"). Every direct call, tail branch, table-branch case and run-into of a replaced
+    // function calls `symbol` (void symbol(PsvContext*, uint32_t ret)), taken to have the AAPCS's contract (analysis::
+    // RegisterOptions::hosts): every dirty register in the context before it, r4-r11 and sp kept in locals across it,
+    // r0-r3, r12 and lr read back after it where live; the flags and the floating-point registers as for a call of its
+    // code. It has no internal entry and is never inlined, and its f_<address> (the function table's entry: indirect
+    // calls, jumps through the runtime, other modules' imports of it) calls `symbol` too. A function whose code reads
+    // flags at entry is not replaced (a note in Stats::replacement_notes). With a
+    // `guard` (int guard(const PsvContext*)), f_<address> calls `symbol` only when the guard holds for the arguments,
+    // else the guest code's translation, kept as fo_<address>: for functions whose result on some inputs depends on the
+    // guest's algorithm (memcpy of overlapping buffers).
+    struct Replacement {
+        u32 code = 0;  // a function code discovery found (bit 0: Thumb)
+        nx::string symbol;
+        nx::string guard;
+    };
+    nx::vector<Replacement> replacements;
+};
+
+// The host functions and guards the runtime defines (guest.h, psv_host_*; libs/recomp/src/host_functions.cpp): the
+// names psvrecomp accepts with that prefix (a test checks the list against guest.h's declarations).
+struct RuntimeHostFunction {
+    const char* name;
+    bool guard;  // int name(const PsvContext*), else void name(PsvContext*, uint32_t ret)
+};
+inline constexpr RuntimeHostFunction kRuntimeHostFunctions[] = {
+    {"psv_host_memcpy", false},          {"psv_host_memmove", false},           {"psv_host_memset", false},
+    {"psv_host_memcmp", false},          {"psv_host_strlen", false},            {"psv_host_strcmp", false},
+    {"psv_host_strncpy", false},         {"psv_host_wcslen", false},            {"psv_host_atomic_fetch_add_4", false},
+    {"psv_host_atomic_fetch_sub_4", false}, {"psv_host_memcpy_exact", true},    {"psv_host_atomic_order_valid", true},
 };
 
 struct GeneratedFile {
@@ -163,6 +193,17 @@ struct Stats {
     usize inline_copies = 0;
     usize internal_params = 0;
     usize internal_results = 0;
+    // Host implementations (Options::replacements): functions replaced, of them with a guard; calls of them (direct
+    // calls, and tail branches, table-branch cases and run-intos); the direct calls after which the caller reads a
+    // register or flag the AAPCS lets a callee change (r1-r3, r12, lr, NZCV) before writing it: such a caller relies on
+    // what the guest's own code leaves there, which the host implementation does not (each is listed in
+    // replacement_notes, with the replacements the generator could not make).
+    usize replaced = 0;
+    usize replaced_guarded = 0;
+    usize replaced_calls = 0;
+    usize replaced_tails = 0;
+    usize replaced_relying = 0;
+    nx::vector<nx::string> replacement_notes;
 };
 
 struct Output {

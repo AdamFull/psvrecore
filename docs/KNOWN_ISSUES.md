@@ -302,6 +302,32 @@
   (`obs_*`); the tables against the registry (`codegen_tests.cpp`: Thumb and ARM targets, other modules, import
   stubs, addresses no function starts at, overrides, an emptied registry). `psvrecomp --no-internal-calls
   --no-call-table` gives the code from before byte for byte (WipEout 2048's four modules, P4D's six).
+- **Host implementations of guest functions (task 8): what is assumed and not checked.**
+  - a host function leaves r1-r3, r12, lr, the flags and d0-d7/d16-d31 as it likes (the AAPCS's); a caller reading
+    one after the call gets something else than from the guest's code. Calls inside the replaced module are scanned
+    for that (listed by psvrecomp); calls from other modules through an import are not;
+  - callers keep r4-r11 and sp in their locals across a host function's call on the contract's word
+    (`kHostPreserved`; the same `PSV_KEPT` check as any call whose callee is shown to keep them), not on a proof
+    from the host function's code; with a guard, only what the guest code is also shown to keep;
+  - the comparison with the module's own code (`PSVRECORE_TEST_LIBC`) runs only where the module is at hand, not
+    in CI (ARCHITECTURE.md, "Host implementations of guest functions");
+  - the table's lines hold for one build of a module (its fingerprint); WipEout 2048's libc (another memcpy, which
+    returns through r12 and copies with vext) and the other games' were not checked and get none. A game opts in by
+    passing `--replace-table` to psvrecomp; no game's `generate_code.py` does yet;
+  - a host function reads memory through `PSV_HOST` with no fault of its own: where the guest's code would fault at
+    an unmapped address the host function faults the same way (the memory is the same), but strlen and memcmp read
+    in 8-byte aligned units that stay in the page of the last byte the guest's code reads;
+  - the atomics are host `__atomic` read-modify-writes on the guest's memory; guest ldrex/strex is a compare-and-swap
+    (above), so a host atomic and another thread's ldrex/strex loop interleave as two guest threads' loops would
+    (and share the compare-and-swap's ABA blind spot);
+  - WipEout 2048's libfios2 inflate (`f_8311A9C8`, called by its zlib wrapper 0x8311A94C) is not replaced: it is a
+    hand-tuned raw deflate decoder, `int inflate(u8* dst, u32 capacity, const u8* src, const u8** end)` (r3 may be 0)
+    returning the bytes written or 0x80560100 (bad data)/0x80560101 (output full), and it is not byte-equivalent to a
+    host inflate: a match at distance 4 or more is copied in words and may write up to 3 bytes past its end (inside
+    the capacity, later overwritten, but left after the last one), output written before an error stays, its table
+    building and limits (HLIT/HDIST at most 29, code-length repeats with no previous length) are its own, and `*end`
+    is the byte after the last bit read. A replacement would be a port of this decoder checked by fuzzing, not zlib
+    (CODEGEN_METRICS.md, task 8).
 - **Floating-point registers in locals (task 5): what is assumed and not checked.**
   - The host's floating-point environment on x64 (and arm64 without native floating point) is the default one while
     generated code runs: round to nearest, no flush-to-zero or denormals-are-zero (MXCSR's FTZ/DAZ clear). The typed

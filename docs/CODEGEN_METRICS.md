@@ -1328,3 +1328,126 @@ and noinline with the lookup at each site; then the shared lookup, the final cod
   gameplay without other sessions' set-up (Resistance's level is reached by a timed touch script but its lighting is
   black; CoD's notes record boots and menus), and each needs about 450-550 MB of generated C built twice; their
   measurements here are static.
+
+## Host implementations of guest functions (task 8)
+
+Measured 2026-11-21. `psvrecomp generate --replace <target>=<symbol>[/<guard>]` and `--replace-table <file>` replace a
+module's function by a host function: every direct call, tail branch, table case and running into it calls it, `f_<address>` (the
+module table's entry: indirect calls, `psv_call`, other modules' imports) calls it, and the function has no internal
+entry or inlined copy ([ARCHITECTURE.md](ARCHITECTURE.md), "Host implementations of guest functions"). The host
+functions (`recomp/src/host_functions.cpp`) are memcpy, memmove, memset, memcmp, strlen, strcmp, strncpy, wcslen and
+`_Atomic_fetch_add_4`/`_sub_4`; `tools/psvrecomp/host_functions.tsv` lists them, by export NID, for one module: P4D's
+libc.suprx (SHA-256 of its ELF 99268287be03...0426). "Before" is 5212ea2 (the shared checkout's build of it).
+
+### What the guest's functions do (P4D's libc, read instruction by instruction)
+
+- memcpy copies forward, each source byte read before any store reaches it: the result is memmove's when the
+  destination is not inside the source above its start (`d <= s` or `d - s >= n`), which is its guard
+  (`psv_host_memcpy_exact`); otherwise the guest code's translation runs (`fo_81013C80`). memmove tail-calls memcpy
+  when `d - s >= n` and copies backward otherwise. memset stores `r1 & 0xFF`. memcmp and strcmp compare unsigned bytes
+  and return 1, -1 or 0 (not the difference). strncpy copies to the NUL and pads with zeros to n. wcslen counts u16
+  units (`asrs` of the byte span: an arithmetic shift, as the host function does). All return what C says in r0.
+- `_Atomic_fetch_add_4`/`_sub_4(ptr, value, order)`: an ldrex/strex loop returning the old value, with barriers by
+  order; an order above 5 asserts, so the guard is `r2 <= 5` (`psv_host_atomic_order_valid`). The host functions are
+  sequentially consistent `__atomic` read-modify-writes, and leave the monitor as the guest's strex does (no access
+  outstanding; address and value of the ldrex).
+- WipEout 2048's libc (3a5c7681...) has another memcpy (it copies with vext and returns through r12): no line for it.
+
+### Static effect
+
+- The synthetic corpus (`codegen_metrics.py --synthetic --functions all`): it has no replacement, and its generated C
+  is byte for byte 5212ea2's (`diff -r` of the two corpusgen trees); host instructions per guest instruction 9.86 x64,
+  7.43 arm64 in both, all 236 compared numbers +0.0%. The stored `docs/codegen_metrics_synthetic.json` was not 5212ea2's
+  (overall 10.00/7.52 against task 7's 9.86/7.43: an earlier configuration of task 7), so a compare with it showed
+  -1.4%/-1.2% that are task 7's; it now holds this run (`--all-functions`), the baseline for the next change.
+- P4D's libc without replacements: psvrecomp's output is 5212ea2's byte for byte. With the table: 10 functions
+  replaced (3 with a guard), 267 direct calls of them call the host function (0 tail branches or table cases in this
+  module), 0 calls followed by a read of r1-r3/r12/lr/flags; 16,126,198 -> 16,092,163 bytes of C (the 7 unguarded
+  functions' guest code is no longer translated). Discovery errors 0, the same 3 bkpt traps. Its 5 files compile
+  for x64 and arm64 (the codegen_metrics runs below). psvrecomp prints `10 of 10 table lines apply to this module`;
+  for P4D's libfios2, `0 of 10`.
+
+### Callers of a replaced function: an import's stub, or the AAPCS contract
+
+The first version made each replaced entry an import's stub for the analyses: its callers wrote the whole context
+at the call (`kAllRegisters`) and, the callee being outside the module's view, lost r4-r11 in locals and checked sp
+after it, and that spread to their callers (functions reaching outside). The kept version (ARCHITECTURE.md) leaves
+the calls direct and gives the register solver a contract for the callee (`RegisterOptions::hosts`: writes r0-r3,
+r12, lr; keeps r4-r11, sp; a Flushed callee; not outside). P4D's libc, psvrecomp's statistics:
+
+| | no table | table, import stub | table, contract (kept) |
+|---|---|---|---|
+| registers written to the context / read back after calls | 33,058 / 8,869 | 34,273 / 10,200 | 34,066 / 8,949 |
+| direct calls keeping registers in locals (registers) | 3,555 (10,547) | 3,292 (9,056) | 3,560 (10,784) |
+| calls checking sp | 347 | 521 | 347 |
+| functions shown to preserve all of r4-r11 and sp | 680 | 653 | 680 |
+| internal entries reaching nothing outside / that may | 85 / 390 | 76 / 392 | 78 / 390 |
+| direct calls to internal entries without the context / with it | 1,156 / 2,438 | 873 / 2,477 | 912 / 2,438 |
+| inlined: functions, calls, static copies | 65, 472, 104 | 64, 443, 100 | 64, 443, 100 |
+
+`codegen_metrics.py` on the three trees (all 5 files, clang-cl x64 and NDK 29 arm64; the replaced functions' own
+code is not counted, so 1544 functions against 1554):
+
+| tree | funcs | guest | x64 insns | /g | B/g | arm64 insns | /g | B/g |
+|---|---|---|---|---|---|---|---|---|
+| no table | 1554 | 83,418 | 374,568 | 4.49 | 18.53 | 330,640 | 3.96 | 15.86 |
+| table, import stub | 1544 | 83,136 | 372,095 | 4.48 | 18.43 | 328,627 | 3.95 | 15.81 |
+| table, contract | 1544 | 83,136 | 371,069 | 4.46 | 18.43 | 328,064 | 3.95 | 15.78 |
+
+The contract is 1,026 x64 and 563 arm64 instructions fewer than the stub; against no table, -0.6% x64 and -0.5% arm64
+per guest instruction (class integer -1.1%/-0.9%, call-heavy -0.6%/-0.5%, vfp -0.1%). The fewer internal entries
+without the context (912 against 1,156) are, for the most part, calls of the replaced functions' internal entries
+that are now host calls (267 of them).
+- Where it would count (not used: WipEout's libc is not in the table): WipEout 2048's executable calls the libc
+  imports at 5012 sites: memset 1877, memcpy 1123, strlen 853, strcmp 511, strncpy 409, memmove 164, memcmp 75,
+  wcslen 0. Every one goes through `psv_call_import` to the libc module's `f_<address>`; with a line for its libc that
+  would be the host function after one wrapper call.
+- Time is not measured: no game was regenerated with the table, and no device run was made.
+
+### WipEout 2048's libfios2 inflate (0x8311A9C8): not replaced
+
+From the disassembly in the generated C (`WipEout_2048/generated-perf/code/wo_libfios2`, grep only; 383 instructions,
+callees 0x8311ADF4, 0x8311AE40 (table building) and 0x8311AFBC (the fixed tables)):
+
+- Signature: `int inflate(u8* dst, u32 capacity, const u8* src, const u8** end)`, a raw deflate stream decoded in one
+  call, all three block types (stored, fixed, dynamic). It returns the bytes written, or 0x80560100 (bad data: block
+  type 3, LEN/NLEN mismatch, HLIT or HDIST above 29, a bad code set, a distance past the start of the output) or
+  0x80560101 (the output is full). `*end` (r3 may be 0) is the byte after the last bit read. Its one caller,
+  0x8311A94C, checks the zlib header (CM 8, no FDICT), calls it, and returns the big-endian Adler-32 after the stream
+  for its caller to check; nothing checks it inside. 0x4E4 bytes of tables on the stack.
+- Not byte-equivalent to a host inflate (zlib, miniz): a match at a distance of 4 or more with 3 or more bytes of room
+  after it is copied in 4-byte words, so it may write up to 3 bytes past the match's end. Later output overwrites them,
+  but after the last match they stay in the buffer past the returned length. Output written before an error stays
+  (zlib's partial output differs in where it stops). Its limits and table building are its own (0x8311ADF4,
+  0x8311AE40: code-length repeats with no previous length, incomplete code sets), and an invalid stream's error code
+  depends on which check it reaches first. The bit reader takes halfwords and may read up to 4 bytes past the stream.
+- A replacement would be a C port of this decoder (its overrun, its checks, its order), checked against the
+  interpreter on fuzzed valid and invalid streams. Not done here; the function stays translated, and KNOWN_ISSUES
+  lists it.
+
+### Checks
+
+- `psvrecore_host_functions_tests`: each host function against a reference model of the guest's code on random
+  inputs (lengths 0-13000, alignments, overlapping buffers either way, NUL positions, buffers ending at the last byte
+  before a page that faults when touched): 29,804 runs, 0 differences (196 cases outside a guard not run); the guards'
+  truth table; the atomics from 4 threads x 50,000 (no lost or torn update). The synthetic module
+  (`codegen/replace_module.hpp`) translated with six functions replaced, four with a guard, ten callers: a direct call,
+  a tail branch, a table case, an indirect call, the guarded call, a guarded function whose guest code calls an
+  inlined internal entry (`add3`), running into a replaced function, a constant `ldr pc` jump to one, a guarded guest
+  code looping to its own entry and one calling itself; against the interpreter running the guest code: 640 runs, 0
+  differences (the guards: 94 runs by the host function, 162 by the guest code; the table case to the host function
+  23).
+- With `PSVRECORE_TEST_LIBC` set to P4D's libc.suprx: each host function against that module's own export run by the
+  interpreter, on the same random inputs (r0, r4-r11, sp, d8-d15, the data memory, the monitor): 14,906 runs, 0
+  differences (memcpy 1406 inside its guard, the others 1500 each). Skipped (exit 0, reported) without it. Local
+  only (the module is not in the repository): `PSVRECORE_TEST_LIBC=<libc.suprx>
+  build/windows-x64-release/tests/psvrecore_host_functions_tests.exe`; last run 2026-11-21, the numbers above.
+- `psvrecore_tests` (`replace_tests.cpp`): the generator's text for the synthetic module (no `fi_` or inlined copy
+  of a replaced function; the host function at the direct calls with the guest's return addresses, at the tail branch
+  and table case with `ret`; `f_<address>` and the guarded wrapper; the header's declarations; the caller reading r2
+  after the call counted and listed; an address no function starts at listed, the module as without it; callers
+  keeping r4 and sp across a host call; every replacement of the module at once: the inlined `fi_` copy in a guarded
+  function's `fo_`, running into, the constant jump through `psv_jump`, the loop and the self-call; a function reading
+  flags at entry refused with its note; `recomp::kRuntimeHostFunctions` equal to guest.h's `psv_host_*` declarations).
+  132 test cases, 0 failures.
+- `scripts\build.ps1 -Preset windows-x64-release` and `-Preset windows-x64-debug`: built, 9 of 9 test programs pass.

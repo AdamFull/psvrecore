@@ -10,6 +10,7 @@
 #include "psvrecore/analysis/vfp.hpp"
 #include "psvrecore/arm/instruction.hpp"
 #include "psvrecore/recomp/generator.hpp"
+#include "core/foundation/containers/hash_map.h"
 #include "core/foundation/containers/hash_set.h"
 #include "core/foundation/strings/format.h"
 #include "core/foundation/strings/utf8_string.h"
@@ -70,6 +71,17 @@ public:
     const nx::flat_hash_set<u32>& internal_callees() const { return internal_callees_; }
     // Indirect calls through the module's table (guest.h, psv_call_in; off: psv_call, psvrecomp --no-call-table).
     void set_call_table(bool on, bool inline_lookup) { call_table_ = on, call_table_inline_ = inline_lookup; }
+    // Host implementations (Options::replacements): the C function each replaced function (code address, bit 0 clear)
+    // is called through at its calls and tail calls; the name of the function's own definition (fo_<address> for a
+    // guarded replacement's guest code; default function_name).
+    void set_replacements(const nx::flat_hash_map<u32, nx::string>* callees) { replaced_ = callees; }
+    void set_name(nx::string name) { name_ = std::move(name); }
+    // The C function a call of `target_code` goes to when it is a replaced function, else nullptr.
+    const nx::string* replacement(u32 target_code) const {
+        if (!replaced_) return nullptr;
+        const auto it = replaced_->find(target_code & ~1u);
+        return it == replaced_->end() ? nullptr : &it->second;
+    }
     // The statement of an indirect call of `target` returning to `next`.
     nx::string indirect_call(nx::string_view target, nx::string_view next) const {
         if (!call_table_) return nx::format("psv_call(ctx, {}, {});", target, next);
@@ -250,6 +262,8 @@ private:
     bool call_table_ = false, call_table_inline_ = false;
     bool inline_ = false;
     nx::string wrapper_;
+    const nx::flat_hash_map<u32, nx::string>* replaced_ = nullptr;
+    nx::string name_;
     nx::flat_hash_set<u32> internal_callees_;
     // The current instruction's register accesses so far, and (Probe) every instruction's.
     analysis::RegisterEffect access_;

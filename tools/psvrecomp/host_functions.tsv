@@ -1,0 +1,21 @@
+# Host implementations of guest functions, by module (psvrecomp generate --replace-table; ARCHITECTURE.md, "Host
+# implementations of guest functions"; the functions are libs/recomp/src/host_functions.cpp).
+#
+# <module fingerprint (SHA-256 of the ELF)> <address or nid:NID> <host function> [<guard>]
+#
+# A line is added only for a module whose functions were read instruction by instruction and found to do what the host
+# function does (results, memory effects, overlapping buffers; docs/CODEGEN_METRICS.md, task 8). The same NID in another
+# build of the library is another algorithm until checked: WipEout 2048's libc memcpy (3a5c7681...) returns through r12
+# and copies with vext, and has no line here.
+
+# SceLibc and SceLibstdcxx (libc.suprx) as Persona 4: Dancing All Night ships it, linked at 0x81000000.
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:7205BFDB psv_host_memcpy psv_host_memcpy_exact
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:AF5C218D psv_host_memmove
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:6DC1F0D8 psv_host_memset
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:7747F6D7 psv_host_memcmp
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:8AECC873 psv_host_strlen
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:1B58FA3B psv_host_strcmp
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:9F87712D psv_host_strncpy
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:BE43BB07:A778A14B psv_host_wcslen
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:F7629240:67D5334B psv_host_atomic_fetch_add_4 psv_host_atomic_order_valid
+99268287be0397b10cefa9c20f858a038dea854a2a1510f85300250a84690426 nid:F7629240:2F7BA372 psv_host_atomic_fetch_sub_4 psv_host_atomic_order_valid

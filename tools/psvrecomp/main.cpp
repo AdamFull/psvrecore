@@ -158,6 +158,7 @@ struct FlagArgs {
     bool no_call_table = false, call_table_inline = false;
     u32 inline_limit = recomp::Options{}.inline_limit;
     bool inline_in_file = false;
+    nx::vector<nx::string> replace, replace_tables;
 };
 
 bool valid_identifier(nx::string_view name) {
@@ -165,6 +166,141 @@ bool valid_identifier(nx::string_view name) {
     for (const char c : name)
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return false;
     return true;
+}
+
+// Host implementations of guest functions (psvrecomp --replace, --replace-table; recomp::Options::replacements).
+//
+// A target is a code address of a function code discovery found (bit 0 for Thumb may be left out), or an export of
+// the module by NID: nid:<function NID>, or nid:<library NID>:<function NID> where two libraries export the same NID.
+// A replacement is <target>=<symbol>[/<guard>]. A table file's lines are
+//   <module fingerprint, 64 hex digits, or *> <target> <symbol> [<guard>]
+// separated by blanks, # starting a comment; only the lines of this module's fingerprint (the SHA-256 of its ELF, as
+// its PsvModuleCode records it) or * apply. A fingerprint's line whose target the module does not have is an error (the
+// table says it was checked against this very module); a * line's is skipped.
+Result<u32> replacement_target(const analysis::Program& program, nx::string_view target) {
+    if (target.starts_with("nid:")) {
+        const auto parts = split(target.substr(4), ':');
+        if (parts.size() != 1 && parts.size() != 2) return failure(nx::format("bad replacement target '{}'", target));
+        const auto nid = parse_u64(parts.back(), 16);
+        const auto lib = parts.size() == 2 ? parse_u64(parts[0], 16) : Result<u64>(u64(0));
+        if (!nid || *nid > 0xFFFFFFFFu || !lib || *lib > 0xFFFFFFFFu) return failure(nx::format("bad NID in '{}'", target));
+        u32 found = 0;
+        usize matches = 0;
+        for (const auto& l : program.image->module().exports) {
+            if (l.attributes & module::kExportMain) continue;
+            if (parts.size() == 2 && l.nid != *lib) continue;
+            for (const auto& f : l.functions)
+                if (f.nid == *nid && (matches == 0 || found != f.address)) found = f.address, ++matches;
+        }
+        if (matches == 0) return failure(nx::format("'{}': the module exports no function of that NID", target));
+        if (matches > 1) return failure(nx::format("'{}': exported by more than one library at different addresses (give nid:<library>:<function>)", target));
+        if (program.function_at(found)) return found;
+        if (program.function_at(found | 1u)) return found | 1u;
+        return failure(nx::format("'{}': exported at 0x{:08x}, where code discovery found no function", target, found));
+    }
+    const auto v = parse_u64(target, 0);
+    if (!v || *v > 0xFFFFFFFFu) return failure(nx::format("bad replacement target '{}'", target));
+    const u32 a = static_cast<u32>(*v);
+    if (program.function_at(a)) return a;
+    if (program.function_at(a | 1u)) return a | 1u;
+    return failure(nx::format("'{}': no function starts there", target));
+}
+
+// (the host function and guard of a replacement, checked before its target so a table's * line can skip a module
+// that lacks the function without also hiding a misspelt host function)
+Result<recomp::Options::Replacement> replacement_callee(nx::string_view callee) {
+    recomp::Options::Replacement r;
+    const usize slash = callee.find('/');
+    r.symbol = nx::string(callee.substr(0, slash));
+    if (slash != nx::string_view::npos) r.guard = nx::string(callee.substr(slash + 1));
+    if (!valid_identifier(r.symbol) || (slash != nx::string_view::npos && !valid_identifier(r.guard)))
+        return failure(nx::format("'{}': the host function (and guard) must be C identifiers", callee));
+    // (psv_host_ is guest.h's prefix: only the runtime's functions and guards, recomp::kRuntimeHostFunctions)
+    const auto runtime_has = [](nx::string_view name, bool guard) {
+        for (const auto& h : recomp::kRuntimeHostFunctions)
+            if (name == h.name && guard == h.guard) return true;
+        return false;
+    };
+    const auto known = [](bool guard) {
+        nx::string list;
+        for (const auto& h : recomp::kRuntimeHostFunctions)
+            if (h.guard == guard) list += nx::format("{}{}", list.empty() ? "" : " ", h.name);
+        return list;
+    };
+    if (r.symbol.starts_with("psv_host_") && !runtime_has(r.symbol, false))
+        return failure(nx::format("'{}': the runtime defines no host function {} (it has: {})", callee, r.symbol, known(false)));
+    if (r.guard.starts_with("psv_host_") && !runtime_has(r.guard, true))
+        return failure(nx::format("'{}': the runtime defines no guard {} (it has: {})", callee, r.guard, known(true)));
+    return r;
+}
+
+Result<recomp::Options::Replacement> replacement_of(const analysis::Program& program, nx::string_view target, nx::string_view callee) {
+    auto r = replacement_callee(callee);
+    if (!r) return r;
+    const auto code = replacement_target(program, target);
+    if (!code) return nx::err(code.error());
+    r->code = *code;
+    return r;
+}
+
+// (table_rows: the tables' lines that apply to this module, of table_lines; fingerprint: the module's)
+Result<nx::vector<recomp::Options::Replacement>> replacements_of(const analysis::Program& program, const FlagArgs& args, usize& table_rows,
+                                                                 usize& table_lines, nx::string& fingerprint) {
+    nx::vector<recomp::Options::Replacement> out;
+    for (const auto& spec : args.replace) {
+        const usize eq = spec.find('=');
+        if (eq == nx::string::npos) return failure(nx::format("--replace '{}': <address or nid:NID>=<host function>[/<guard>]", spec));
+        auto r = replacement_of(program, nx::string_view(spec).substr(0, eq), nx::string_view(spec).substr(eq + 1));
+        if (!r) return failure(nx::format("--replace {}", r.error().message));
+        out.push_back(std::move(*r));
+    }
+    fingerprint.clear();
+    for (u8 b : program.image->fingerprint()) fingerprint += nx::format("{:02x}", b);
+    for (const auto& path : args.replace_tables) {
+        const auto text = io::read_text_file(nx::fs::path_view(path));
+        if (!text) return nx::err(text.error());
+        usize line_number = 0;
+        nx::string_view rest(*text);
+        while (!rest.empty()) {
+            const usize end = rest.find('\n');
+            const nx::string_view raw = rest.substr(0, end);
+            rest = end == nx::string_view::npos ? nx::string_view() : rest.substr(end + 1);
+            ++line_number;
+            const nx::string_view line = raw.substr(0, raw.find('#'));
+            nx::vector<nx::string_view> fields;
+            for (usize i = 0; i < line.size();) {
+                while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r')) ++i;
+                const usize start = i;
+                while (i < line.size() && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') ++i;
+                if (i > start) fields.push_back(line.substr(start, i - start));
+            }
+            if (fields.empty()) continue;
+            ++table_lines;
+            if (fields.size() != 3 && fields.size() != 4)
+                return failure(nx::format("{}:{}: <fingerprint or *> <target> <host function> [<guard>]", path, line_number));
+            nx::string key(fields[0]);
+            std::transform(key.begin(), key.end(), key.begin(), [](char c) { return static_cast<char>(c >= 'A' && c <= 'F' ? c - 'A' + 'a' : c); });
+            if (key != "*" && key.size() != 64) return failure(nx::format("{}:{}: bad fingerprint '{}'", path, line_number, fields[0]));
+            if (key != "*" && key != fingerprint) continue;
+            const nx::string callee = fields.size() == 4 ? nx::format("{}/{}", fields[2], fields[3]) : nx::string(fields[2]);
+            auto r = replacement_callee(callee);
+            if (!r) return failure(nx::format("{}:{}: {}", path, line_number, r.error().message));
+            const auto code = replacement_target(program, fields[1]);
+            if (!code) {
+                if (key == "*") continue;  // (a line for any module: this one does not have the function)
+                return failure(nx::format("{}:{}: {}", path, line_number, code.error().message));
+            }
+            r->code = *code;
+            ++table_rows;
+            out.push_back(std::move(*r));
+        }
+    }
+    // (one replacement per function: a second one, --replace over a table's, is an error rather than a silent choice)
+    for (usize i = 0; i < out.size(); ++i)
+        for (usize j = i + 1; j < out.size(); ++j)
+            if (out[i].code == out[j].code)
+                return failure(nx::format("the function at 0x{:08x} is replaced twice ({}, {})", out[i].code, out[i].symbol, out[j].symbol));
+    return out;
 }
 
 Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const nx::string& name, const nx::vector<u32>& bases,
@@ -203,6 +339,13 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
         const auto listed = parse_entries(flag_args.no_inline);
         if (!listed) return nx::err(listed.error());
         gen.no_internal = *listed;
+    }
+    usize table_rows = 0, table_lines = 0;
+    nx::string fingerprint;
+    {
+        auto reps = replacements_of(program, flag_args, table_rows, table_lines, fingerprint);
+        if (!reps) return nx::err(reps.error());
+        gen.replacements = std::move(*reps);
     }
     if (flag_args.keep_registers == "all") gen.keep_registers = analysis::KeepPolicy::All;
     else if (flag_args.keep_registers == "loops") gen.keep_registers = analysis::KeepPolicy::Loops;
@@ -301,6 +444,14 @@ Result<void> cmd_generate(nx::string_view path, nx::string_view out_dir, const n
               st.neon_values, st.neon_context, gen.neon_in_context ? " (--neon-in-context)" : "", st.vfp_q_held,
               gen.no_q_locals ? " (--no-q-locals)" : "");
     }
+    if (!gen.replacements.empty() || !st.replacement_notes.empty() || !flag_args.replace_tables.empty()) {
+        print("replaced    {} functions by host implementations ({} with a guard; {} table lines resolved, before the notes' refusals): {} calls, {} tail "
+              "branches and table cases; {} calls followed by reads of a register or flag the callee may change\n",
+              st.replaced, st.replaced_guarded, table_rows, st.replaced_calls, st.replaced_tails, st.replaced_relying);
+        if (!flag_args.replace_tables.empty())
+            print("              {} of {} table lines apply to this module (fingerprint {})\n", table_rows, table_lines, fingerprint);
+        for (const auto& note : st.replacement_notes) print("              {}\n", note);
+    }
     print("discovery   {} errors (psvrecomp analyze --diagnostics lists them)\n", errors);
     usize traps = 0;
     for (const auto& [what, n] : st.traps) traps += n;
@@ -367,6 +518,14 @@ int main(int argc, char** argv) {
         .option_many("no-inline", flag_args.no_inline,
                      "a function (code address) given no internal entry and never inlined: every direct call to it goes "
                      "through f_<address>, which a game may stand in for; repeatable", {.value_name = "ADDRESS"})
+        .option_many("replace", flag_args.replace,
+                     "a function replaced by a host implementation: <address or nid:NID>=<host function>[/<guard>]; every "
+                     "call, tail branch and table entry of it calls void <host function>(PsvContext*, uint32_t ret) (with a "
+                     "guard, int <guard>(const PsvContext*), only when it holds, else the guest code); repeatable",
+                     {.value_name = "TARGET=FUNCTION"})
+        .option_many("replace-table", flag_args.replace_tables,
+                     "a file of replacements by module fingerprint: lines '<fingerprint or *> <address or nid:NID> <host "
+                     "function> [<guard>]'; only this module's lines apply; repeatable", {.value_name = "FILE"})
         .option("inline-limit", flag_args.inline_limit,
                 "inline the internal entries of at most N instructions without a jump table into their callers (a static "
                 "copy in each .c file that calls them); 0: none (default 8)", {.value_name = "N"})

@@ -83,7 +83,19 @@ struct RegisterOptions {
     // Functions given no internal entry (code addresses): every direct call to them goes through f_<address>, the
     // symbol a game may stand in for (psvrecomp --no-inline).
     const nx::vector<u32>* no_internal = nullptr;
+    // Functions a host implementation stands in for (recomp::Options::replacements), by code address; true where the
+    // guest's code may run instead (a guarded replacement). A direct call or tail call of one is taken to have the
+    // AAPCS's contract (kHostWrites, kHostPreserved; a guarded one's code's too, what it may write and does not
+    // preserve), not its code's: its callers write every dirty register to the context first (EntryKind::Flushed, no
+    // results by value), keep r4-r11 and sp, and are not taken to reach outside the generated code's view for it. Give
+    // them no internal entry too (no_internal): their own code is a function entered with every register in the context.
+    const nx::map<u32, bool>* hosts = nullptr;
 };
+
+// The AAPCS's contract of a host implementation (RegisterOptions::hosts): it may write r0-r3, r12 and lr; it preserves
+// r4-r11 and sp. (The runtime's write only r0.)
+inline constexpr RegSet kHostWrites = 0x100F | kLrRegister;
+inline constexpr RegSet kHostPreserved = kPreservable;
 
 // The registers an internal entry takes as C arguments when it reads them at entry; the others (r4-r12) it reads
 // from the context, where its callers put them.

@@ -57,9 +57,12 @@ add_executable(psvrecore_tests
     usse_interp_tests.cpp
     gxm_texture_tests.cpp
     gxm_translate_tests.cpp
+    replace_tests.cpp
 )
-target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}")
-target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::analysis psvrecore::recomp_support psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code psvrecore_fuzz_simd_code
+target_include_directories(psvrecore_tests PRIVATE "${_nxtest_dir}" codegen)
+# (replace_tests checks recomp::kRuntimeHostFunctions against guest.h's declarations)
+target_compile_definitions(psvrecore_tests PRIVATE PSVRECORE_GUEST_H="${CMAKE_CURRENT_SOURCE_DIR}/../libs/recomp/include/psvrecore/recomp/guest.h")
+target_link_libraries(psvrecore_tests PRIVATE psvrecore::formats psvrecore::arm psvrecore::analysis psvrecore::recomp psvrecore::recomp_support psvrecore::usse psvrecore::usse_interp psvrecore::gxm psvrecore::interp psvrecore_fuzz_code psvrecore_fuzz_simd_code
                                               nx::foundation zlib-ng::zlibstatic)
 psvrecore_target_defaults(psvrecore_tests)
 
@@ -137,6 +140,33 @@ foreach(_config "" _masked _locals)
 endforeach()
 target_compile_definitions(psvrecore_codegen_masked_tests PRIVATE CODEGEN_TEST_MASK=0x7FFFF)
 target_compile_definitions(psvrecore_codegen_locals_tests PRIVATE CODEGEN_TEST_NO_CALLEE_SAVED)
+
+# Host implementations of guest functions (psvrecomp --replace; libs/recomp/src/host_functions.cpp): the psv_host_*
+# functions against reference models on random buffers, and codegen/replace_module.hpp's synthetic module translated
+# with two of its functions replaced (replacegen), its callers run against the interpreter. PSVRECORE_TEST_LIBC=<a
+# libc.suprx or its ELF> at run time: the psv_host_* functions against that module's own exports in the interpreter
+# too (local only: no Sony code in the repository).
+add_executable(replacegen codegen/replacegen.cpp)
+target_include_directories(replacegen PRIVATE codegen)
+target_link_libraries(replacegen PRIVATE psvrecore::recomp)
+psvrecore_target_defaults(replacegen)
+set(_replace_dir "${CMAKE_CURRENT_BINARY_DIR}/replace/rep_mod")
+add_custom_command(
+    OUTPUT "${_replace_dir}/rep_mod_code_0.c" "${_replace_dir}/rep_mod_module.c"
+    COMMAND replacegen "${CMAKE_CURRENT_BINARY_DIR}/replace"
+    DEPENDS replacegen "${CMAKE_CURRENT_SOURCE_DIR}/codegen/replace_module.hpp"
+    COMMENT "Translating the synthetic module with host implementations"
+    VERBATIM)
+add_library(psvrecore_replace_code STATIC "${_replace_dir}/rep_mod_code_0.c" "${_replace_dir}/rep_mod_module.c")
+target_include_directories(psvrecore_replace_code PUBLIC "${_replace_dir}")
+target_link_libraries(psvrecore_replace_code PUBLIC psvrecore::recomp_support)
+psvrecore_generated_code(psvrecore_replace_code)
+add_executable(psvrecore_host_functions_tests "${_nxtest_dir}/nxtest.cpp" codegen/host_functions_tests.cpp)
+target_include_directories(psvrecore_host_functions_tests PRIVATE "${_nxtest_dir}" codegen)
+target_link_libraries(psvrecore_host_functions_tests PRIVATE psvrecore::interp psvrecore::analysis psvrecore_replace_code nx::foundation)
+psvrecore_target_defaults(psvrecore_host_functions_tests)
+add_test(NAME psvrecore_host_functions_tests COMMAND psvrecore_host_functions_tests)
+set_tests_properties(psvrecore_host_functions_tests PROPERTIES SKIP_RETURN_CODE 77)
 
 # Same-source probes, built only by scripts/probe_check.py (they need the SDK and recompiled SDK code: local only).
 set(PSVRECORE_PROBES_DIR "" CACHE PATH "folder of SDK-built probes and their recompiled code (scripts/probe_check.py)")

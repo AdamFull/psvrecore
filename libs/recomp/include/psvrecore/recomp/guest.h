@@ -119,6 +119,34 @@ typedef struct PsvImport {
 
 PSVRECORE_API void psv_import_missing(PsvContext* ctx, const PsvImport* import, uint32_t ret);
 
+/* Host implementations of guest functions (psvrecomp --replace; ARCHITECTURE.md, "Host implementations of guest
+ * functions"): called where the module's code calls the function, as its f_<address> would be. Each does what the
+ * guest function does to memory and leaves what the AAPCS says a callee leaves: r0 the result, r4-r11, sp and every
+ * other register as they were (none of r1-r3, r12, lr or the flags written: the caller may not rely on them), and
+ * returns to the caller (ret). The results are those of the SceLibc build they were checked against (data/
+ * host_functions.tsv, by module fingerprint): memcmp and strcmp return -1, 0 or 1, comparing unsigned bytes; wchar_t is
+ * 16 bits. A guard (int guard(const PsvContext*)) says for which arguments a host function is exact; for the others the
+ * generated code runs the guest's own code. The psv_host_ prefix is guest.h's: the generator declares no such symbol. */
+PSVRECORE_API void psv_host_memcpy(PsvContext* ctx, uint32_t ret);  /* guard: psv_host_memcpy_exact */
+PSVRECORE_API void psv_host_memmove(PsvContext* ctx, uint32_t ret);
+PSVRECORE_API void psv_host_memset(PsvContext* ctx, uint32_t ret);
+PSVRECORE_API void psv_host_memcmp(PsvContext* ctx, uint32_t ret);
+PSVRECORE_API void psv_host_strlen(PsvContext* ctx, uint32_t ret);
+PSVRECORE_API void psv_host_strcmp(PsvContext* ctx, uint32_t ret);
+PSVRECORE_API void psv_host_strncpy(PsvContext* ctx, uint32_t ret);
+PSVRECORE_API void psv_host_wcslen(PsvContext* ctx, uint32_t ret);
+/* libstdc++'s int _Atomic_fetch_add_4(volatile int*, int, memory_order) and _sub_4: one host atomic read-modify-write
+ * (sequentially consistent, at least what every order asks), the old value returned; the exclusive monitor left open
+ * as the guest's strex leaves it. Guard: psv_host_atomic_order_valid (orders above 5 reach the guest's assertion). */
+PSVRECORE_API void psv_host_atomic_fetch_add_4(PsvContext* ctx, uint32_t ret);
+PSVRECORE_API void psv_host_atomic_fetch_sub_4(PsvContext* ctx, uint32_t ret);
+/* memcpy(r0, r1, r2) for which psv_host_memcpy (memmove's result) is what the guest's gives: no bytes to copy, buffers
+ * that do not overlap, or a destination at or below an overlapping source, for a guest memcpy that copies forward and
+ * loads each source byte before any store reaches it (and never loads it again after one may have): the checked build's
+ * does. A destination above an overlapping source gets what the guest's algorithm leaves, its own code. */
+PSVRECORE_API int psv_host_memcpy_exact(const PsvContext* ctx);
+PSVRECORE_API int psv_host_atomic_order_valid(const PsvContext* ctx);
+
 PSV_INLINE void psv_call_import(PsvContext* PSV_RESTRICT ctx, const PsvImport* import, uint32_t ret) {
     if (__builtin_expect(import->function == 0, 0)) {
         psv_import_missing(ctx, import, ret);

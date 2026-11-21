@@ -13,6 +13,7 @@ using namespace detail;
 
 nx::string function_name(u32 code) { return nx::format("f_{:08X}", code & ~1u); }
 nx::string internal_function_name(u32 code) { return nx::format("fi_{:08X}", code & ~1u); }
+nx::string guest_code_name(u32 code) { return nx::format("fo_{:08X}", code & ~1u); }
 
 namespace detail {
 
@@ -49,6 +50,45 @@ nx::string comment_text(nx::string_view text) {
 }
 
 constexpr std::pair<FlagSet, char> kFlagNames[] = {{analysis::kFlagN, 'n'}, {analysis::kFlagZ, 'z'}, {analysis::kFlagC, 'c'}, {analysis::kFlagV, 'v'}};
+
+// What the function's own code reads, after the call at instruction `index`, of r1-r3, r12, lr and the flags before
+// writing them: what it would take from a callee that the AAPCS lets leave them changed (a replaced function's guest
+// code; Options::replacements). The paths from the call's return through the function's instructions, each ending at
+// the next call (whose callee may change them), return, jump or trap: what is live there is the AAPCS's business of
+// that code, not a read of this function (the register and flag liveness count it, the context being every function's
+// at its exits, so they cannot tell this).
+void reads_after_call(const analysis::Function& fn, const analysis::Cfg& cfg, u32 index, RegSet& regs, FlagSet& flags) {
+    constexpr RegSet kScratch = static_cast<RegSet>((1u << 1) | (1u << 2) | (1u << 3) | (1u << 12) | (1u << 14));
+    regs = 0;
+    flags = 0;
+    nx::vector<RegSet> seen_regs(fn.code.size(), 0);
+    nx::vector<FlagSet> seen_flags(fn.code.size(), 0);
+    nx::vector<std::tuple<u32, RegSet, FlagSet>> work;
+    const auto go = [&](const analysis::Edge& e, RegSet r, FlagSet f) {
+        if (e.kind != analysis::EdgeKind::Next || e.to >= fn.code.size()) return;
+        const RegSet nr = static_cast<RegSet>(r & ~seen_regs[e.to]);
+        const FlagSet nf = static_cast<FlagSet>(f & ~seen_flags[e.to]);
+        if (!nr && !nf) return;
+        seen_regs[e.to] |= nr;
+        seen_flags[e.to] |= nf;
+        work.emplace_back(e.to, nr, nf);
+    };
+    const analysis::CfgNode& at = cfg.nodes[index];
+    for (const analysis::Edge* e = cfg.begin(at); e != cfg.end(at); ++e) go(*e, kScratch, analysis::kAllFlags);
+    while (!work.empty()) {
+        const auto [i, r, f] = work.back();
+        work.pop_back();
+        const analysis::CfgNode& n = cfg.nodes[i];
+        const analysis::RegisterEffect re = analysis::register_effect(fn.code[i]);
+        const analysis::FlagEffect fe = analysis::flag_effect(fn.code[i]);
+        regs |= static_cast<RegSet>(re.uses & r);
+        flags |= static_cast<FlagSet>(fe.uses & f);
+        if (n.conditional) go(n.skip, r, f);
+        if (n.call != analysis::CallKind::None) continue;
+        for (const analysis::Edge* e = cfg.begin(n); e != cfg.end(n); ++e)
+            go(*e, static_cast<RegSet>(r & ~re.defs), static_cast<FlagSet>(f & ~fe.kills));
+    }
+}
 
 }  // namespace
 
@@ -605,7 +645,10 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
                 store += (store.empty() ? "" : " ") + vfp_line(vfp_->exit_store[index_], true);
                 ++stats_.vfp_stores;
             }
-            line(nx::format("case {}u: {}{}{}(ctx, ret); return;", i, store, store.empty() ? "" : " ", function_name(target_code)));
+            // (a replaced function's case: its host implementation)
+            const nx::string* host = replacement(target_code);
+            if (host) ++stats_.replaced_tails;
+            line(nx::format("case {}u: {}{}{}(ctx, ret); return;", i, store, store.empty() ? "" : " ", host ? *host : function_name(target_code)));
         } else {
             line(nx::format("case {}u: goto {};", i, label_name(target_code)));
         }
@@ -660,12 +703,14 @@ void Emitter::branch_to(const Instruction& in, u32 target_code, bool after) {
         line("return;");
         return;
     }
+    // (a branch to the function's own entry is a loop, in a replaced function's code, fo_<address>, too)
     if (target_code != fn_.entry && program_.function_at(target_code)) {
-        ++stats_.tail_calls;
+        const nx::string* host = replacement(target_code);
+        ++(host ? stats_.replaced_tails : stats_.tail_calls);
         store_flags(flags_.into(target_code, flags_fn_->live_out));
         store_registers(exit);
         store_vfp(vexit, stats_.vfp_stores);
-        line(nx::format("{}(ctx, ret);", function_name(target_code)));
+        line(nx::format("{}(ctx, ret);", host ? *host : function_name(target_code)));
         line("return;");
         return;
     }
@@ -680,6 +725,27 @@ void Emitter::call(const Instruction& in, u32 target_code) {
     if (auto stub = program_.import_stubs.find(target_code & ~1u); stub != program_.import_stubs.end()) {
         ++stats_.import_calls;
         line(nx::format("psv_call_import(ctx, &{}_imports[{}], {});", prefix_, stub->second, hex(next)));
+    } else if (const nx::string* host = program_.function_at(target_code) ? replacement(target_code) : nullptr) {
+        // A replaced function (Options::replacements): its host implementation (a guarded one's f_<address>)
+        // directly. The register analysis took the call to have the AAPCS's contract (analysis::RegisterOptions::
+        // hosts): every dirty register is in the context before it (EntryKind::Flushed), r4-r11 and sp are kept in
+        // the locals, what else is live after it is read back. The flags and the floating-point registers are as at a
+        // call of the function's code (which reads no flags at entry: generate). What the host function changes is
+        // the AAPCS's: r0 (the result) and memory; a caller that reads r1-r3, r12, lr or a flag after the call before
+        // writing it relies on what the guest's code leaves there (no compiler's call of a C function does): counted
+        // and listed.
+        ++stats_.replaced_calls;
+        line(nx::format("{}(ctx, {});", *host, hex(next)));
+        RegSet relied = 0;
+        FlagSet relied_flags = 0;
+        reads_after_call(fn_, cfg_, static_cast<u32>(index_), relied, relied_flags);
+        if (relied || relied_flags) {
+            ++stats_.replaced_relying;
+            if (stats_.replacement_notes.size() < 40)
+                stats_.replacement_notes.push_back(nx::format("0x{:08x}: the call of {} is followed by reads of {}{}{}", in.address, *host,
+                                                              relied ? analysis::register_names(relied) : nx::string(), relied && relied_flags ? " and " : "",
+                                                              relied_flags ? nx::format("flags {}", analysis::flag_names(relied_flags)) : nx::string()));
+        }
     } else if (program_.function_at(target_code)) {
         const analysis::EntryKind ck = all_ && all_->internal_calls && regs_ && !regs_->call_entry.empty()
                                            ? static_cast<analysis::EntryKind>(regs_->call_entry[index_])
@@ -824,7 +890,7 @@ nx::string Emitter::function() {
     const auto& code = fn_.code;
     if (code.empty()) {  // (a function with no code: synthetic programs' placeholders)
         ++stats_.functions;
-        return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{ (void)ctx; (void)ret; }}\n", function_name(fn_.entry));
+        return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{ (void)ctx; (void)ret; }}\n", name_.empty() ? function_name(fn_.entry) : name_);
     }
     // Labels: branch targets, and the places control continues at that are not right after the instruction before.
     for (u32 l : fn_.labels) labels_.insert(l);
@@ -977,7 +1043,7 @@ nx::string Emitter::function() {
     if (sp_trap_) out += nx::format("L_SP_MOVED:;\n    psv_trap(ctx, {}, PSV_TRAP_STACK_POINTER);\n", hex(fn_.start()));
     const nx::string locals = nx::format("{}    PsvFlags fl = {{{}}};\n{}{}", memory ? "    uint8_t* const mb = psv_membase;\n" : "", flags, registers, vfp);
     if (!internal_body())
-        return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n", function_name(fn_.entry)) + locals + out + "}\n";
+        return nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n", name_.empty() ? function_name(fn_.entry) : name_) + locals + out + "}\n";
     // An internal entry (analysis::EntryKind), then f_<address> around it: from the context's registers, its results
     // back into it, and a jump through the runtime to the LR it was entered with when that is not ret (what the
     // function's own returns did before). Every way through the code ends in a return or a trap; one more trap at the end
@@ -992,7 +1058,7 @@ nx::string Emitter::function() {
     // (the definition's text differs from that of a function without an internal entry, so that a game's script that
     // renames that definition to stand in for the function finds nothing: direct calls reach the internal entry, so such
     // a function must be given none, psvrecomp --no-inline)
-    w += nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret)\n{{\n    const uint32_t lr = ctx->r[14];\n", function_name(fn_.entry));
+    w += nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret)\n{{\n    const uint32_t lr = ctx->r[14];\n", name_.empty() ? function_name(fn_.entry) : name_);
     const nx::string c = internal_call(fn_.entry, *regs_, "ctx->r[", "]");
     if (regs_->results == 3) w += nx::format("    const uint64_t rv = {};\n    ctx->r[0] = (uint32_t)rv; ctx->r[1] = (uint32_t)(rv >> 32);\n", c);
     else if (regs_->results == 1) w += nx::format("    ctx->r[0] = {};\n", c);
@@ -1055,14 +1121,65 @@ nx::string module_source(const analysis::Program& program, const Options& option
 
 }  // namespace
 
-Output generate(const analysis::Program& program, const Options& options) {
+Output generate(const analysis::Program& original, const Options& options) {
     Output result;
     const nx::string& p = options.name;
+    Stats& st = result.stats;
+    const analysis::Program& program = original;
+    analysis::FlagOptions flag_options;
+    flag_options.everywhere = options.flags_everywhere;
+    flag_options.given_at_entry = options.flags_given_at_entry;
+    flag_options.given_at_return = options.flags_given_at_return;
+    flag_options.full_exit = options.full_exit_flags;
+    analysis::FlagLiveness flags = analysis::flag_liveness(program, flag_options);
+    // Host implementations (Options::replacements): a replaced function keeps its place among the functions (f_<address>
+    // stays in the function table), and its address its calls and branches; the register analysis takes a call or tail
+    // call of it to have the AAPCS's contract (analysis::RegisterOptions::hosts) and the Emitter calls the host function
+    // there. It gets no internal entry (so it is never inlined): a guarded one's code, fo_<address>, is a function
+    // entered with every register in the context. A function whose code reads flags at entry (analysis::FunctionFlags::
+    // need) is not a C function: not replaced.
+    nx::flat_hash_map<u32, nx::string> host_callees;  // code address (bit 0 clear) -> the C function called
+    nx::map<u32, const Options::Replacement*> replaced;  // by code address
+    nx::map<u32, bool> hosts;                            // (analysis::RegisterOptions::hosts)
+    nx::vector<u32> no_internal = options.no_internal;
+    for (const auto& r : options.replacements) {
+        const analysis::Function* fn = original.function_at(r.code);
+        if (!fn || fn->entry != r.code) {
+            st.replacement_notes.push_back(nx::format("0x{:08x} ({}): no function starts there; not replaced", r.code, r.symbol));
+            continue;
+        }
+        if (original.import_stubs.contains(r.code & ~1u) || replaced.contains(r.code)) {
+            st.replacement_notes.push_back(nx::format("0x{:08x} ({}): already replaced, or an import's stub; not replaced", r.code, r.symbol));
+            continue;
+        }
+        if (const auto* ff = flags.at(r.code); ff && ff->need) {
+            st.replacement_notes.push_back(nx::format("0x{:08x} ({}): its code reads flags {} at entry; not replaced", r.code, r.symbol,
+                                                      analysis::flag_names(ff->need)));
+            continue;
+        }
+        replaced.emplace(r.code, &r);
+        hosts[r.code] = !r.guard.empty();
+        host_callees[r.code & ~1u] = r.guard.empty() ? r.symbol : function_name(r.code);
+        no_internal.push_back(r.code & ~1u);
+        ++st.replaced;
+        st.replaced_guarded += !r.guard.empty();
+    }
     nx::string header = nx::format(
         "/* Generated by psvrecomp: module {}. */\n#pragma once\n#include \"psvrecore/recomp/guest.h\"\n\n"
         "extern PsvImport {}_imports[];\nextern PsvVariable {}_variables[];\nextern const PsvModuleCode {}_module;\n{}\n",
         program.image->module().info.name, p, p, p, options.call_table ? nx::format("extern PsvDispatch {0}_dispatch;\nvoid {0}_call(PsvContext* PSV_RESTRICT ctx, uint32_t target, uint32_t ret);\n", p) : nx::string());
     for (const auto& [code, fn] : program.functions) header += nx::format("void {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret);\n", function_name(code));
+    // (the host functions and guards; guest.h declares the runtime's, psv_host_*, with their DLL linkage)
+    {
+        nx::flat_hash_set<nx::string> declared;
+        for (const auto& [code, r] : replaced) {
+            if (!r->guard.empty()) header += nx::format("void {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret);\n", guest_code_name(code));
+            if (!r->symbol.starts_with("psv_host_") && declared.insert(r->symbol).second)
+                header += nx::format("void {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret);\n", r->symbol);
+            if (!r->guard.empty() && !r->guard.starts_with("psv_host_") && declared.insert(r->guard).second)
+                header += nx::format("int {}(const PsvContext* ctx);\n", r->guard);
+        }
+    }
     result.files.push_back(GeneratedFile{p + "_functions.h", nx::string()});
 
     // The .c files: each function's definition (a small internal entry's wrapper alone), and the functions inlined
@@ -1081,12 +1198,6 @@ Output generate(const analysis::Program& program, const Options& options) {
         chunk = Chunk{};
         chunk_instructions = 0;
     };
-    analysis::FlagOptions flag_options;
-    flag_options.everywhere = options.flags_everywhere;
-    flag_options.given_at_entry = options.flags_given_at_entry;
-    flag_options.given_at_return = options.flags_given_at_return;
-    flag_options.full_exit = options.full_exit_flags;
-    analysis::FlagLiveness flags = analysis::flag_liveness(program, flag_options);
     // The registers (analysis/registers.hpp): a first translation records what each instruction's translation reads
     // and writes (checked against analysis::register_effect), the analysis runs on that, then the translation.
     // The floating-point registers likewise (analysis/vfp.hpp): what the first translation reads and writes of them,
@@ -1098,12 +1209,12 @@ Output generate(const analysis::Program& program, const Options& options) {
     analysis::RegisterAnalysis registers;
     analysis::VfpAnalysis vfp;
     nx::map<u32, nx::vector<analysis::VfpEffect>> vfp_effects;
-    Stats& st = result.stats;
     if (vfp_locals && !locals) {
         Stats scratch;
         for (const auto& [code, fn] : program.functions) {
             Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe, nullptr, VfpMode::Probe);
             e.set_neon_locals(!options.neon_in_context);
+            e.set_replacements(&host_callees);
             (void)e.function();
             vfp_effects[code] = e.vfp_effects();
         }
@@ -1114,6 +1225,7 @@ Output generate(const analysis::Program& program, const Options& options) {
         for (const auto& [code, fn] : program.functions) {
             Emitter e(program, fn, flags, p, scratch, RegisterMode::Probe, nullptr, vfp_locals ? VfpMode::Probe : VfpMode::Context);
             e.set_neon_locals(!options.neon_in_context);
+            e.set_replacements(&host_callees);
             (void)e.function();
             if (vfp_locals) vfp_effects[code] = e.vfp_effects();
             const auto& got = e.effects();
@@ -1139,7 +1251,8 @@ Output generate(const analysis::Program& program, const Options& options) {
         register_options.check_sp = options.check_sp;
         register_options.effects = &effects;
         register_options.internal_calls = options.internal_calls;
-        register_options.no_internal = &options.no_internal;
+        register_options.no_internal = &no_internal;
+        register_options.hosts = &hosts;
         registers = analysis::register_analysis(program, register_options);
         for (const auto& [code, r] : registers.functions) {
             const auto* fn = program.function_at(code);
@@ -1181,9 +1294,36 @@ Output generate(const analysis::Program& program, const Options& options) {
                   vfp_locals ? VfpMode::Locals : VfpMode::Context, vfp.at(code));
         e.set_neon_locals(!options.neon_in_context);
         e.set_call_table(options.call_table, options.call_table_inline);
+        e.set_replacements(&host_callees);
         if (locals) e.set_register_analysis(&registers);
         const bool small = inlined.contains(code);
         e.set_inline(small);
+        if (const auto rep = replaced.find(code); rep != replaced.end()) {
+            // A replaced function's f_<address>: the host function; with a guard, the guest code's translation
+            // (fo_<address>, a function without an internal entry: Options::replacements) where the guard does not hold.
+            // fo_<address> reads at entry what any function entered from outside may (the contract's flags given at
+            // entry, every register from the context) and leaves what it changes in the context, as every f_<address>
+            // does; its callers here are only this wrapper.
+            const Options::Replacement& r = *rep->second;
+            nx::string text;
+            if (r.guard.empty()) {
+                text = nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{ {}(ctx, ret); }}  /* host implementation (psvrecomp --replace) */\n",
+                                  function_name(code), r.symbol);
+            } else {
+                e.set_name(guest_code_name(code));
+                text = e.function();
+                for (u32 c : e.internal_callees())  // (fo_<address>'s calls of inlined functions: their copies in this file)
+                    if (inlined.contains(c)) chunk.uses.insert(c), ++st.calls_inlined;
+                text += nx::format("\nvoid {}(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {{\n"
+                                   "    if ({}(ctx)) {{ {}(ctx, ret); return; }}  /* host implementation (psvrecomp --replace) */\n"
+                                   "    {}(ctx, ret);\n}}\n",
+                                   function_name(code), r.guard, r.symbol, guest_code_name(code));
+            }
+            chunk.text += text;
+            chunk_instructions += static_cast<u32>(fn.code.size());
+            if (chunk_instructions >= options.instructions_per_file) flush();
+            continue;
+        }
         nx::string text = e.function();
         for (u32 c : e.internal_callees())
             if (inlined.contains(c)) chunk.uses.insert(c), ++st.calls_inlined;
@@ -1219,7 +1359,7 @@ Output generate(const analysis::Program& program, const Options& options) {
         result.files.push_back(GeneratedFile{nx::format("{}_code_{}.c", p, k), nx::format("/* Generated by psvrecomp. */\n#include \"{}_functions.h\"\n", p) +
                                                                                  front + chunks[k].text});
     }
-    result.files.push_back(GeneratedFile{p + "_module.c", module_source(program, options, flags)});
+    result.files.push_back(GeneratedFile{p + "_module.c", module_source(original, options, flags)});
     // (the summaries only: the per-instruction sets are the generator's business)
     for (auto& [code, f] : flags.functions) {
         nx::vector<FlagSet>().swap(f.after);

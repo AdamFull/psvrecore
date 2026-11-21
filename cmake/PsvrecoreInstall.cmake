@@ -233,6 +233,8 @@ function(psvrecore_write_package)
     # Host tools.
     if(PSVRECORE_BUILD_TOOLS)
         install(TARGETS psvinfo psvdis psvrecomp psvusse psvrender RUNTIME DESTINATION bin COMPONENT psvrecore)
+        # (psvrecomp generate --replace-table <package>/share/psvrecore/host_functions.tsv)
+        install(FILES "${PSVRECORE_DIR}/tools/psvrecomp/host_functions.tsv" DESTINATION share/psvrecore COMPONENT psvrecore)
     endif()
 
     # The functions a game calls.

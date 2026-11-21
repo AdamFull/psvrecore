@@ -15,6 +15,7 @@ target_link_libraries(psvrecore_recomp PUBLIC psvrecore::analysis)
 psvrecore_target_defaults(psvrecore_recomp)
 
 add_library(psvrecore_recomp_support STATIC
+    src/host_functions.cpp
     src/support.cpp
 )
 add_library(psvrecore::recomp_support ALIAS psvrecore_recomp_support)
