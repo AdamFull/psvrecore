@@ -52,6 +52,12 @@ public:
     // Runs module_start(args, argp) on a new thread of default priority and the main stack size, and waits for it.
     // Returns module_start's result (or an error).
     i32 start(i32 uid, u32 args, u32 argp);
+    // Runs module_stop(args, argp) as start runs module_start (a started module's; 0 for one without it). Returns
+    // module_stop's result (or an error).
+    i32 stop(i32 uid, u32 args, u32 argp);
+    // Takes a module out: its memory unmapped (where it was stays reserved for its code), every other module's imports
+    // linked again. False if no module has the UID.
+    bool unload(i32 uid);
 
     struct BootOptions {
         nx::string main = "app0:eboot.bin";

@@ -268,12 +268,12 @@ TEST_CASE("clib: heaps grow and shrink blocks, zero them, report their use; text
     psv_st32(count, 9);
     CHECK(call32(ctx, kSceLibKernel, 0xD16C03B0 /*sceKernelBacktraceSelf*/, {scratch(64), 64, count, 0}) == 0);
     CHECK(psv_ld32(count) == 0);
-    // Modules: one that is not there is not found; stopping and unloading are not supported.
+    // Modules: one that is not there is not found (to load, start, stop or unload).
     CHECK(u(call32(ctx, kSceLibKernel, 0xBBE82155 /*sceKernelLoadModule*/, {guest_string("app0:none.suprx"), 0, 0})) ==
           0x8002D01Cu);
     CHECK(call32(ctx, kSceLibKernel, 0x702425D5 /*sceKernelStartModule*/, {0x1234, 0, 0, 0, 0, 0}) < 0);
-    CHECK(call32(ctx, kSceLibKernel, 0x3B2CBA09 /*sceKernelStopModule*/, {0x1234, 0, 0, 0, 0, 0}) == err::kUnsupported);
-    CHECK(call32(ctx, kSceLibKernel, 0x1987920E /*sceKernelUnloadModule*/, {0x1234, 0, 0}) == err::kUnsupported);
+    CHECK(u(call32(ctx, kSceLibKernel, 0x3B2CBA09 /*sceKernelStopModule*/, {0x1234, 0, 0, 0, 0, 0})) == 0x8002D01Cu);
+    CHECK(u(call32(ctx, kSceLibKernel, 0x1987920E /*sceKernelUnloadModule*/, {0x1234, 0, 0})) == 0x8002D01Cu);
 }
 
 TEST_CASE("rtc: ticks compared and added, days of the week, C and Win32 times, RFC 2822 and 3339 written and read") {

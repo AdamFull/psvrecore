@@ -1,5 +1,6 @@
 #include "psvrecore/runtime/loader.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 #include "psvrecore/log.hpp"
@@ -213,6 +214,46 @@ i32 Loader::start(i32 uid, u32 args, u32 argp) {
     if (r < 0) return r;
     nx::logi(logs::loader, "{}: module_start returned {}", name, status);
     return status;
+}
+
+i32 Loader::stop(i32 uid, u32 args, u32 argp) {
+    u32 entry = 0;
+    nx::string name;
+    {
+        nx::scoped_lock<nx::mutex> guard(lock_);
+        for (auto& m : modules_)
+            if (m->uid == uid) {
+                entry = m->started ? m->stop : 0;
+                name = m->name;
+                m->started = false;
+            }
+    }
+    if (!entry) return err::kOk;  // (a module without module_stop, or not started)
+    Kernel& kernel = runtime_.kernel();
+    const i32 thread = kernel.create_thread(nx::format("{} module_stop", name), entry, kernel::kDefaultPriority,
+                                            kernel::kMainStackSize, 0, 0);
+    if (thread < 0) return thread;
+    if (const i32 r = kernel.start_thread(thread, args, argp); r < 0) return r;
+    i32 status = 0;
+    const i32 r = kernel.wait_thread_end(thread, &status, kernel::Timeout{}, false);
+    kernel.delete_thread(thread);
+    if (r < 0) return r;
+    nx::logi(logs::loader, "{}: module_stop returned {}", name, status);
+    return status;
+}
+
+bool Loader::unload(i32 uid) {
+    nx::scoped_lock<nx::mutex> guard(lock_);
+    auto it = std::find_if(modules_.begin(), modules_.end(), [&](const auto& m) { return m->uid == uid; });
+    if (it == modules_.end()) return false;
+    nx::unique_ptr<LoadedModule> m = std::move(*it);
+    modules_.erase(it);
+    GuestMemory& memory = runtime_.memory();
+    for (const auto& s : m->image.segments()) memory.unmap(s.base);
+    nx::logi(logs::loader, "unloaded {} ({}), UID 0x{:08x}", m->name, m->path, static_cast<u32>(uid));
+    // (what imported its exports: the system's libraries, or nothing, again)
+    for (auto& other : modules_) link_module(*other);
+    return true;
 }
 
 Result<i32> Loader::boot(const BootOptions& options) {

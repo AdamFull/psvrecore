@@ -64,20 +64,23 @@ i32 sceKernelStartModule(i32 uid, u32 args, u32 argp, u32 /*flags*/, Ptr<const v
     if (result && writable(result.address, 4)) *result = status;
     return status == kStartFailedResult ? kStartFailed : 0;
 }
-// (stopping and unloading: not supported, as for sceKernelStopUnloadModule below)
-i32 sceKernelStopModule(i32 uid, u32, u32, u32, Ptr<const void>, Ptr<i32>) {
-    nx::logw(logs::loader, "sceKernelStopModule(0x{:08x}) not supported", static_cast<u32>(uid));
-    return err::kUnsupported;
+// Stopping (module_stop's result in `result`) and unloading. The memory a module leaves stays reserved for its code
+// (generated for that place), and every module's imports are linked again without it.
+i32 sceKernelStopModule(i32 uid, u32 args, u32 argp, u32 /*flags*/, Ptr<const void> /*opt*/, Ptr<i32> result) {
+    Loader& loader = runtime().loader();
+    if (!loader.find(uid)) return kModuleNotFound;
+    const i32 status = loader.stop(uid, args, argp);
+    if (status < 0) return status;
+    if (result && writable(result.address, 4)) *result = status;
+    return err::kOk;
 }
-i32 sceKernelUnloadModule(i32 uid, u32, Ptr<const void>) {
-    nx::logw(logs::loader, "sceKernelUnloadModule(0x{:08x}) not supported", static_cast<u32>(uid));
-    return err::kUnsupported;
+i32 sceKernelUnloadModule(i32 uid, u32 /*flags*/, Ptr<const void> /*opt*/) {
+    Kernel::Blocking blocking(kernel());
+    return runtime().loader().unload(uid) ? err::kOk : kModuleNotFound;
 }
-
-i32 sceKernelStopUnloadModule(i32 uid, u32, u32, u32, Ptr<const void>, Ptr<i32>) {
-    // Modules stay where their code was generated for: unloading one is not supported.
-    nx::logw(logs::loader, "sceKernelStopUnloadModule(0x{:08x}) not supported", static_cast<u32>(uid));
-    return err::kUnsupported;
+i32 sceKernelStopUnloadModule(i32 uid, u32 args, u32 argp, u32 flags, Ptr<const void> opt, Ptr<i32> result) {
+    if (const i32 r = sceKernelStopModule(uid, args, argp, flags, opt, result); r < 0) return r;
+    return sceKernelUnloadModule(uid, 0, Ptr<const void>{});
 }
 
 i32 sceKernelCallModuleExit() { return err::kOk; }  // (module_exit runs only in the development kits' mode)

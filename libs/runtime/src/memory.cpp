@@ -149,6 +149,8 @@ void GuestMemory::reserve(u32 base, u32 size) {
     nx::scoped_lock<nx::mutex> guard(lock_);
     const u32 begin = base & ~(kPageSize - 1);
     const u32 end = static_cast<u32>(std::min<u64>((u64{base} + size + kPageSize - 1) & ~u64{kPageSize - 1}, 0xFFFFFFFFu));
+    for (const Region& r : reserved_ranges_)
+        if (r.begin == begin && r.end == end) return;  // (modules generated for the same place: once)
     reserved_ranges_.push_back(Region{begin, end});
 }
 
