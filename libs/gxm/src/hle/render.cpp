@@ -77,6 +77,7 @@ enum class Packing : u8 {
     None,
     U2F10F10F10,  // (A in the top 2 bits, then B, G and R as unsigned 10-bit floats from bit 20, 10 and 0) as F16x4
     U8U8U8,       // (three bytes, R first: no 24-bit attachments) as U8x4, A 1
+    U4U4U4U4,     // (a 16-bit word, R in the low four bits, then G, B and A: no device must draw into 4444) as U8x4
 };
 
 struct ColorFormat {
@@ -85,7 +86,10 @@ struct ColorFormat {
     u8 swizzle[4] = {0, 1, 2, 3};  // (FragmentShader::swizzle)
     Packing packing = Packing::None;
     u32 guest_bytes() const {  // per pixel in guest memory
-        return packing == Packing::None ? bytes : packing == Packing::U8U8U8 ? 3 : 4;
+        return packing == Packing::None       ? bytes
+               : packing == Packing::U8U8U8   ? 3
+               : packing == Packing::U4U4U4U4 ? 2
+                                              : 4;
     }
 };
 
@@ -113,6 +117,12 @@ bool color_format(u32 gxm, ColorFormat& out) {
         case 0x10000000u:  // U8U8U8_BGR (LittleBigPlanet)
             out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {0, 1, 2, 3}, Packing::U8U8U8};
             return true;
+        case 0x50000000u:  // U4U4U4U4_ABGR (Killzone Mercenary)
+            out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {0, 1, 2, 3}, Packing::U4U4U4U4};
+            return true;
+        case 0x50100000u:  // U4U4U4U4_ARGB
+            out = {VK_FORMAT_R8G8B8A8_UNORM, 4, {2, 1, 0, 3}, Packing::U4U4U4U4};
+            return true;
         case 0x41000000u:  // U2F10F10F10_ABGR
             out = {VK_FORMAT_R16G16B16A16_SFLOAT, 8, {0, 1, 2, 3}, Packing::U2F10F10F10};
             return true;
@@ -139,6 +149,12 @@ void unpack_pixels(Packing packing, const u8* guest, u8* image, usize count) {
             std::memcpy(image + i * 8, h, 8);
         }
     }
+    if (packing == Packing::U4U4U4U4) {
+        for (usize i = 0; i < count; ++i) {
+            const u32 v = guest[i * 2] | u32{guest[i * 2 + 1]} << 8;
+            for (u32 c = 0; c < 4; ++c) image[i * 4 + c] = static_cast<u8>((v >> (c * 4) & 0xF) * 17);
+        }
+    }
 }
 void pack_pixels(Packing packing, const u8* image, u8* guest, usize count) {
     if (packing == Packing::U8U8U8) {
@@ -155,6 +171,13 @@ void pack_pixels(Packing packing, const u8* image, u8* guest, usize count) {
             std::memcpy(h, image + i * 8, n * 8);
             pack_u2f10f10f10(h, v, n);
             std::memcpy(guest + i * 4, v, n * 4);
+        }
+    }
+    if (packing == Packing::U4U4U4U4) {
+        for (usize i = 0; i < count; ++i) {
+            u32 v = 0;
+            for (u32 c = 0; c < 4; ++c) v |= (u32{image[i * 4 + c]} * 15 + 127) / 255 << (c * 4);
+            guest[i * 2] = static_cast<u8>(v), guest[i * 2 + 1] = static_cast<u8>(v >> 8);
         }
     }
 }
