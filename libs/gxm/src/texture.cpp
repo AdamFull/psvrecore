@@ -195,8 +195,35 @@ bool components(u32 code, u32 mode, u64 texel, f32 c[4], u32& count, bool& wide)
     }
 }
 
-// The BC1-BC3 blocks: 4x4 texels as RGBA floats.
-void decode_bc(u32 code, const u8* block, f32 out[16][4]) {
+// A BC4 block (BC5's two): 4x4 values from two 8-bit endpoints and 3-bit indices, as BC3's alpha; signed ones
+// (SBC4, SBC5) from two's-complement endpoints, -128 read as -127, to [-1, 1].
+void decode_bc4(const u8* block, bool sign, f32 out[16]) {
+    const auto value = [&](u8 b) {
+        return sign ? nx::max(static_cast<f32>(static_cast<i8>(b)), -127.0f) / 127.0f : unorm(b, 8);
+    };
+    const f32 v0 = value(block[0]), v1 = value(block[1]);
+    const bool eight = sign ? static_cast<i8>(block[0]) > static_cast<i8>(block[1]) : block[0] > block[1];
+    f32 v[8] = {v0, v1};
+    for (u32 k = 2; k < 8; ++k)
+        v[k] = eight ? ((8 - k) * v0 + (k - 1) * v1) / 7 : k < 6 ? ((6 - k) * v0 + (k - 1) * v1) / 5 : k == 6 ? (sign ? -1.0f : 0.0f) : 1.0f;
+    u64 bits = 0;
+    for (u32 k = 0; k < 6; ++k) bits |= u64{block[2 + k]} << (8 * k);
+    for (u32 i = 0; i < 16; ++i) out[i] = v[(bits >> (3 * i)) & 7];
+}
+
+// The BC1-BC5 blocks: 4x4 texels as RGBA floats (BC4 and BC5: their components through the swizzle `mode`).
+void decode_bc(u32 code, const u8* block, f32 out[16][4], u32 mode = 0) {
+    if (code >= kUBC4 && code <= kSBC5) {
+        const bool sign = code == kSBC4 || code == kSBC5, two = code == kUBC5 || code == kSBC5;
+        f32 r[16], g[16] = {};
+        decode_bc4(block, sign, r);
+        if (two) decode_bc4(block + 8, sign, g);
+        for (u32 i = 0; i < 16; ++i) {
+            const f32 c[4] = {r[i], g[i], 0, 0};
+            swizzle(c, two ? 2 : 1, mode, out[i]);
+        }
+        return;
+    }
     const u8* color = code == kUBC1 ? block : block + 8;
     const u16 c0 = static_cast<u16>(color[0] | color[1] << 8), c1 = static_cast<u16>(color[2] | color[3] << 8);
     f32 pal[4][4];
@@ -918,7 +945,6 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
     if (code >= kYUV420P2 && code <= kYUV422) return read_yuv(t, code, read);
-    if (code >= kUBC4 && code <= kSBC5) return failure("texture: format not implemented");
     if (code == kX8S8S8U8 || (code == kX8U24 && t.swizzle != 0) || code == kU32 || code == kS32 ||
         code == kSE5M9M9M9 || code == kU32U32)
         return failure(nx::format("texture: format 0x{:08x} not implemented", t.base_format));
@@ -946,7 +972,7 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     out.height = t.height;
     out.levels = static_cast<u32>(levels.size());
     out.faces = is_cube(t.type) ? 6 : 1;
-    bool wide = t.gamma != 0;
+    bool wide = t.gamma != 0 || code == kSBC4 || code == kSBC5;  // (signed BC4 and BC5: below 0 too)
     {
         f32 c[4];
         u32 n;
@@ -1076,7 +1102,7 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                     at += usize{lv.width} * lv.height * out_bytes;
                     continue;
                 }
-                const u32 block_bytes = code == kUBC1 ? 8 : 16;
+                const u32 block_bytes = code == kUBC1 || code == kUBC4 || code == kSBC4 ? 8 : 16;
                 const u32 pbx = nx::max(pw / 4, 1u), pby = nx::max(ph / 4, 1u);
                 const SwizzleTables sw(is_swizzled(t.type) ? bx : 0, is_swizzled(t.type) ? by : 0, pbx, pby);
                 for (u32 y = 0; y < by; ++y) {
@@ -1103,7 +1129,7 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                             continue;
                         }
                         f32 texels[16][4];
-                        decode_bc(code, block, texels);
+                        decode_bc(code, block, texels, t.swizzle);
                         for (u32 i = 0; i < 16; ++i) {
                             const u32 tx = x * 4 + (i & 3), ty = y * 4 + i / 4;
                             if (tx < lv.width && ty < lv.height) put(dst + (usize{ty} * lv.width + tx) * out_bytes, texels[i]);

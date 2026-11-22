@@ -348,6 +348,56 @@ TEST_CASE("gxm textures: BC blocks kept for the device are the texture's blocks 
     }
 }
 
+TEST_CASE("gxm textures: BC4 and BC5 (unsigned and signed) decode their endpoints and indices through the swizzle") {
+    auto decode = [](u32 base_format, u32 swizzle, std::initializer_list<u8> blocks) {
+        Memory m;
+        m.bytes.assign(blocks.begin(), blocks.end());
+        TextureInfo t;
+        t.base_format = base_format;
+        t.swizzle = swizzle;
+        t.type = texture_type::kLinear;
+        t.width = t.height = 4;
+        t.stride = static_cast<u32>(blocks.size()) / 4;
+        auto texels = read_texels(t, [&](u32 address, void* out, u32 size) { return m.read(address, out, size); });
+        REQUIRE(texels);
+        return *texels;
+    };
+    // (indices: texel 0 index 0, 1 index 1, 2 index 2, 3 index 6, the rest 0)
+    const u8 i0 = 0x88, i1 = 0x0C;
+    // UBC4, R: 255 and 0, eight values: index 2 (6 * 255 + 0) / 7, index 6 (2 * 255) / 7
+    auto r = decode(0x88000000, 0, {255, 0, i0, i1, 0, 0, 0, 0});
+    REQUIRE(r.bytes == 4);
+    CHECK(r.data[0] == 255);
+    CHECK(r.data[4] == 0);
+    CHECK(r.data[8] == 219);
+    CHECK(r.data[12] == 73);
+    CHECK(r.data[1] == 0);
+    CHECK(r.data[3] == 255);
+    // UBC4, RRRR; 0 and 255 the other way round: six values, index 6 is 0 and 7 is 1
+    auto rrrr = decode(0x88000000, 3, {0, 255, i0, i1, 0, 0, 0, 0});
+    CHECK(rrrr.data[4 * 1 + 0] == 255);
+    CHECK(rrrr.data[4 * 1 + 3] == 255);
+    CHECK(rrrr.data[4 * 2 + 1] == 51);  // ((6 - 2) * 0 + (2 - 1) * 255) / 5
+    CHECK(rrrr.data[4 * 3 + 2] == 0);
+    // SBC4: 127 and -127 (1 and -1), as halves
+    auto s4 = decode(0x89000000, 0, {0x7F, 0x81, i0, i1, 0, 0, 0, 0});
+    REQUIRE(s4.bytes == 8);
+    u16 h[4];
+    std::memcpy(h, s4.data.data(), 8);
+    CHECK(h[0] == 0x3C00);
+    std::memcpy(h, s4.data.data() + 8, 8);
+    CHECK(h[0] == 0xBC00);
+    // UBC5, GR: R the first block, G the second
+    auto gr = decode(0x8A000000, 0, {255, 0, i0, i1, 0, 0, 0, 0, 0x40, 0x10, 0, 0, 0, 0, 0, 0});
+    REQUIRE(gr.bytes == 4);
+    CHECK(gr.data[0] == 255);
+    CHECK(gr.data[1] == 0x40);
+    CHECK(gr.data[4 * 1 + 0] == 0);
+    CHECK(gr.data[4 * 1 + 1] == 0x40);
+    CHECK(gr.data[2] == 0);
+    CHECK(gr.data[3] == 255);
+}
+
 TEST_CASE("gxm textures: unsigned packed floats (U2F10F10F10, F11F11F10) come out as halves") {
     auto halves = [](u32 base_format, u32 word) {
         Memory m;
