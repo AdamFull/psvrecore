@@ -257,6 +257,12 @@ Result<i32> Loader::boot(const BootOptions& options) {
             affinity = static_cast<i32>(psv_ld32(p.main_thread_affinity));
     }
     if (thread_name.empty()) thread_name = "main";
+    // The system gives the main thread all the user cores when the block names no mask: a game reads it back
+    // (sceKernelGetThreadCpuAffinityMask) and places its threads by it. FINAL FANTASY X | X-2 HD Remaster gives a
+    // thread for all the cores its creator's priority, a thread on fewer cores 0x40 more (the queues of one core are
+    // 64-127, the common queue's 128-191): a main thread reading 0 (the default mask) made its render thread's
+    // priority 0xE0, refused.
+    if (affinity == 0) affinity = kernel::kAllUserCpus;
 
     // Its arguments: the strings, NUL-terminated one after another.
     nx::vector<u8> block;
