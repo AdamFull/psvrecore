@@ -1033,3 +1033,132 @@ ie_ov_caller:
     add     r0, r0, r4
     pop     {r4, pc}
     .ltorg
+
+@ ---- Inside calls that leave dirty registers out of the context ----
+@ Before a call of an Inside internal entry the caller writes to the context only the dirty registers the callee's
+@ reach reads or writes there, or whose value code after the call may read there before the caller writes them again
+@ (ARCHITECTURE.md, "Internal entries"): before cr_mid_r4 r4 (read by the callee), r6 (read by the callee's callee)
+@ and r7 (changed under a condition after the call: the old value reaches the psv_call on one path), not r5 or r8,
+@ written again before anything reads them; then around a second Inside call that touches none of them and a loop of
+@ such calls, all must be exact in the context at the call through psv_call (obs_reads_all: the whole context
+@ compared with the interpreter's).
+
+@ Reads r6 from the context (not an argument).
+    .global cr_leaf_r6
+    .type cr_leaf_r6, %function
+    .thumb_func
+cr_leaf_r6:
+    add     r0, r0, r6
+    bx      lr
+
+@ Reads r4 and calls cr_leaf_r6.
+    .global cr_mid_r4
+    .type cr_mid_r4, %function
+    .thumb_func
+cr_mid_r4:
+    push    {r4, lr}
+    add     r0, r0, r4
+    bl      cr_leaf_r6
+    pop     {r4, pc}
+
+@ Touches r0 only.
+    .global cr_leaf_none
+    .type cr_leaf_none, %function
+    .thumb_func
+cr_leaf_none:
+    add     r0, r0, #5
+    bx      lr
+
+@ @test cr_caller r0=any r1=any
+    .global cr_caller
+    .type cr_caller, %function
+    .thumb_func
+cr_caller:
+    push    {r4-r8, lr}
+    add     r4, r0, #1
+    eor     r5, r0, r1
+    add     r6, r1, #7
+    movs    r7, #0x41
+    add     r8, r0, r1
+    bl      cr_mid_r4
+    cmp     r0, r1
+    it      hi
+    addhi   r7, r7, #2
+    add     r0, r0, r5
+    bl      cr_leaf_none
+    add     r5, r5, r0
+    movs    r2, #3
+1:  bl      cr_leaf_none
+    add     r8, r8, r0
+    subs    r2, r2, #1
+    bne     1b
+    ldr     r3, =obs_reads_all
+    blx     r3
+    add     r0, r0, r5
+    add     r0, r0, r6
+    add     r0, r0, r7
+    add     r0, r0, r8
+    pop     {r4-r8, pc}
+    .ltorg
+
+@ Recursive Inside callees (context_reads, a fixed point over the module's calls): cr_rec reads r6 and calls itself;
+@ cr_mut_a reads none of r4-r12 itself but calls cr_mut_b, which reads r7 and calls cr_mut_a. The caller's dirty r6
+@ and r7 must be in the context at the calls that reach their reads (r7 defined only after cr_rec, so it is stored for
+@ cr_mut_a's reach alone), r5 and r8 not (touched by neither, written again before the psv_call that reads them).
+    .thumb
+    .global cr_rec
+    .type cr_rec, %function
+    .thumb_func
+cr_rec:
+    push    {r4, lr}
+    cmp     r0, #0
+    beq     1f
+    subs    r0, #1
+    bl      cr_rec
+    add     r0, r0, r6
+1:  pop     {r4, pc}
+
+    .global cr_mut_a
+    .type cr_mut_a, %function
+    .thumb_func
+cr_mut_a:
+    push    {r4, lr}
+    cmp     r0, #0
+    beq     1f
+    subs    r0, #1
+    bl      cr_mut_b
+1:  pop     {r4, pc}
+
+    .global cr_mut_b
+    .type cr_mut_b, %function
+    .thumb_func
+cr_mut_b:
+    push    {r4, lr}
+    add     r1, r1, r7
+    bl      cr_mut_a
+    pop     {r4, pc}
+
+@ @test cr_rec_caller r0=int:0:3 r1=any r2=any
+    .global cr_rec_caller
+    .type cr_rec_caller, %function
+    .thumb_func
+cr_rec_caller:
+    push    {r4-r8, lr}
+    ldr     r4, =obs_reads_all
+    mov     r5, r2
+    add     r6, r1, #5
+    mov     r8, r0
+    bl      cr_rec
+    add     r7, r2, #9
+    mov     r1, r0
+    mov     r0, r8
+    bl      cr_mut_a
+    add     r0, r1, r5
+    add     r0, r0, r8
+    add     r5, r0, #1
+    add     r6, r0, #2
+    add     r7, r0, #3
+    add     r8, r0, #4
+    blx     r4
+    pop     {r4-r8, pc}
+    .ltorg

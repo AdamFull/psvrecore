@@ -88,13 +88,29 @@ enum {
 /* After a direct call, the registers the callee was found to preserve (analysis/registers.hpp) stay in the caller's
  * locals. Built with PSV_CHECK_KEPT_REGISTERS, the generated code checks that the context holds the same values, which
  * is what the analysis assumes and cannot show (the words a function saves them in are changed only by itself). */
+/* Before a call of an internal entry that does not touch some dirty r4-r12 (analysis: call_unsynced), the generated
+ * code leaves them out of the context. Built with PSV_CHECK_KEPT_REGISTERS, it puts a sentinel in the context's copy
+ * of each one for the call (saving the copy in `saved`), checks after the call that the callee left it there, and puts
+ * the copy back: a callee that does read or write one (an analysis that missed it) then computes from the sentinel or
+ * traps, instead of reading the older copy unseen. */
+#define PSV_UNSYNCED_SENTINEL(k) (0x5E70C0DEu ^ ((uint32_t)(k) << 24))
 #ifdef PSV_CHECK_KEPT_REGISTERS
 #define PSV_KEPT(ctx, pc, same) \
     do { \
         if (!(same)) psv_trap(ctx, pc, PSV_TRAP_KEPT_REGISTER); \
     } while (0)
+#define PSV_UNSYNCED_BEGIN(ctx, k, saved) \
+    const uint32_t saved = (ctx)->r[k]; \
+    (ctx)->r[k] = PSV_UNSYNCED_SENTINEL(k)
+#define PSV_UNSYNCED_END(ctx, pc, k, saved) \
+    do { \
+        if ((ctx)->r[k] != PSV_UNSYNCED_SENTINEL(k)) psv_trap(ctx, pc, PSV_TRAP_KEPT_REGISTER); \
+        (ctx)->r[k] = saved; \
+    } while (0)
 #else
 #define PSV_KEPT(ctx, pc, same) ((void)0)
+#define PSV_UNSYNCED_BEGIN(ctx, k, saved) ((void)0)
+#define PSV_UNSYNCED_END(ctx, pc, k, saved) ((void)0)
 #endif
 
 PSVRECORE_API PSV_NORETURN void psv_trap(PsvContext* ctx, uint32_t pc, uint32_t kind);

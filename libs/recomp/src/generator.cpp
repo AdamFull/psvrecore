@@ -447,6 +447,68 @@ void Emitter::plan_fused_compares() {
     }
 }
 
+// Where each flag's local equals the context's copy (fl.X == ctx->X), so that a store of it to the context changes
+// nothing and is left out: at an exit (return, jump through the runtime, tail call, an import's tail call, running into
+// the next function), before a call and before a trap. A function that never writes a flag no longer writes back at
+// its returns the value it read at entry (task 10; under the relaxed-atomic guest accesses the C compiler cannot
+// remove such a store itself, a guest access being a clobber of all memory to it).
+//
+// A forward pass over the graph, an intersection at joins: at entry the flags read from the context (live_in; the
+// others start as 0, the context's copy unknown); an instruction that may write a flag ends its agreement (its
+// FlagEffect::defs, on its executed edges); a call (to a function, an import, through the runtime, svc) leaves only
+// those it reads back (after_call), as the callee may write the context's flags; a call that never returns, none.
+// Stores leave the analysis as they are (a flag stored agrees afterwards, which the pass does not count: only less is
+// left out). Nothing else writes the context's N, Z, C or V while the function runs: the generated code writes them
+// only through flags_line, and the helpers it calls with ctx (saturation and GE: psv_add_q, psv_sel..., Advanced SIMD
+// and VFP in the context, psv_yield, the APSR's fl helpers) write Q, GE, the FPSCR, the register file or `fl`, never
+// ctx->n/z/c/v; another guest thread has its own context. So the context holds at every point exactly what it held
+// with the stores: right for whatever reads it after a store left out (a caller, a callee, the runtime at svc, an
+// import or psv_jump, a trap's report, a C++ exception unwinding through the frame, HLE switching fibers inside a call).
+// With flags everywhere (psvrecomp --flags-everywhere, the fallback without liveness) nothing is left out.
+void Emitter::plan_flag_sync() {
+    const usize n = fn_.code.size();
+    flag_sync_in_.assign(n, 0);
+    if (flags_.everywhere || cfg_.entry == analysis::kNoIndex || cfg_.entry >= n) return;
+    nx::vector<u8> reached(n, 0);
+    nx::vector<u32> work;
+    const auto reach = [&](u32 to, FlagSet s) {
+        if (to >= n) return;
+        if (!reached[to]) {
+            reached[to] = 1;
+            flag_sync_in_[to] = s;
+            work.push_back(to);
+        } else if ((flag_sync_in_[to] & s) != flag_sync_in_[to]) {
+            flag_sync_in_[to] &= s;
+            work.push_back(to);
+        }
+    };
+    reach(cfg_.entry, flags_fn_->live_in);
+    while (!work.empty()) {
+        const u32 i = work.back();
+        work.pop_back();
+        const analysis::CfgNode& node = cfg_.nodes[i];
+        const FlagSet s = flag_sync_in_[i];
+        const FlagSet exec = flag_sync_exec(i, s);
+        for (const analysis::Edge* e = cfg_.begin(node); e != cfg_.end(node); ++e)
+            if (e->kind == analysis::EdgeKind::Next) reach(e->to, exec);
+        if (node.conditional && node.skip.kind == analysis::EdgeKind::Next) reach(node.skip.to, s);
+    }
+}
+
+// The flags that agree after instruction i when it executes, from those that agree before it.
+FlagSet Emitter::flag_sync_exec(usize i, FlagSet in) const {
+    if (cfg_.nodes[i].call != analysis::CallKind::None) return noreturn_call(fn_.code[i]) ? FlagSet(0) : flags_fn_->after_call[i];
+    return static_cast<FlagSet>(in & ~analysis::flag_effect(fn_.code[i]).defs);
+}
+
+// Those that agree at the continuation after instruction i's translation (executed, or skipped when conditional).
+FlagSet Emitter::flag_sync_out(usize i) const {
+    if (flag_sync_in_.size() <= i) return 0;
+    const FlagSet in = flag_sync_in_[i];
+    const FlagSet exec = flag_sync_exec(i, in);
+    return cfg_.nodes[i].conditional ? static_cast<FlagSet>(exec & in) : exec;
+}
+
 void Emitter::exit_registers() {
     store_registers(regs_ ? regs_->exit_store[index_] : RegSet(0));
     if (vfp_) store_vfp(vfp_->exit_store[index_], stats_.vfp_stores);
@@ -456,11 +518,19 @@ void Emitter::call_registers_before() {
     call_vfp_before();
     if (!regs_) return;
     store_registers(regs_->call_store[index_]);
+    // (builds with PSV_CHECK_KEPT_REGISTERS: a sentinel in the context's copy of each register left out, for the call
+    // only; checked and put back after it, call_registers_after. Nothing otherwise.)
+    if (!regs_->call_unsynced.empty())
+        for (u32 k = 0; k < 15; ++k)
+            if (regs_->call_unsynced[index_] & (1u << k)) line(nx::format("PSV_UNSYNCED_BEGIN(ctx, {}, unsynced{});", k, k));
 }
 
 void Emitter::call_registers_after(const Instruction& in) {
     call_vfp_after(in);
     if (!regs_ || noreturn_call(in)) return;
+    if (!regs_->call_unsynced.empty())
+        for (u32 k = 0; k < 15; ++k)
+            if (regs_->call_unsynced[index_] & (1u << k)) line(nx::format("PSV_UNSYNCED_END(ctx, {}, {}, unsynced{});", hex(in.address), k, k));
     const auto& node = cfg_.nodes[index_];
     RegSet kept = regs_->call_kept[index_];
     // (after a call of an Inside internal entry the context's r0-r3, sp and lr are not the callee's to make exact)
@@ -469,11 +539,14 @@ void Emitter::call_registers_after(const Instruction& in) {
             kept &= static_cast<RegSet>(~analysis::kArgumentRegisters);
     if (node.call == analysis::CallKind::Direct) {
         if (kept) {
-            // (the callee preserves them: builds with PSV_CHECK_KEPT_REGISTERS check that it did)
+            // (the callee preserves them: builds with PSV_CHECK_KEPT_REGISTERS check that it did; not the dirty
+            // registers an Inside call left out of the context, whose copy there is older: its callee touches none)
+            RegSet checked = kept;
+            if (!regs_->call_unsynced.empty()) checked &= static_cast<RegSet>(~regs_->call_unsynced[index_]);
             nx::string same;
             for (u32 k = 0; k < 15; ++k)
-                if (kept & (1u << k)) same += nx::format("{}ctx->r[{}] == g{}", same.empty() ? "" : " && ", k, k);
-            line(nx::format("PSV_KEPT(ctx, {}, {});", hex(in.address), same));
+                if (checked & (1u << k)) same += nx::format("{}ctx->r[{}] == g{}", same.empty() ? "" : " && ", k, k);
+            if (!same.empty()) line(nx::format("PSV_KEPT(ctx, {}, {});", hex(in.address), same));
             ++stats_.calls_keeping;
             stats_.registers_kept += static_cast<usize>(std::popcount(kept));
         }
@@ -501,13 +574,15 @@ nx::string Emitter::trap_register_stores() {
 }
 
 nx::string Emitter::trap_stores() {
-    nx::string s = flags_line(analysis::kAllFlags, true);
+    nx::string s = flags_line(unsynced(analysis::kAllFlags), true);
     const nx::string r = trap_register_stores();
     if (!r.empty()) s += (s.empty() ? "" : " ") + r;
     return s;
 }
 
-void Emitter::store_for_trap() { line(trap_stores()); }
+void Emitter::store_for_trap() {
+    if (const nx::string s = trap_stores(); !s.empty()) line(s);
+}
 
 nx::string Emitter::flags_line(FlagSet f, bool store) const {
     nx::string out;
@@ -520,6 +595,7 @@ nx::string Emitter::flags_line(FlagSet f, bool store) const {
 }
 
 void Emitter::store_flags(FlagSet f) {
+    f = unsynced(f);
     if (f) line(flags_line(f, true));
 }
 
@@ -627,7 +703,7 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
     line(nx::format("    static const uint32_t {}[{}] = {{{}\n            }};", list, n, values));
     line(nx::format("    {} = psv_table_find({}, {}u, {});", index, list, n, target));
     line(nx::format("    if ({} >= {}u) {{", index, n));
-    line("        " + trap_stores());
+    if (const nx::string s = trap_stores(); !s.empty()) line("        " + s);
     line(nx::format("        psv_trap(ctx, {}, PSV_TRAP_BAD_JUMP);", hex(in.address)));
     line("    }");
     line("}");
@@ -636,7 +712,7 @@ void Emitter::table_branch(const Instruction& in, const analysis::JumpTable& tab
         const u32 target_code = targets[i];
         const bool tail = target_code != fn_.entry && program_.function_at(target_code) != nullptr;
         if (tail) {
-            nx::string store = flags_line(flags_.into(target_code, flags_fn_->live_out), true);
+            nx::string store = flags_line(unsynced(flags_.into(target_code, flags_fn_->live_out)), true);
             if (regs_ && regs_->exit_store[index_]) {
                 store += (store.empty() ? "" : " ") + register_line(regs_->exit_store[index_], true);
                 stats_.register_stores += static_cast<usize>(std::popcount(regs_->exit_store[index_]));
@@ -670,7 +746,7 @@ void Emitter::branch_to_value(const Instruction& in, nx::string_view target) {
     const auto& node = cfg_.nodes[index_];
     for (const auto* e = cfg_.begin(node); e != cfg_.end(node); ++e) jump |= flags_.at_exit(*flags_fn_, *e);
     ++stats_.return_sites;
-    if (out) ++stats_.return_sites_store;
+    if (unsynced(out)) ++stats_.return_sites_store;
     if (internal_body()) {
         // An internal entry's every way out goes back to the LR it was entered with (analysis::EntryKind): a return to
         // its caller, with no compare. The flags a jump through the runtime would leave are left (its wrapper makes
@@ -781,13 +857,15 @@ void Emitter::call(const Instruction& in, u32 target_code) {
 void Emitter::call_flags_before() {
     const FlagSet f = flags_fn_->before_call[index_];
     ++stats_.call_sites;
-    if (f) ++stats_.call_sites_store;
+    if (unsynced(f)) ++stats_.call_sites_store;
     store_flags(f);
+    flag_sync_ |= f;  // (stored on the way to the call, or agreeing already)
 }
 
 void Emitter::call_flags_after(const Instruction& in) {
     // (a call to a function that never returns: a trap if it does. The flags are the callee's then.)
     if (noreturn_call(in)) {
+        flag_sync_ = 0;
         line(nx::format("psv_trap(ctx, {}, PSV_TRAP_RETURNED);", hex(in.address + in.size)));
         ended_ = true;
         return;
@@ -795,6 +873,8 @@ void Emitter::call_flags_after(const Instruction& in) {
     const FlagSet f = flags_fn_->after_call[index_];
     if (f) ++stats_.call_sites_load;
     load_flags(f);
+    // (the callee may have written the context's flags: only those read back agree; flag_sync_exec)
+    flag_sync_ = f;
 }
 
 bool Emitter::constant_load(u32 address, u32 size, u32& value) const {
@@ -913,6 +993,7 @@ nx::string Emitter::function() {
     if (mode_ == RegisterMode::Probe) effects_.assign(code.size(), {});
     if (vfp_mode_ == VfpMode::Probe) vfp_effects_.assign(code.size(), {});
     if (vfp_locals()) plan_fused_compares();
+    plan_flag_sync();
     for (usize i = 0; i < code.size(); ++i) {
         const auto& in = code[i];
         index_ = i;
@@ -920,6 +1001,8 @@ nx::string Emitter::function() {
         if (labels_.contains(in.address)) out += nx::format("{}:;\n", label_name(in.address));
         body_.clear();
         temp_counter_ = 0;
+        // (inside the translation, before the call it makes if any: what agrees before it, but what it may write)
+        flag_sync_ = static_cast<FlagSet>(flag_sync_in_[i] & ~analysis::flag_effect(in).defs);
         if (labels_.contains(in.address)) flushed_ = 0;
         flushed_out_ = 0;
         instruction(in);
@@ -950,6 +1033,7 @@ nx::string Emitter::function() {
         // (a translation that ends in a trap ends the flow only where the instruction is not conditional)
         if (!falls_through(in) || (ended_ && !analysis::is_conditional(in))) continue;
         const u32 next = in.address + in.size;
+        flag_sync_ = flag_sync_out(i);
         if (auto into = fn_.runs_into.find(in.address); into != fn_.runs_into.end()) {
             body_.clear();
             branch_to(in, into->second, true);  // (a code address, or an import stub's address)
@@ -960,16 +1044,16 @@ nx::string Emitter::function() {
         if (addresses.contains(next)) {
             out += nx::format("    goto {};\n", label_name(next));
         } else {
-            nx::string stores = flags_line(analysis::kAllFlags, true);
+            nx::string stores = flags_line(unsynced(analysis::kAllFlags), true);
             if (regs_ && regs_->after_store[i]) {
-                stores += " " + register_line(regs_->after_store[i], true);
+                stores += (stores.empty() ? "" : " ") + register_line(regs_->after_store[i], true);
                 stats_.register_trap_stores += static_cast<usize>(std::popcount(regs_->after_store[i]));
             }
             if (vfp_ && !vfp_->after_store[i].empty()) {
-                stores += " " + vfp_line(vfp_->after_store[i], true);
+                stores += (stores.empty() ? "" : " ") + vfp_line(vfp_->after_store[i], true);
                 ++stats_.vfp_trap_stores;
             }
-            out += "    " + stores + "\n";
+            if (!stores.empty()) out += "    " + stores + "\n";
             out += nx::format("    psv_trap(ctx, {}, PSV_TRAP_UNDISCOVERED);\n", hex(next));
         }
     }
@@ -1369,7 +1453,8 @@ Output generate(const analysis::Program& original, const Options& options) {
     }
     result.flags = std::move(flags);
     for (auto& [code, r] : registers.functions) {
-        for (auto* v : {&r.trap_store, &r.call_store, &r.call_load, &r.call_kept, &r.exit_store, &r.after_store, &r.live_before})
+        for (auto* v : {&r.trap_store, &r.call_store, &r.call_load, &r.call_kept, &r.call_unsynced, &r.exit_store, &r.after_store,
+                       &r.live_before})
             nx::vector<RegSet>().swap(*v);
         nx::vector<u8>().swap(r.call_entry);
     }

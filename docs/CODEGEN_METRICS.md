@@ -1569,3 +1569,91 @@ from in the examples above; how much of it they recover is not measured.
 
 Not measured: those two generator changes; timing on a game (PC, Odin or 8a); arm64 time; the spin-wait test on
 arm64 (Android); WipEout 2048's hot ten (inputs gone); the stack-only option (no escape analysis to measure it with).
+
+## Context stores the generator leaves out (task 10)
+
+Measured 2026-11-22 on 1038d4a plus this change. Task 9 kept the relaxed-atomic guest accesses and named the
+context traffic they keep (each atomic access is a clobber of all memory to LLVM, so a redundant `ctx->` store
+cannot be removed by the C compiler) as the generator's to remove. Two changes, both leaving the context as exact as
+before wherever something outside the function can read it:
+
+- **Flags already in the context** (`Emitter::plan_flag_sync`, ARCHITECTURE.md, "Condition flags", "Stores left
+  out"). A forward pass over each function's graph finds where `fl.X == ctx->X` holds on every path (read at entry,
+  stored, or read back after a call; not after an instruction that may write X or a call that does not read X back).
+  Stores at returns, other exits, calls and traps leave those flags out. The context's contents are the same at every
+  point as with the stores, so traps, svc, mrs/msr, `psv_jump`, fiber switches and C++ exceptions are unaffected.
+- **Registers an `Inside` callee does not touch** (`FunctionRegisters::context_reads`, `call_unsynced`; ARCHITECTURE.md,
+  "Internal entries"). Before a call of an `Inside` internal entry a dirty r4-r12 is left out when the callee's reach
+  neither uses nor defines it and nothing after the call may read the value from the context before the caller writes
+  the register again (a backward pass, `wanted`: every call but such an `Inside` one, every trap and every exit reads
+  all registers). The value left out dies unread; the register stays dirty in the caller's local, its context copy
+  older (nothing in the callee's reach writes it), and the caller keeps it in the local across the call (an `Inside`
+  call keeps all it does not modify). Stores are only removed, never moved. `Flushed` and public entries, host
+  implementations and any function with a trap, a non-direct call or a non-return exit count as touching every
+  register.
+
+  A first version only left out what the callee does not touch, so the store went to the next place code outside
+  may read the context (an exit, a later call): stores moved off a call onto every path after it, and registers
+  dirty at joins were then live there, read back after earlier calls. On P4D that was +1,758 register loads and no
+  instruction gain (x64 5.445 -> 5.446, arm64 5.184 -> 5.188); the synthetic figures were those below. The
+  `wanted` condition replaced it.
+
+### Static effect (host instructions per guest instruction)
+
+A: task 9's relaxed-atomics figures (base generator); A10: this generator, relaxed atomics; V: task 9's volatile
+experiment (base generator), the bound the context traffic set.
+
+| tree | A x64 | A10 x64 | V x64 | A arm64 | A10 arm64 | V arm64 |
+|---|---:|---:|---:|---:|---:|---:|
+| synthetic corpus (task 9's 221 functions) | 9.863 | 9.571 (-3.0%) | 9.490 (-3.8%) | 7.432 | 7.331 (-1.4%) | 7.291 (-1.9%) |
+| P4D, six modules (16,704 functions) | 5.445 | 5.437 (-0.15%) | 5.413 (-0.6%) | 5.184 | 5.178 (-0.12%) | 5.167 (-0.3%) |
+
+- Synthetic: 78% of V's x64 gain and 72% of its arm64 gain. By module x64 (A / A10 / V): `syn_regs` 9.147 / 7.923 /
+  7.700, `syn_calls` 5.926 / 5.666 / 5.653, `syn_control` 9.134 / 8.843 / 8.597, `syn_flags` 8.151 / 8.021 / 8.089;
+  call-heavy class 9.501 / 8.200 / 7.845. `syn_vfp_locals` arm64 grows (16.885 -> 17.338; V 17.193): register
+  allocation, not stores.
+- Stores in the generated C (counted, not compiled): synthetic flag stores 1,546 -> 863, `ctx->r[k] = gk` stores
+  939 -> 846, register loads 245 -> 245; P4D flag stores 10,826 -> 9,066 (-16%), register stores 481,465 -> 476,277
+  (-1.1%), register loads 141,014 -> 140,935 (a register no longer stored is no longer live after an earlier import
+  call, so it is not read back there). The P4D C differs from task 9's only in store, load and `PSV_KEPT` lines
+  (10,075 changed lines; the 113 that are not only stores or checks are those read-backs).
+- P4D: 27% of V's x64 gain, 38% of its arm64 gain. 1,716 functions get smaller (-12,973 x64), 130 larger (+3,554;
+  arm64 1,598 / -10,094 and 126 / +2,824); the larger ones are clang's register allocation (f_81187E5A +224 x64, 14
+  calls). Game code reaches imports almost everywhere, so few of its calls are `Inside` ones; most of its flag
+  stores were already needed.
+
+### Time (synthetic corpus, x64)
+
+`CODEGEN_BENCH=8` builds of `psvrecore_codegen_tests` (windows-x64-release, `/DWIN32 /D_WINDOWS`): task 9's A and V
+and this generator (A10), all three over task 9's corpus (`corpus_data.inc` as committed: the tests added below
+change the RNG inputs of the tests after them, which moves unrelated functions' times by up to 60x). Two sessions of
+7 runs each, interleaved, geometric mean over the 147 functions every build times:
+
+| build | median of runs | gm of per-function bests |
+|---|---:|---:|
+| A | 29.92 / 28.82 ns | 26.75 / 26.72 ns |
+| A10 | 27.21 / 28.75 ns (-9.1% / -0.3%) | 25.55 / 26.01 ns (-4.5% / -2.7%) |
+| V | 28.27 / 27.07 ns (-5.5% / -6.1%) | 25.45 / 25.46 ns (-4.8% / -4.7%) |
+
+The medians are noise (runs spread 26-36 ns); the bests give A10 about 55-90% of V's gain. The largest moves are
+the call-heavy functions: `vec_sum` 105 -> 58 ns (V 70), `recursion` 77 -> 43 (V 43), `tail_caller` 19 -> 12 (V
+12), `ie_fact` 43 -> 34 (V 34). `loop_kept` stays at A's 14 ns (V 10.5): its cost is the guest accesses
+themselves.
+
+### Tests
+
+- `tests/codegen/corpus/regs.s`: `cr_caller` with `cr_mid_r4` (reads r4), `cr_leaf_r6` (read through the callee's
+  callee) and `cr_leaf_none` (touches r0 only): before `cr_mid_r4` r4, r6 and r7 (changed under a condition after
+  the call, so its old value reaches the `psv_call` on one path) stored, r5 and r8 left out; then a second `Inside`
+  call and a loop of them; the whole context compared at a `psv_call` to `obs_reads_all`.
+- `tests/codegen/corpus/flags.s`: `entry_flags_again`, one compare's flags read by a callee that writes none twice,
+  then through `psv_call` after `movs` changed N and Z only.
+- `tests/registers_tests.cpp`: `context_reads` of b_keep and c_clobber; d_caller's call of b_keep stores r4 only, r5
+  in `call_unsynced`.
+- `PSV_CHECK_KEPT_REGISTERS` (the masked corpus build) no longer compares a register left out of the context: its
+  copy there is older by design. `PSV_KEPT` checks in the synthetic corpus: 66 -> 27; P4D 64,525 -> 63,725.
+- windows-x64-release and windows-x64-debug (`scripts\build.ps1 -Preset ...`): 9 of 9 test programs pass.
+
+Not done: an internal entry's exit stores that only its `f_` wrapper's callers need (fi_82038128's nzcv at return:
+they depend on the call site, a second variant per function would be needed); passing the r4-r12 an `Inside` callee
+reads at entry as more C arguments instead of through the context.

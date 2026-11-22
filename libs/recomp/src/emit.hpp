@@ -145,7 +145,8 @@ public:
     void set_nz(nx::string_view r, FlagSet which);
     // const uint32_t r = x + y + carry_in (AddWithCarry), setting the flags of `which` that are live.
     void add_with_carry(nx::string_view r, nx::string_view x, nx::string_view y, nx::string_view carry_in, FlagSet which);
-    // Writes flags to the context (before something outside the function may read them), and reads them back.
+    // Writes flags to the context (before something outside the function may read them), and reads them back. A store
+    // leaves out the flags whose local already equals the context's copy here (see plan_flag_sync).
     void store_flags(FlagSet f);
     void load_flags(FlagSet f);
     // Around the current instruction's call (to a function, an import, through the runtime, svc): the flags the
@@ -155,7 +156,15 @@ public:
     // Before a trap: every local flag in the context (what the function computed; see analysis::FunctionFlags), and
     // the registers whose locals differ from it (with those the instruction has written so far).
     void store_for_trap();
-    void store_flags_for_trap() { store_flags(analysis::kAllFlags); }
+    // (an unconditional store on the instruction's path: every flag agrees with the context after it)
+    // Call it only where the rest of the instruction's translation runs after it on every path (svc, vmsr: at the
+    // top of the body, not inside a branch of it): flag_sync_ = all leaves out the flags of every later store in this
+    // translation, which would be wrong on a path that did not run this store. (The next instruction starts again
+    // from plan_flag_sync's own state, which does not count this store.) A store on a trap path only is trap_stores().
+    void store_flags_for_trap() {
+        store_flags(analysis::kAllFlags);
+        flag_sync_ = analysis::kAllFlags;
+    }
     // The register stores alone, for a trap inside a helper: they must be on the trapping path only (the analysis
     // takes the context to hold what it held before them on every path that goes on).
     nx::string trap_register_stores();
@@ -224,6 +233,12 @@ public:
 private:
     void instruction(const Instruction& in);
     void plan_fused_compares();
+    void plan_flag_sync();
+    FlagSet flag_sync_exec(usize i, FlagSet in) const;
+    FlagSet flag_sync_out(usize i) const;
+    // Of `f`, the flags whose local differs from the context's copy (or may) at the current point of the translation.
+    // (all of them with flags everywhere: psvrecomp --flags-everywhere stores as before)
+    FlagSet unsynced(FlagSet f) const { return flags_.everywhere ? f : static_cast<FlagSet>(f & ~flag_sync_); }
     nx::string vfp_line(VfpSet units, bool store) const;
     nx::string dv_of(u32 n) const;
     void dv_assign(u32 n, nx::string_view value);
@@ -277,6 +292,10 @@ private:
     nx::vector<u8> fuse_;
     nx::vector<FlagSet> fused_flags_;
     nx::vector<u8> fused_cond_;
+    // The flags whose local equals the context's copy (fl.X == ctx->X): before each instruction on every path to it
+    // (plan_flag_sync), and at the current point of the current instruction's translation.
+    nx::vector<FlagSet> flag_sync_in_;
+    FlagSet flag_sync_ = 0;
     bool uses_fc32_ = false, uses_fc64_ = false;
     bool neon_locals_ = true;
     u32 flushed_ = 0, flushed_out_ = 0;

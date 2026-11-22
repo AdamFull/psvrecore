@@ -290,3 +290,142 @@ table_other_base:
     bx      lr
 9:  mov     r0, #0
     bx      lr
+
+@ The flags of one compare read by a callee that writes none (an Inside internal entry), twice, then by a callee
+@ through psv_call after a setter changed N and Z only: the context's copy of C and V is already exact there (the
+@ generator writes only the flags whose context copy is older, emit.hpp: plan_flag_sync).
+    .global keeps_entry_flags
+    .type keeps_entry_flags, %function
+    .thumb_func
+keeps_entry_flags:
+    ite     eq
+    addeq   r0, r0, #3
+    subne   r0, r0, #5
+    bx      lr
+
+@ @test entry_flags_again r0=int:0:3 r1=int:0:3
+    .global entry_flags_again
+    .type entry_flags_again, %function
+    .thumb_func
+entry_flags_again:
+    push    {r4, lr}
+    ldr     r4, =reads_entry_flags
+    cmp     r0, r1
+    bl      keeps_entry_flags
+    bl      keeps_entry_flags
+    it      hi
+    addhi   r0, r0, #1
+    movs    r2, r0
+    blx     r4
+    pop     {r4, pc}
+    .ltorg
+
+@ ---- Flag stores left out where the context already holds them (emit.hpp: plan_flag_sync) ----
+    .thumb
+
+@ Reached only through psv_call: reads N, Z, C and V at entry (the test also compares the context's flags there).
+    .global obs_reads_flags
+    .type obs_reads_flags, %function
+    .thumb_func
+obs_reads_flags:
+    mov     r0, #0
+    it      mi
+    addmi   r0, r0, #1
+    it      eq
+    addeq   r0, r0, #2
+    it      cs
+    addcs   r0, r0, #4
+    it      vs
+    addvs   r0, r0, #8
+    bx      lr
+
+@ A loop whose header calls through psv_call: entered with the flags already in the context (read back after a first
+@ such call) and from its back edge after a compare changed them. The paths meet with an intersection: the header's
+@ call must store them for every iteration after the first.
+@ @test flag_loop_header r0=int:0:3 r1=int:0:3
+    .global flag_loop_header
+    .type flag_loop_header, %function
+    .thumb_func
+flag_loop_header:
+    push    {r4-r7, lr}
+    ldr     r6, =obs_reads_flags
+    mov     r4, r0
+    mov     r7, #0
+    mov     r5, #3
+    cmp     r4, r1
+    blx     r6
+    add     r7, r7, r0
+1:  blx     r6
+    add     r7, r7, r0
+    cmp     r4, r5
+    sub     r5, r5, #1
+    cbz     r5, 2f
+    b       1b
+2:  mov     r0, r7
+    pop     {r4-r7, pc}
+    .ltorg
+
+@ An Inside callee that writes all four flags (and reads none).
+    .global sets_flags
+    .type sets_flags, %function
+    .thumb_func
+sets_flags:
+    cmp     r0, #2
+    bx      lr
+
+@ A conditional call: where it runs, the flags it leaves are read back (in the context); where it is skipped, they
+@ are the caller's own compare's, not stored yet. Then one with the flags in the context before it (read back after
+@ a psv_call).
+@ @test cond_call_sync r0=int:0:3 r1=int:0:3
+    .global cond_call_sync
+    .type cond_call_sync, %function
+    .thumb_func
+cond_call_sync:
+    push    {r4, r5, r6, lr}
+    ldr     r4, =obs_reads_flags
+    mov     r6, r0
+    cmp     r0, r1
+    it      ne
+    blne    sets_flags
+    blx     r4
+    mov     r5, r0
+    mov     r0, r1
+    cmp     r6, r1
+    blx     r4
+    add     r5, r5, r0
+    mov     r0, r6
+    it      hi
+    blhi    sets_flags
+    blx     r4
+    add     r0, r0, r5
+    pop     {r4, r5, r6, pc}
+    .ltorg
+
+@ vmsr writes every flag to the context on its way to the trap of an FPSCR setting not implemented (store_flags_for_
+@ trap); a later store must not count on it where the vmsr is skipped.
+@ @test vmsr_flags r0=int:0:3 r1=int:0:3
+    .global vmsr_flags
+    .type vmsr_flags, %function
+    .thumb_func
+vmsr_flags:
+    push    {r4, r5, r6, lr}
+    ldr     r4, =obs_reads_flags
+    mov     r6, r0
+    vmrs    r2, fpscr
+    cmp     r0, r1
+    vmsr    fpscr, r2
+    blx     r4
+    mov     r5, r0
+    cmp     r6, r1
+    it      ne
+    vmsrne  fpscr, r2
+    blx     r4
+    add     r5, r5, r0
+    cmp     r1, r6
+    it      hi
+    vmsrhi  fpscr, r2
+    mov     r0, r6
+    bl      keeps_entry_flags
+    add     r0, r0, r5
+    pop     {r4, r5, r6, pc}
+    .ltorg

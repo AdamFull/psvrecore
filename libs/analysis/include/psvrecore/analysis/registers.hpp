@@ -138,8 +138,15 @@ struct FunctionRegisters {
     RegSet results = 0;   // internal entry: returned by value (r0, r1: those it may change)
     RegSet modified = 0;  // may differ at its returns from what they were at entry (its writes but what it preserves)
     RegSet writes = 0;    // its code and what it calls may write
+    // An Inside internal entry: the registers its code, and the code it calls, may read or write in the context (its
+    // instructions' uses and defs, and its callees'); every register for any other entry. A caller's Inside call
+    // stores before it only the dirty registers of these (and of no C argument), and those whose value the caller's
+    // code after the call may read from the context before it writes them again.
+    RegSet context_reads = kAllRegisters;
     // By instruction index (Function::code):
     nx::vector<u8> call_entry;       // a direct call: how (EntryKind of the callee as this call uses it)
+    nx::vector<RegSet> call_unsynced;  // an Inside call: the dirty registers (not C arguments) it does not store:
+                                       // the callee does not touch them and their value dies unread in the context
     nx::vector<RegSet> trap_store;   // dirty before the instruction: written to the context by a trap inside it
                                      // (with what the instruction has written so far)
     nx::vector<RegSet> call_store;   // a call: written to the context before it

@@ -196,6 +196,14 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
       original's module gives at return (all four for an export). Host code that does not touch the flags leaves them
       as its caller wrote them.
     - mrs and msr read and write the locals (`psv_read_apsr_fl`, `psv_write_apsr_fl`); Q and GE stay in the context.
+  - **Stores left out.** Where the contract writes a flag to the context, the generator leaves the store out when the
+    context's copy already equals the local on every path there (`Emitter::plan_flag_sync`, a forward pass over the
+    graph: at entry the `live_in` flags read from the context; a flag-writing instruction ends its flags' sync; a
+    store or a read-back after a call starts it; a call that does not return syncs nothing; paths meet with an
+    intersection). The context then holds what it held before at every point (only redundant stores go), so traps,
+    svc, mrs/msr, calls through the runtime, fiber switches and C++ exceptions see the same flags. Typical gain: a
+    function that writes no flag no longer stores back at its returns the `live_out` flags it read at entry, and two
+    calls with the same flags live store them once. `--flags-everywhere` keeps every store.
   - **Module boundaries.** Each module's `PsvModuleCode` records `flags_needed_at_entry`, `flags_given_at_entry`,
     `flags_needed_at_return` and `flags_given_at_return` (`flag_contract` 1; 0 is code generated before, which has all
     four in the context everywhere and is taken to read all four). `recomp::register_module` checks every pair of
@@ -335,7 +343,14 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
       exact context out; the differential tests compare every register at every function's exit through it.
   - **Why code outside the view still sees an exact context.** Callers up the host stack keep registers in locals
     across internal calls, so the context alone is no longer exact at any depth. What makes it exact where something
-    reads it: r4-r12 are written before every internal call where dirty (as before); r0-r3, sp and lr enter an
+    reads it: r4-r12 are written before every internal call where dirty (as before), except, before a call of an
+    `Inside` entry, those the callee's reach does not touch (`FunctionRegisters::context_reads`: its instructions'
+    uses and defs and its callees', a least fixed point; every register for an entry of any other kind, a host
+    implementation, or code with a trap, a call other than a direct one or an exit other than a return), and whose
+    value at the call nothing after it may read from the context before the caller writes them again (a backward
+    pass: every call but such an `Inside` one, traps and exits read all). Those stay dirty in the caller's locals,
+    their context copy older (`call_unsynced`), until the caller writes them; the value left out dies unread, so no
+    store moves elsewhere (the corpus' `cr_caller` checks the whole context at a later `psv_call`); r0-r3, sp and lr enter an
     `Inside` entry dirty, so wherever its code writes registers to the context (a trap, a call through the runtime,
     an import: places an `Inside` entry has none of, by its kind, but the property does not rest on that) it writes
     them from its arguments, which its liveness then makes it take; and every call of a `Flushed` entry or a function
@@ -349,7 +364,8 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
   - What is assumed and not checked (KNOWN_ISSUES): the frame's saved LR is changed by nothing but the function's own
     stores, the assumption the callee-saved proof already makes; before, a return to an overwritten saved LR became a
     jump through the runtime (usually a trap: no function there), now it returns to the caller.
-  - Builds with `PSV_CHECK_KEPT_REGISTERS` check after a call of an `Inside` entry only r4-r12 against the context.
+  - Builds with `PSV_CHECK_KEPT_REGISTERS` check after a call of an `Inside` entry only r4-r12 against the context,
+    and of those not the ones left out of it before the call (`call_unsynced`).
   - `override_function` replaces a function for table lookups only, as before: direct calls (internal entries,
     inlined copies) are compiled in. A game that stands in for a function by renaming its generated definition (a
     script matching `void f_<address>(PsvContext* PSV_RESTRICT ctx, uint32_t ret) {`) must give it

@@ -692,6 +692,9 @@ struct Fn {
     EntryKind kind = EntryKind::Public;
     EntryReason reason = EntryReason::None;
     RegSet modified = 0, results = 0, params = 0;
+    // (Inside) The registers it or anything it calls may read or write in the context (FunctionRegisters::
+    // context_reads); everything for the others.
+    RegSet context_reads = kAllRegisters;
     nx::vector<RegSet> kept;  // (each call's kept registers as the forward pass gives them, before liveness narrows them)
     // A host implementation stands in for it (RegisterOptions::hosts); `guarded`: its code may run instead.
     bool host = false, guarded = false;
@@ -779,6 +782,41 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* 
     // (the blocks inside a loop: a strongly connected component with a cycle)
     nx::vector<u8> in_loop;
     if (out && options_.keep == KeepPolicy::Loops) in_loop = loop_blocks(g);
+    // After each instruction (on its executed edges): the registers whose value there something may read from the
+    // context before the function writes them again, the ones a store would have to put there if dirty: at a call
+    // (of an Inside entry, what its reach touches, context_reads; of anything else, all), a trap, an exit (a return,
+    // a jump through the runtime, a tail call, running into another function: all). A least fixed point, backwards.
+    // A call of an Inside entry leaves out of the context only dirty registers neither its callee touches nor this
+    // set holds: their value dies in the context unread, so no store is moved elsewhere (which would make them dirty
+    // where the paths join, and add loads after the calls there), only left out.
+    nx::vector<RegSet> wanted;
+    bool any_inside = false;
+    for (const CfgNode& node : g.nodes) any_inside |= node.call == CallKind::Direct && entry_of(node) == EntryKind::Inside;
+    if (any_inside) {
+        const usize n = f.fn->code.size();
+        nx::vector<RegSet> before(n, 0);
+        wanted.assign(n, 0);
+        const auto edge_wants = [&](const Edge& e) -> RegSet {
+            return e.kind == EdgeKind::Next && e.to < n ? before[e.to] : kAllRegisters;
+        };
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (usize i = n; i-- > 0;) {
+                const CfgNode& node = g.nodes[i];
+                RegSet after = 0;
+                for (const Edge* e = g.begin(node); e != g.end(node); ++e) after |= edge_wants(*e);
+                RegSet b = static_cast<RegSet>(after & ~f.effect[i].defs);
+                if (node.call != CallKind::None) {
+                    const Fn* c = entry_of(node) == EntryKind::Inside ? callee_of(node) : nullptr;
+                    b |= c ? c->context_reads : kAllRegisters;
+                }
+                if (f.effect[i].traps) b = kAllRegisters;
+                if (node.conditional) b |= edge_wants(node.skip);
+                wanted[i] = after;
+                if (b != before[i]) before[i] = b, changed = true;
+            }
+        }
+    }
     const auto kept_by = [&](const CfgNode& node) -> RegSet {
         if (!options_.callee_saved) return 0;
         if (node.call == CallKind::Direct) {
@@ -838,8 +876,18 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* 
             const EntryKind ck = entry_of(node);
             const Fn* callee = ck == EntryKind::Public ? nullptr : callee_of(node);
             // (a callee with nothing outside in its reach gets r0-r3, sp and lr as C arguments: only the other dirty
-            // registers go to the context, which it reads them from)
-            const RegSet store = ck == EntryKind::Inside ? static_cast<RegSet>(post.dirty() & ~kArgumentRegisters) : post.dirty();
+            // registers go to the context, which it reads them from; and of those only the ones it or what it calls
+            // may read or write there, context_reads, or whose value something after the call may read there before
+            // this function writes them again (`wanted`). The others stay dirty across the call, the context's copy
+            // as it was (the callee does not write it: below), until the function writes them: nothing reads the
+            // value left out. Nothing in an Inside callee's reach reads them: its code and its callees' (all Inside,
+            // or host implementations, whose callers here count every register) read the context only for registers
+            // their translations touch; it reaches no trap, svc, import, indirect call or jump, so no runtime code, no
+            // fiber switch and no C++ exception runs while it does; context_reads is every register where its code
+            // has such a place all the same)
+            const RegSet dirty = post.dirty();
+            const RegSet store =
+                ck == EntryKind::Inside ? static_cast<RegSet>(dirty & ~kArgumentRegisters & (callee->context_reads | wanted[i])) : dirty;
             for (u32 k = 0; k < 15; ++k) {
                 if (!(store & (1u << k))) continue;
                 if (post.local[k] == kTop) post.local[k] = fresh(i, k, 1);
@@ -881,7 +929,10 @@ RegSet Solver::forward(const Fn& f, bool sp_kept, FunctionRegisters* out, bool* 
                     else if (options_.keep == KeepPolicy::Loops && !in_loop[g.block_of[i]]) keep = 0;
                 }
             }
-            if (record) out->call_store[i] = store, out->call_kept[i] = keep, out->call_entry[i] = static_cast<u8>(ck);
+            if (record) {
+                out->call_store[i] = store, out->call_kept[i] = keep, out->call_entry[i] = static_cast<u8>(ck);
+                if (ck == EntryKind::Inside) out->call_unsynced[i] = static_cast<RegSet>(dirty & ~kArgumentRegisters & ~store);
+            }
         } else if (record) {
             out->exit_store[i] = exit_set(post);
         }
@@ -1150,6 +1201,49 @@ void Solver::classify() {
         c.modified = static_cast<RegSet>(c.writes & ~c.preserved & kAllRegisters);
         contracts_[i] = std::move(c);
     }
+    // What an Inside entry's reach may read or write in the context: a least fixed point. Its translation reads the
+    // context only at its entry, for the registers it uses that are not C arguments, and after its calls, for what
+    // its callees changed there; it writes it at its calls and returns, for registers it wrote (or loaded back): all
+    // of them its instructions' uses and defs. Its callees are Inside ones (their own sets) or host implementations
+    // (every register: their callers store everything, and a guarded one may run the guest's code through f_).
+    // Nothing else runs while it does (no trap, svc, import, indirect call or jump in its reach: no runtime code).
+    // (That is what the kind says; the sets do not rest on it alone: a place where code outside the generated code's
+    // view may run, found in the function's own code, makes its set every register, as for any other entry. So the
+    // kinds stay a choice of where to write, ARCHITECTURE.md, "Internal entries".)
+    nx::vector<RegSet> own(nf, kAllRegisters);
+    for (u32 i = 0; i < nf; ++i) {
+        Fn& f = fns_[i];
+        if (f.kind != EntryKind::Inside) continue;
+        RegSet s = f.writes;
+        for (const RegisterEffect& e : f.effect) {
+            s |= static_cast<RegSet>(e.uses | e.defs);
+            if (e.traps) s = kAllRegisters;
+        }
+        for (const CfgNode& node : f.cfg.nodes) {
+            if (node.call != CallKind::None && node.call != CallKind::Direct) s = kAllRegisters;
+            const auto edge = [&](const Edge& e) {
+                if (e.kind != EdgeKind::Next && e.kind != EdgeKind::Return) s = kAllRegisters;
+            };
+            for (const Edge* e = f.cfg.begin(node); e != f.cfg.end(node); ++e) edge(*e);
+            if (node.conditional) edge(node.skip);
+        }
+        own[i] = static_cast<RegSet>(s & kAllRegisters);
+        f.context_reads = own[i];
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (u32 i = 0; i < nf; ++i) {
+            Fn& f = fns_[i];
+            if (f.kind != EntryKind::Inside) continue;
+            RegSet s = own[i];
+            for (const CfgNode& node : f.cfg.nodes) {
+                if (node.call != CallKind::Direct) continue;
+                const u32 t = index(node.call_target);
+                s |= t == kNoIndex || fns_[t].host || fns_[t].kind != EntryKind::Inside ? kAllRegisters : fns_[t].context_reads;
+            }
+            if (s != f.context_reads) f.context_reads = s, changed = true;
+        }
+    }
 }
 
 RegisterAnalysis Solver::run() {
@@ -1235,6 +1329,7 @@ RegisterAnalysis Solver::run() {
         r.trap_store.assign(n, 0);
         r.call_store.assign(n, 0);
         r.call_kept.assign(n, 0);
+        r.call_unsynced.assign(n, 0);
         r.exit_store.assign(n, 0);
         r.after_store.assign(n, 0);
         r.call_entry.assign(n, 0);
@@ -1243,6 +1338,7 @@ RegisterAnalysis Solver::run() {
         r.modified = f.modified;
         r.results = f.results;
         r.writes = f.writes;
+        r.context_reads = f.context_reads;
         if (n == 0 || f.cfg.entry == kNoIndex) {
             r.call_load.assign(n, 0);
             r.live_before.assign(n, 0);

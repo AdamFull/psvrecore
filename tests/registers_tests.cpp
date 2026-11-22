@@ -39,6 +39,12 @@ constexpr RegSet kSp = analysis::kSpRegister, kLr = analysis::kLrRegister;
 //   i_recurse   4e push {r4, lr}; movs r4, r0; beq 1f; subs r0, #1; bl i_recurse; add r0, r4; 1: pop {r4, pc}
 //   j_loop      5e push {r4, r5, lr}; movs r5, #3; 1: bl b_keep; add r4, r0; subs r5, #1; bne 1b; bl b_keep;
 //                  add r0, r4; pop {r4, r5, pc}
+//   k_mutual_a  74 push {lr}; cmp r0, #0; beq 1f; subs r0, #1; bl k_mutual_b; 1: pop {pc}
+//   k_mutual_b  82 push {lr}; add r1, r7; bl k_mutual_a; pop {pc}
+//   k_caller    8c push {r6, r7, lr}; mov r6, r1; mov r7, r2; bl k_mutual_a; add r0, r6; add r0, r7; pop {r6, r7, pc}
+//   l_host      9c adds r0, #1; bx lr                                  (a host implementation stands in for it below)
+//   l_calls_host a0 push {r4, lr}; mov r4, r1; bl l_host; add r0, r4; pop {r4, pc}
+//   l_caller    ac push {r5, r6, lr}; mov r5, r1; mov r6, r2; bl l_calls_host; add r0, r5; add r0, r6; pop {r5, r6, pc}
 constexpr u16 kCode[] = {
     0x1840, 0x4770,                                                          // a_leaf
     0xB510, 0x4604, 0x1C60, 0xBD10,                                          // b_keep
@@ -50,9 +56,17 @@ constexpr u16 kCode[] = {
     0xB540, 0x4288, 0xBF88, 0x4606, 0x4790, 0x4430, 0xBD40,                  // h_cond
     0xB510, 0x0004, 0xD003, 0x3801, 0xF7FF, 0xFFFA, 0x4420, 0xBD10,          // i_recurse
     0xB530, 0x2503, 0xF7FF, 0xFFCF, 0x4404, 0x3D01, 0xD1FA, 0xF7FF, 0xFFCA, 0x4420, 0xBD30,  // j_loop
+    0xB500, 0x2800, 0xD002, 0x3801, 0xF000, 0xF801, 0xBD00,                  // k_mutual_a
+    0xB500, 0x4439, 0xF7FF, 0xFFF5, 0xBD00,                                  // k_mutual_b
+    0xB5C0, 0x460E, 0x4617, 0xF7FF, 0xFFEF, 0x4430, 0x4438, 0xBDC0,          // k_caller
+    0x3001, 0x4770,                                                          // l_host
+    0xB510, 0x460C, 0xF7FF, 0xFFFA, 0x4420, 0xBD10,                          // l_calls_host
+    0xB560, 0x460D, 0x4616, 0xF7FF, 0xFFF5, 0x4428, 0x4430, 0xBD60,          // l_caller
 };
 constexpr u32 kA = kBase + 0x00 + 1, kB = kBase + 0x04 + 1, kC = kBase + 0x0C + 1, kD = kBase + 0x10 + 1, kE = kBase + 0x24 + 1,
-              kF = kBase + 0x2A + 1, kG = kBase + 0x34 + 1, kH = kBase + 0x40 + 1, kI = kBase + 0x4E + 1, kJ = kBase + 0x5E + 1;
+              kF = kBase + 0x2A + 1, kG = kBase + 0x34 + 1, kH = kBase + 0x40 + 1, kI = kBase + 0x4E + 1, kJ = kBase + 0x5E + 1,
+              kKa = kBase + 0x74 + 1, kKb = kBase + 0x82 + 1, kK = kBase + 0x8C + 1, kLh = kBase + 0x9C + 1,
+              kLc = kBase + 0xA0 + 1, kL = kBase + 0xAC + 1;
 
 analysis::Image image() {
     analysis::Segment seg;
@@ -68,7 +82,7 @@ analysis::Image image() {
 
 analysis::Program discover(const analysis::Image& image) {
     analysis::Options options;
-    options.extra_entries = {kA, kB, kC, kD, kE, kF, kG, kH, kI, kJ};
+    options.extra_entries = {kA, kB, kC, kD, kE, kF, kG, kH, kI, kJ, kKa, kKb, kK, kLh, kLc, kL};
     options.use_exidx = false;
     return analysis::analyze(image, options);
 }
@@ -130,7 +144,7 @@ TEST_CASE("analysis: the core registers each instruction reads and writes") {
 TEST_CASE("analysis: registers read at entry, dirty at exits, kept across calls") {
     const auto img = image();
     const auto p = discover(img);
-    REQUIRE(p.functions.size() == 10);
+    REQUIRE(p.functions.size() == 16);
     // (every call through f_<address>, as before internal entries: their test is below)
     analysis::RegisterOptions legacy;
     legacy.internal_calls = false;
@@ -234,13 +248,18 @@ TEST_CASE("analysis: internal entries: kinds, arguments, results, and what calls
     CHECK(C.modified == r({4}));
     CHECK(C.results == 0);
     CHECK(C.exit_store[at(*p.function_at(kC), 0x0E)] == r({4}));
-    // The caller of both: its dirty r4 and r5 go to the context before them, not r0-r3, sp or lr; after c_clobber r4 is
-    // read back from the context.
+    // The caller of both: of its dirty r4 and r5 only r4 goes to the context before b_keep, the one b_keep reads there
+    // (context_reads), not r0-r3, sp or lr; r5 stays dirty, kept in its local; after c_clobber r4 is read back from the
+    // context.
+    CHECK(B.context_reads == (r({0, 4}) | kSp | kLr));
+    CHECK((C.context_reads & r({5})) == 0);
     const auto& D = *regs.at(kD);
     const auto& fd = *p.function_at(kD);
     const usize call_b = at(fd, 0x16), call_c = at(fd, 0x1A);
     CHECK(D.call_entry[call_b] == static_cast<u8>(EntryKind::Inside));
-    CHECK(D.call_store[call_b] == r({4, 5}));
+    CHECK(D.call_store[call_b] == r({4}));
+    CHECK(D.call_unsynced[call_b] == r({5}));
+    CHECK((D.call_store[call_c] & r({5})) == 0);
     CHECK((D.call_load[call_c] & r({4})) != 0);
     CHECK((D.call_load[call_b] & r({0})) == 0);  // (b_keep's result: by value)
     CHECK((D.call_kept[call_b] & (r({5}) | kSp)) == (r({5}) | kSp));
@@ -257,6 +276,56 @@ TEST_CASE("analysis: internal entries: kinds, arguments, results, and what calls
     // Recursion: an internal entry calling itself.
     CHECK(regs.at(kI)->entry == EntryKind::Inside);
     CHECK(regs.at(kI)->params == (r({0}) | kSp | kLr));
+    // (what its reach touches: its own code's registers, the fixed point over the call of itself)
+    CHECK(regs.at(kI)->context_reads == (r({0, 4}) | kSp | kLr));
+    // Mutual recursion: k_mutual_a's reach is k_mutual_b's too (r7 read there, r1 written), and the reverse; the
+    // caller's dirty r7 goes to the context before the call, r6 (touched by neither) stays in its local.
+    const auto& Ka = *regs.at(kKa);
+    const auto& Kb = *regs.at(kKb);
+    CHECK(Ka.entry == EntryKind::Inside);
+    CHECK(Kb.entry == EntryKind::Inside);
+    CHECK(Ka.context_reads == (r({0, 1, 7}) | kSp | kLr));
+    CHECK(Kb.context_reads == Ka.context_reads);
+    const auto& K = *regs.at(kK);
+    const usize call_ka = at(*p.function_at(kK), 0x92);
+    CHECK(K.call_entry[call_ka] == static_cast<u8>(EntryKind::Inside));
+    CHECK(K.call_store[call_ka] == r({7}));
+    CHECK(K.call_unsynced[call_ka] == r({6}));
+    CHECK((K.call_kept[call_ka] & r({6})) != 0);
+    // A loop of Inside calls: the counter r5 (dirty, read only by the caller, restored by its pop) is left out at both
+    // calls, and kept in its local across the one in the loop (after the other it is dead); r4, which b_keep reads,
+    // is not left out.
+    const auto& J = *regs.at(kJ);
+    const auto& fj = *p.function_at(kJ);
+    for (const usize call : {at(fj, 0x62), at(fj, 0x6C)}) {
+        CHECK(J.call_entry[call] == static_cast<u8>(EntryKind::Inside));
+        CHECK(J.call_unsynced[call] == r({5}));
+        CHECK((J.call_store[call] & r({5})) == 0);
+        CHECK((J.call_unsynced[call] & r({4})) == 0);
+    }
+    CHECK((J.call_kept[at(fj, 0x62)] & r({5})) != 0);
+    // Without a host implementation, l_calls_host touches r0, r1, r4, sp and lr: l_caller leaves its dirty r5 and r6
+    // out of the context.
+    const auto& Lc = *regs.at(kLc);
+    const usize call_lc = at(*p.function_at(kL), 0xB2);
+    CHECK(Lc.entry == EntryKind::Inside);
+    CHECK(Lc.context_reads == (r({0, 1, 4}) | kSp | kLr));
+    CHECK(regs.at(kL)->call_unsynced[call_lc] == r({5, 6}));
+    // A host implementation standing in for l_host (RegisterOptions::hosts): it reads the context as the AAPCS says,
+    // so l_calls_host's reach counts every register, and l_caller writes its dirty r5 and r6 before calling it.
+    {
+        analysis::RegisterOptions hosted;
+        const nx::map<u32, bool> hosts = {{kLh, false}};
+        hosted.hosts = &hosts;
+        const nx::vector<u32> none_for_host = {kLh & ~1u};
+        hosted.no_internal = &none_for_host;
+        const auto h = analysis::register_analysis(p, hosted);
+        CHECK(h.at(kLc)->entry == EntryKind::Inside);
+        CHECK(h.at(kLc)->context_reads == analysis::kAllRegisters);
+        CHECK(h.at(kL)->call_entry[call_lc] == static_cast<u8>(EntryKind::Inside));
+        CHECK((h.at(kL)->call_store[call_lc] & r({5, 6})) == r({5, 6}));
+        CHECK(h.at(kL)->call_unsynced[call_lc] == 0);
+    }
     // --no-inline: b_keep given none; its callers call f_<address>, every register in the context first.
     analysis::RegisterOptions excluded;
     const nx::vector<u32> list = {kB & ~1u};

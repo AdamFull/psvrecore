@@ -11,7 +11,8 @@
 //
 // Functions named obs_* are reached only through psv_call (code outside the generated code's view, which reads the
 // whole context): the test also compares the context at each of their entries with the interpreter's state there,
-// r0-r14, Q, GE, d0-d31 and the FPSCR (the condition flags there are only those the module gives at entry). That is the
+// r0-r14, Q, GE, d0-d31, the FPSCR and the condition flags the modules give at every call to code they do not know
+// (flags_given_at_entry; the others there are the caller's to give or not). That is the
 // property internal entries put at risk: callers up the host stack keep registers in locals (ARCHITECTURE.md,
 // "Internal entries").
 //
@@ -335,9 +336,20 @@ const char* observed_name(u32 address) {
     return "?";
 }
 
+// The flags every module puts in the context at a call to code it does not know (PsvModuleCode::flags_given_at_entry;
+// corpusgen gives every module the same), bit 3 N to bit 0 V: those compared at the obs_* entries. (A call there may
+// also give the flags its caller reads after it returns; those the result compares.)
+u32 flags_given_at_unknown_calls() {
+    u32 given = 15;
+    for (unsigned i = 0; i < corpus_module_count; ++i)
+        if (corpus_modules[i]->flag_contract) given &= corpus_modules[i]->flags_given_at_entry;
+    return given;
+}
+
 // The contexts at the obs_* entries, the generated code's against the interpreter's.
 nx::string observed_differences(const nx::vector<Seen>& a, const nx::vector<Seen>& b) {
     if (a.size() != b.size()) return nx::format(" calls through psv_call to obs_*: {} vs {};", a.size(), b.size());
+    static const u32 given = flags_given_at_unknown_calls();
     nx::string out;
     for (usize k = 0; k < a.size() && out.empty(); ++k) {
         const PsvContext& x = a[k].ctx;
@@ -348,6 +360,13 @@ nx::string observed_differences(const nx::vector<Seen>& a, const nx::vector<Seen
             if (x.r[r] != y.r[r]) d += nx::format(" r{}: {:08x} vs {:08x};", r, x.r[r], y.r[r]);
         if (x.q != y.q) d += " q differs;";
         if (x.ge != y.ge) d += " ge differs;";
+        const auto flag = [&](u32 bit, const char* name, u32 fx, u32 fy) {
+            if ((given & bit) && (fx != 0) != (fy != 0)) d += nx::format(" {}: {} vs {};", name, fx != 0, fy != 0);
+        };
+        flag(8, "n", x.n, y.n);
+        flag(4, "z", x.z, y.z);
+        flag(2, "c", x.c, y.c);
+        flag(1, "v", x.v, y.v);
         if (x.fpscr != y.fpscr) d += nx::format(" fpscr: {:08x} vs {:08x};", x.fpscr, y.fpscr);
         for (int r = 0; r < 32; ++r)
             if (x.vfp.d[r] != y.vfp.d[r]) d += nx::format(" d{}: {:016x} vs {:016x};", r, x.vfp.d[r], y.vfp.d[r]);
@@ -572,7 +591,8 @@ TEST_CASE("recomp: generated functions agree with the interpreter on the synthet
     std::printf("%s\n", nx::format("generator vs interpreter ({}): {} functions, {} runs, {} interpreted instructions, {} disagreements, {} skipped",
                                    kConfig, sizeof kCorpusTests / sizeof kCorpusTests[0], runs, steps_total, failures, skipped)
                             .c_str());
-    std::printf("%s\n", nx::format("contexts compared at calls through psv_call to obs_*: {}", observed_calls).c_str());
+    std::printf("%s\n", nx::format("contexts compared at calls through psv_call to obs_*: {} (flags {:x} among them)", observed_calls,
+                                   flags_given_at_unknown_calls()).c_str());
     CHECK((g_observed_count == 0 || observed_calls > 0));
     std::printf("%s\n", nx::format("flags compared at exit: all four in {} functions, some in {}, none in {} (those no caller reads)", all_flags,
                                    some_flags, sizeof kCorpusTests / sizeof kCorpusTests[0] - all_flags - some_flags)
