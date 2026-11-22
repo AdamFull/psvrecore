@@ -209,6 +209,56 @@ TEST_CASE("gxm translate: a colour read left to the blending reads no attachment
     CHECK(!has_capability(*blends, kCapabilityInputAttachment));
 }
 
+namespace {
+
+// An instruction of the opcode whose words at `at` and after are `a` and `b`.
+bool has_instruction(const nx::vector<u32>& m, u32 op, u32 at, u32 a, u32 b) {
+    for (usize i = 5; i < m.size() && (m[i] >> 16); i += m[i] >> 16)
+        if ((m[i] & 0xFFFF) == op && (m[i] >> 16) > at + 1 && m[i + at] == a && m[i + at + 1] == b) return true;
+    return false;
+}
+
+constexpr u32 kOpExecutionMode = 16, kOpDecorate = 71, kModeDepthReplacing = 12, kDecorationBuiltIn = 11,
+              kBuiltInFragDepth = 22;
+
+bool has_execution_mode(const nx::vector<u32>& m, u32 mode) {
+    for (usize i = 5; i < m.size() && (m[i] >> 16); i += m[i] >> 16)
+        if ((m[i] & 0xFFFF) == kOpExecutionMode && (m[i] >> 16) >= 3 && m[i + 2] == mode) return true;
+    return false;
+}
+
+// A fragment program of one depthf (of r1), under a predicate or not.
+nx::vector<u32> depth_program(Pred pred, bool executed) {
+    Gxp gxp;
+    gxp.type = ShaderType::Fragment;
+    Decoded d;
+    d.in.op = Op::DepthF;
+    d.in.pred = pred;
+    d.in.dest.bank = Bank::Temp;
+    d.in.dest.number = 1;
+    d.executed = executed;
+    const nx::vector<Decoded> program = {d};
+    gxm::FragmentShader fs;
+    const auto m = gxm::translate_fragment(gxp, program, fs);
+    REQUIRE(m);
+    REQUIRE(walk(*m).ok);
+    return *m;
+}
+
+}  // namespace
+
+TEST_CASE("gxm translate: depthf replaces the fragment's depth") {
+    for (const Pred pred : {Pred::None, Pred::P0, Pred::NotP0}) {
+        const nx::vector<u32> m = depth_program(pred, true);
+        CHECK(has_execution_mode(m, kModeDepthReplacing));
+        CHECK(has_instruction(m, kOpDecorate, 2, kDecorationBuiltIn, kBuiltInFragDepth));
+    }
+    // (a depthf that does not execute: the depth is left to the pipeline)
+    const nx::vector<u32> none = depth_program(Pred::None, false);
+    CHECK(!has_execution_mode(none, kModeDepthReplacing));
+    CHECK(!has_instruction(none, kOpDecorate, 2, kDecorationBuiltIn, kBuiltInFragDepth));
+}
+
 TEST_CASE("gxm translate: the driver's secondary attributes hold a user uniform buffer's container") {
     // (container 1: BUFFER[1]'s first words in sa0-sa3; the default uniform buffer's in sa4-sa5; a literal after)
     Gxp gxp;

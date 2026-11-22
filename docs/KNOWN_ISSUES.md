@@ -95,8 +95,12 @@
   clamped to the bank; a load outside the memory buffer or a sample of a missing texture gives zeros; a run of more
   than 1,000,000 blocks stops and is reported.
 - **Not implemented** (as in the interpreter): the per-instance predicate, `rlp`, per-lane predicate tests, o8
-  packs, depth output, loads and stores other than absolute ones, texture queries other than `.irsd` of a 2D texture
+  packs, loads and stores other than absolute ones, texture queries other than `.irsd` of a 2D texture
   with an f32 result (and that one has no oracle: see below).
+- **Depth output (`depthf`) is the draw's fragment form's only**: the register's f32, clamped to 0-1, replaces the
+  fragment's depth (FragDepth, DepthReplacing); a predicated one that does not run leaves the fragment's own depth.
+  The compute form, the one compared with the interpreter, has no depth: it ignores `depthf`, which the interpreter
+  refuses, so this has no oracle.
 - **Stores** of 1 or 2 bytes read, modify and write their word, not atomically: instances storing bytes of one word
   can race. Stores of 4 bytes are assumed aligned. A store outside the memory buffer is dropped.
 - **Implicit levels of detail** need derivatives, which fragment shaders have only outside non-uniform control

@@ -421,6 +421,8 @@ private:
     bool stores_ = false;       // (the program stores to memory: its buffers are writable)
     bool in_secondary_ = false;  // (emitting the inline secondary program: its primary bank is sa)
     Id frag_coord_ = 0;          // (the fragment form's FragCoord input)
+    bool writes_depth_ = false;  // (the program has a depthf)
+    Id depth_ = 0;               // (the fragment form of a program with a depthf: the depth it leaves)
 
     Id tu_ = 0, ti_ = 0, tf_ = 0, tb_ = 0;
     Id tp_fu_ = 0, tp_fi_ = 0, tp_fb_ = 0, tp_su_ = 0;
@@ -1440,6 +1442,11 @@ void Translator::emit(usize i) {
         case Op::Store: memory_op(in); break;
         case Op::Tex: tex_op(in); break;
         case Op::Kill: store_now(tb_, killed_, b_.c_bool(true)); break;
+        // The fragment's depth, an f32 in the register (the shader compiler's DEPTH output); the other forms have
+        // no depth to replace.
+        case Op::DepthF:
+            if (depth_) store_now(tf_, depth_, fval(in.dest, 0, Type::F32));
+            break;
         case Op::MovToLink: store_now(tu_, link_, load(tu_, chain(tp_fu_, temp_.var, {u(0)}))), temp_.used = nx::max(temp_.used, 1u); break;
         case Op::MovFromLink: put(Operand{Bank::Temp, 0, 0, false, 1, 1}, 0, Type::U32, load(tu_, link_)); break;
         default: fail(nx::format("{} not implemented", usse::mnemonic(in.op))); break;
@@ -1747,6 +1754,8 @@ Id Translator::special(i32 code) {
 
 void Translator::fragment_prologue() {
     sa_base_ = iadd(imul(push_constant(0, tu_), u(kDrawSecondaryWords)), u(256));
+    // (a depthf under a predicate that is false leaves the fragment's own depth)
+    if (depth_) store(depth_, b_.op(SpvOpCompositeExtract, tf_, {load(tv4_, frag_coord()), 2}));
     if (!inline_secondary.empty()) {
         // (the secondary attributes, privately: the inline secondary program writes them)
         sa_.minimum = 256;
@@ -1944,6 +1953,13 @@ void Translator::fragment_epilogue() {
         store(color, b_.op(SpvOpCompositeConstruct, tv4_, {lane[nx::min<u8>(z[0], 5)], lane[nx::min<u8>(z[1], 5)],
                                                           lane[nx::min<u8>(z[2], 5)], lane[nx::min<u8>(z[3], 5)]}));
     }
+    if (depth_) {
+        // (the depth surface's range: what is outside it is undefined in Vulkan)
+        const Id depth = b_.variable(b_.t_pointer(SpvStorageClassOutput, tf_), SpvStorageClassOutput);
+        b_.decorate(depth, SpvDecorationBuiltIn, {SpvBuiltInFragDepth});
+        interface_.push_back(depth);
+        store(depth, ext(tf_, GLSLstd450NClamp, {load(tf_, depth_), f(0.0f), f(1.0f)}));
+    }
     // A discarded instance: no colour, no depth.
     const Id kill = b_.new_label(), merge = b_.new_label();
     const Id killed = load(tb_, killed_);
@@ -1970,8 +1986,12 @@ Result<nx::vector<u32>> Translator::translate() {
     for (const Decoded& d : program_) {
         branches_ |= d.executed && d.in.op == Op::Br;
         stores_ |= d.executed && d.in.op == Op::Store;
+        writes_depth_ |= d.executed && d.in.op == Op::DepthF;
     }
-    for (const Decoded& d : inline_secondary) stores_ |= d.executed && d.in.op == Op::Store;
+    for (const Decoded& d : inline_secondary) {
+        stores_ |= d.executed && d.in.op == Op::Store;
+        writes_depth_ |= d.executed && d.in.op == Op::DepthF;
+    }
 
     // The storage buffers: one struct of a runtime array of words.
     const Id words = b_.t_runtime_array(tu_);
@@ -2052,6 +2072,7 @@ Result<nx::vector<u32>> Translator::translate() {
     pred_ = local(b_.t_array(tb_, 4), "p");
     killed_ = local(tb_, "killed");
     link_ = local(tu_, "link");
+    if (form_ == Form::Fragment && writes_depth_) depth_ = local(tf_, "depth");
 
     Id gid = 0;
     switch (form_) {
@@ -2101,6 +2122,7 @@ Result<nx::vector<u32>> Translator::translate() {
         case Form::Fragment:
             b_.entry_point(SpvExecutionModelFragment, fn, "main", interface_);
             b_.execution_mode(fn, SpvExecutionModeOriginUpperLeft);
+            if (depth_) b_.execution_mode(fn, SpvExecutionModeDepthReplacing);
             break;
     }
     if (int64_) b_.capability(SpvCapabilityInt64);
