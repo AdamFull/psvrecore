@@ -144,7 +144,7 @@
 - **Uniform buffers** are copied once per scene and shared by the draws that use them; buffers at different
   addresses that overlap get separate copies.
 - **The mask update program** has no `SceGxmProgram`: `sceGxmFragmentProgramGetProgram` returns 0 for it.
-- **Texture formats not done:** PVRTC, BC4/5, X8U24, F11F11F10. The mirror-clamp addressing modes clamp.
+- **Texture formats not done:** X8S8S8U8, U32, S32, U32U32, SE5M9M9M9, X8U24 in a swizzle other than its first. The mirror-clamp addressing modes clamp.
 - **YUV textures are converted to RGBA on the CPU** when they are read, with the colour space profile set then. A
   profile changed later (`sceGxmSetYuvProfile`) does not reach textures already converted and cached. Only their top
   level is read.
