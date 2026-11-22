@@ -79,6 +79,7 @@ Result<i32> Loader::load(nx::string_view host_path, nx::string_view guest_path) 
     GuestMemory& memory = runtime_.memory();
     nx::vector<u32> mapped;
     for (const auto& s : image->segments()) {
+        if (s.size() == 0) continue;  // (an empty data segment: nothing to map)
         const nx::string name = nx::format("{} segment {}", image->module().info.name, s.index);
         if (!memory.map_fixed(s.base, s.size(), Access::ReadWrite, BlockKind::Module, name)) {
             for (u32 b : mapped) memory.unmap(b);
