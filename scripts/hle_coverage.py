@@ -67,7 +67,9 @@ def strip_comments(text):
 
 TABLE_RE = re.compile(r'\bconst\s+(?:[\w:]*::)?(Function|Variable)\s+(\w+)\s*\[\s*\]\s*=\s*\{')
 ENTRY_RE = re.compile(r'(?:\b\w+\s*\(|\{)\s*(0x[0-9A-Fa-f]+)\s*,\s*(?:"([^"]+)"|([A-Za-z_]\w*))')
-REGISTER_RE = re.compile(r'register_library\s*\(\s*\{\s*"(\w+)"\s*,\s*([\w:]+)\s*,\s*(\w+|\{\s*\})\s*(?:,\s*(\w+)\s*)?\}')
+# ({name, NID, functions[, variables][, flags...]}: the variables a table or {}, later fields not tables)
+REGISTER_RE = re.compile(r'register_library\s*\(\s*\{\s*"(\w+)"\s*,\s*([\w:]+)\s*,\s*(\w+|\{\s*\})\s*'
+                         r'(?:,\s*(\w+|\{\s*\})\s*)?(?:,\s*[\w:]+\s*)*\}')
 CONSTANT_RE = re.compile(r'\b(k\w+)\s*=\s*(0x[0-9A-Fa-f]+)')
 LIBRARY_NIDS = {}  # (filled by read_hle: library -> the NIDs it is registered with)
 
