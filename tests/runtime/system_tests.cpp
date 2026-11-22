@@ -182,6 +182,27 @@ TEST_CASE("appmgr, screenshots, debug switches, fios overlays: what has nothing 
     CHECK(call32(ctx, kSceFios2User, kSetDisabled, {1}) == 0);
     CHECK(call32(ctx, kSceFios2User, kIsDisabled, {}) == 1);
     CHECK(call32(ctx, kSceFios2User, kSetDisabled, {0}) == 0);
+    // An overlay over "app0:game_data/lumps" takes "app0:/game_data/lumps/..." too (the same folder), and not
+    // "app0:/game_data/lumpsx".
+    {
+        constexpr u32 kAdd = 0x6C4BE9CD, kRemove = 0xE5D1B6F5;
+        const u32 overlay = scratch(0x258), id = scratch(4);
+        u8* o = t.rt.memory().host(overlay);
+        std::memset(o, 0, 0x258);
+        std::strcpy(reinterpret_cast<char*>(o + 0x10), "app0:game_data/lumps");        // (dst)
+        std::strcpy(reinterpret_cast<char*>(o + 0x10 + 292), "data_ngp/lumps");      // (src)
+        REQUIRE(call32(ctx, kSceFios2User, kAdd, {0, overlay, id}) == 0);
+        const auto resolved = [&](const char* path) {
+            REQUIRE(call32(ctx, kSceFios2User, kResolveSync, {0, 0, guest_string(path), out, 64}) == 0);
+            return nx::string(reinterpret_cast<const char*>(t.rt.memory().host(out)));
+        };
+        CHECK(resolved("app0:/game_data/lumps/a.core") == "data_ngp/lumps/a.core");
+        CHECK(resolved("app0:game_data/lumps/a.core") == "data_ngp/lumps/a.core");
+        CHECK(resolved("app0:/game_data/lumpsx") == "app0:/game_data/lumpsx");
+        u32 overlay_id = 0;
+        std::memcpy(&overlay_id, t.rt.memory().host(id), 4);
+        CHECK(call32(ctx, kSceFios2User, kRemove, {0, overlay_id}) == 0);
+    }
     // (the overlay directory handles: refused as overlays are)
     for (u32 nid : {0x5D6A1CCEu, 0x2F06ADC6u, 0x021B4AF7u, 0x759EBEE6u, 0xF6A3E335u, 0x2A9724C9u})
         CHECK(call32(ctx, kSceFios2Kernel, nid, {0, 0, 0, 0}) == err::kUnsupported);

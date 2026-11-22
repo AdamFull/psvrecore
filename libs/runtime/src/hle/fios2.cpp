@@ -65,9 +65,26 @@ nx::string trimmed(nx::string_view path) {
     return nx::string(path);
 }
 
+// A path as overlays match it: a device's root with its '/' ("app0:game_data" is "app0:/game_data": Killzone
+// Mercenary lays its archives over the first and resolves the second).
+nx::string rooted(nx::string_view path) {
+    const usize colon = path.find(':');
+    const usize slash = path.find('/');
+    if (colon == nx::string_view::npos || (slash != nx::string_view::npos && slash < colon) || colon + 1 == path.size() ||
+        path[colon + 1] == '/')
+        return nx::string(path);
+    nx::string s(path.substr(0, colon + 1));
+    s += '/';
+    s += path.substr(colon + 1);
+    return s;
+}
+
 // The path under the overlay's source that `path` is under its destination, if it is.
-bool remapped(const Overlay& o, nx::string_view path, nx::string* out) {
-    const nx::string_view dst = o.dst.view();
+bool remapped(const Overlay& o, nx::string_view given, nx::string* out) {
+    const nx::string dst_rooted = rooted(o.dst.view());
+    const nx::string path_rooted = rooted(given);
+    const nx::string_view dst = dst_rooted.view();
+    const nx::string_view path = path_rooted.view();
     if (path.size() < dst.size() || path.substr(0, dst.size()) != dst) return false;
     nx::string_view rest = path.substr(dst.size());
     const bool dst_ends = dst.back() == '/' || dst.back() == ':';
