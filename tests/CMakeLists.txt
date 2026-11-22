@@ -175,7 +175,22 @@ if(PSVRECORE_PROBES_DIR)
 endif()
 
 # The runtime: its own executable (it reserves the guest address space, which the generator's tests also use).
-add_library(psvrecore_runtime_test_guest STATIC runtime/runtime_guest.c)
+# With it, runtime/spin_module.hpp's guest threads that wait for each other through memory, translated by the
+# generator (spingen) and compiled as a game's code is.
+add_executable(spingen runtime/spingen.cpp)
+target_include_directories(spingen PRIVATE runtime)
+target_link_libraries(spingen PRIVATE psvrecore::recomp)
+psvrecore_target_defaults(spingen)
+set(_spin_dir "${CMAKE_CURRENT_BINARY_DIR}/spin/spin_mod")
+add_custom_command(
+    OUTPUT "${_spin_dir}/spin_mod_code_0.c" "${_spin_dir}/spin_mod_module.c"
+    COMMAND spingen "${CMAKE_CURRENT_BINARY_DIR}/spin"
+    DEPENDS spingen "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spin_module.hpp"
+    COMMENT "Translating the synthetic module of waiting threads"
+    VERBATIM)
+add_library(psvrecore_runtime_test_guest STATIC runtime/runtime_guest.c "${_spin_dir}/spin_mod_code_0.c"
+                                                "${_spin_dir}/spin_mod_module.c")
+target_include_directories(psvrecore_runtime_test_guest PRIVATE "${_spin_dir}")
 target_link_libraries(psvrecore_runtime_test_guest PUBLIC psvrecore::recomp_support)
 psvrecore_generated_code(psvrecore_runtime_test_guest)
 

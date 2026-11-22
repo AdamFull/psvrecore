@@ -87,7 +87,9 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     memory blocks, thread stacks and TLS areas, the runtime's own data.
   - Touching anything else faults. A fault handler reports the guest address and the guest thread that touched it.
   - Generated code accesses guest memory with relaxed atomic loads and stores. Plain C accesses would let the C
-    compiler keep a value across a guest spin loop. On x86-64 and arm64 they compile to ordinary moves.
+    compiler keep a value across a guest spin loop. On x86-64 and arm64 they compile to ordinary moves. Their
+    remaining cost, the weaker models measured and why they are not used: [CODEGEN_METRICS.md](CODEGEN_METRICS.md),
+    "Guest memory access model". The runtime test of generated code waiting for another thread's store guards it.
   - The base (`psv_membase`) is set before guest code runs and never changes. Each generated function reads it once,
     into a local (`uint8_t* const mb`), and passes it to the accessors (`psv_mld32(mb, a)`...): read from the global
     at each access, the C compiler would load it again after every guest store (generated code has no strict

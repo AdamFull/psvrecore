@@ -1451,3 +1451,121 @@ callees 0x8311ADF4, 0x8311AE40 (table building) and 0x8311AFBC (the fixed tables
   flags at entry refused with its note; `recomp::kRuntimeHostFunctions` equal to guest.h's `psv_host_*` declarations).
   132 test cases, 0 failures.
 - `scripts\build.ps1 -Preset windows-x64-release` and `-Preset windows-x64-debug`: built, 9 of 9 test programs pass.
+
+## Guest memory access model (task 9)
+
+Measured 2026-11-22 on 710b33d (tasks 1-8). The question: can generated code's guest loads and stores
+(`PSV_LOAD_AT`/`PSV_STORE_AT` in `guest.h`: relaxed `__atomic` accesses) be weaker? Decision: **no change**; the
+accessors stay relaxed atomics. Below: what weaker accesses buy, where the cost of the atomics is, each option's
+argument, and the test that decides whether an option is safe.
+
+### Variants measured
+
+- A: relaxed atomics (as shipped). One host move per access on x64 and arm64.
+- V: `volatile` accesses through an `aligned(1)` type (`*(volatile psv_x32*)(mb + a)`), NEON's as now (they are
+  already volatile). Every guest access is still made, once, in program order among volatile accesses, as one host
+  move (checked in the objects: `mov` on x64, `ldr`/`str` on arm64, unaligned addresses included). `aligned(1)` is
+  needed with clang-cl: its default `-fms-volatile` makes a naturally aligned volatile access an acquire/release
+  atomic, which is A again with a stronger order (`/volatile:iso` would be the explicit way).
+- P: plain accesses through the same `aligned(1), may_alias` type, NEON's too.
+
+A guarded switch in `guest.h` produced V and P; it is not kept.
+
+### Static effect (host instructions per guest instruction)
+
+| tree | A x64 | V x64 | P x64 | A arm64 | V arm64 | P arm64 |
+|---|---:|---:|---:|---:|---:|---:|
+| synthetic corpus, all functions | 9.863 | 9.490 (-3.8%) | 9.346 (-5.2%) | 7.432 | 7.291 (-1.9%) | 7.174 (-3.5%) |
+| P4D, its six modules (16,704 functions, 1,164,693 guest instructions) | 5.445 | 5.413 (-0.6%) | 5.384 (-1.1%) | 5.184 | 5.167 (-0.3%) | 5.061 (-2.4%) |
+
+- Synthetic by class, V / P: integer -2.9/-6.7% x64, -2.0/-4.5% arm64; vfp -1.3/-1.5%, +0.8/-1.3%; neon -1.0/+0.9%,
+  -1.0/+2.8%; call-heavy -17.4/-24.2%, -11.6/-17.8%. Most of the synthetic gain is in `syn_regs` and `syn_calls`:
+  tiny functions and inlined internal entries (`syn_regs` V -15.8% x64). P grows `syn_integer` (+6.6%): with plain
+  accesses clang unrolls and vectorises byte loops (f_82018592 166 -> 299 instructions x64).
+- P4D by class, V / P: integer -0.6/0.0% x64, -0.2/+0.5% arm64; vfp -0.5/-0.9%, -0.3/-3.5%; neon -1.0/-0.9%,
+  -0.4/-1.9%; call-heavy -0.8/-5.1%, -0.5/-4.3%. Per module V is -0.0 to -1.1%. On game code V's gain is about a sixth
+  of the synthetic corpus's, on both hosts: game functions are larger and spend their instructions on
+  arithmetic, not on context traffic around a few accesses.
+- WipEout 2048's hot ten could not be measured: its game files and `generated/code` are no longer on the disk (only
+  `generated-perf`, from an older generator without `mb`, is left).
+
+### Time (synthetic corpus, x64)
+
+`CODEGEN_BENCH=8` (2000 calls a round, the fastest of 8) of `psvrecore_codegen_tests`, three builds of it (the
+generated corpus compiled as A, V, P), 9 runs each alternated (a v p, p v a, ...), pinned to one logical CPU at high
+priority. Geometric mean over the corpus functions: A 26.89 ns (runs 26.74-27.24), V 25.85 ns (-3.9%;
+25.49-28.50), P 24.91 ns (-7.4%; 24.83-25.63). Largest moves (A / V / P ns): recursion 76.5 / 42.8 / 40.0, vec_sum
+105.3 / 70.0 / 70.2, tail_caller 19.2 / 11.8 / 11.0, ie_even 64.8 / 54.4 / 34.3. No game was timed: that needs the
+game's code regenerated and built three times and a repeatable scene, and with P4D's static -0.6% the expected gain
+of V is below the noise of a game run.
+
+### Where the cost of relaxed atomics is
+
+Not in the accesses: A, V and P compile each access to the same host move. LLVM treats an atomic load or store
+stronger than `unordered` (relaxed included) as a read and write of all memory it cannot prove private, so each guest
+access is a compiler barrier for the context and the host stack too:
+
+- `ctx->n/z/c/v` loaded at entry and stored back unchanged at the exit: `fi_82000000` (`ldr r0, [r0]; bx lr`) keeps
+  an x64 `movups 0x40(%rcx)` load and store under A, none under V and P (14 -> 12 instructions);
+- `ctx->r[]` stores before an inlined internal entry, kept although the callee takes the values as arguments
+  (f_820382DA: 129 / 66 / 57 instructions, A / V / P).
+
+Volatile accesses order only against other volatile accesses and calls, so V removes that part: about 70% of P's
+static gain on the synthetic corpus, about half on P4D x64, an eighth on P4D arm64. What P adds on top is forwarding and merging of the guest
+accesses themselves (a pushed value read back from the stack, a store then a load of the same word, loops kept in
+registers). The last of these is what makes P wrong.
+
+### The options and their multi-thread argument
+
+- Plain accesses everywhere (P): wrong. A guest thread waiting in a loop of loads with no call (a spin lock's test
+  loop, a flag) becomes a loop that never loads again: spin_flag below compiles to `je 0x30` / `0x30: jmp 0x30` under
+  P, and the test hangs. Every access other threads make is also a data race in C (undefined behaviour).
+- Plain accesses with a compiler barrier at every loop header (about 4% slower in an earlier measurement): the
+  barrier (`asm volatile("" ::: "memory")`) clobbers the context as the atomics do, so it gives back most of what P
+  gains, and it is not sufficient. A guest loop is not always a loop of the C function: clang's tail-recursion
+  elimination makes a loop of a function that tail-calls itself, with no header the generator marked; and between
+  barriers plain accesses may still be merged, split or moved above the check that guards them. Not worth its risk.
+- Plain accesses only for stack slots proven not to escape: safe only with an escape analysis of every `sp`-derived
+  value: `mov rX, sp` / `add rX, sp, #n` copied to a register or to memory, the callee's view of the caller's frame
+  (stack arguments; its own `sp` is the caller's), system library functions reading the guest stack (varargs, pointers
+  to locals), other threads (spin_stack below posts the address of a stack word and waits on it). The generator has
+  no such analysis. Its upper bound is the stack part of P's gain over V (P - V on P4D: -0.5% x64, -2.1% arm64, not
+  all of it stack). Not implemented.
+- Volatile accesses (V): the host instructions are A's, so single-copy atomicity (aligned words), coherence and the
+  orders the hardware gives are unchanged. The compiler keeps every guest access, once and in order among guest
+  accesses, which is stricter than relaxed atomics (those may in principle be merged). Non-volatile memory (the
+  context, the host stack) may move across guest accesses; it belongs to the running thread. A fault on a guest
+  access is resolved by re-running the one host instruction (watched or deferred pages) or reported; the context is
+  not up to date at a fault under A either (registers live in locals). `dmb` stays a sequentially consistent fence and
+  LDREX/STREX/SWP stay sequentially consistent atomics, full compiler barriers both. The weak point is formal: a
+  racing non-atomic volatile access is undefined in C11. LLVM's IR gives it a meaning (not split, merged or removed;
+  a racing read returns a target-dependent value), the one the Linux kernel's `READ_ONCE`/`WRITE_ONCE` rely on, and
+  clang-cl needs the `aligned(1)` type (or `/volatile:iso`) for it not to become an atomic. The spin-wait test passes
+  under V.
+
+### The spin-wait test
+
+`kernel: generated code waiting in a loop sees a store of another thread` (`tests/runtime/kernel_tests.cpp`) runs a
+synthetic Thumb module (`tests/runtime/spin_module.hpp`, translated at build time by `spingen` and compiled with the
+generated code's options into `psvrecore_runtime_test_guest`) on three guest CPUs, three rounds of:
+
+- a thread waiting in a loop of loads for a word another thread stores 5 ms later;
+- a thread waiting on a word of its own stack frame, whose address it posts to the storing thread;
+- message passing: data, `dmb ish`, flag; the reader waits for the flag, `dmb ish`, reads the data.
+
+A wait that does not end in 10 s ends the program with a message (a thread looping in guest code cannot be ended).
+Under A it passes (about 1 s); under V it passes (3 of 3 runs); under P it fails: `FAILED: spin_flag did not end in
+10 s`, exit 1. It stays in the suite as the guard for any later change to the accessors.
+
+### Recommendation
+
+Keep relaxed atomics. V is the only option that looks safe, and it passes the test, but on game code it buys 0.3-0.6%
+of host instructions (3.9% of time on the synthetic corpus, whose functions are a few instructions each), for leaning
+on behaviour C leaves undefined and on a clang-cl option detail. That is not clearly worth it. The cost that is there
+is context traffic kept around guest accesses. Where a profile shows it in a hot function, the target is the
+generator: not storing back `n/z/c/v` that a function never writes, and not storing `ctx->r[]` before an inlined
+internal entry that takes them as arguments. Both are correct under any memory model. They are where V's gain comes
+from in the examples above; how much of it they recover is not measured.
+
+Not measured: those two generator changes; timing on a game (PC, Odin or 8a); arm64 time; the spin-wait test on
+arm64 (Android); WipEout 2048's hot ten (inputs gone); the stack-only option (no escape analysis to measure it with).

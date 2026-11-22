@@ -13,6 +13,7 @@
 
 #include "nxtest.h"
 #include "runtime_support.hpp"
+#include "spin_module.hpp"
 #include "core/foundation/threading/thread.h"
 #include "core/foundation/platform/os.h"
 #include "core/foundation/strings/format.h"
@@ -25,6 +26,7 @@ extern "C" {
 extern PsvImport test_exit_import;
 extern volatile int test_returned_after_exit;
 void test_exit_entry(PsvContext* ctx, uint32_t ret);
+extern const PsvModuleCode spin_mod_module;
 }
 
 namespace {
@@ -284,6 +286,70 @@ TEST_CASE("kernel: a thread spinning in guest code after losing its CPU sees wha
     wait_end(ctx, b);
     wait_end(ctx, a);
     CHECK(seen.load() == 1);
+}
+
+TEST_CASE("kernel: generated code waiting in a loop sees a store of another thread") {
+    // spin_module.hpp's threads, translated by the generator and compiled with the generated code's options: each
+    // waits in a loop of guest loads with no kernel call for a word another thread stores (a word of scratch memory,
+    // a word of the waiting thread's own stack frame whose address it posts, a flag after data and a barrier). The
+    // loads must not be kept in a register across the loop (docs/CODEGEN_METRICS.md, "Guest memory access model").
+    // A thread looping in guest code cannot be ended, so a wait that does not end in 10 s ends the program.
+    TestRuntime t(3, 100);
+    recomp::register_module(spin_mod_module);
+    PsvContext* ctx = t.ctx();
+    const auto wait_or_die = [&](i32 uid, const char* what) {
+        const u32 at = scratch(8);
+        psv_st32(at + 4, 10'000'000);  // (microseconds)
+        const i32 r = call32(ctx, kSceLibKernel, kWaitThreadEnd, {u(uid), at, at + 4});
+        if (r == err::kWaitTimeout) {
+            std::printf("FAILED: %s did not end in 10 s: it never saw the store\n", what);
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        CHECK(r == 0);
+        return psv_ld32(at);
+    };
+    const auto args = [](std::initializer_list<u32> words) {
+        const u32 at = scratch(4 * static_cast<u32>(words.size()));
+        u32 i = 0;
+        for (u32 w : words) psv_st32(at + 4 * i++, w);
+        return at;
+    };
+    for (int round = 0; round < 3; ++round) {
+        // A word of memory: the waiter starts first and loops; the store comes 5 ms later from another thread.
+        const u32 flag = scratch(4);
+        psv_st32(flag, 0);
+        const i32 waiter = create_thread(ctx, "spin_flag", spin_test::kSpinFlag, 120);
+        CHECK(start_thread(ctx, waiter, 4, args({flag})) == 0);
+        delay(ctx, 5000);
+        const i32 setter = create_thread(ctx, "set_flag", spin_test::kSetFlag, 120);
+        CHECK(start_thread(ctx, setter, 8, args({flag, 0x1234u + static_cast<u32>(round)})) == 0);
+        CHECK(wait_or_die(waiter, "spin_flag") == 0x1234u + static_cast<u32>(round));
+        wait_or_die(setter, "set_flag");
+
+        // A word of the waiter's stack frame, its address posted through memory (the setter waits for the address).
+        const u32 post = scratch(4);
+        psv_st32(post, 0);
+        const i32 stack_waiter = create_thread(ctx, "spin_stack", spin_test::kSpinStack, 120);
+        const i32 poster = create_thread(ctx, "set_posted", spin_test::kSetPosted, 120);
+        CHECK(start_thread(ctx, poster, 8, args({post, 77})) == 0);
+        delay(ctx, 5000);
+        CHECK(start_thread(ctx, stack_waiter, 4, args({post})) == 0);
+        CHECK(wait_or_die(stack_waiter, "spin_stack") == 77);
+        wait_or_die(poster, "set_posted");
+
+        // Message passing: the reader that saw the flag after its barrier sees the data stored before the writer's.
+        const u32 data = scratch(8);
+        psv_st32(data, 0);
+        psv_st32(data + 4, 0);
+        const i32 reader = create_thread(ctx, "mp_read", spin_test::kMpRead, 120);
+        CHECK(start_thread(ctx, reader, 8, args({data, data + 4})) == 0);
+        delay(ctx, 5000);
+        const i32 writer = create_thread(ctx, "mp_write", spin_test::kMpWrite, 120);
+        CHECK(start_thread(ctx, writer, 12, args({data, data + 4, 0xC0FFEEu})) == 0);
+        CHECK(wait_or_die(reader, "mp_read") == 0xC0FFEEu);
+        wait_or_die(writer, "mp_write");
+    }
 }
 
 TEST_CASE("kernel: three CPUs run three threads at once, never four") {
