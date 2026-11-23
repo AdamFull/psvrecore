@@ -77,8 +77,9 @@
   draw that read the colour attachment as an input attachment in a dynamic rendering pass (`VK_KHR_dynamic_rendering_local_read`)
   saw the colour from before the pass, not the earlier draws' writes, with the attachment and the input attachment in
   GENERAL and a by-region barrier between the draws (the validation layer reports nothing; render passes were correct).
-  Killzone's depth-of-field pass read its own near masks as stale and blurred the whole level. Such passes keep the
-  colour in `RENDERING_LOCAL_READ`, which reads the writes. `PSVRECORE_LOCAL_READ=0` uses render passes instead.
+  Such passes keep the colour in `RENDERING_LOCAL_READ`, which reads the writes. (This was first taken for the cause
+  of Killzone: Mercenary's blurred level, but the sharp run had reused a shader cached without the read. The blur came
+  from depth taps read as four bytes and from a depth store dropped by sceGxmBeginSceneEx.) `PSVRECORE_LOCAL_READ=0` uses render passes instead.
 - **No swapchain yet.** Presenting comes with the platform layer (SDL3).
 - **Rasterization-order attachment access** is enabled where a driver has it (`VK_EXT_` or `VK_ARM_`); neither GPU
   tested here does, so draws that read the colour attachment are separated by barriers, which only holds between
