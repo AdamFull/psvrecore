@@ -4783,9 +4783,19 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     // later one reads, and the copies of the buffers programs store to go back to guest memory after the scene).
     struct BufferCopy {
         u32 address = 0, bytes = 0, offset = 0;  // (offset: in mem)
+        u32 region = 0;
         bool placed = false, written = false;
     };
     nx::hash_map<u32, BufferCopy> buffer_copies;
+    // (buffers whose ranges overlap share one copy of their union: Killzone's depth reconstruction binds a uniform
+    // buffer at each of many rows of a surface, each declared 17 MB long; copied one by one, a scene's memory buffer
+    // took 300-500 MiB, a new allocation each scene, and a phone killed the game within a minute)
+    struct BufferRegion {
+        u32 start = 0, offset = 0;
+        u64 end = 0;
+        bool placed = false;
+    };
+    nx::vector<BufferRegion> buffer_regions;
     for (const Draw& dr : scene.draws) {
         for (u32 stage = 0; stage < 2; ++stage) {
             const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
@@ -4800,13 +4810,38 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             }
         }
     }
+    {
+        nx::vector<BufferCopy*> by_address;
+        by_address.reserve(buffer_copies.size());
+        for (auto& [address, c] : buffer_copies) {
+            c.bytes = mapped_prefix(c.address, c.bytes);
+            by_address.push_back(&c);
+        }
+        std::sort(by_address.begin(), by_address.end(),
+                  [](const BufferCopy* a, const BufferCopy* b) { return a->address < b->address; });
+        for (BufferCopy* c : by_address) {
+            const u64 end = u64{c->address} + c->bytes;
+            // (in the last region if it starts in it, at a whole word from its start: the words stay aligned)
+            if (!buffer_regions.empty() && c->bytes && c->address < buffer_regions.back().end &&
+                (c->address - buffer_regions.back().start) % 4 == 0) {
+                buffer_regions.back().end = nx::max(buffer_regions.back().end, end);
+            } else {
+                buffer_regions.push_back({c->address, 0, end, false});
+            }
+            c->region = static_cast<u32>(buffer_regions.size() - 1);
+        }
+    }
     auto place = [&](u32 address) {
         BufferCopy& c = buffer_copies[address];
         if (!c.placed) {
+            BufferRegion& g = buffer_regions[c.region];
+            if (!g.placed) {
+                g.placed = true;
+                g.offset = static_cast<u32>(mem.size());
+                host_copy(mem, g.start, static_cast<u32>(g.end - g.start));
+            }
             c.placed = true;
-            c.offset = static_cast<u32>(mem.size());
-            c.bytes = mapped_prefix(c.address, c.bytes);
-            host_copy(mem, address, c.bytes);
+            c.offset = g.offset + (c.address - g.start);
         }
         return kMemoryBase + c.offset;
     };
@@ -5206,6 +5241,13 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         sa.insert(sa.end(), table.begin(), table.end());
     }
     vk::Buffer* sa_buf = make(sa.data(), sa.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // (past the device's storage buffer range, what the programs read there is undefined: zeros on an Adreno)
+    if (static bool told = false;
+        !told && u64{mem_words.size()} * 4 > d.properties().limits.maxStorageBufferRange) {
+        told = true;
+        nx::logw(logs::gpu, "a scene's memory buffer of {} MiB is past the device's storage buffer range ({} MiB)",
+                 u64{mem_words.size()} * 4 >> 20, d.properties().limits.maxStorageBufferRange >> 20);
+    }
     vk::Buffer* mem_buf = make(mem_words.data(), mem_words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     vk::Buffer* vb = make(nullptr, static_cast<usize>(vertex_bytes), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     if (vb) {
