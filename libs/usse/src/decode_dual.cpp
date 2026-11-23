@@ -152,9 +152,12 @@ bool decode_dual(const Word& w, ProgramKind, nx::vector<Instruction>& out) {
     auto make = [&](const DualOp& op, u32 code, const u8* slots, Operand dest, bool coissued) {
         Instruction in;
         in.op = op.op;
-        in.type = (!f16 || (coissued && op.op == Op::Mov)) ? Type::F32 : Type::F16;
-        // (the co-issued move of an f16 word is printed .f32 but reads f16 lanes: it widens them)
-        if (f16 && coissued && op.op == Op::Mov) in.src_type = Type::F16;
+        // The co-issued move of an f16 word into an internal register is printed .f32 but reads
+        // f16 lanes: it widens them. Into a primary/secondary/output register it is a plain f16
+        // move of four f16 lanes (widening there would clobber the neighbouring registers).
+        const bool widen = f16 && coissued && op.op == Op::Mov && dest.bank == Bank::Internal;
+        in.type = (!f16 || widen) ? Type::F32 : Type::F16;
+        if (widen) in.src_type = Type::F16;
         in.dest = dest;
         in.src_count = op.reads;
         for (u8 i = 0; i < op.reads; ++i) in.src[i] = source(slots[i], op, dest);
