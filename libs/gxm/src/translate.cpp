@@ -1122,6 +1122,8 @@ void Translator::write_sample(const Id rgba[4], u32 format, Id regs[4]) {
             w = bor(w, k ? shl(q, u(8 * k)) : q);
         }
         regs[0] = w;
+    } else if (format == usse::kSampleF32x1) {
+        regs[0] = cast(tu_, rgba[0]);
     } else if (format == 1) {
         regs[0] = bor(to_half(cast(tu_, rgba[0])), shl(to_half(cast(tu_, rgba[1])), u(16)));
         regs[1] = bor(to_half(cast(tu_, rgba[2])), shl(to_half(cast(tu_, rgba[3])), u(16)));
@@ -1902,7 +1904,7 @@ void Translator::fragment_prologue() {
             branches_ = saved;
             Id regs[4];
             write_sample(rgba, in.sample_format, regs);
-            const u32 count = in.sample_format == 0 ? 1u : in.sample_format == 1 ? 2u : 4u;
+            const u32 count = usse::sample_register_count(in.sample_format);
             for (u32 k = 0; k < count; ++k) pa(in.sample_offset + k, regs[k]);
         }
     }

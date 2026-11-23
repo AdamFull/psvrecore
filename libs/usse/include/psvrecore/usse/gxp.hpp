@@ -87,6 +87,14 @@ struct SamplerSlot {
     u16 offset = 0;
 };
 
+// A sampled input's format that no hardware field value spells: one f32 register holding the first component.
+inline constexpr u8 kSampleF32x1 = 4;
+
+// The primary registers a sample in the format (0 u8x4, 1 f16x4, 3 f32x4, kSampleF32x1) takes.
+constexpr u32 sample_register_count(u32 format) {
+    return format == 0 || format == kSampleF32x1 ? 1u : format == 1 ? 2u : 4u;
+}
+
 // A fragment program input: an interpolated value (and/or a texture sampled with an interpolated coordinate
 // before the program runs), placed in the primary attributes.
 struct FragmentInput {
@@ -95,9 +103,9 @@ struct FragmentInput {
     u8 format = 0;         // 0 f32, 1 fx10, 2 f16 (of the interpolated value)
     u8 components = 0;
     u16 offset = 0;        // the interpolated value's first primary attribute (32-bit register)
-    // The sample (when `sampled`): the sampler's texture unit, the result's format (0 u8x4, 1 f16x4, 3 f32x4) and
-    // first primary attribute (after the interpolated value), and whether the coordinate is projected (divided by
-    // its last component).
+    // The sample (when `sampled`): the sampler's texture unit, the result's format (0 u8x4, 1 f16x4, 3 f32x4, or
+    // kSampleF32x1: the texture's first component as one f32, the form of a depth tap) and first primary attribute
+    // (after the interpolated value), and whether the coordinate is projected (divided by its last component).
     u8 sampler = 0;
     u8 sample_format = 0;
     u16 sample_offset = 0;

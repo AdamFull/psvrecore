@@ -312,6 +312,29 @@ TEST_CASE("usse interp: textures, sampled inputs and texture instructions") {
     for (u32 k = 0; k < 4; ++k) CHECK(from_half(static_cast<u16>(m.primary[k / 2] >> (16 * (k % 2)))) == want[k]);
 }
 
+TEST_CASE("usse interp: a depth tap is the texture's first component as an f32") {
+    // (the sample of a program whose texture holds a depth: not packed as u8x4, whose 0xFF in the alpha byte reads as
+    // an f32 of -1.7e38)
+    Gxp gxp;
+    gxp.type = ShaderType::Fragment;
+    FragmentInput in;
+    in.interpolated = in.sampled = varying::kTexCoord0;
+    in.format = 0, in.components = 4, in.offset = 0;
+    in.sampler = 0, in.sample_format = kSampleF32x1, in.sample_offset = 4;
+    gxp.inputs.push_back(in);
+    TestTextures textures;
+    Machine m;
+    m.textures = &textures;
+    const SamplerState samplers[1] = {SamplerState{{0, 0, 0, 0}}};
+    VaryingValue t;
+    t.varying = varying::kTexCoord0;
+    t.value[0] = 0.25f, t.value[1] = 0.5f, t.value[2] = 0.75f, t.value[3] = 0.5f;
+    m.primary[5] = 0x12345678;
+    REQUIRE(load_fragment_inputs(gxp, std::span<const VaryingValue>(&t, 1), samplers, m));
+    CHECK(std::bit_cast<f32>(m.primary[4]) == 0.25f);  // (the left texel of unit 0: 0.25, 0.5, 0.75, 1)
+    CHECK(m.primary[5] == 0x12345678u);                // (one register only)
+}
+
 TEST_CASE("usse interp: a texture instruction's f16 coordinates") {
     // half2 c = t.xy * k + t.zw; tex2D(s1, c) (half t and k: the shader compiler's code, the coordinates f16 halves of
     // pa0, which read as an f32 would be near 0)

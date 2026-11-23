@@ -34,7 +34,8 @@ namespace psvrecore::usse {
 // none; bit 10: the sprite coordinate instead), the interpolated value's format (bits 28-29: 0 f32, 1 fx10,
 // 2 f16) and component count less one (bits 22-23); bit 25 marks the last record; bits 8-9: 2 for a projected
 // sample. Word 1 is the sample's texture unit; word 2 holds the sizes, bits 6-7 the sample's format (0 u8x4,
-// 1 f16x4, 3 f32x4).
+// 1 f16x4, 3 f32x4); word 3's bits 4-6 are 2 for f16x4, 3 for f32x4 and 7 for an f32 depth tap (format 0 in word 2,
+// but read as an f32 in one register).
 
 namespace {
 
@@ -183,9 +184,12 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
             if (in.sampled) {
                 in.sampler = static_cast<u8>(in.raw[1]);
                 in.sample_format = static_cast<u8>((in.raw[2] >> 6) & 3);
+                // (Killzone's depth taps: word 2 empty and word 3's bits 4-6 all set, where the f16x4 and f32x4 samples
+                // have 2 and 3. They are read as f32, one register, so not as u8x4.)
+                if (in.sample_format == 0 && ((in.raw[3] >> 4) & 7) == 7) in.sample_format = kSampleF32x1;
                 in.projected = ((record >> 8) & 3) == 2;
                 in.sample_offset = static_cast<u16>(offset);
-                offset += in.sample_format == 0 ? 1u : in.sample_format == 1 ? 2u : 4u;
+                offset += sample_register_count(in.sample_format);
             }
             g.inputs.push_back(in);
         }

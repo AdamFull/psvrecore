@@ -273,6 +273,27 @@ TEST_CASE("usse: GXP fragment inputs in the primary attributes") {
     CHECK(p->fragment_inputs == (varying::kTexCoord0 | varying::kColor0 | (varying::kTexCoord0 << 1)));
 }
 
+TEST_CASE("usse: GXP sampled inputs: depth taps are one f32 register") {
+    // Killzone's depth-of-field program: a depth tap (word 2 empty, word 3 = 0x70), an f16x4 sample (0x40, 0x20) and a
+    // u8x4 sample (word 3 empty) of TEXCOORD0..2, none of them interpolated
+    GxpImage g;
+    g.put32(0x14, 1);
+    g.offset(0x2C, 0xA0);
+    g.put32(0xA0 + 0x0C, 3);
+    const u32 records[3][4] = {{0xF000, 3, 0, 0x70}, {0xF001, 1, 0x40, 0x20}, {0xF002, 2, 0, 0}};
+    for (u32 i = 0; i < 3; ++i)
+        for (u32 j = 0; j < 4; ++j) g.put32(0xA0 + 0x14 + 16 * i + 4 * j, records[i][j]);
+    const auto p = parse_gxp(g.data);
+    REQUIRE(p);
+    REQUIRE(p->inputs.size() == 3);
+    CHECK(p->inputs[0].sample_format == kSampleF32x1);
+    CHECK(p->inputs[0].sample_offset == 0);
+    CHECK(p->inputs[1].sample_format == 1);
+    CHECK(p->inputs[1].sample_offset == 1);
+    CHECK(p->inputs[2].sample_format == 0);
+    CHECK(p->inputs[2].sample_offset == 3);
+}
+
 TEST_CASE("usse: GXP vertex outputs and attributes") {
     GxpImage g;
     g.put32(0x24, 2);

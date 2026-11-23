@@ -746,6 +746,8 @@ void write_sample(const f32 rgba[4], u32 format, u32* regs) {
             w |= static_cast<u32>(std::nearbyint(nx::clamp(std::isnan(rgba[k]) ? 0.0f : rgba[k], 0.0f, 1.0f) * 255.0f))
                  << (8 * k);
         regs[0] = w;
+    } else if (format == kSampleF32x1) {
+        regs[0] = std::bit_cast<u32>(rgba[0]);
     } else if (format == 1) {
         regs[0] = u32{to_half(rgba[0])} | u32{to_half(rgba[1])} << 16;
         regs[1] = u32{to_half(rgba[2])} | u32{to_half(rgba[3])} << 16;
@@ -754,7 +756,7 @@ void write_sample(const f32 rgba[4], u32 format, u32* regs) {
     }
 }
 
-u32 sample_registers(u32 format) { return format == 0 ? 1u : format == 1 ? 2u : 4u; }
+u32 sample_registers(u32 format) { return sample_register_count(format); }
 
 // Family 28: the sampler state is four registers from the second source; the coordinates are f32 lanes.
 void tex_op(Exec& x, const Instruction& in) {
