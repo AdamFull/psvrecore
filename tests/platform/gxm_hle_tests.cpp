@@ -6,6 +6,7 @@
 #include "nxtest.h"
 #include "psvrecore/gxm/hle.hpp"
 #include "runtime_support.hpp"
+#include "state.hpp"
 
 using namespace psvrecore;
 using namespace psvrecore::runtime;
@@ -247,4 +248,65 @@ TEST_CASE("gxm: user markers only within a scene or a command list; Razor's capt
     CHECK(call32(ctx, kSceRazorCapture, 0xD2358BFB /*IsInProgress*/, {}) == 0);
     CHECK(call32(ctx, kSceRazorCapture, 0x911E0AA0 /*sceRazorCaptureIsInProgress*/, {}) == 0);
     CHECK(call32(ctx, kSceRazorCapture, 0x3F0913CF /*StartSalvageMode*/, {}) == 0);
+}
+
+// sceGxmBeginSceneEx with a load surface and a store surface at different addresses (Killzone: Mercenary's depth
+// reductions load one 240x136 depth image and store the next): the scene's depth is the one loaded, and what is
+// drawn is stored at the store surface's addresses, not dropped.
+TEST_CASE("gxm: a scene that loads depth from one surface and stores it to another stores to the second") {
+    TestRuntime t;
+    REQUIRE(t.rt.ok());
+    gxm::Options options;
+    gxm::register_libraries(options);
+    PsvContext* ctx = t.ctx();
+    constexpr u32 kInitialize = 0xB0F1E4EC, kCreateTarget = 0x207AF96B, kCreateContext = 0xE84CE5B4,
+                  kBeginSceneEx = 0x4709CF5A;
+    using namespace gxm::hle;
+
+    const u32 init = scratch(sizeof(InitializeParams));
+    const InitializeParams ip{0, 2, 0, 0, 0};
+    std::memcpy(current_runtime()->memory().host(init), &ip, sizeof ip);
+    REQUIRE(call32(ctx, kSceGxm, kInitialize, {init}) == 0);
+
+    const u32 tp = scratch(sizeof(RenderTargetParams)), target_out = scratch(4);
+    const RenderTargetParams rp{0, 240, 136, 1, 0, 0, 0};
+    std::memcpy(current_runtime()->memory().host(tp), &rp, sizeof rp);
+    REQUIRE(call32(ctx, kSceGxm, kCreateTarget, {tp, target_out}) == 0);
+    const u32 target = psv_ld32(target_out);
+
+    const u32 cp = scratch(sizeof(ContextParams)), context_out = scratch(4), host_mem = scratch(4096);
+    const ContextParams cparams{host_mem, 4096, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    std::memcpy(current_runtime()->memory().host(cp), &cparams, sizeof cparams);
+    REQUIRE(call32(ctx, kSceGxm, kCreateContext, {cp, context_out}) == 0);
+    const u32 context = psv_ld32(context_out);
+
+    constexpr u32 kFormat = 0x00026000;  // (D24S8, as Killzone's: only the format bits must match)
+    auto surface = [&](u32 control, u32 depth) {
+        const u32 at = scratch(sizeof(DepthStencilSurface));
+        const DepthStencilSurface s{control | kFormat, depth, 0, 1.0f, 0};
+        std::memcpy(current_runtime()->memory().host(at), &s, sizeof s);
+        return at;
+    };
+    const u32 load = surface(kDsEnabled | kDsTiled | kDsForceLoad, 0x65480000 + 0x28000);
+    const u32 store = surface(kDsEnabled | kDsTiled | kDsForceStore, 0x65480000);
+
+    auto scene_of = [&]() -> const Scene& { return state().contexts.at(context)->scene; };
+    REQUIRE(call32(ctx, kSceGxm, kBeginSceneEx, {context, 0, target, 0, 0, 0, 0, load, store}) == 0);
+    CHECK(scene_of().has_depth);
+    CHECK((scene_of().depth.control & kDsForceLoad) != 0);
+    CHECK(scene_of().depth.depth_data == 0x65480000u + 0x28000);  // (loaded from the load surface)
+    CHECK(scene_of().store_elsewhere);
+    CHECK(scene_of().store_depth_data == 0x65480000u);  // (stored to the store surface)
+
+    // (the same surface to load and to store: the scene stores in place)
+    const u32 both = surface(kDsEnabled | kDsTiled | kDsForceLoad | kDsForceStore, 0x65480000);
+    state().contexts.at(context)->in_scene = false;  // (no renderer here to end the first scene with)
+    REQUIRE(call32(ctx, kSceGxm, kBeginSceneEx, {context, 0, target, 0, 0, 0, 0, both, both}) == 0);
+    CHECK(!scene_of().store_elsewhere);
+    CHECK((scene_of().depth.control & kDsForceStore) != 0);
+
+    state().contexts.at(context)->in_scene = false;
+    CHECK(call32(ctx, kSceGxm, 0xEDDC5FB2 /*sceGxmDestroyContext*/, {context}) == 0);
+    CHECK(call32(ctx, kSceGxm, 0x0B94C50A /*sceGxmDestroyRenderTarget*/, {target}) == 0);
+    CHECK(call32(ctx, kSceGxm, 0xB627DE66 /*sceGxmTerminate*/, {}) == 0);
 }

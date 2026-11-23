@@ -294,6 +294,10 @@ struct Scene {
     bool has_color = false;
     DepthStencilSurface depth{};
     bool has_depth = false;
+    // A scene that loads its depth/stencil from one surface and stores it to another (sceGxmBeginSceneEx's load and
+    // store surfaces at different addresses): `depth` is the load surface, the store's addresses are here.
+    bool store_elsewhere = false;
+    u32 store_depth_data = 0, store_stencil_data = 0;
     ValidRegion region{};
     u32 flags = 0;
     u32 visibility_buffer = 0;  // (core 0's counters; 0: none)

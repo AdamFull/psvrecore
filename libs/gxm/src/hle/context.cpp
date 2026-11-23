@@ -67,6 +67,11 @@ void set_default_region_and_viewport(Context& c, u32 x_max, u32 y_max) {
     s.viewport[5] = 0.5f;
 }
 
+struct StoreElsewhere {
+    bool set = false;
+    u32 depth_data = 0, stencil_data = 0;
+};
+
 // A depth/stencil surface as given (enabled or not), or none.
 std::optional<DepthStencilSurface> depth_surface_at(u32 at) {
     if (!at || !memory().valid(at, sizeof(DepthStencilSurface))) return std::nullopt;
@@ -76,9 +81,10 @@ std::optional<DepthStencilSurface> depth_surface_at(u32 at) {
 // sceGxmBeginSceneEx's two depth/stencil surfaces as the one a scene has. The store surface is the scene's depth/stencil
 // (its format: depth and stencil tests need one), stored when it forces a store; the load surface is where the values
 // are loaded from when it forces a load (one without memory, or of another format, loads nothing: Killzone draws its
-// main scene with a stencil-only load surface and a D24S8 store surface). A scene's surface is one address: a scene that loads one
-// surface and stores another loads it and is not stored (said once).
-std::optional<DepthStencilSurface> load_store_surface(u32 load_at, u32 store_at) {
+// main scene with a stencil-only load surface and a D24S8 store surface). A scene that loads one surface and stores
+// another (of the same format) has the load surface as its own, and `elsewhere` set with the store's addresses: the
+// image drawn is stored there (Killzone's depth reductions load 0x654a8000 and store 0x65480000).
+std::optional<DepthStencilSurface> load_store_surface(u32 load_at, u32 store_at, StoreElsewhere& elsewhere) {
     const auto load = depth_surface_at(load_at), store = depth_surface_at(store_at);
     if (!store || !(store->control & kDsEnabled)) {
         if (!load) return std::nullopt;
@@ -103,10 +109,8 @@ std::optional<DepthStencilSurface> load_store_surface(u32 load_at, u32 store_at)
     out.control |= kDsForceLoad;
     if (load->depth_data == store->depth_data && load->stencil_data == store->stencil_data) return out;
     if (store->control & kDsForceStore) {
-        static bool said = false;
-        if (!std::exchange(said, true))
-            nx::logw(logs::gxm, "a scene loads depth/stencil from 0x{:08x}/0x{:08x} and stores it to 0x{:08x}/0x{:08x}: "
-                     "loaded, not stored", load->depth_data, load->stencil_data, store->depth_data, store->stencil_data);
+        elsewhere.set = true;
+        elsewhere.depth_data = store->depth_data, elsewhere.stencil_data = store->stencil_data;
         out.control &= ~kDsForceStore;
     }
     out.depth_data = load->depth_data, out.stencil_data = load->stencil_data;
@@ -114,7 +118,7 @@ std::optional<DepthStencilSurface> load_store_surface(u32 load_at, u32 store_at)
 }
 
 i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> region, u32 fragment_sync, u32 color,
-                std::optional<DepthStencilSurface> depth) {
+                std::optional<DepthStencilSurface> depth, StoreElsewhere elsewhere = {}) {
     if (!context || !target) return err::kInvalidPointer;
     State& st = state();
     nx::scoped_lock<nx::mutex> held(st.lock);
@@ -136,6 +140,8 @@ i32 begin_scene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> regio
     if (depth) {
         scene.depth = *depth;
         scene.has_depth = (scene.depth.control >> 31) != 0;
+        scene.store_elsewhere = elsewhere.set && scene.has_depth;
+        scene.store_depth_data = elsewhere.depth_data, scene.store_stencil_data = elsewhere.stencil_data;
     }
     c->scene = std::move(scene);
     c->in_scene = true;
@@ -152,7 +158,9 @@ i32 sceGxmBeginScene(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> 
 i32 sceGxmBeginSceneEx(u32 context, u32 flags, u32 target, Ptr<const ValidRegion> region, u32 vertex_sync,
                        u32 fragment_sync, u32 color, u32 load_depth, u32 store_depth) {
     (void)vertex_sync;
-    return begin_scene(context, flags, target, region, fragment_sync, color, load_store_surface(load_depth, store_depth));
+    StoreElsewhere elsewhere;
+    const auto surface = load_store_surface(load_depth, store_depth, elsewhere);
+    return begin_scene(context, flags, target, region, fragment_sync, color, surface, elsewhere);
 }
 
 i32 sceGxmEndScene(u32 context, Ptr<const Notification> vertex_notification, Ptr<const Notification> fragment_notification) {

@@ -4622,7 +4622,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     // not stored). Nothing is rendered or written back (a depth surface loaded and scaled up takes milliseconds); its
     // notifications are written after the scenes before it, an empty submission in their order. One that stores a
     // depth surface it does not load clears it, and one with visibility counters writes them: rendered.
-    if (scene.draws.empty() && !scene.visibility_buffer &&
+    if (scene.draws.empty() && !scene.visibility_buffer && !scene.store_elsewhere &&
         !(scene.has_depth && (scene.depth.control & kDsForceStore) && !(scene.depth.control & kDsForceLoad))) {
         auto shot = nx::make_unique<vk::OneShot>(*r.device);
         if (auto cmd = shot->begin(); cmd && shot->submit()) {
@@ -4647,6 +4647,12 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     vk::Device& d = *r.device;
     const ColorSurface& cs = scene.color;
     const DepthStencilSurface& ds = scene.depth;
+    // (where the depth/stencil is stored: the surface's own, or another's when the scene loads one and stores one)
+    DepthStencilSurface ds_store = ds;
+    if (scene.store_elsewhere) {
+        ds_store.depth_data = scene.store_depth_data, ds_store.stencil_data = scene.store_stencil_data;
+        ds_store.control |= kDsForceStore;
+    }
     ColorFormat cf;
     // (without a colour surface, a depth-only scene: the render target's size)
     u32 width = scene.target->width, height = scene.target->height, stride = 0;
@@ -4787,13 +4793,14 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (!std::exchange(reported, true)) nx::logw(logs::gxm, "the mask bit of DF32M_S8 surfaces is not implemented");
     }
     bool load_depth = has_depth && (ds.control & kDsForceLoad);
-    bool store_depth = has_depth && (ds.control & kDsForceStore);
-    if ((load_depth || store_depth) && !depth_surface_valid(ds, dl, width, height)) {
+    bool store_depth = has_depth && (ds_store.control & kDsForceStore);
+    if ((load_depth && !depth_surface_valid(ds, dl, width, height)) ||
+        (store_depth && !depth_surface_valid(ds_store, dl, width, height))) {
         nx::logw(logs::gxm, "depth/stencil surface outside guest memory: not loaded or stored");
         load_depth = store_depth = false;
     }
     if (!has_depth || !(load_depth || store_depth)) kept_depth = nullptr, depth_kept = depth_target ? depth_kept : false;
-    if (kept_depth && !store_depth) kept_depth->written.clear();  // (drawn over: no longer the surface)
+    if (kept_depth && !(store_depth && !scene.store_elsewhere)) kept_depth->written.clear();  // (drawn over: no longer the surface)
     // (a kept image, the scene's own or the surface's: its layout copied back when the scene is done)
     DepthTarget* const depth_keeper = depth_target ? depth_target : kept_depth;
     if (has_depth && depth_keeper) {
@@ -5850,7 +5857,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         // (the bytes the store writes: the layout's a sample, of the depth and of the stencil. Taken as 4 of depth
         // and one of stencil whatever the layout, WipEout 2048's D16 shadow map (256 x 256) covered the 128 x 128
         // surface after it, which the next scene draws: that scene waited for the GPU to finish all it had, a frame.)
-        const DepthRanges g = depth_ranges(ds, dl, width, height);
+        const DepthRanges g = depth_ranges(ds_store, dl, width, height);
         if (g.depth_bytes) pending.writes.push_back({g.depth, g.depth_bytes});
         if (g.stencil_bytes) pending.writes.push_back({g.stencil, g.stencil_bytes});
     }
@@ -5870,7 +5877,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     }
     pending.target = color ? target : nullptr;
     pending.kept_depth = kept_depth;
-    pending.stores_kept_depth = kept_depth && store_depth;
+    pending.stores_kept_depth = kept_depth && store_depth && !scene.store_elsewhere;
     pending.depth_sources[0] = aspect_from[0], pending.depth_sources[1] = aspect_from[1];
     for (const Renderer::TargetConversion& c : r.target_conversions)
         if (c.depth && std::find(pending.converted_from.begin(), pending.converted_from.end(), c.depth) == pending.converted_from.end())
@@ -5879,7 +5886,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     pending.finish = [&r, &d, stamps, color = color != nullptr, readback, mem_buf, depth_buf, buffers = std::move(buffers),
                       layout, data = cs.data, width, height, bytes = cf.guest_bytes(), image_bytes = cf.bytes, packing = cf.packing, target,
                       buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
-                      stores_depth, ds, dl, unorm24, samples, depth_target, kept_depth, depth, pool, sets,
+                      stores_depth, ds = ds_store, dl, unorm24, samples, depth_target,
+                      kept_depth, kept_stores = !scene.store_elsewhere, depth, pool, sets,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
                       uploads = std::move(r.texture_uploads), conversions = std::move(r.target_conversions), pack_work,
                       pack_set, pack_verify](bool ok) mutable {
@@ -5982,7 +5990,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             vk::invalidate(d, *depth_buf);
             const u8* src = static_cast<const u8*>(depth_buf->mapped);
             const DepthRanges g = depth_ranges(ds, dl, width, height);
-            const WrittenWatch* exempt = kept_depth ? &kept_depth->background_watch : nullptr;
+            const WrittenWatch* exempt = kept_depth && kept_stores ? &kept_depth->background_watch : nullptr;
             bool deferred = false;
             if (lazy_write_backs() && g.depth_bytes && !g.stencil_bytes) {
                 std::unique_lock<std::mutex> held(g_lazy_lock);
@@ -6031,7 +6039,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 if (keep_stored_bytes({&depth_target->watch[0]})) w.bytes.assign(now.begin(), now.end());
                 else w.bytes.clear();
             }
-            if (kept_depth) {
+            // (a scene that stores elsewhere drew over its kept image: not the surface it stored)
+            if (kept_depth && kept_stores) {
                 watch_range(kept_depth->watch[0], g.depth, g.depth_bytes);
                 watch_range(kept_depth->watch[1], g.stencil, g.stencil_bytes);
                 StoredDepth& w = kept_depth->written;
