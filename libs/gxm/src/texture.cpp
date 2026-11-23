@@ -936,11 +936,12 @@ void set_yuv_profile(u32 csc, u32 profile) {
 }
 
 Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) { return detail::read_texels(t, read, false); }
-Result<Texels> read_texels(const TextureInfo& t, ReadGuest read, bool native_bc, bool single_float) {
-    return detail::read_texels(t, read, false, native_bc, single_float);
+Result<Texels> read_texels(const TextureInfo& t, ReadGuest read, bool native_bc, bool single_float, bool srgb) {
+    return detail::read_texels(t, read, false, native_bc, single_float, srgb);
 }
 
-Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool reference, bool native_bc, bool single_float) {
+Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool reference, bool native_bc, bool single_float,
+                                   bool srgb) {
     const u32 code = code_of(t.base_format);
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
@@ -972,7 +973,17 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     out.height = t.height;
     out.levels = static_cast<u32>(levels.size());
     out.faces = is_cube(t.type) ? 6 : 1;
-    bool wide = t.gamma != 0 || code == kSBC4 || code == kSBC5;  // (signed BC4 and BC5: below 0 too)
+    // (gamma mode 1 kept encoded, for an sRGB image to decode as it samples: unsigned normalized components of up to 8
+    // bits, as 8-bit texels or BC1-BC3 blocks. The texels are the RGBA after the swizzle, whose R, G and B mode 1
+    // decodes, as the image's format does: the swizzle's constants 0 and 1 decode to themselves)
+    const bool srgb8 = srgb && t.gamma == 1 &&
+                       (code == kU8 || code == kU8U8 || code == kU8U8U8 || code == kU8U8U8U8 || code == kU4U4U4U4 ||
+                        code == kU8U3U3U2 || code == kU1U5U5U5 || code == kU5U6U5 || code == kP4 || code == kP8 ||
+                        code == kPVRT2 || code == kPVRT4 || code == kPVRTII2 || code == kPVRTII4 || code == kUBC1 ||
+                        code == kUBC2 || code == kUBC3 || code == kUBC4 || code == kUBC5);
+    out.srgb = srgb8;
+    const bool plain = t.gamma == 0 || srgb8;  // (no decode here)
+    bool wide = !plain || code == kSBC4 || code == kSBC5;  // (signed BC4 and BC5: below 0 too)
     {
         f32 c[4];
         u32 n;
@@ -983,9 +994,9 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     const bool single = single_float && !reference && t.gamma == 0 && (code == kF32 || code == kF32M);
     out.bytes = single ? 4 : full ? 16 : wide ? 8 : 4;
     const u32 out_bytes = out.bytes;
-    // 8-bit unsigned components without gamma: where each output byte comes from (a component's byte, or -1 for 0
+    // 8-bit unsigned components without gamma (or kept encoded): where each output byte comes from (a component's byte, or -1 for 0
     // and -256 for 255), found by putting markers through the swizzle.
-    const bool bytes8 = out_bytes == 4 && t.gamma == 0 && (code == kU8 || code == kU8U8 || code == kU8U8U8 || code == kU8U8U8U8);
+    const bool bytes8 = out_bytes == 4 && plain && (code == kU8 || code == kU8U8 || code == kU8U8U8 || code == kU8U8U8U8);
     i32 byte_of[4] = {};
     if (bytes8) {
         const f32 marks[4] = {10, 11, 12, 13};
@@ -1027,9 +1038,10 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
         f32 v[4];
         for (u32 k = 0; k < 4; ++k) {
             v[k] = rgba[k];
-            // (gamma: sRGB-encoded components decoded to linear; R, GR or BGR)
-            const bool srgb = (t.gamma == 1 && k < 3) || (t.gamma == 3 && k < 2);
-            if (srgb) v[k] = v[k] <= 0.04045f ? v[k] / 12.92f : std::pow((v[k] + 0.055f) / 1.055f, 2.4f);
+            // (gamma: sRGB-encoded components decoded to linear, by the sRGB curve; R, GR or BGR. Not where they are
+            // kept encoded for an sRGB image: srgb8)
+            const bool decode = !srgb8 && ((t.gamma == 1 && k < 3) || (t.gamma == 3 && k < 2));
+            if (decode) v[k] = v[k] <= 0.04045f ? v[k] / 12.92f : std::pow((v[k] + 0.055f) / 1.055f, 2.4f);
         }
         if (full) {
             std::memcpy(dst, v, 16);
@@ -1047,8 +1059,9 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     // P4 and P8 to 8-bit components: each texel its palette entry's bytes, as put() writes them (not with `reference`,
     // which the tests compare with).
     const bool paletted = !reference && (code == kP4 || code == kP8) && out_bytes == 4;
-    // BC1-BC3 without gamma: the blocks as they are for a device that samples them, else 8-bit texels a block at a time
-    const bool bc_plain = (code == kUBC1 || code == kUBC2 || code == kUBC3) && t.gamma == 0 && out_bytes == 4;
+    // BC1-BC3 without gamma (or kept encoded: srgb8): the blocks as they are for a device that samples them, else 8-bit
+    // texels a block at a time
+    const bool bc_plain = (code == kUBC1 || code == kUBC2 || code == kUBC3) && plain && out_bytes == 4;
     const bool keep_blocks = native_bc && bc_plain;
     const bool bc_bytes = !reference && bc_plain && !keep_blocks;
     if (keep_blocks) {
@@ -1084,8 +1097,9 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                             const u8* block = base + index * 8;
                             if (block + 8 <= raw.data() + raw.size()) std::memcpy(&blocks[usize{y} * bx + x], block, 8);
                         }
-                    // (8-bit texels without gamma: the bytes as they are, as put() rounds n / 255 back to n)
-                    const bool pvrtc_bytes = !reference && out_bytes == 4 && t.gamma == 0;
+                    // (8-bit texels without gamma (or kept encoded): the bytes as they are, as put() rounds n / 255
+                    // back to n)
+                    const bool pvrtc_bytes = !reference && out_bytes == 4 && plain;
                     const auto texel = [&](u32 x, u32 y, const i32* c) {
                         u8* o = dst + (usize{y} * lv.width + x) * out_bytes;
                         if (pvrtc_bytes) {

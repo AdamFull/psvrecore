@@ -412,6 +412,21 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
             break;
         }
     }
+    {
+        // (sampled and filtered, and copied into: required of these by Vulkan, BC's where it has textureCompressionBC)
+        const auto sampled = [&](VkFormat f) {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(gpu, f, &fp);
+            const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                              VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            return (fp.optimalTilingFeatures & need) == need;
+        };
+        caps.texture_srgb = sampled(VK_FORMAT_R8G8B8A8_SRGB) && sampled(VK_FORMAT_B8G8R8A8_SRGB);
+        if (caps.texture_bc)
+            caps.texture_srgb = caps.texture_srgb && sampled(VK_FORMAT_BC1_RGBA_SRGB_BLOCK) &&
+                                sampled(VK_FORMAT_BC2_SRGB_BLOCK) && sampled(VK_FORMAT_BC3_SRGB_BLOCK);
+    }
 
     VmaVulkanFunctions functions{};
     VmaAllocatorCreateInfo allocator{};

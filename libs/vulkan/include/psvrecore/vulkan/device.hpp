@@ -40,6 +40,9 @@ struct Capabilities {
     bool depth_bias_clamp = false;
     bool wide_lines = false;
     bool texture_bc = false;
+    // R8G8B8A8_SRGB and B8G8R8A8_SRGB images sampled (filtered) and uploaded to, and BC1-BC3's sRGB formats with
+    // texture_bc: gamma-mode textures kept encoded, the sampler decoding them.
+    bool texture_srgb = false;
     bool texture_astc = false;
     bool texture_etc2 = false;
     bool occlusion_query_precise = false;

@@ -274,6 +274,105 @@ TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted
     CHECK(compared > 300);
 }
 
+TEST_CASE("gxm textures: gamma mode 1 kept encoded for an sRGB image decodes, by the sRGB curve, to the CPU's texels") {
+    Memory m;
+    m.bytes.resize(1u << 20);
+    u32 seed = 2468;
+    for (u8& b : m.bytes) b = static_cast<u8>((seed = seed * 1103515245u + 12345u) >> 16);
+    auto read = [&](u32 address, void* out, u32 size) { return m.read(address, out, size); };
+    auto half = [](u16 h) {
+        const u32 exp = (h >> 10) & 0x1F, mant = h & 0x3FFu;
+        const f32 v = exp == 0 ? std::ldexp(static_cast<f32>(mant), -24) : std::ldexp(1.0f + mant / 1024.0f, static_cast<i32>(exp) - 15);
+        return (h & 0x8000u) ? -v : v;
+    };
+    // (the sRGB curve, as Vulkan's sRGB formats decode)
+    auto decode = [](f32 e) { return e <= 0.04045f ? e / 12.92f : std::pow((e + 0.055f) / 1.055f, 2.4f); };
+    struct Format {
+        u32 base_format, bits;
+        bool exact;  // (components of 8 bits, or 4: as 8-bit texels exactly; else rounded to them)
+    };
+    const Format formats[] = {{0x0C000000, 32, true}, {0x00000000, 8, true}, {0x07000000, 16, true}, {0x98000000, 24, true},
+                              {0x95000000, 8, true},  {0x94000000, 4, true}, {0x02000000, 16, true}, {0x05000000, 16, false},
+                              {0x85000000, 4, false}, {0x86000000, 8, false}, {0x87000000, 8, false}, {0x81000000, 4, true},
+                              {0x83000000, 4, true}};
+    u32 compared = 0;
+    for (const Format& f : formats)
+        for (u32 type : {texture_type::kSwizzled, texture_type::kLinear})
+            for (u32 swizzle = 0; swizzle < 8; ++swizzle) {
+                const bool block = f.base_format >= 0x80000000 && f.base_format <= 0x87000000;  // (PVRT, BC)
+                if (block && swizzle > 0) continue;
+                TextureInfo t;
+                t.base_format = f.base_format;
+                t.swizzle = swizzle;
+                t.type = type;
+                t.width = 64, t.height = 32;
+                t.address = 0x1000;
+                t.palette = 0x80000;
+                t.stride = t.width * f.bits / 8;
+                t.gamma = 1;
+                auto kept = read_texels(t, read, false, false, true);
+                auto general = detail::read_texels(t, read, true, false, false, true);
+                auto cpu = read_texels(t, read);
+                REQUIRE(kept);
+                REQUIRE(general);
+                REQUIRE(cpu);
+                REQUIRE(kept->srgb);
+                REQUIRE(kept->bytes == 4);
+                REQUIRE(cpu->bytes == 8);
+                REQUIRE(!cpu->srgb);
+                CHECK(kept->data == general->data);  // (the fast paths, kept encoded, as the general path)
+                REQUIRE(kept->data.size() * 2 == cpu->data.size());
+                // (R, G and B decoded by the sRGB curve, alpha as it is: the CPU's half floats, to their rounding, and
+                // where the components are not 8-bit, to a rounding to 8 bits, made 2.4 times larger by the curve)
+                const f32 tolerance = f.exact ? 1.5e-3f : 0.5f / 255 * 2.4f + 1.5e-3f;
+                f32 worst = 0;
+                for (usize i = 0; i < kept->data.size() / 4; ++i)
+                    for (u32 k = 0; k < 4; ++k) {
+                        const f32 e = kept->data[i * 4 + k] / 255.0f;
+                        u16 h;
+                        std::memcpy(&h, cpu->data.data() + i * 8 + k * 2, 2);
+                        const f32 want = half(h), got = k < 3 ? decode(e) : e;
+                        worst = std::fmax(worst, std::fabs(want - got));
+                    }
+                if (worst > tolerance)
+                    std::fprintf(stderr, "sRGB texels differ: format %08x type %u swizzle %u by %g\n", f.base_format, type, swizzle, worst);
+                CHECK(worst <= tolerance);
+                ++compared;
+            }
+    CHECK(compared == 8 * 2 * 8 + 5 * 2);
+    // (BC1-BC3 kept as blocks for the device's sRGB block formats)
+    TextureInfo bc;
+    bc.base_format = 0x87000000;
+    bc.type = texture_type::kSwizzled;
+    bc.width = bc.height = 32;
+    bc.address = 0x1000;
+    bc.gamma = 1;
+    auto blocks = read_texels(bc, read, true, false, true);
+    REQUIRE(blocks);
+    CHECK(blocks->bc == 3);
+    CHECK(blocks->srgb);
+    // (decoded here still: mode 3 (G and R only), components wider than 8 bits, signed ones; or without `srgb`)
+    for (const auto& [format, gamma] : {std::pair{0x0C000000u, 3u}, std::pair{0x09000000u, 1u}, std::pair{0x0D000000u, 1u}}) {
+        TextureInfo w = bc;
+        w.base_format = format;
+        w.type = texture_type::kLinear;
+        w.stride = 32 * texel_bits(format) / 8;
+        w.gamma = gamma;
+        auto texels = read_texels(w, read, false, false, true);
+        REQUIRE(texels);
+        CHECK(!texels->srgb);
+        CHECK(texels->bytes == 8);
+    }
+    TextureInfo off = bc;
+    off.base_format = 0x0C000000;
+    off.type = texture_type::kLinear;
+    off.stride = 128;
+    auto decoded = read_texels(off, read, false, false, false);
+    REQUIRE(decoded);
+    CHECK(!decoded->srgb);
+    CHECK(decoded->bytes == 8);
+}
+
 TEST_CASE("gxm textures: F32 and F32M one float a texel give the general path's RGBA through rgba_of") {
     Memory m;
     m.bytes.resize(1u << 20);

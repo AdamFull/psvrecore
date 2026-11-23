@@ -1333,6 +1333,17 @@ void capture_after(u64 number) {
     if (c.active && c.to && number >= c.to) capture_end(c);
 }
 
+// Whether textures of gamma mode 1 are kept encoded and sampled through sRGB formats (read_texels' `srgb`; a gamma-mode
+// colour surface read as such a texture copied from its image into an sRGB one), which decode them as they sample: the
+// device's formats allow it, and not PSVRECORE_SRGB_TEXTURES=0 (decoded to half floats on the CPU, as before).
+bool srgb_textures(const vk::Device& d) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PSVRECORE_SRGB_TEXTURES");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return enabled && d.caps().texture_srgb;
+}
+
 bool ensure(Renderer& r) {
     if (r.tried) return static_cast<bool>(r.device);
     r.tried = true;
@@ -1352,7 +1363,7 @@ bool ensure(Renderer& r) {
 #if PSVRECORE_TRACY
     make_gpu_zones(r);
 #endif
-    prefetch_start(d.caps().texture_bc);
+    prefetch_start(d.caps().texture_bc, srgb_textures(d));
     if (!r.flusher) {
         // (the scenes the GPU is done with finished when nothing else has a while after: their notifications written
         // for a game that polls them. Not at once: the game's next scene or frame finishes them, and this, finishing
@@ -2016,8 +2027,10 @@ VkSampler texture_sampler(Renderer& r, const TextureInfo& info, VkFormat format,
 
 // Whether a texture's texels are what sampling an image of this format gives for the same bytes in memory (the
 // texture decoder, on one texel of known bytes): 8-bit RGBA images, and half-float RGBA images whose texels the decoder
-// gives as the bytes are (an F16x4 surface read as an F16x4 texture).
-bool texels_as_image(const TextureInfo& info, VkFormat format) {
+// gives as the bytes are (an F16x4 surface read as an F16x4 texture). With `srgb` (srgb_textures), an 8-bit texture of
+// gamma mode 1 too, whose texels are the image's bytes still encoded (Texels::srgb): sampled through the sRGB format
+// of the image's (texture_format), which decodes them.
+bool texels_as_image(const TextureInfo& info, VkFormat format, bool srgb) {
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) {
         if (texel_bits(info.base_format) != 64 || info.gamma || info.palette) return false;
         TextureInfo one = info;
@@ -2038,7 +2051,8 @@ bool texels_as_image(const TextureInfo& info, VkFormat format) {
     if (format == VK_FORMAT_R8G8B8A8_UNORM) order[0] = 0, order[1] = 1, order[2] = 2, order[3] = 3;
     else if (format == VK_FORMAT_B8G8R8A8_UNORM) order[0] = 2, order[1] = 1, order[2] = 0, order[3] = 3;
     else return false;
-    if (texel_bits(info.base_format) != 32 || info.gamma || info.palette) return false;
+    if (texel_bits(info.base_format) != 32 || info.palette) return false;
+    if (info.gamma && (!srgb || vk::srgb_format_of(format) == VK_FORMAT_UNDEFINED)) return false;
     TextureInfo one = info;
     one.width = one.height = 1;
     one.levels = 1;
@@ -2049,12 +2063,16 @@ bool texels_as_image(const TextureInfo& info, VkFormat format) {
         if (bytes > 4) return false;
         std::memcpy(out, probe, bytes);
         return true;
-    });
-    if (!texels || texels->bytes != 4 || texels->data.size() < 4) return false;
+    }, false, false, srgb);
+    if (!texels || texels->bytes != 4 || texels->data.size() < 4 || texels->srgb != (info.gamma != 0)) return false;
     for (u32 k = 0; k < 4; ++k)
         if (texels->data[k] != probe[order[k]]) return false;
     return true;
 }
+
+// The format a texture that texels_as_image takes from an image of this format is sampled as: the image's, or its
+// sRGB format for a texture with a gamma mode.
+VkFormat texture_format(const TextureInfo& info, VkFormat format) { return info.gamma ? vk::srgb_format_of(format) : format; }
 
 // Whether a texture reads its texels where a colour surface of this layout has its pixels (texels as large as the
 // surface's pixels: texels_as_image checks the texture's size of a texel against the image's).
@@ -2079,7 +2097,9 @@ Target* scaled_texture(Renderer& r, const TextureInfo& info, const Target* drawi
         if (t->scale <= 1 || t.get() == drawing || t->address != info.address || t->width != info.width ||
             t->height != info.height)
             continue;
-        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) return nullptr;
+        // (a texture with a gamma mode: read through the scaled image's sRGB view, made with a gamma-mode surface's)
+        const bool srgb = srgb_textures(*r.device) && t->scaled.srgb_view != VK_NULL_HANDLE;
+        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format, srgb)) return nullptr;
         const Changes changes = surface_changes(*t);
         return changes.all || changes.pixels ? nullptr : t.get();
     }
@@ -2675,6 +2695,7 @@ bool texture_in_surface(const TextureInfo& info, const Target& t, u32& ox, u32& 
 // `only`: that surface, which a pending scene draws (its image will hold what guest memory will: not compared).
 CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key, u64 words_key, Target* only = nullptr) {
     if (info.levels != 1 || !info.address) return nullptr;  // (cube types: texture_reads_layout refuses them)
+    const bool srgb = srgb_textures(*r.device);
     for (auto& t : r.targets) {
         if (only && t.get() != only) continue;
         // (the surface this scene draws into too: the copy is recorded before the draws, so it holds what the scene
@@ -2685,7 +2706,7 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         const bool whole = t->address == info.address && info.height == t->height && info.width >= t->width &&
                            (info.width == t->width || t->layout.kind == SurfaceLayout::kLinear);
         if (!whole && !texture_in_surface(info, *t, ox, oy)) continue;
-        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) continue;
+        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format, srgb)) continue;
         if (!only) {
             const Changes changes = surface_changes(*t);
             if (changes.all || changes.pixels) continue;
@@ -2693,7 +2714,9 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         const u32 s = t->scale > 1 && t->scaled.image ? t->scale : 1;
         const u32 pb = t->layout.bytes;  // (a pixel's bytes, the image's as guest memory's: texture_reads_layout)
         vk::ImageDesc d;
-        d.format = t->image.desc.format;
+        // (a texture with a gamma mode: the image's bytes copied into an image of its sRGB format, of the same size of
+        // texel, which decodes them as it is sampled)
+        d.format = texture_format(info, t->image.desc.format);
         d.width = info.width * s;
         d.height = info.height * s;
         CachedTexture c;
@@ -2733,8 +2756,8 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
                 if (!memory().valid(address, bytes)) return false;
                 std::memcpy(out, memory().host(address), bytes);
                 return true;
-            });
-            if (texels && texels->bytes != pb)
+            }, false, false, srgb);
+            if (texels && (texels->bytes != pb || texels->srgb != (info.gamma != 0)))
                 texels = decltype(texels)(failure("texture: the columns past the surface decode otherwise"));
             if (texels && s > 1) {
                 // (each texel over an s x s block, as the scaled image's pixels are)
@@ -3446,7 +3469,8 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         u32 ox = 0, oy = 0;
         if (t->written.empty() || info.levels != 1) continue;
         if (!texture_in_surface(info, *t, ox, oy)) continue;
-        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format)) break;
+        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format, srgb_textures(*r.device)))
+            break;
         const Changes changes = surface_changes(*t);
         if (changes.all || changes.pixels) break;
         const u64 key = (wh.value() * 0x9E3779B97F4A7C15ull) ^ (reinterpret_cast<u64>(t.get()) * 0xC2B2AE3D27D4EB4Full) ^
@@ -3542,7 +3566,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     } else if (yuv) {
         texels->width = yuv->width, texels->height = yuv->height;
     } else {
-        texels = read_texels(info, read_guest, r.device->caps().texture_bc, true);
+        texels = read_texels(info, read_guest, r.device->caps().texture_bc, true, srgb_textures(*r.device));
     }
     if (!texels) {
         nx::logw(logs::gxm, "{} (format 0x{:08x}, type {})", texels.error().message, info.base_format, info.type);
@@ -3550,12 +3574,15 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
         return nullptr;
     }
     vk::ImageDesc d;
-    d.format = texels->bc == 1   ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
-               : texels->bc == 2 ? VK_FORMAT_BC2_UNORM_BLOCK
-               : texels->bc == 3 ? VK_FORMAT_BC3_UNORM_BLOCK
+    // (texels of a gamma mode kept encoded, Texels::srgb: the sRGB formats, which decode R, G and B as they are sampled)
+    const bool srgb = texels->srgb;
+    d.format = texels->bc == 1   ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+               : texels->bc == 2 ? (srgb ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK)
+               : texels->bc == 3 ? (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK)
                : texels->single      ? VK_FORMAT_R32_SFLOAT
                : texels->bytes == 16 ? VK_FORMAT_R32G32B32A32_SFLOAT
                : texels->bytes == 8 ? VK_FORMAT_R16G16B16A16_SFLOAT
+               : srgb               ? VK_FORMAT_R8G8B8A8_SRGB
                                     : VK_FORMAT_R8G8B8A8_UNORM;
     d.width = texels->width;
     d.height = texels->height;
@@ -3575,7 +3602,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
             auto queued = queue_yuv420(r, key, *yuv);
             if (!queued) return nx::err(queued.error());
             if (*queued) return {};
-            auto decoded = read_texels(info, read_guest, r.device->caps().texture_bc, true);
+            auto decoded = read_texels(info, read_guest, r.device->caps().texture_bc, true, srgb_textures(*r.device));
             if (!decoded) return nx::err(decoded.error());
             *texels = std::move(*decoded);
         }
@@ -5427,7 +5454,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             }
         }
         if (!misses.empty()) {
-            const bool bc = r.device->caps().texture_bc;
+            const bool bc = r.device->caps().texture_bc, srgb = srgb_textures(*r.device);
             const u64 decode_from = g_profile.on ? nx::os::ticks_ns() : 0;
             // (those decoded ahead, as they were set up, taken; the rest decoded here)
             nx::vector<usize> order;
@@ -5446,7 +5473,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 const usize k = order[i];
                 const u64 from = g_profile.on ? nx::os::ticks_ns() : 0;
                 const TextureInfo& info = misses[k].info;
-                misses[k].texels = read_texels(info, read_guest_memory, bc, true);
+                misses[k].texels = read_texels(info, read_guest_memory, bc, true, srgb);
                 // (one that took a while to decode: which)
                 if (const u64 took = g_profile.on ? nx::os::ticks_ns() - from : 0; took >= 1'000'000)
                     std::fprintf(stderr, "gxm profile: a slow decode, %.1f ms: format %08x type %u gamma %u, %u x %u, %u levels, "
@@ -5491,8 +5518,9 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 // (a surface drawn at the internal resolution: read there)
                 if (Target* st = sc.color) {
                     const TextureInfo info = decode_texture(words.words);
-                    ii[binding].imageView = st->scaled.view;
-                    const VkSampler smp = texture_sampler(r, info, st->scaled.desc.format, 1);
+                    // (a texture with a gamma mode: its sRGB view, which scaled_texture found it has)
+                    ii[binding].imageView = info.gamma ? st->scaled.srgb_view : st->scaled.view;
+                    const VkSampler smp = texture_sampler(r, info, texture_format(info, st->scaled.desc.format), 1);
                     ii[binding].sampler = smp ? smp : r.sampler;
                     if (std::find(sampled.begin(), sampled.end(), st) == sampled.end()) sampled.push_back(st);
                     continue;

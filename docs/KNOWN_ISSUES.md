@@ -127,6 +127,16 @@
   fixed-function blending then blends the encoded values. Other modes (GR, on no format drawn) and other formats
   than 8888 are not applied, with a warning once. That the console blends in linear light is an inference (the
   SDK headers say only that the gamma is applied "on pixel write"); check it against a game before relying on it.
+- **Textures with gamma mode 1 (`SCE_GXM_TEXTURE_GAMMA_R` / `_BGR`) are sampled through sRGB formats where they can
+  be.** Their texels stay 8-bit and encoded (`Texels::srgb`): RGBA8 as `R8G8B8A8_SRGB`, BC1-BC3 blocks as
+  `BC*_SRGB_BLOCK`, PVRTC and the other unsigned formats of up to 8 bits a component decoded to RGBA8, so the sampler
+  decodes R, G and B (the RGBA after the swizzle, as the decoder did; alpha linear) by the sRGB curve, before
+  filtering. A gamma-mode colour surface read as such a texture is copied from its image into an sRGB image (or read
+  through a scaled image's sRGB view), not written back and decoded. The CPU still decodes, to half floats, mode 3
+  (`_GR`, no sRGB format has only R and G), formats of more than 8 bits a component or signed ones, and everything
+  on a device without the formats (`Capabilities::texture_srgb`) or with `PSVRECORE_SRGB_TEXTURES=0`. Either way
+  the filtering is of decoded (linear) values, as Vulkan's sRGB formats decode before filtering; that the console's
+  texture unit does the same is assumed.
 - **A program and state seen for the first time is still translated (and its pipeline compiled) when it is first
   drawn.** The shader cache makes everything an earlier run drew with before the game starts, but nothing can be
   made ahead of that: the programs are in the user's game files (not there when the program is built, and never in

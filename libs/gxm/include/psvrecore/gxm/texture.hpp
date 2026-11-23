@@ -64,6 +64,9 @@ struct Texels {
     // `rgba_of` says (0: the float, 1: 0, 2: 1), for an image view to put it there: a quarter of RGBA32F's bytes.
     bool single = false;
     u8 rgba_of[4] = {};
+    // RGBA8 texels (or BC1-BC3 blocks) of a texture with gamma mode 1 read with `srgb`: R, G and B still sRGB-encoded,
+    // alpha linear, for an sRGB image (VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_BC*_SRGB_BLOCK) to decode as it is sampled.
+    bool srgb = false;
     nx::vector<u8> data;  // face 0's levels, then face 1's, ...: each level width x height of its own, rows packed
 };
 
@@ -73,11 +76,17 @@ using ReadGuest = nx::function_ref<bool(u32 address, void* out, u32 size)>;
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read);
 // With `native_bc` (a device that samples BC1-BC3): those formats' blocks as they are (Texels::bc), not decoded.
 // With `single_float`: F32 and F32M textures one float a texel (Texels::single).
-Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool native_bc, bool single_float = false);
+// With `srgb` (a device that samples sRGB images: RGBA8, and BC1-BC3 with `native_bc`): a texture of gamma mode 1 whose
+// texels are unsigned normalized of up to 8 bits a component keeps them 8-bit and encoded (Texels::srgb), not decoded
+// to linear half floats. Gamma mode 1 decodes the RGBA's R, G and B (the SDK's _R for one component, _BGR for more:
+// the swizzle's constant 0 and 1 are their own decode), never alpha, as sRGB images do; the others (mode 3, _GR) and
+// wider formats are decoded here still.
+Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool native_bc, bool single_float = false,
+                           bool srgb = false);
 namespace detail {
 // (`reference`: without the fast paths that give the same texels, for the tests to compare them with)
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool reference, bool native_bc = false,
-                           bool single_float = false);
+                           bool single_float = false, bool srgb = false);
 }  // namespace detail
 
 // YUV420 textures (two planes or three), for a GPU to convert as read_texels does, to the same bytes: the planes as

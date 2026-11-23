@@ -443,6 +443,182 @@ TEST_CASE("vulkan gpu: blending through the sRGB view happens in linear light") 
     }
 }
 
+TEST_CASE("vulkan gpu: gamma-mode textures sampled through sRGB formats give the CPU decoder's linear texels") {
+    auto g = open(false);
+    Device& d = *g->device;
+    if (!d.caps().texture_srgb) SKIP("no sRGB texture formats");
+    // (an 8x8 texture, each texel over 8x8 pixels of the target; guest memory's bytes varied)
+    constexpr u32 kTexels = 8;
+    nx::vector<u8> guest(4096 + kTexels * kTexels * 4);
+    u32 seed = 31337;
+    for (u8& v : guest) seed = seed * 1103515245u + 12345u, v = static_cast<u8>(seed >> 16);
+    auto read = [&](u32 address, void* out, u32 bytes) {
+        if (address + u64{bytes} > guest.size()) return false;
+        std::memcpy(out, guest.data() + address, bytes);
+        return true;
+    };
+    auto half = [](const u8* p) {
+        u16 h;
+        std::memcpy(&h, p, 2);
+        const u32 exp = (h >> 10) & 0x1F, mant = h & 0x3FFu;
+        const f32 v = exp == 0 ? std::ldexp(static_cast<f32>(mant), -24) : std::ldexp(1.0f + mant / 1024.0f, static_cast<i32>(exp) - 15);
+        return (h & 0x8000u) ? -v : v;
+    };
+    Samplers samplers(d);
+    SamplerDesc sd;
+    sd.mag = sd.min = VK_FILTER_NEAREST;
+    sd.u = sd.v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    const VkSampler sampler = value_or_throw(samplers.get(sd));
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 16;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &size;
+    VkDescriptorPool pool;
+    REQUIRE(vkCreateDescriptorPool(d.device(), &pi, nullptr, &pool) == VK_SUCCESS);
+    // (the view sampled over a half-float target: each texel's RGBA as the shader got it, in the CPU's layout)
+    auto sample = [&](VkImageView view) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &g->set_layout[1];
+        VkDescriptorSet set;
+        REQUIRE(vkAllocateDescriptorSets(d.device(), &ai, &set) == VK_SUCCESS);
+        VkDescriptorImageInfo ii{sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = set;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &ii;
+        vkUpdateDescriptorSets(d.device(), 1, &w, 0, nullptr);
+        Image color = value_or_throw(create_image(d, target(VK_FORMAT_R16G16B16A16_SFLOAT)));
+        Pass pass;
+        pass.color = {&color, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, {}};
+        const auto desc = desc_for(*g, Fragment::Texture, pass);
+        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
+        const Vertex quad[] = {{-1, -1, 0, {0, 0, 0, 0}}, {3, -1, 0, {2, 0, 0, 0}}, {-1, 3, 0, {0, 2, 0, 0}}};
+        OneShot shot(d);
+        VkCommandBuffer cmd = value_or_throw(shot.begin());
+        REQUIRE(g->passes->begin(cmd, pass));
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g->layout[1], 0, 1, &set, 0, nullptr);
+        draw(*g, cmd, p, desc, quad, kSize, kSize);
+        g->passes->end(cmd);
+        REQUIRE(shot.submit_and_wait());
+        const auto image = value_or_throw(read_image(d, color));
+        nx::vector<u8> texels(kTexels * kTexels * 8);
+        const u32 per = kSize / kTexels;
+        for (u32 y = 0; y < kTexels; ++y)
+            for (u32 x = 0; x < kTexels; ++x)
+                std::memcpy(texels.data() + (y * kTexels + x) * 8, image.data() + ((y * per + per / 2) * kSize + x * per + per / 2) * 8, 8);
+        g->passes->forget(color.view);
+        destroy_image(d, color);
+        return texels;
+    };
+    // (the largest difference of the sampled texels from the CPU's decode, half floats both)
+    auto worst = [&](const nx::vector<u8>& got, const nx::vector<u8>& want) {
+        REQUIRE(got.size() == want.size());
+        f32 w = 0;
+        for (usize i = 0; i < got.size(); i += 2) w = std::fmax(w, std::fabs(half(got.data() + i) - half(want.data() + i)));
+        return w;
+    };
+    // (a device's sRGB decode is good to half an 8-bit step (Direct3D's tolerance; an RTX 4060's was 0.46 of one near
+    // white), the curve's slope up to 2.3 there, and a half float's rounding)
+    constexpr f32 kCurve = 0.5f / 255 * 2.3f + 5e-4f;
+    gxm::TextureInfo t;
+    t.base_format = 0x0C000000u;  // U8U8U8U8
+    t.type = gxm::texture_type::kLinear;
+    t.width = t.height = kTexels;
+    t.stride = kTexels * 4;
+    t.address = 4096;
+    t.gamma = 1;  // SCE_GXM_TEXTURE_GAMMA_BGR
+    for (u32 swizzle : {0u, 2u, 6u}) {  // (ABGR; RGBA: alpha's byte decoded as R; RGB1: a constant alpha)
+        t.swizzle = swizzle;
+        const auto cpu = value_or_throw(gxm::read_texels(t, read));
+        const auto kept = value_or_throw(gxm::read_texels(t, read, false, false, true));
+        REQUIRE(cpu.bytes == 8);
+        REQUIRE(kept.srgb);
+        // (an R8G8B8A8_SRGB image of the texels kept encoded, as make_texture makes it)
+        ImageDesc td;
+        td.format = VK_FORMAT_R8G8B8A8_SRGB;
+        td.width = td.height = kTexels;
+        Image tex = value_or_throw(create_image(d, td));
+        REQUIRE(upload_image(d, tex, kept.data));
+        CHECK(worst(sample(tex.view), cpu.data) <= kCurve);
+        destroy_image(d, tex);
+    }
+    // A gamma-mode surface's image (its bytes guest memory's) read as the texture: copied into an sRGB image, as
+    // texture_from_target does, or through its own sRGB view, as a scaled surface is read.
+    t.swizzle = 0;
+    const auto cpu = value_or_throw(gxm::read_texels(t, read));
+    const std::span<const u8> surface(guest.data() + 4096, kTexels * kTexels * 4);
+    ImageDesc sd8;
+    sd8.format = VK_FORMAT_R8G8B8A8_UNORM;
+    sd8.width = sd8.height = kTexels;
+    sd8.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    sd8.srgb_view = true;
+    Image surf = value_or_throw(create_image(d, sd8));
+    REQUIRE(surf.srgb_view != VK_NULL_HANDLE);
+    REQUIRE(upload_image(d, surf, surface));
+    CHECK(worst(sample(surf.srgb_view), cpu.data) <= kCurve);
+    ImageDesc cd;
+    cd.format = VK_FORMAT_R8G8B8A8_SRGB;
+    cd.width = cd.height = kTexels;
+    Image copied = value_or_throw(create_image(d, cd));
+    {
+        OneShot shot(d);
+        VkCommandBuffer cmd = value_or_throw(shot.begin());
+        transition(cmd, surf, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        transition(cmd, copied, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {kTexels, kTexels, 1};
+        vkCmdCopyImage(cmd, surf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copied.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &region);
+        transition(cmd, copied, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        REQUIRE(shot.submit_and_wait());
+    }
+    CHECK(worst(sample(copied.view), cpu.data) <= kCurve);
+    destroy_image(d, copied);
+    destroy_image(d, surf);
+    // BC1-BC3 blocks kept for the device, as BC*_SRGB_BLOCK: the device's UNORM decode of the same blocks through the
+    // curve (its interpolation of the endpoints is its own: up to 3 8-bit steps from the CPU decoder's, sRGB or not,
+    // made up to 2.3 times larger by the curve)
+    if (d.caps().texture_bc) {
+        auto decode = [](f32 e) { return e <= 0.04045f ? e / 12.92f : std::pow((e + 0.055f) / 1.055f, 2.4f); };
+        for (const auto& [format, vk_format] : {std::pair{0x85000000u, VK_FORMAT_BC1_RGBA_SRGB_BLOCK},
+                                                std::pair{0x86000000u, VK_FORMAT_BC2_SRGB_BLOCK},
+                                                std::pair{0x87000000u, VK_FORMAT_BC3_SRGB_BLOCK}}) {
+            gxm::TextureInfo b = t;
+            b.base_format = format;
+            const auto blocks_cpu = value_or_throw(gxm::read_texels(b, read));
+            const auto blocks = value_or_throw(gxm::read_texels(b, read, true, false, true));
+            REQUIRE(blocks.bc != 0);
+            REQUIRE(blocks.srgb);
+            ImageDesc bd;
+            bd.format = vk_format;
+            bd.width = bd.height = kTexels;
+            Image tex = value_or_throw(create_image(d, bd));
+            REQUIRE(upload_image(d, tex, blocks.data));
+            const auto srgb = sample(tex.view);
+            CHECK(worst(srgb, blocks_cpu.data) <= 3.5f / 255 * 2.3f);
+            destroy_image(d, tex);
+            bd.format = static_cast<VkFormat>(vk_format - 1);  // (BC*_UNORM_BLOCK)
+            Image unorm = value_or_throw(create_image(d, bd));
+            REQUIRE(upload_image(d, unorm, blocks.data));
+            const auto encoded = sample(unorm.view);
+            destroy_image(d, unorm);
+            f32 w = 0;
+            for (usize i = 0; i < srgb.size(); i += 2) {
+                const f32 e = half(encoded.data() + i);
+                w = std::fmax(w, std::fabs(half(srgb.data() + i) - ((i / 2) % 4 < 3 ? decode(e) : e)));
+            }
+            CHECK(w <= 5e-3f);
+        }
+    }
+    vkDestroyDescriptorPool(d.device(), pool, nullptr);
+    check_no_validation_errors(*g);
+}
+
 TEST_CASE("vulkan gpu: reading the colour attachment (programmable blending)") {
     auto g = open(false);
     Device& d = *g->device;
