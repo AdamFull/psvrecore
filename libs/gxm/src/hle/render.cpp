@@ -2005,8 +2005,25 @@ VkSampler texture_sampler(Renderer& r, const TextureInfo& info, VkFormat format,
 }
 
 // Whether a texture's texels are what sampling an image of this format gives for the same bytes in memory (the
-// texture decoder, on one texel of known bytes): 8-bit RGBA images only.
+// texture decoder, on one texel of known bytes): 8-bit RGBA images, and half-float RGBA images whose texels the decoder
+// gives as the bytes are (an F16x4 surface read as an F16x4 texture).
 bool texels_as_image(const TextureInfo& info, VkFormat format) {
+    if (format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        if (texel_bits(info.base_format) != 64 || info.gamma || info.palette) return false;
+        TextureInfo one = info;
+        one.width = one.height = 1;
+        one.levels = 1;
+        one.stride = 8;
+        one.type = texture_type::kLinear;
+        const u8 probe[8] = {0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44};  // (halves 1, 2, 3, 4)
+        auto texels = read_texels(one, [&](u32, void* out, u32 bytes) {
+            if (bytes > 8) return false;
+            std::memcpy(out, probe, bytes);
+            return true;
+        });
+        return texels && texels->bytes == 8 && !texels->single && texels->data.size() >= 8 &&
+               std::memcmp(texels->data.data(), probe, 8) == 0;
+    }
     u32 order[4];
     if (format == VK_FORMAT_R8G8B8A8_UNORM) order[0] = 0, order[1] = 1, order[2] = 2, order[3] = 3;
     else if (format == VK_FORMAT_B8G8R8A8_UNORM) order[0] = 2, order[1] = 1, order[2] = 0, order[3] = 3;
@@ -2029,11 +2046,13 @@ bool texels_as_image(const TextureInfo& info, VkFormat format) {
     return true;
 }
 
-// Whether a texture reads its texels where a colour surface of this layout has its pixels (4-byte texels).
+// Whether a texture reads its texels where a colour surface of this layout has its pixels (texels as large as the
+// surface's pixels: texels_as_image checks the texture's size of a texel against the image's).
 bool texture_reads_layout(const TextureInfo& info, const SurfaceLayout& l) {
+    if (texel_bits(info.base_format) != l.bytes * 8) return false;
     switch (info.type) {
         case texture_type::kLinear:
-        case texture_type::kLinearStrided: return l.kind == SurfaceLayout::kLinear && info.stride == l.stride * 4;
+        case texture_type::kLinearStrided: return l.kind == SurfaceLayout::kLinear && info.stride == l.stride * l.bytes;
         case texture_type::kTiled: return l.kind == SurfaceLayout::kTiled && (l.stride + 31) / 32 == (info.width + 31) / 32;
         case texture_type::kSwizzled:
         case texture_type::kSwizzledArbitrary: return l.kind == SurfaceLayout::kSwizzled;
@@ -2612,17 +2631,19 @@ namespace {
 
 // Where a texture starts inside a colour surface (at its address, or past it, smaller): laid out alike (rows of the surface's
 // stride, or rows of tiles as wide as its own: a tile row's bytes from the surface's start), wholly within its size.
+// 4- and 8-byte pixels.
 bool texture_in_surface(const TextureInfo& info, const Target& t, u32& ox, u32& oy) {
     const SurfaceLayout& l = t.layout;
-    if (info.address < t.address || info.address - t.address >= l.span() || l.bytes != 4) return false;
+    const u32 b = l.bytes;
+    if (info.address < t.address || info.address - t.address >= l.span() || (b != 4 && b != 8)) return false;
     const u32 delta = info.address - t.address;
     if (l.kind == SurfaceLayout::kLinear &&
-        (info.type == texture_type::kLinear || info.type == texture_type::kLinearStrided) && info.stride == l.stride * 4 &&
-        delta % 4 == 0) {
-        oy = delta / (l.stride * 4), ox = delta % (l.stride * 4) / 4;
+        (info.type == texture_type::kLinear || info.type == texture_type::kLinearStrided) && info.stride == l.stride * b &&
+        delta % b == 0) {
+        oy = delta / (l.stride * b), ox = delta % (l.stride * b) / b;
     } else if (l.kind == SurfaceLayout::kTiled && info.type == texture_type::kTiled &&
                (l.stride + 31) / 32 == (info.width + 31) / 32) {
-        const u32 tile_row = (l.stride + 31) / 32 * 1024 * 4;
+        const u32 tile_row = (l.stride + 31) / 32 * 1024 * b;
         if (delta % tile_row) return false;
         ox = 0, oy = delta / tile_row * 32;
     } else {
@@ -2660,6 +2681,7 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
             if (changes.all || changes.pixels) continue;
         }
         const u32 s = t->scale > 1 && t->scaled.image ? t->scale : 1;
+        const u32 pb = t->layout.bytes;  // (a pixel's bytes, the image's as guest memory's: texture_reads_layout)
         vk::ImageDesc d;
         d.format = t->image.desc.format;
         d.width = info.width * s;
@@ -2683,7 +2705,7 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
             if (!image) return nullptr;
             c.image = *image;
             c.sampler = texture_sampler(r, info, d.format, 1);
-            c.bytes = usize{d.width} * d.height * 4;
+            c.bytes = usize{d.width} * d.height * pb;
             r.texture_bytes += c.bytes;
         }
         Renderer::TargetCopy copy;
@@ -2695,20 +2717,22 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         if (info.width > t->width) {
             // (the columns past the surface's width: as they are in guest memory)
             TextureInfo strip = info;
-            strip.address = info.address + t->width * 4;
+            strip.address = info.address + t->width * pb;
             strip.width = info.width - t->width;
             auto texels = read_texels(strip, [](u32 address, void* out, u32 bytes) {
                 if (!memory().valid(address, bytes)) return false;
                 std::memcpy(out, memory().host(address), bytes);
                 return true;
             });
+            if (texels && texels->bytes != pb)
+                texels = decltype(texels)(failure("texture: the columns past the surface decode otherwise"));
             if (texels && s > 1) {
                 // (each texel over an s x s block, as the scaled image's pixels are)
                 const u32 w = strip.width, h = info.height;
-                nx::vector<u8> up(usize{w} * s * h * s * 4);
+                nx::vector<u8> up(usize{w} * s * h * s * pb);
                 for (u32 y = 0; y < h * s; ++y)
                     for (u32 x = 0; x < w * s; ++x)
-                        std::memcpy(up.data() + (usize{y} * w * s + x) * 4, texels->data.data() + (usize{y / s} * w + x / s) * 4, 4);
+                        std::memcpy(up.data() + (usize{y} * w * s + x) * pb, texels->data.data() + (usize{y / s} * w + x / s) * pb, pb);
                 texels->data = std::move(up);
             }
             auto buffer = texels ? vk::create_host_buffer(*r.device, texels->data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
