@@ -6,7 +6,7 @@ namespace psvrecore::vulkan {
 
 PassFormats Pass::formats() const {
     PassFormats f;
-    if (color.image) f.color = color.image->desc.format, f.samples = color.image->desc.samples;
+    if (color.image) f.color = color.format(), f.samples = color.image->desc.samples;
     if (depth.image) f.depth = depth.image->desc.format, f.samples = depth.image->desc.samples;
     f.color_input = color_input ? 1 : 0;
     return f;
@@ -186,7 +186,7 @@ Result<void> RenderPasses::begin(VkCommandBuffer cmd, Pass& pass) {
         info.renderArea = area;
         info.layerCount = 1;
         if (pass.color.image) {
-            color.imageView = pass.color.image->view;
+            color.imageView = pass.color.view();
             color.imageLayout = color_layout;
             color.loadOp = color_load;
             color.storeOp = pass.color.store;
@@ -232,7 +232,7 @@ Result<void> RenderPasses::begin(VkCommandBuffer cmd, Pass& pass) {
     VkImageView views[3];
     VkClearValue clears[3]{};
     u32 count = 0;
-    if (pass.color.image) clears[count].color = pass.color.clear, views[count++] = pass.color.image->view;
+    if (pass.color.image) clears[count].color = pass.color.clear, views[count++] = pass.color.view();
     if (pass.depth.image) {
         clears[count].depthStencil = {pass.depth.clear_depth, pass.depth.clear_stencil};
         views[count++] = pass.depth.image->view;

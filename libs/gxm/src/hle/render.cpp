@@ -86,6 +86,10 @@ struct ColorFormat {
     u8 swizzle[4] = {0, 1, 2, 3};  // (FragmentShader::swizzle)
     Packing packing = Packing::None;
     u8 gamma = 0;  // (FragmentShader::gamma, a lane mask: the surface's gamma mode, set where the scene's surface is known)
+    // The surface is drawn through its image's sRGB view (`gamma` is 0 then: the hardware encodes what is written,
+    // and blends and reads the colour in linear light), set where the scene's surface is known.
+    bool srgb = false;
+    VkFormat attachment_format() const { return srgb ? vk::srgb_format_of(format) : format; }
     u32 guest_bytes() const {  // per pixel in guest memory
         return packing == Packing::None       ? bytes
                : packing == Packing::U8U8U8   ? 3
@@ -1737,9 +1741,10 @@ VkPipeline secondary_pipeline_keyed(Renderer& r, const Program& p) {
     return pipeline;
 }
 
-Result<vk::Image> target_image(Renderer& r, VkFormat format, u32 width, u32 height) {
+Result<vk::Image> target_image(Renderer& r, VkFormat format, u32 width, u32 height, bool srgb_view) {
     vk::ImageDesc d;
     d.format = format;
+    d.srgb_view = srgb_view;
     d.width = width;
     d.height = height;
     d.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1747,14 +1752,14 @@ Result<vk::Image> target_image(Renderer& r, VkFormat format, u32 width, u32 heig
     return vk::create_image(*r.device, d);
 }
 
-Target* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format, const SurfaceLayout& layout) {
+Target* color_target(Renderer& r, u32 address, u32 format, VkFormat vk_format, const SurfaceLayout& layout, bool srgb_view) {
     const u32 width = layout.width, height = layout.height;
     for (auto& t : r.targets) {
         if (t->address != address || t->format != format || t->width != width || t->height != height) continue;
         if (t->layout != layout) settle_lazy(*t), t->layout = layout, t->written.clear();  // (the same memory, laid out otherwise)
         return t.get();
     }
-    auto img = target_image(r, vk_format, width, height);
+    auto img = target_image(r, vk_format, width, height, srgb_view);
     if (!img) return nullptr;
     auto t = nx::make_unique<Target>();
     t->address = address, t->format = format, t->width = width, t->height = height;
@@ -1790,12 +1795,13 @@ bool ensure_scaled(Renderer& r, Target& t, u32 scale) {
     if (t.scaled.image && t.scale == scale) return true;
     if (t.scaled.image) {
         r.passes->forget(t.scaled.view);
+        if (t.scaled.srgb_view) r.passes->forget(t.scaled.srgb_view);
         vk::destroy_image(*r.device, t.scaled);
         t.scaled = {};
     }
     settle_lazy(t);
     t.written.clear();
-    auto img = target_image(r, t.image.desc.format, t.width * scale, t.height * scale);
+    auto img = target_image(r, t.image.desc.format, t.width * scale, t.height * scale, t.image.srgb_view != VK_NULL_HANDLE);
     if (!img) return false;
     t.scaled = *img;
     t.scale = scale;
@@ -4125,9 +4131,11 @@ u64 vertex_quick(const Program& vp, const VertexShader& vs) {
 // (never alpha, wherever its swizzle puts it), _GR (0x3000, stored as 3) the first two of a two-component one. The game
 // then reads such a surface back as a texture with a gamma mode, which decodes it, and draws in linear light.
 //
-// Known limitation: fixed-function blending blends the encoded values, as the written colour is; the hardware most
-// likely blends in linear light and encodes the blended colour as it stores it. (A VK_FORMAT_R8G8B8A8_SRGB view of the
-// attachment would do that for mode 1: docs/KNOWN_ISSUES.md.)
+// Where the surface's image can be drawn through an sRGB view (gamma_view), the hardware does this instead of the
+// shader: the lanes are written linear, blending runs in linear light and the blended colour is encoded as it is
+// stored, as the console does (a translucent fill over a dark surface is much brighter than one blended in encoded
+// space: Killzone: Mercenary's selection highlight is that). The shader's own encode (FragmentShader::gamma) stays
+// for the others (a colour lane order other than RGB(A), an image made without the view).
 u8 surface_gamma(const ColorSurface& cs, const ColorFormat& cf) {
     const u32 mode = (cs.modes >> 8) & 0xF;
     if (!mode) return 0;
@@ -4148,6 +4156,23 @@ u8 surface_gamma(const ColorSurface& cs, const ColorFormat& cf) {
     if (mode == 1) return drop("only the 8888 formats are gamma-corrected"), u8{0};
     if (mode == 3) return drop("no two-component 8-bit format is drawn"), u8{0};
     return drop("an unknown mode"), u8{0};
+}
+
+// Whether a colour surface with a gamma mode (`cf.gamma` set) is drawn through its image's sRGB view: not with
+// PSVRECORE_GAMMA_VIEW=0 (the fragment shader encodes, blending in encoded space), nor for a lane order other than the
+// attachment's own (the view encodes components 0 to 2), nor for an image of the surface made without the view.
+bool gamma_view(Renderer& r, const ColorFormat& cf, u32 address, u32 format, u32 width, u32 height) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PSVRECORE_GAMMA_VIEW");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    if (!enabled || !cf.gamma || cf.packing != Packing::None || vk::srgb_format_of(cf.format) == VK_FORMAT_UNDEFINED) return false;
+    for (int k = 0; k < 4; ++k)
+        if (cf.swizzle[k] != k) return false;
+    for (const auto& t : r.targets)
+        if (t->address == address && t->format == format && t->width == width && t->height == height)
+            return t->image.srgb_view != VK_NULL_HANDLE;
+    return true;  // (made with the view)
 }
 
 // A draw's read of the colour done by the pipeline's blending instead (color_read_blend), or none: a program whose
@@ -4445,7 +4470,7 @@ void ahead_make(Renderer& r, const AheadPair& pair, const ColorFormat& cf) {
     const bool reads_color = w.fp.gxp.native_color && w.fp.gxp.frag_color && !br;
     const u64 vq = vertex_quick(w.vp, vs), fq = fragment_quick(w.fp, fs, inline_secondary);
     vk::PassFormats formats;
-    formats.color = cf.format;
+    formats.color = cf.attachment_format();
     formats.depth = r.device->caps().depth_stencil_format;
     formats.color_input = reads_color ? 1 : 0;
     nx::fnv1a64 vk_, fk;
@@ -4671,6 +4696,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         }
         width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
         cf.gamma = surface_gamma(cs, cf);
+        if (gamma_view(r, cf, cs.data, cs.format, cs.size & 0xFFFF, cs.size >> 16)) cf.srgb = true, cf.gamma = 0;
         ahead_color(cf);
         ahead_start(r);  // (once: warm_up, when there is one, is done by now)
         layout.kind = cs.modes & 3;
@@ -4681,7 +4707,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         layout.stride = stride, layout.bytes = cf.guest_bytes(), layout.width = width, layout.height = height;
         if (!width || !height || layout.span() > 0xFFFFFFFFu || !memory().valid(cs.data, static_cast<u32>(layout.span()), true))
             return false;
-        target = color_target(r, cs.data, cs.format, cf.format, layout);
+        target = color_target(r, cs.data, cs.format, cf.format, layout, cf.srgb);
         if (!target) return false;
         color = &target->image;
         if (const u32 s = surface_scale(r, cf.format); s > 1 && ensure_scaled(r, *target, s)) {
@@ -5158,6 +5184,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (mask_update || !st.fragment_enabled[0]) desc.blend.write_mask = 0;
         vk::Pass pass_formats;
         pass_formats.color.image = color;
+        pass_formats.color.srgb = cf.srgb;
         pass_formats.color_input = reads_color;
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
@@ -5437,7 +5464,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         VkDescriptorImageInfo ii[kDrawBindings];
         for (u32 b = kDrawBindingFragmentTextures; b < kDrawBindings; ++b)
             ii[b] = {r.sampler, r.white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        if (color) ii[kDrawBindingColor] = {VK_NULL_HANDLE, color->view, input_layout};
+        if (color) ii[kDrawBindingColor] = {VK_NULL_HANDLE, cf.srgb ? color->srgb_view : color->view, input_layout};
         for (u32 stage = 0; stage < 2; ++stage) {
             const Draw& dr = *plans[i].draw;
             const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
@@ -5656,7 +5683,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         vkCmdPipelineBarrier(*cmd, tests, tests, 0, 1, &b, 0, nullptr, 0, nullptr);
     }
     vk::Pass pass;
-    if (color) pass.color = {color, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {}};
+    if (color) pass.color = {color, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {}, nullptr, cf.srgb};
     pass.color_input = reads_color;
     if (has_depth && depth.image) {
         pass.depth.image = &depth;

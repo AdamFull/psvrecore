@@ -117,15 +117,16 @@
 
 ## GXM layer (HLE)
 
-- **A colour surface's gamma mode blends in encoded space.** `sceGxmColorSurfaceSetGammaMode` (R / BGR on an 8888
-  surface; Killzone: Mercenary sets it on all of its colour surfaces and reads them back as textures with a gamma
-  mode) is applied in the fragment shader: the colour lanes are encoded (linear to sRGB) as they are written, and
-  decoded where a program reads the colour back (`FragmentShader::gamma`). Fixed-function blending then blends the
-  encoded values, where the hardware most likely blends in linear light and encodes the blended colour as it stores
-  it: translucent fills and glows come out a little off. A `VK_FORMAT_R8G8B8A8_SRGB` view of the attachment would do
-  that for mode 1 (it needs mutable-format images, the passes' and pipelines' formats, and the blits and
-  `target_texture` paths to follow). Other modes (GR, on no format drawn) and other formats than 8888 are not
-  applied, with a warning once.
+- **A colour surface's gamma mode (R / BGR on an 8888 surface) is drawn through an sRGB view where it can be.**
+  `sceGxmColorSurfaceSetGammaMode` (Killzone: Mercenary sets it on all of its colour surfaces and reads them back as
+  textures with a gamma mode): the surface's image is created with a second, `*_SRGB` view (`ImageDesc::srgb_view`)
+  and drawn through it (`ColorAttachment::srgb`), so the hardware encodes what is written, blends in linear light
+  and decodes what a program reads back (`gamma_view` in `render.cpp`; `PSVRECORE_GAMMA_VIEW=0` turns it off). Where
+  that cannot be (a packed or swizzled format, a target that was created without the view), the fragment shader
+  encodes the colour lanes as they are written and decodes the native-colour reads (`FragmentShader::gamma`), and
+  fixed-function blending then blends the encoded values. Other modes (GR, on no format drawn) and other formats
+  than 8888 are not applied, with a warning once. That the console blends in linear light is an inference (the
+  SDK headers say only that the gamma is applied "on pixel write"); check it against a game before relying on it.
 - **A program and state seen for the first time is still translated (and its pipeline compiled) when it is first
   drawn.** The shader cache makes everything an earlier run drew with before the game starts, but nothing can be
   made ahead of that: the programs are in the user's game files (not there when the program is built, and never in

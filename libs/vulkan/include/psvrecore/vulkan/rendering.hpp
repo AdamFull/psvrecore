@@ -16,6 +16,11 @@ struct ColorAttachment {
     VkAttachmentStoreOp store = VK_ATTACHMENT_STORE_OP_STORE;
     VkClearColorValue clear{};
     Image* resolve = nullptr;  // (a multisampled image resolved into this one at the end)
+    // Drawn through the image's sRGB view (Image::srgb_view): the pipelines' colour format is the sRGB one, the
+    // hardware encodes what is written and blends and reads back in linear light.
+    bool srgb = false;
+    VkImageView view() const { return srgb ? image->srgb_view : image->view; }
+    VkFormat format() const { return srgb ? srgb_format_of(image->desc.format) : image->desc.format; }
 };
 
 struct DepthAttachment {

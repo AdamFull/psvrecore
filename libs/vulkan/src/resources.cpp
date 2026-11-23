@@ -19,6 +19,14 @@ VkImageAspectFlags aspect_of(VkFormat format) {
     }
 }
 
+VkFormat srgb_format_of(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+        case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 u32 texel_size(VkFormat format) {
     switch (format) {
         case VK_FORMAT_R8_UNORM:
@@ -62,6 +70,16 @@ u32 texel_size(VkFormat format) {
 Result<Image> create_image(Device& device, const ImageDesc& desc) {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = desc.cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+    // (a view of the sRGB format: the image's format and it, as a list where the device takes one, which lets a driver
+    // that would drop compression for a mutable-format image keep it)
+    const VkFormat srgb = desc.srgb_view ? srgb_format_of(desc.format) : VK_FORMAT_UNDEFINED;
+    const VkFormat both[2] = {desc.format, srgb};
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    format_list.viewFormatCount = 2, format_list.pViewFormats = both;
+    if (srgb != VK_FORMAT_UNDEFINED) {
+        info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        if (device.caps().api_version >= VK_API_VERSION_1_2) info.pNext = &format_list;
+    }
     info.imageType = VK_IMAGE_TYPE_2D;
     info.format = desc.format;
     info.extent = {desc.width, desc.height, 1};
@@ -102,10 +120,24 @@ Result<Image> create_image(Device& device, const ImageDesc& desc) {
         vmaDestroyImage(device.allocator(), im.image, im.allocation);
         return nx::err(vk_error("vkCreateImageView", r));
     }
+    if (srgb != VK_FORMAT_UNDEFINED) {
+        // (the usages the sRGB format has: not storage)
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = desc.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        view.pNext = &usage;
+        view.format = srgb;
+        if (r = vkCreateImageView(device.device(), &view, nullptr, &im.srgb_view); r != VK_SUCCESS) {
+            vkDestroyImageView(device.device(), im.view, nullptr);
+            vmaDestroyImage(device.allocator(), im.image, im.allocation);
+            return nx::err(vk_error("vkCreateImageView (sRGB)", r));
+        }
+    }
     return im;
 }
 
 void destroy_image(Device& device, Image& image) {
+    if (image.srgb_view) vkDestroyImageView(device.device(), image.srgb_view, nullptr);
     if (image.view) vkDestroyImageView(device.device(), image.view, nullptr);
     if (image.image) vmaDestroyImage(device.allocator(), image.image, image.allocation);
     image = Image{};

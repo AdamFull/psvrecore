@@ -410,6 +410,39 @@ TEST_CASE("vulkan gpu: multisampling with a resolve") {
     }
 }
 
+TEST_CASE("vulkan gpu: blending through the sRGB view happens in linear light") {
+    for (const bool render_passes : {false, true}) {
+        auto g = open(render_passes);
+        Device& d = *g->device;
+        ImageDesc cd = target();
+        cd.srgb_view = true;
+        Image color = value_or_throw(create_image(d, cd));
+        REQUIRE(color.srgb_view != VK_NULL_HANDLE);
+        Pass pass;
+        // (linear red, cleared through the sRGB view: stored as 255)
+        pass.color = {&color, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, {{1.0f, 0.0f, 0.0f, 1.0f}}, nullptr, true};
+        auto desc = desc_for(*g, Fragment::Color, pass);
+        desc.blend.enable = 1;
+        desc.blend.src_color = VK_BLEND_FACTOR_SRC_ALPHA;
+        desc.blend.dst_color = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
+        OneShot shot(d);
+        VkCommandBuffer cmd = value_or_throw(shot.begin());
+        REQUIRE(g->passes->begin(cmd, pass));
+        draw(*g, cmd, p, desc, half(0.5f, 0, 0, 1, 0.5f), kSize, kSize);  // half-transparent blue over red
+        g->passes->end(cmd);
+        REQUIRE(shot.submit_and_wait());
+        const auto image = value_or_throw(read_image(d, color));
+        // 0.5 in linear light is 188 encoded (a blend of the encoded values would give 128); outside: the clear
+        CHECK(near(pixel(image, 8, 8), 188, 0, 188, 128, 2));
+        CHECK(near(pixel(image, 56, 56), 255, 0, 0, 255, 0));
+        g->passes->forget(color.view);
+        g->passes->forget(color.srgb_view);
+        destroy_image(d, color);
+        check_no_validation_errors(*g);
+    }
+}
+
 TEST_CASE("vulkan gpu: reading the colour attachment (programmable blending)") {
     auto g = open(false);
     Device& d = *g->device;
