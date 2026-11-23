@@ -3675,6 +3675,23 @@ u32 buffer_bytes(const usse::Gxp& g, u32 index) {
     return bytes;
 }
 
+// The bytes of [address, address + bytes) that are guest memory, from the start (in pages past the first): a buffer
+// a program declares larger than what follows it in memory (Killzone's depth reconstruction reads the rows of a colour
+// surface through uniform buffers declared 17 MB long) is copied as far as memory goes, not left out.
+u32 mapped_prefix(u32 address, u32 bytes) {
+    if (!bytes || memory().valid(address, bytes)) return bytes;
+    constexpr u32 kPage = 4096;
+    const u32 first = nx::min(bytes, kPage - (address & (kPage - 1)));
+    if (!memory().valid(address, first)) return 0;
+    u32 lo = 0, hi = (bytes - first) / kPage;  // (whole pages past the first known mapped / not yet known)
+    while (lo < hi) {
+        const u32 mid = (lo + hi + 1) / 2;
+        if (memory().valid(address, first + mid * kPage)) lo = mid;
+        else hi = mid - 1;
+    }
+    return first + lo * kPage;
+}
+
 void host_copy(nx::vector<u8>& out, u32 address, u32 bytes) {
     depend(address, bytes);
     const usize at = out.size();
@@ -4690,6 +4707,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (!c.placed) {
             c.placed = true;
             c.offset = static_cast<u32>(mem.size());
+            c.bytes = mapped_prefix(c.address, c.bytes);
             host_copy(mem, address, c.bytes);
         }
         return kMemoryBase + c.offset;
