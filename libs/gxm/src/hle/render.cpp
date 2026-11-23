@@ -2007,6 +2007,9 @@ VkSampler texture_sampler(Renderer& r, const TextureInfo& info, VkFormat format,
     sd.w = sd.u;
     sd.lod_bias = (static_cast<f32>(info.lod_bias) - 31.0f) / 8.0f;  // (assumed: eighths of a level, 31 none)
     sd.max_lod = static_cast<f32>(levels - 1);
+    // (the texture's minimum LOD, sceGxmTextureSetLodMin: the levels above it are never sampled. Killzone: Mercenary
+    // sets 1 on its 512x512 BC1/BC3 chains, whose level 0 holds stale memory, not texels)
+    sd.min_lod = static_cast<f32>(nx::min(info.lod_min, levels - 1));
     auto smp = r.samplers->get(sd);
     return smp ? *smp : VK_NULL_HANDLE;
 }
