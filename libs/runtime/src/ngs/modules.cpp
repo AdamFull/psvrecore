@@ -384,6 +384,9 @@ struct Streamer : Module {
     virtual void buffer_started(bool looped) { (void)looped; }
     // The voice starts.
     virtual void started() {}
+    // A frame read in an update before reads its samples again from where they are (they may have been written
+    // since: a game fills the buffer the voice swapped to after the update that swapped, before the next one).
+    virtual void refresh(Frame& f) { (void)f; }
 
     // (the read side: where the next frame comes from)
     i32 buffer = -1;
@@ -497,6 +500,10 @@ struct Streamer : Module {
             began = true;
             x0 = fetch();
             if (x0.real) x1 = fetch();
+        } else {
+            // (the frames read ahead at the end of the update before: as they are now)
+            refresh(x0);
+            refresh(x1);
         }
         const f64 step = std::fmin(std::fmax(static_cast<f64>(s.frequency) * s.scalar / c.sample_rate, 0.0), 4.0);
         const u32 nch = s.channels == 2 ? 2 : 1;
@@ -601,6 +608,21 @@ struct Player : Streamer {
             s = s < -32768.0 ? -32768.0 : s > 32767.0 ? 32767.0 : s;
             h[3] = h[2], h[2] = h[1], h[1] = h[0], h[0] = s;
             decoded[ch][i] = static_cast<f32>(s);
+        }
+    }
+
+    // (16-bit PCM only: a decoded VAG frame depends on the blocks before it)
+    void refresh(Frame& f) override {
+        if (p().type != 0 || !f.real || f.bytes == 0 || f.end < f.bytes || f.buffer < 0 || f.buffer > 3) return;
+        const u32 nch = settings().channels == 2 ? 2 : 1;
+        GuestMemory& mem = runtime().memory();
+        const u32 at = buffer_at(f.buffer).address + f.end - f.bytes;
+        if (!buffer_at(f.buffer).address || !mem.valid(at, 2 * nch)) return;
+        const u8* src = mem.host(at);
+        for (u32 ch = 0; ch < nch; ++ch) {
+            i16 v;
+            std::memcpy(&v, src + 2 * ch, 2);
+            f.s[ch] = static_cast<f32>(v) / 32768.0f;
         }
     }
 
