@@ -188,7 +188,7 @@ void bind(Gpu& g, VkCommandBuffer cmd, VkPipeline pipeline, const GraphicsPipeli
 }
 
 void draw(Gpu& g, VkCommandBuffer cmd, VkPipeline pipeline, const GraphicsPipelineDesc& desc,
-          std::span<const Vertex> vertices, u32 width, u32 height) {
+          std::span<const Vertex> vertices, u32 width, u32 height, bool reading = false, u32 instances = 1) {
     Buffer vb = value_or_throw(create_host_buffer(*g.device, vertices.size_bytes(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
     std::memcpy(vb.mapped, vertices.data(), vertices.size_bytes());
     flush(*g.device, vb);
@@ -200,7 +200,8 @@ void draw(Gpu& g, VkCommandBuffer cmd, VkPipeline pipeline, const GraphicsPipeli
     bind(g, cmd, pipeline, desc);
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb.buffer, &offset);
-    vkCmdDraw(cmd, static_cast<u32>(vertices.size()), 1, 0, 0);
+    if (reading) draw_color_reading(cmd, g.device->caps().raster_order_attachment, false, static_cast<u32>(vertices.size()), instances);
+    else vkCmdDraw(cmd, static_cast<u32>(vertices.size()), instances, 0, 0);
 }
 
 constexpr u32 kSize = 64;
@@ -460,6 +461,69 @@ TEST_CASE("vulkan gpu: reading the colour attachment (programmable blending)") {
     const auto image = value_or_throw(read_image(d, color));
     CHECK(near(pixel(image, 8, 8), 64, 128, 191, 255));    // inverted twice
     CHECK(near(pixel(image, 56, 56), 191, 128, 64, 0));    // inverted once (alpha 1 - 1)
+    vkDestroyDescriptorPool(d.device(), pool, nullptr);
+    g->passes->forget(color.view);
+    destroy_image(d, color);
+    check_no_validation_errors(*g);
+}
+
+TEST_CASE("vulkan gpu: overlapping primitives of one draw read the colour attachment in order") {
+    auto g = open(false);
+    Device& d = *g->device;
+    Image color = value_or_throw(create_image(d, target()));
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 1;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &size;
+    VkDescriptorPool pool;
+    REQUIRE(vkCreateDescriptorPool(d.device(), &pi, nullptr, &pool) == VK_SUCCESS);
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &g->set_layout[2];
+    VkDescriptorSet set;
+    REQUIRE(vkAllocateDescriptorSets(d.device(), &ai, &set) == VK_SUCCESS);
+    PassFormats reading;
+    reading.color_input = 1;
+    VkDescriptorImageInfo ii{VK_NULL_HANDLE, color.view, g->passes->color_layout(reading)};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+    w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(d.device(), 1, &w, 0, nullptr);
+
+    Pass pass;
+    pass.color = {&color, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, {{0.25f, 0.5f, 0.75f, 1.0f}}};
+    pass.color_input = true;
+    const auto desc = desc_for(*g, Fragment::InvertInput, pass);
+    const VkPipeline p = value_or_throw(g->pipelines->graphics(desc));
+    // Triangles that all cover the whole target: each inverts what the one before it left, so a pixel is right only if
+    // every primitive saw its predecessor's write (a device without rasterization-order access, drawing them as one,
+    // reads stale colour in places).
+    auto stack = [](u32 triangles) {
+        nx::vector<Vertex> v;
+        for (u32 i = 0; i < triangles; ++i) {
+            const auto t = full(0, 0, 0, 0, 0);
+            v.insert(v.end(), t.begin(), t.end());
+        }
+        return v;
+    };
+    OneShot shot(d);
+    VkCommandBuffer cmd = value_or_throw(shot.begin());
+    REQUIRE(g->passes->begin(cmd, pass));
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g->layout[2], 0, 1, &set, 0, nullptr);
+    draw(*g, cmd, p, desc, stack(7), kSize, kSize, true, 2);  // (14 inversions: as cleared)
+    color_read_barrier(cmd);
+    draw(*g, cmd, p, desc, stack(5), kSize, kSize, true);     // (5 more: inverted)
+    g->passes->end(cmd);
+    REQUIRE(shot.submit_and_wait());
+    const auto image = value_or_throw(read_image(d, color));
+    u32 wrong = 0;
+    for (u32 y = 0; y < kSize; ++y)
+        for (u32 x = 0; x < kSize; ++x) wrong += !near(pixel(image, x, y), 191, 128, 64, 0);
+    CHECK(wrong == 0);
     vkDestroyDescriptorPool(d.device(), pool, nullptr);
     g->passes->forget(color.view);
     destroy_image(d, color);

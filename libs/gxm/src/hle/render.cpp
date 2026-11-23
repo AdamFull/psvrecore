@@ -3767,6 +3767,7 @@ struct DrawPlan {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     DrawConstants constants;
     VkRect2D scissor{};
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 };
 
 // PSVRECORE_GXM_TRACE=<first scene>[-<last scene>] (or 1: all): each scene logged before it is rendered (its surfaces
@@ -5161,6 +5162,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
         if (d.caps().dynamic_state) plan.state = desc;
+        plan.topology = desc.topology;
         // (one not made yet: made with the scene's others after its draws are planned, on several threads)
         plan.pipeline = r.pipelines->find(desc);
         if (!plan.pipeline) {
@@ -5702,11 +5704,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             if (reads && i > 0 && !d.caps().raster_order_attachment) {
                 if (g_profile.on) ++g_profile.barriers;
                 // (what the draws before wrote, for this one to read: the render pass's self-dependency)
-                VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                b.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-                vkCmdPipelineBarrier(*cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                     VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0, nullptr, 0, nullptr);
+                vk::color_read_barrier(*cmd);
             }
             if (last.pipeline != p.pipeline) vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline), last.pipeline = p.pipeline;
             if (d.caps().dynamic_state) vk::set_dynamic_state(*cmd, p.state);
@@ -5746,7 +5744,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             if (query)
                 vkCmdBeginQuery(*cmd, queries, query_of[i],
                                 !st.visibility_set[0] && d.caps().occlusion_query_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-            vkCmdDrawIndexed(*cmd, p.draw->index_count, p.draw->instances, 0, 0, 0);
+            // (a draw whose primitives read the colour they overlap is ordered by hand without the device's help)
+            if (reads && p.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                vk::draw_color_reading(*cmd, d.caps().raster_order_attachment, true, p.draw->index_count, p.draw->instances);
+            else
+                vkCmdDrawIndexed(*cmd, p.draw->index_count, p.draw->instances, 0, 0, 0);
             if (query) vkCmdEndQuery(*cmd, queries, query_of[i]);
         }
         markers.close();  // (the labels end in the render pass they began in)

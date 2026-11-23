@@ -292,6 +292,28 @@ u32 dynamic_state_count(const VkDynamicState (&states)[N], bool dynamic) {
 
 }  // namespace
 
+void color_read_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0, nullptr, 0, nullptr);
+}
+
+void draw_color_reading(VkCommandBuffer cmd, bool order_attachment, bool indexed, u32 count, u32 instances) {
+    if (order_attachment || count <= 3) {
+        if (indexed) vkCmdDrawIndexed(cmd, count, instances, 0, 0, 0);
+        else vkCmdDraw(cmd, count, instances, 0, 0);
+        return;
+    }
+    for (u32 instance = 0; instance < instances; ++instance)
+        for (u32 first = 0; first + 3 <= count; first += 3) {
+            if (instance || first) color_read_barrier(cmd);
+            if (indexed) vkCmdDrawIndexed(cmd, 3, 1, first, 0, instance);
+            else vkCmdDraw(cmd, 3, 1, first, instance);
+        }
+}
+
 void set_dynamic_state(VkCommandBuffer cmd, const GraphicsPipelineDesc& d) {
     vkCmdSetCullMode(cmd, d.cull);
     vkCmdSetFrontFace(cmd, d.front);

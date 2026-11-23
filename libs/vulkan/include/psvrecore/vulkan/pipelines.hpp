@@ -126,6 +126,18 @@ private:
 // dynamic_state): set for each draw (whole pipelines have them dynamic too, then).
 void set_dynamic_state(VkCommandBuffer cmd, const GraphicsPipelineDesc& desc);
 
+// The barrier a draw that reads the colour attachment needs after what the draws before it wrote (the pass's self-
+// dependency: by region, the colour writes before the input attachment reads).
+void color_read_barrier(VkCommandBuffer cmd);
+
+// A draw of triangle lists (`count` vertices or indices) from the first, `instances` times, whose fragment shader
+// reads the colour attachment (programmable blending). The guest GPU runs the primitives of a draw in order, each
+// reading what the ones before it wrote; without rasterization-order attachment access (Capabilities::
+// raster_order_attachment) the device does not, and primitives that overlap race, each reading the colour before the
+// other's write lands (in blocks the size of the device's raster tiles). So there each triangle is its own draw with
+// a barrier before it, the instances one after the other. With that access, one draw.
+void draw_color_reading(VkCommandBuffer cmd, bool order_attachment, bool indexed, u32 count, u32 instances);
+
 // A shader module from SPIR-V words.
 Result<VkShaderModule> create_shader(Device& device, std::span<const u32> spirv);
 
