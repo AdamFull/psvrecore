@@ -3745,9 +3745,12 @@ struct DrawPlan {
 };
 
 // PSVRECORE_GXM_TRACE=<first scene>[-<last scene>] (or 1: all): each scene logged before it is rendered (its surfaces
-// and draws: their programs, primitives and textures), for finding what a frame draws.
+// and draws: their programs, primitives, textures, depth and stencil state), for finding what a frame draws. Scene
+// numbers vary between runs: *<colour address>[:<count>] traces <count> scenes (default 16) from the first that draws
+// to that colour surface.
 struct Trace {
     u64 first = 0, last = 0;
+    u32 surface = 0;
     bool on = false;
 };
 const Trace& trace() {
@@ -3756,13 +3759,27 @@ const Trace& trace() {
         const char* spec = std::getenv("PSVRECORE_GXM_TRACE");
         if (!spec || !*spec) return t;
         char* end = nullptr;
+        t.on = true;
+        if (*spec == '*') {
+            t.surface = static_cast<u32>(std::strtoul(spec + 1, &end, 0));
+            t.last = *end == ':' ? std::strtoull(end + 1, nullptr, 0) : 16;  // (a count until the surface is seen)
+            return t;
+        }
         t.first = std::strtoull(spec, &end, 0);
         t.last = *end == '-' ? std::strtoull(end + 1, nullptr, 0) : t.first;
         if (t.first <= 1 && *end != '-') t.first = 0, t.last = ~u64{0};
-        t.on = true;
         return t;
     }();
     return t;
+}
+// Whether this scene is traced (the first scene drawing to PSVRECORE_GXM_TRACE's surface starts the count).
+bool traced(u64 number, const Scene& scene) {
+    const Trace& t = trace();
+    if (!t.on) return false;
+    if (!t.surface) return number >= t.first && number <= t.last;
+    static u64 start = 0;
+    if (!start && scene.has_color && scene.color.data == t.surface) start = number + 1;
+    return start && number + 1 - start < t.last;
 }
 
 // (PSVRECORE_GXM_TRACE_PROGRAMS=<folder>: a traced program's GXP written there, for psvusse)
@@ -3787,8 +3804,9 @@ void trace_scene(u64 number, const Scene& scene) {
     const ColorSurface& cs = scene.color;
     const DepthStencilSurface& ds = scene.depth;
     nx::logi(logs::gxm, "trace: scene {}: colour {} (0x{:08x}, format 0x{:08x}, {} x {}, stride {}, type {}), depth {} "
-             "(0x{:08x}, control 0x{:08x}), {} draws", number, scene.has_color, cs.data, cs.format, cs.size & 0xFFFF,
-             cs.size >> 16, cs.stride, cs.modes & 3, scene.has_depth, ds.depth_data, ds.control, scene.draws.size());
+             "(0x{:08x}, stencil 0x{:08x}, control 0x{:08x}, background {}/0x{:x}), {} draws", number, scene.has_color,
+             cs.data, cs.format, cs.size & 0xFFFF, cs.size >> 16, cs.stride, cs.modes & 3, scene.has_depth, ds.depth_data,
+             ds.stencil_data, ds.control, ds.background_depth, ds.background_control, scene.draws.size());
     for (usize i = 0; i < scene.draws.size(); ++i) {
         const Draw& d = scene.draws[i];
         nx::string textures;
@@ -3804,6 +3822,15 @@ void trace_scene(u64 number, const Scene& scene) {
                  "{} indices x {}{}", i, d.vertex ? d.vertex->guest : 0, d.fragment ? d.fragment->guest : 0,
                  d.fragment && d.fragment->blend_enabled, d.fragment && d.fragment->mask_update, d.primitive,
                  d.index_count, d.instances, textures);
+        {
+            const DrawState& st = d.state;
+            const StencilState& f = st.stencil[0];
+            nx::logi(logs::gxm, "trace:     depth func 0x{:08x} write {}, stencil func 0x{:08x} ops 0x{:x}/0x{:x}/0x{:x} "
+                     "ref {} masks 0x{:02x}/0x{:02x}, cull {}, fragment {}, region clip {} ({},{})-({},{})",
+                     st.depth_func[0], st.depth_write[0], f.func, f.fail, f.depth_fail, f.pass, f.ref, f.compare_mask,
+                     f.write_mask, st.cull, st.fragment_enabled[0], st.region_clip_mode, st.region_min[0],
+                     st.region_min[1], st.region_max[0], st.region_max[1]);
+        }
         // (each vertex program's attributes, the first time it is seen: its parameters' names, and the formats the
         // program was made with)
         static nx::hash_map<u32, bool> described;
@@ -3874,8 +3901,11 @@ const nx::vector<u32>& skipped_programs() {
 struct CaptureAt {
     u64 scene = 0;
     u32 draw = 0;
+    u32 surface = 0;  // (`*<address>`: every draw of the first scene drawing to the colour surface at that address)
     nx::string folder;
 };
+
+void capture_one(u64 number, const Scene& scene, usize which, const nx::string& folder);
 
 void capture_draw(u64 number, const Scene& scene) {
     static const CaptureAt at = [] {
@@ -3884,12 +3914,23 @@ void capture_draw(u64 number, const Scene& scene) {
         if (!spec || !*spec) return out;
         char* end = nullptr;
         out.scene = std::strtoull(spec, &end, 0);
-        if (*end == ':') out.draw = static_cast<u32>(std::strtoul(end + 1, &end, 0));
+        if (*end == ':' && end[1] == '*') out.surface = static_cast<u32>(std::strtoul(end + 2, &end, 0));
+        else if (*end == ':') out.draw = static_cast<u32>(std::strtoul(end + 1, &end, 0));
         if (*end == ':') out.folder = nx::string(end + 1);
         return out;
     }();
     static bool done = false;
     if (done || !at.scene || number < at.scene || at.folder.empty()) return;
+    if (at.surface) {
+        if (!scene.has_color || scene.color.data != at.surface) return;
+        done = true;
+        for (usize i = 0; i < scene.draws.size(); ++i) {
+            const nx::string folder = nx::format("{}/d{}", at.folder, i);
+            (void)nx::fs::create_directories(nx::fs::path_view(folder));
+            capture_one(number, scene, i, folder);
+        }
+        return;
+    }
     usize which = at.draw;
     if (at.draw >= 0x10000) {
         which = scene.draws.size();
@@ -3903,6 +3944,13 @@ void capture_draw(u64 number, const Scene& scene) {
     }
     if (which >= scene.draws.size()) return;
     done = true;
+    capture_one(number, scene, which, at.folder);
+}
+
+void capture_one(u64 number, const Scene& scene, usize which, const nx::string& folder) {
+    struct {
+        const nx::string& folder;
+    } at{folder};
     const Draw& d = scene.draws[which];
     if (!d.vertex || !d.vertex->program || !d.fragment || !d.fragment->program) return;
     auto write_gxp = [&](const Program& p, const char* name) {
@@ -3931,6 +3979,13 @@ void capture_draw(u64 number, const Scene& scene) {
     nx::string text = nx::format("# scene {} draw {} (PSVRECORE_GXM_CAPTURE)\ntarget {} {} ff404040\nvertex vertex.gxp\n"
                                  "fragment fragment.gxp\n", number, which, nx::min(scene.color.size & 0xFFFFu, 1024u),
                                  nx::min(scene.color.size >> 16, 1024u));
+    {
+        const BlendInfo& b = d.fragment->blend;
+        text += nx::format("# vertex program 0x{:08x}, fragment program 0x{:08x}: blend {}, mask 0x{:x}, colour func {} src {} "
+                           "dst {}, alpha func {} src {} dst {}\n", d.vertex->guest, d.fragment->guest,
+                           d.fragment->blend_enabled, b.color_mask, b.color_func(), b.color_src(), b.color_dst(),
+                           b.alpha_func(), b.alpha_src(), b.alpha_dst());
+    }
     for (const VertexAttribute& a : d.vertex->attributes) {
         nx::string name;
         for (const usse::Parameter& p : d.vertex->program->gxp.parameters)
@@ -3985,6 +4040,25 @@ void capture_draw(u64 number, const Scene& scene) {
             words(stage ? "fragment" : "vertex", nx::format("{}", b).c_str(),
                   reinterpret_cast<const u32*>(memory().host(buffers[b])), bytes / 4);
         }
+    }
+    // The fragment textures as guest memory holds them now, decoded (level 0, face 0): t<unit>.bin, described in a
+    // comment (psvrender draws with its own textures; these are for looking at).
+    for (u32 u = 0; u < 16; ++u) {
+        const TextureWords& w = d.fragment_textures[u];
+        if (!w.words[0] && !w.words[1] && !w.words[2] && !w.words[3]) continue;
+        const TextureInfo t = decode_texture(w.words);
+        auto texels = read_texels(t, read_guest_memory);
+        if (!texels) {
+            text += nx::format("# texture {}: 0x{:08x}:{:08x} not read ({})\n", u, t.address, t.base_format,
+                               texels.error().message);
+            continue;
+        }
+        const usize level0 = usize{texels->width} * texels->height * texels->bytes;
+        if (texels->bc || texels->data.size() < level0) continue;
+        (void)io::write_file(nx::fs::path_view(nx::format("{}/t{}.bin", at.folder, u)), {texels->data.data(), level0});
+        text += nx::format("# texture {}: 0x{:08x}:{:08x}/type {} {}x{}, {} bytes a texel{}: t{}.bin\n", u, t.address,
+                           t.base_format, t.type, texels->width, texels->height, texels->bytes,
+                           texels->single ? " (one float)" : "", u);
     }
     text += "draw\n";
     (void)io::write_file(nx::fs::path_view(nx::format("{}/scene.txt", at.folder)),
@@ -4472,7 +4546,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         bool& recorded;
         ~Copies() { finish_target_copies(r, recorded); }
     } copies{r, copies_recorded};
-    if (const Trace& t = trace(); t.on && r.scenes >= t.first && r.scenes <= t.last) trace_scene(r.scenes, scene);
+    if (traced(r.scenes, scene)) trace_scene(r.scenes, scene);
     if (const auto& skip = skipped_programs(); !skip.empty()) {
         auto skipped = [&](const Draw& dr) {
             return std::find(skip.begin(), skip.end(), dr.vertex ? dr.vertex->guest : 0) != skip.end() ||
