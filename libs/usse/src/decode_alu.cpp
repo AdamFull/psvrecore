@@ -544,6 +544,9 @@ bool decode_tex(const Word& w, nx::vector<Instruction>& out) {
     in.tex_dim = static_cast<TexDim>(dim);
     in.tex_kind = static_cast<TexKind>(w.field(40, 2));
     in.type = ty == 0 ? Type::None : ty == 2 ? Type::F16 : Type::F32;
+    // (bits 35-36: the coordinates' format, 0 f32, 1 f16; checked with the shader compiler's tex2D of float and half
+    // coordinates, the same result type. 2 is not known: read as f32, as before.)
+    in.tex_coord = w.field(35, 2) == 1 ? Type::F16 : Type::F32;
     if (w.bit(37)) in.flags |= kTexRsd;
     if (w.bit(38)) in.flags |= kTexInfo;
     if (w.bit(51)) in.flags |= kTexMinP;
@@ -552,7 +555,8 @@ bool decode_tex(const Word& w, nx::vector<Instruction>& out) {
     const u8 n = static_cast<u8>(dim + 1);
     static constexpr Kind coord_kind[4] = {Kind::Temp, Kind::Primary, Kind::Output, Kind::Secondary};
     in.src[0] = operand(coord_kind[w.bit(34) | (w.bit(50) << 1)], w.field(14, 7),
-                        lanes_identity(n, static_cast<u8>((1 << n) - 1)), View::F32, true);
+                        lanes_identity(n, static_cast<u8>((1 << n) - 1)),
+                        in.tex_coord == Type::F16 ? View::F16 : View::F32, true);
     in.src[1] = operand(src_kind(w.field(30, 2), w.bit(49)), w.field(7, 7), Lanes{}, View::Int, true, 2, false);
     in.src_count = 2;
     if (in.tex_kind != TexKind::Plain) {

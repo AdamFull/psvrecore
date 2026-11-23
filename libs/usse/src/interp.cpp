@@ -776,13 +776,16 @@ void tex_op(Exec& x, const Instruction& in) {
     r.dim = in.tex_dim;
     r.kind = in.tex_kind;
     const u32 n = static_cast<u32>(in.tex_dim) + 1;
-    for (u32 k = 0; k < n; ++k) r.coord[k] = x.fval(in.src[0], k, Type::F32);
+    for (u32 k = 0; k < n; ++k) r.coord[k] = x.fval(in.src[0], k, in.tex_coord);
     if (in.src_count > 2) {
         for (u32 k = 0; k < 4; ++k) {
             u32* w = x.reg_word(in.src[2], in.src[2].number + k);
             if (!w) return;
             r.extra[k] = std::bit_cast<f32>(*w);
         }
+        // (a bias or LOD in the coordinates' format: f16, the first word's low half)
+        if (in.tex_coord == Type::F16 && in.tex_kind != TexKind::Grad)
+            if (u32* w = x.reg_word(in.src[2], in.src[2].number)) r.extra[0] = from_half(static_cast<u16>(*w));
     }
     f32 rgba[4];
     if (!x.m_.textures->sample(state, r, rgba)) {

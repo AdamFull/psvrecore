@@ -1220,7 +1220,7 @@ void Translator::tex_op(const Instruction& in) {
     state.lanes = 0;
     Id coord[4] = {f(0.0f), f(0.0f), f(0.0f), f(0.0f)};
     const u32 n = static_cast<u32>(in.tex_dim) + 1;
-    for (u32 k = 0; k < n; ++k) coord[k] = fval(in.src[0], k, Type::F32);
+    for (u32 k = 0; k < n; ++k) coord[k] = fval(in.src[0], k, in.tex_coord);
     Id rgba[4];
     if (form_ == Form::Compute) {
         const Id unit = raw(state, 0, Type::U32);
@@ -1253,6 +1253,8 @@ void Translator::tex_op(const Instruction& in) {
                 e.swizzle[j] = static_cast<Comp>(j);
                 extra[j] = cast(tf_, raw(e, j, Type::U32));
             }
+            // (a bias or LOD in the coordinates' format: f16, the first word's low half)
+            if (in.tex_coord == Type::F16 && in.tex_kind != usse::TexKind::Grad) extra[0] = fval(e, 0, Type::F16);
         }
         const u32 binding = (vertex ? kDrawBindingVertexTextures : kDrawBindingFragmentTextures) + static_cast<u32>(unit);
         if (query) {

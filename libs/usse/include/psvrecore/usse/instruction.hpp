@@ -147,6 +147,9 @@ struct Instruction {
     // Texture sampling.
     TexDim tex_dim = TexDim::D2;
     TexKind tex_kind = TexKind::Plain;
+    // The coordinates' format, and a bias's or LOD's (`type` is the result's): F32 or F16. (A gradient is f32 either
+    // way: the compiler packs f16 gradients into f32 registers.)
+    Type tex_coord = Type::F32;
     // Memory.
     Space space = Space::Absolute;
     u8 size = 32;           // bits per element

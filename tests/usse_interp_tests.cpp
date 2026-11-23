@@ -311,3 +311,25 @@ TEST_CASE("usse interp: textures, sampled inputs and texture instructions") {
     const f32 want[4] = {0.75f, 1.0f, 1.25f, 1.5f};  // (0.25, 0.5, 0.75, 1) + (0.5, 0.5, 0.5, 0.5)
     for (u32 k = 0; k < 4; ++k) CHECK(from_half(static_cast<u16>(m.primary[k / 2] >> (16 * (k % 2)))) == want[k]);
 }
+
+TEST_CASE("usse interp: a texture instruction's f16 coordinates") {
+    // half2 c = t.xy * k + t.zw; tex2D(s1, c) (half t and k: the shader compiler's code, the coordinates f16 halves of
+    // pa0, which read as an f32 would be near 0)
+    const u64 primary[] = {0xFA44070000000000ull, 0x3800045881000000ull, 0x04208086C0000000ull, 0xE001848CE0000080ull,
+                           0xF920000000000000ull};
+    Gxp gxp;
+    gxp.type = ShaderType::Fragment;
+    gxp.containers = {Container{kDefaultUniformContainer, 0, 2}, Container{kConstantsContainer, 2, 4}};
+    for (u16 k = 0; k < 4; ++k) gxp.sampler_slots.push_back(SamplerSlot{k, k});
+    TestTextures textures;
+    Machine m;
+    m.textures = &textures;
+    const SamplerState samplers[1] = {SamplerState{{0, 0, 0, 0}}};
+    const u32 uniforms[2] = {u32{to_half(1.0f)}, 0};
+    REQUIRE(load_secondary(gxp, uniforms, {}, m, samplers));
+    m.primary[0] = u32{to_half(0.25f)} | u32{to_half(0.5f)} << 16;  // t
+    m.primary[1] = u32{to_half(0.5f)} | u32{to_half(0.25f)} << 16;
+    REQUIRE(run(decode_program(primary, ProgramKind::Primary), ProgramKind::Primary, m));
+    const f32 want[4] = {1.0f, 0.0f, 0.5f, 0.25f};  // c = (0.75, 0.75): the right texel
+    for (u32 k = 0; k < 4; ++k) CHECK(from_half(static_cast<u16>(m.primary[k / 2] >> (16 * (k % 2)))) == want[k]);
+}
