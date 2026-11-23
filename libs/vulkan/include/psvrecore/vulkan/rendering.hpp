@@ -57,6 +57,13 @@ public:
     bool uses_render_pass(const PassFormats& f) const {
         return (f.color_input && !device_.caps().local_read) || !device_.caps().dynamic_rendering;
     }
+    // The layout of the colour attachment of passes with these formats, and of the input attachment that reads it. A
+    // dynamic rendering pass reads it in RENDERING_LOCAL_READ: an NVIDIA driver (RTX 4060) let a draw read the colour
+    // from before the pass, not the earlier draws' writes, in GENERAL (see KNOWN_ISSUES).
+    VkImageLayout color_layout(const PassFormats& f) const {
+        if (!f.color_input) return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        return uses_render_pass(f) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR;
+    }
     // A render pass pipelines with these formats can be made for (any load and store operations).
     Result<VkRenderPass> compatible(const PassFormats& formats);
 

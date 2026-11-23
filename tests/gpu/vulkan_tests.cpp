@@ -426,7 +426,9 @@ TEST_CASE("vulkan gpu: reading the colour attachment (programmable blending)") {
     ai.pSetLayouts = &g->set_layout[2];
     VkDescriptorSet set;
     REQUIRE(vkAllocateDescriptorSets(d.device(), &ai, &set) == VK_SUCCESS);
-    VkDescriptorImageInfo ii{VK_NULL_HANDLE, color.view, VK_IMAGE_LAYOUT_GENERAL};
+    PassFormats reading;
+    reading.color_input = 1;
+    VkDescriptorImageInfo ii{VK_NULL_HANDLE, color.view, g->passes->color_layout(reading)};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = set;
     w.descriptorCount = 1;

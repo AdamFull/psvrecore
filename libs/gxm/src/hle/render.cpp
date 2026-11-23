@@ -5225,13 +5225,17 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             for (TextureMiss& m : misses) make_texture(r, m.info, m.size, m.key, m.words_key, &m.texels);
         }
     }
+    // (the colour as an input attachment: in the layout the pass leaves it in)
+    vk::PassFormats input_formats;
+    input_formats.color_input = reads_color ? 1 : 0;
+    const VkImageLayout input_layout = reads_color ? r.passes->color_layout(input_formats) : VK_IMAGE_LAYOUT_GENERAL;
     for (usize i = 0; i < plans.size(); ++i) {
         VkDescriptorBufferInfo bi[2] = {{sa_buf->buffer, 0, VK_WHOLE_SIZE}, {mem_buf->buffer, 0, VK_WHOLE_SIZE}};
         // The units each program declares: the draw's texture there, or a white texel of the declared kind.
         VkDescriptorImageInfo ii[kDrawBindings];
         for (u32 b = kDrawBindingFragmentTextures; b < kDrawBindings; ++b)
             ii[b] = {r.sampler, r.white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        if (color) ii[kDrawBindingColor] = {VK_NULL_HANDLE, color->view, VK_IMAGE_LAYOUT_GENERAL};
+        if (color) ii[kDrawBindingColor] = {VK_NULL_HANDLE, color->view, input_layout};
         for (u32 stage = 0; stage < 2; ++stage) {
             const Draw& dr = *plans[i].draw;
             const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;

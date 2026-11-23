@@ -163,7 +163,7 @@ Result<void> RenderPasses::begin(VkCommandBuffer cmd, Pass& pass) {
     if (!size_of) return failure("a pass without attachments");
     VkRect2D area = pass.area;
     if (!area.extent.width || !area.extent.height) area = {{0, 0}, {size_of->desc.width, size_of->desc.height}};
-    const VkImageLayout color_layout = f.color_input ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    const VkImageLayout color_layout = this->color_layout(f);
     // A colour attachment the shaders read is cleared before the pass and loaded: an Intel Arc driver reads wrong
     // values back from an attachment cleared by its load operation (see KNOWN_ISSUES).
     VkAttachmentLoadOp color_load = pass.color.load;
