@@ -62,6 +62,14 @@ nx::string params(const usse::Gxp& g) {
             if (l.texcoord[k] >= 0) out += nx::format(" texcoord{}={}+{}", k, l.texcoord[k], l.texcoord_registers[k]);
         out += "\n";
     }
+    // (how the driver fills the secondary attributes: register ranges, then the constants block's words)
+    for (const usse::Container& c : g.containers)
+        out += nx::format("container {} base=sa{} size={}\n", c.index, c.base, c.size);
+    for (const usse::BufferSlot& s : g.buffer_slots)
+        out += nx::format("buffer slot buffer={} offset={} bias={}\n", s.buffer, s.offset, s.bias);
+    for (const usse::SamplerSlot& s : g.sampler_slots)
+        out += nx::format("sampler slot unit={} word={} offset={}\n", s.word / 4, s.word % 4, s.offset);
+    for (const usse::Literal& l : g.literals) out += nx::format("literal offset={} value={:08x}\n", l.offset, l.value);
     return out;
 }
 
@@ -152,12 +160,12 @@ void trace(void* user, const usse::Decoded& d, const usse::Machine& m) {
     std::fputs(line.c_str(), stderr);
 }
 
-// --run: the input file's lines are "<what> <first> <hex word>...": pa, sa, r (registers from <first>), uniform
+// --run: the input file's lines are "<what> <first> <hex word>...": pa, sa, r, o (registers from <first>), uniform
 // (the default uniform buffer from word <first>), mem (guest memory from address <first>), buffer (<first> is the
 // BUFFER index, one word: its address), special (<first> is the code, one word: its value). The secondary attributes are set up as for a draw, the secondary program
 // runs, then the primary one; the output registers o0-o63 are printed as hex words on one line ("out ..."), and
 // "killed" if the instance was discarded. A fragment program's inputs are "varying <varying:: bit> <4 f32 words>"
-// and its textures "texture <unit> <width> <height> <RGBA8 texels>"; it prints its primary attributes.
+// and its textures "texture <unit> <width> <height> <RGBA8 texels>"; it prints its primary attributes (and, with __nativecolor, o0-o15 on an "o" line).
 Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tracing,
                            const psvusse::GpuOptions* gpu) {
     usse::Machine m;
@@ -180,7 +188,8 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
             if (!v || *v > 0xFFFFFFFFu) return void(error = nx::format("bad word '{}'", f[i]));
             words.push_back(static_cast<u32>(*v));
         }
-        u32* bank = f[0] == "pa" ? m.primary : f[0] == "sa" ? m.secondary : f[0] == "r" ? m.temp : nullptr;
+        u32* bank = f[0] == "pa" ? m.primary : f[0] == "sa" ? m.secondary : f[0] == "r" ? m.temp
+                  : f[0] == "o" ? m.output : nullptr;
         if (bank) {
             if (*first + words.size() > usse::Machine::kBankSize) return void(error = "registers outside the bank");
             for (usize i = 0; i < words.size(); ++i) bank[*first + i] = words[i];
@@ -252,6 +261,11 @@ Result<nx::string> execute(const usse::Gxp& gxp, nx::string_view inputs, bool tr
     const u32* results = gxp.type == usse::ShaderType::Fragment ? m.primary : m.output;
     nx::string out = "out";
     for (u32 i = 0; i < 64; ++i) out += nx::format(" {:08x}", results[i]);
+    // (a fragment program with __nativecolor leaves its colour in the output registers: those too)
+    if (gxp.type == usse::ShaderType::Fragment && gxp.native_color) {
+        out += "\no";
+        for (u32 i = 0; i < 16; ++i) out += nx::format(" {:08x}", m.output[i]);
+    }
     out += m.killed ? "\nkilled\n" : "\n";
     return out;
 }
