@@ -116,6 +116,15 @@
 
 ## GXM layer (HLE)
 
+- **A colour surface's gamma mode blends in encoded space.** `sceGxmColorSurfaceSetGammaMode` (R / BGR on an 8888
+  surface; Killzone: Mercenary sets it on all of its colour surfaces and reads them back as textures with a gamma
+  mode) is applied in the fragment shader: the colour lanes are encoded (linear to sRGB) as they are written, and
+  decoded where a program reads the colour back (`FragmentShader::gamma`). Fixed-function blending then blends the
+  encoded values, where the hardware most likely blends in linear light and encodes the blended colour as it stores
+  it: translucent fills and glows come out a little off. A `VK_FORMAT_R8G8B8A8_SRGB` view of the attachment would do
+  that for mode 1 (it needs mutable-format images, the passes' and pipelines' formats, and the blits and
+  `target_texture` paths to follow). Other modes (GR, on no format drawn) and other formats than 8888 are not
+  applied, with a warning once.
 - **A program and state seen for the first time is still translated (and its pipeline compiled) when it is first
   drawn.** The shader cache makes everything an earlier run drew with before the game starts, but nothing can be
   made ahead of that: the programs are in the user's game files (not there when the program is built, and never in

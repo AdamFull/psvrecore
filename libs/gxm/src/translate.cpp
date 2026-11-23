@@ -397,6 +397,8 @@ private:
     void vertex_epilogue();
     void fragment_prologue();
     void fragment_epilogue();
+    Id srgb_encode(Id linear);  // (a colour surface's gamma mode: the component as the surface writes it)
+    Id srgb_decode(Id encoded);  // (and as a program reading the colour back gets it)
     Id push_constant(u32 member, Id type);
     Id special(i32 code);
     Id frag_coord();
@@ -1754,6 +1756,22 @@ Id Translator::special(i32 code) {
     return bor(band(shr(coord(0), u(4)), u(0xFF)), shl(band(shr(coord(1), u(4)), u(0xFF)), u(8)));
 }
 
+// A component, linear to sRGB (clamped to 0 to 1).
+Id Translator::srgb_encode(Id linear) {
+    const Id c = ext(tf_, GLSLstd450NClamp, {linear, f(0.0f), f(1.0f)});
+    const Id low = fmul(c, f(12.92f));
+    const Id high = fsub(fmul(ext(tf_, GLSLstd450Pow, {c, f(1.0f / 2.4f)}), f(1.055f)), f(0.055f));
+    return b_.op(SpvOpSelect, tf_, {bin(SpvOpFOrdLessThanEqual, tb_, c, f(0.0031308f)), low, high});
+}
+
+// A component, sRGB to linear.
+Id Translator::srgb_decode(Id encoded) {
+    const Id c = ext(tf_, GLSLstd450NClamp, {encoded, f(0.0f), f(1.0f)});
+    const Id low = fdiv(c, f(12.92f));
+    const Id high = ext(tf_, GLSLstd450Pow, {fdiv(fadd(c, f(0.055f)), f(1.055f)), f(2.4f)});
+    return b_.op(SpvOpSelect, tf_, {bin(SpvOpFOrdLessThanEqual, tb_, c, f(0.04045f)), low, high});
+}
+
 void Translator::fragment_prologue() {
     sa_base_ = iadd(imul(push_constant(0, tu_), u(kDrawSecondaryWords)), u(256));
     // (a depthf under a predicate that is false leaves the fragment's own depth)
@@ -1781,6 +1799,9 @@ void Translator::fragment_prologue() {
             const u8 k = fragment_shader->swizzle[c];
             if (k < 4) lane[k] = b_.op(SpvOpCompositeExtract, tf_, {texel, c});
         }
+        // (the surface's gamma-corrected lanes hold sRGB: the program's register has them linear, as it wrote them)
+        for (u32 k = 0; k < 3; ++k)
+            if (fragment_shader->gamma >> k & 1) lane[k] = srgb_decode(lane[k]);
         auto o = [&](u32 r, Id v) {
             out_.used = nx::max(out_.used, r + 1);
             store(chain(tp_fu_, out_.var, {u(r)}), v);
@@ -1952,8 +1973,12 @@ void Translator::fragment_epilogue() {
         b_.decorate(color, SpvDecorationLocation, {0});
         interface_.push_back(color);
         const u8* z = fragment_shader->swizzle;
-        store(color, b_.op(SpvOpCompositeConstruct, tv4_, {lane[nx::min<u8>(z[0], 5)], lane[nx::min<u8>(z[1], 5)],
-                                                          lane[nx::min<u8>(z[2], 5)], lane[nx::min<u8>(z[3], 5)]}));
+        Id out[4] = {lane[nx::min<u8>(z[0], 5)], lane[nx::min<u8>(z[1], 5)], lane[nx::min<u8>(z[2], 5)], lane[nx::min<u8>(z[3], 5)]};
+        // (a colour surface with a gamma mode: the colour lanes it covers are gamma-corrected as written, linear to
+        // sRGB: the lanes, wherever the swizzle puts them in the attachment, never the alpha one)
+        for (u32 k = 0; k < 4; ++k)
+            if (z[k] < 3 && (fragment_shader->gamma >> z[k] & 1)) out[k] = srgb_encode(out[k]);
+        store(color, b_.op(SpvOpCompositeConstruct, tv4_, {out[0], out[1], out[2], out[3]}));
     }
     if (depth_) {
         // (the depth surface's range: what is outside it is undefined in Vulkan)

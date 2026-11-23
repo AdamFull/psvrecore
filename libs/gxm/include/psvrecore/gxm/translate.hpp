@@ -137,6 +137,12 @@ struct FragmentShader {
     // With `blend_read`, a program whose colour read color_read_blend finds leaves that blend to the pipeline's
     // fixed-function blending: its blend writes its other source to the output register, and nothing is read.
     bool blend_read = false;
+    // The colour surface's gamma mode (sceGxmColorSurfaceSetGammaMode): the output register's lanes (bit k: lane k, a
+    // colour lane, never the alpha one: 0 to 2) whose components the surface gamma-corrects as it writes them, linear
+    // to sRGB, and decodes where a program reads the colour back (0: none). Lanes, not the attachment's channels: the
+    // swizzle takes them there. (Fixed-function blending, which runs on the encoded values, is not the surface's: it
+    // blends in encoded space.)
+    u8 gamma = 0;
 };
 
 // A program's read of the colour that fixed-function blending can do: the program reads it (FRAGCOLOR, with

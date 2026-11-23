@@ -3,6 +3,8 @@
 // reference interpreter (scripts/usse_exec_check.py --gpu); validity against the SPIR-V rules by spirv-val (see
 // docs/BUILDING.md).
 
+#include <bit>
+#include <algorithm>
 #include <array>
 #include <span>
 
@@ -281,4 +283,75 @@ TEST_CASE("gxm translate: the driver's secondary attributes hold a user uniform 
     gxm::fill_secondary(gxp, uniforms, {}, sa);
     CHECK(sa[0] == 0u);
     CHECK(sa[4] == 7u);
+}
+
+namespace {
+
+// The OpExtInst instructions of the GLSL.std.450 instruction number `inst` (pow: 26).
+usize count_glsl(const nx::vector<u32>& m, u32 inst) {
+    usize n = 0;
+    for (usize i = 5; i < m.size() && (m[i] >> 16); i += m[i] >> 16)
+        if ((m[i] & 0xFFFF) == 12 && (m[i] >> 16) > 4 && m[i + 4] == inst) ++n;
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("gxm translate: a colour surface's gamma mode gamma-corrects the colour's first components") {
+    constexpr u32 kGlslPow = 26;
+    Gxp gxp;
+    gxp.type = ShaderType::Fragment;
+    const nx::vector<Decoded> program;
+    gxm::FragmentShader fs;
+    const auto plain = gxm::translate_fragment(gxp, program, fs);
+    REQUIRE(plain);
+    REQUIRE(walk(*plain).ok);
+    CHECK(count_glsl(*plain, kGlslPow) == 0);
+    for (const u8 mask : {u8{0x3}, u8{0x7}}) {
+        fs.gamma = mask;  // (a lane mask: the colour lanes encoded)
+        const auto encoded = gxm::translate_fragment(gxp, program, fs);
+        REQUIRE(encoded);
+        REQUIRE(walk(*encoded).ok);
+        CHECK(count_glsl(*encoded, kGlslPow) == static_cast<u32>(std::popcount(mask)));
+    }
+}
+
+namespace {
+
+// The pow instructions of an empty fragment program for a colour surface with that swizzle and gamma lane mask, which
+// reads the colour back (the output register as the colour attachment holds it) or not.
+usize gamma_pows(const u8 (&swizzle)[4], u8 mask, bool reads_color) {
+    Gxp gxp;
+    gxp.type = ShaderType::Fragment;
+    gxp.native_color = gxp.frag_color = reads_color;
+    const nx::vector<Decoded> program;
+    gxm::FragmentShader fs;
+    std::copy(swizzle, swizzle + 4, fs.swizzle);
+    fs.gamma = mask;
+    const auto m = gxm::translate_fragment(gxp, program, fs);
+    REQUIRE(m);
+    REQUIRE(walk(*m).ok);
+    return count_glsl(*m, 26);
+}
+
+}  // namespace
+
+TEST_CASE("gxm translate: a gamma mode's lanes are the output register's colour lanes, wherever the swizzle puts them") {
+    const u8 abgr[4] = {0, 1, 2, 3}, rgba[4] = {3, 2, 1, 0}, bgra[4] = {3, 0, 1, 2};
+    CHECK(gamma_pows(abgr, 0x7, false) == 3);
+    // (U8U8U8U8_RGBA, _BGRA: the alpha lane is the attachment's first channel, and not encoded; its colour lanes are)
+    CHECK(gamma_pows(rgba, 0x7, false) == 3);
+    CHECK(gamma_pows(bgra, 0x7, false) == 3);
+    CHECK(gamma_pows(rgba, 0x1, false) == 1);
+    // (the alpha lane never is: a mask naming it, nor lanes the attachment does not hold)
+    CHECK(gamma_pows(rgba, 0x8, false) == 0);
+    CHECK(gamma_pows(abgr, 0xF8, false) == 0);
+}
+
+TEST_CASE("gxm translate: a program reading a gamma surface's colour gets it decoded, and writes it encoded again") {
+    const u8 abgr[4] = {0, 1, 2, 3}, rgba[4] = {3, 2, 1, 0};
+    CHECK(gamma_pows(abgr, 0, true) == 0);
+    CHECK(gamma_pows(abgr, 0x7, true) == 6);  // (3 decoded as read, 3 encoded as written)
+    CHECK(gamma_pows(rgba, 0x1, true) == 2);
+    CHECK(gamma_pows(rgba, 0x8, true) == 0);  // (alpha: neither)
 }

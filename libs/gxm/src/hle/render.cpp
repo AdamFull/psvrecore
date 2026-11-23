@@ -85,6 +85,7 @@ struct ColorFormat {
     u32 bytes = 0;  // per pixel in the image
     u8 swizzle[4] = {0, 1, 2, 3};  // (FragmentShader::swizzle)
     Packing packing = Packing::None;
+    u8 gamma = 0;  // (FragmentShader::gamma, a lane mask: the surface's gamma mode, set where the scene's surface is known)
     u32 guest_bytes() const {  // per pixel in guest memory
         return packing == Packing::None       ? bytes
                : packing == Packing::U8U8U8   ? 3
@@ -1683,7 +1684,7 @@ ShaderKey fragment_key(const Program& p, const FragmentShader& fs, bool inline_s
     v.insert(v.end(), reinterpret_cast<const u8*>(&fs.output_format), reinterpret_cast<const u8*>(&fs.output_format) + 4);
     v.insert(v.end(), fs.swizzle, fs.swizzle + 4);
     v.push_back(fs.color_output), v.push_back(fs.fragment_program_enabled), v.push_back(inline_secondary);
-    v.push_back(fs.blend_read);
+    v.push_back(fs.blend_read), v.push_back(fs.gamma);
     return shader_key({p.content, v});
 }
 
@@ -3827,9 +3828,10 @@ Result<nx::vector<u32>> failed_noted(const Program* p, Result<nx::vector<u32>> s
 void trace_scene(u64 number, const Scene& scene) {
     const ColorSurface& cs = scene.color;
     const DepthStencilSurface& ds = scene.depth;
-    nx::logi(logs::gxm, "trace: scene {}: colour {} (0x{:08x}, format 0x{:08x}, {} x {}, stride {}, type {}), depth {} "
+    nx::logi(logs::gxm, "trace: scene {}: colour {} (0x{:08x}, format 0x{:08x}, {} x {}, stride {}, type {}, gamma {}), depth {} "
              "(0x{:08x}, stencil 0x{:08x}, control 0x{:08x}, background {}/0x{:x}), {} draws", number, scene.has_color,
-             cs.data, cs.format, cs.size & 0xFFFF, cs.size >> 16, cs.stride, cs.modes & 3, scene.has_depth, ds.depth_data,
+             cs.data, cs.format, cs.size & 0xFFFF, cs.size >> 16, cs.stride, cs.modes & 3, (cs.modes >> 8) & 0xF,
+             scene.has_depth, ds.depth_data,
              ds.stencil_data, ds.control, ds.background_depth, ds.background_control, scene.draws.size());
     for (usize i = 0; i < scene.draws.size(); ++i) {
         const Draw& d = scene.draws[i];
@@ -4117,6 +4119,36 @@ u64 vertex_quick(const Program& vp, const VertexShader& vs) {
     return q.value();
 }
 
+// The output register's lanes an 8-bit colour surface gamma-corrects on writing them (FragmentShader::gamma, a mask), for
+// its gamma mode: SCE_GXM_COLOR_SURFACE_GAMMA_R / _BGR (0x1000, stored as 1) is the three colour lanes of an 8888 surface
+// (never alpha, wherever its swizzle puts it), _GR (0x3000, stored as 3) the first two of a two-component one. The game
+// then reads such a surface back as a texture with a gamma mode, which decodes it, and draws in linear light.
+//
+// Known limitation: fixed-function blending blends the encoded values, as the written colour is; the hardware most
+// likely blends in linear light and encodes the blended colour as it stores it. (A VK_FORMAT_R8G8B8A8_SRGB view of the
+// attachment would do that for mode 1: docs/KNOWN_ISSUES.md.)
+u8 surface_gamma(const ColorSurface& cs, const ColorFormat& cf) {
+    const u32 mode = (cs.modes >> 8) & 0xF;
+    if (!mode) return 0;
+    const bool rgba8 = cf.packing == Packing::None && (cf.format == VK_FORMAT_R8G8B8A8_UNORM || cf.format == VK_FORMAT_B8G8R8A8_UNORM);
+    // (warned of once for each mode and format)
+    auto drop = [&](const char* why) {
+        const u64 key = (u64{mode} << 32) ^ cs.format;
+        static std::mutex lock;
+        static nx::vector<u64> keys;
+        const std::lock_guard<std::mutex> guard(lock);
+        for (u64 k : keys)
+            if (k == key) return;
+        keys.push_back(key);
+        nx::logw(logs::gxm, "colour surface format 0x{:08x}: gamma mode 0x{:x} dropped ({}): its colours are written as they are",
+                 cs.format, mode << 12, why);
+    };
+    if (mode == 1 && rgba8) return 0x7;
+    if (mode == 1) return drop("only the 8888 formats are gamma-corrected"), u8{0};
+    if (mode == 3) return drop("no two-component 8-bit format is drawn"), u8{0};
+    return drop("an unknown mode"), u8{0};
+}
+
 // A draw's read of the colour done by the pipeline's blending instead (color_read_blend), or none: a program whose
 // read is such a blend, of an 8-bit colour surface whose alpha is the output register's alpha lane, without the
 // patcher's blending. (Fragments reading the colour run in no order where the device has no rasterization-order
@@ -4144,6 +4176,7 @@ FragmentShader fragment_shader_of(const Draw& dr, const ColorFormat& cf, bool co
     std::memcpy(fs.swizzle, cf.swizzle, 4);
     fs.color_output = color;
     fs.blend_read = blend_read_of(dr, cf, color).has_value();
+    fs.gamma = color ? cf.gamma : 0;
     return fs;
 }
 
@@ -4157,7 +4190,7 @@ u64 fragment_quick(const Program& fp, const FragmentShader& fs, bool inline_seco
     nx::fnv1a64 q;
     q.combine_bytes(reinterpret_cast<const char*>(fp.content.data()), fp.content.size()).combine('f');
     q.combine_all(fs.output_format, fs.swizzle[0], fs.swizzle[1], fs.swizzle[2], fs.swizzle[3], fs.color_output,
-                  fs.fragment_program_enabled, inline_secondary, fs.blend_read);
+                  fs.fragment_program_enabled, inline_secondary, fs.blend_read, fs.gamma);
     return q.value();
 }
 
@@ -4406,6 +4439,7 @@ void ahead_make(Renderer& r, const AheadPair& pair, const ColorFormat& cf) {
     std::memcpy(fs.swizzle, cf.swizzle, 4);
     fs.color_output = true;
     fs.blend_read = br.has_value();
+    fs.gamma = cf.gamma;
     const bool inline_secondary = tile_secondary_scan(w.fp);
     const bool reads_color = w.fp.gxp.native_color && w.fp.gxp.frag_color && !br;
     const u64 vq = vertex_quick(w.vp, vs), fq = fragment_quick(w.fp, fs, inline_secondary);
@@ -4629,6 +4663,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             return false;
         }
         width = cs.size & 0xFFFF, height = cs.size >> 16, stride = cs.stride;
+        cf.gamma = surface_gamma(cs, cf);
         ahead_color(cf);
         ahead_start(r);  // (once: warm_up, when there is one, is done by now)
         layout.kind = cs.modes & 3;
