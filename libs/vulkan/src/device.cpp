@@ -428,7 +428,10 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
             if (size >= 16ull << 20) nx::logi(logs::gpu, "Vulkan memory: a block of {} MiB of type {} made", size >> 20, type);
             else nx::logd(logs::gpu, "Vulkan memory: {} KiB of type {} allocated", size >> 10, type);
         },
-        nullptr, nullptr};
+        [](VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size, void*) {
+            if (size >= 16ull << 20) nx::logi(logs::gpu, "Vulkan memory: a block of {} MiB of type {} freed", size >> 20, type);
+        },
+        nullptr};
     allocator.pDeviceMemoryCallbacks = &memory_log;
     if (const VkResult r = vmaCreateAllocator(&allocator, &d->allocator_); r != VK_SUCCESS)
         return nx::err(vk_error("vmaCreateAllocator", r));
