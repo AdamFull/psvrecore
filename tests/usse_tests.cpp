@@ -320,3 +320,22 @@ TEST_CASE("usse: GXP vertex outputs and attributes") {
     CHECK(p->find(Semantic::TexCoord, 0) == std::optional<usize>(1));
     CHECK(!p->find(Semantic::TexCoord, 1));
 }
+
+TEST_CASE("usse: GXP sampled inputs: word 3 = 0x60 is two f16 in one register") {
+    // Killzone's world lighting program: the lightmap intensity (a single-channel F16 texture; word 2 empty, word 3 =
+    // 0x60) followed by an f16x4 sample. The program reads the first as an f16 of the register's low half.
+    GxpImage g;
+    g.put32(0x14, 1);
+    g.offset(0x2C, 0xA0);
+    g.put32(0xA0 + 0x0C, 2);
+    const u32 records[2][4] = {{0xF000, 2, 0, 0x60}, {0xF001, 1, 0x40, 0x20}};
+    for (u32 i = 0; i < 2; ++i)
+        for (u32 j = 0; j < 4; ++j) g.put32(0xA0 + 0x14 + 16 * i + 4 * j, records[i][j]);
+    const auto p = parse_gxp(g.data);
+    REQUIRE(p);
+    REQUIRE(p->inputs.size() == 2);
+    CHECK(p->inputs[0].sample_format == kSampleF16x2);
+    CHECK(p->inputs[0].sample_offset == 0);
+    CHECK(p->inputs[1].sample_format == 1);
+    CHECK(p->inputs[1].sample_offset == 1);
+}

@@ -187,6 +187,9 @@ Result<Gxp> parse_gxp(std::span<const u8> data) {
                 // (Killzone's depth taps: word 2 empty and word 3's bits 4-6 all set, where the f16x4 and f32x4 samples
                 // have 2 and 3. They are read as f32, one register, so not as u8x4.)
                 if (in.sample_format == 0 && ((in.raw[3] >> 4) & 7) == 7) in.sample_format = kSampleF32x1;
+                // (and the lightmap intensity of Killzone's world program: word 2 empty, word 3 = 0x60, which the
+                // program reads as an f16 of the register's low half; as u8x4 that half is a denormal near 0)
+                if (in.sample_format == 0 && ((in.raw[3] >> 4) & 7) == 6) in.sample_format = kSampleF16x2;
                 in.projected = ((record >> 8) & 3) == 2;
                 in.sample_offset = static_cast<u16>(offset);
                 offset += sample_register_count(in.sample_format);

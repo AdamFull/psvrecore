@@ -356,3 +356,25 @@ TEST_CASE("usse interp: a texture instruction's f16 coordinates") {
     const f32 want[4] = {1.0f, 0.0f, 0.5f, 0.25f};  // c = (0.75, 0.75): the right texel
     for (u32 k = 0; k < 4; ++k) CHECK(from_half(static_cast<u16>(m.primary[k / 2] >> (16 * (k % 2)))) == want[k]);
 }
+
+TEST_CASE("usse interp: a two-f16 sample is the first two components as halves of one register") {
+    // (a single-channel F16 lightmap intensity: as u8x4 its low half would be a denormal near 0)
+    Gxp gxp;
+    gxp.type = ShaderType::Fragment;
+    FragmentInput in;
+    in.interpolated = in.sampled = varying::kTexCoord0;
+    in.format = 0, in.components = 4, in.offset = 0;
+    in.sampler = 0, in.sample_format = kSampleF16x2, in.sample_offset = 4;
+    gxp.inputs.push_back(in);
+    TestTextures textures;
+    Machine m;
+    m.textures = &textures;
+    const SamplerState samplers[1] = {SamplerState{{0, 0, 0, 0}}};
+    VaryingValue t;
+    t.varying = varying::kTexCoord0;
+    t.value[0] = 0.25f, t.value[1] = 0.5f, t.value[2] = 0.75f, t.value[3] = 0.5f;
+    m.primary[5] = 0x12345678;
+    REQUIRE(load_fragment_inputs(gxp, std::span<const VaryingValue>(&t, 1), samplers, m));
+    CHECK(m.primary[4] == (u32{to_half(0.25f)} | u32{to_half(0.5f)} << 16));
+    CHECK(m.primary[5] == 0x12345678u);
+}

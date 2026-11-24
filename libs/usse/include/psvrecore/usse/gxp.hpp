@@ -90,9 +90,13 @@ struct SamplerSlot {
 // A sampled input's format that no hardware field value spells: one f32 register holding the first component.
 inline constexpr u8 kSampleF32x1 = 4;
 
+// Likewise: word 3's code 6 with word 2 empty, a sample of a single-channel (or two-channel) texture as two f16 in
+// one register (the first component in the low half, the second in the high one).
+inline constexpr u8 kSampleF16x2 = 5;
+
 // The primary registers a sample in the format (0 u8x4, 1 f16x4, 3 f32x4, kSampleF32x1) takes.
 constexpr u32 sample_register_count(u32 format) {
-    return format == 0 || format == kSampleF32x1 ? 1u : format == 1 ? 2u : 4u;
+    return format == 0 || format == kSampleF32x1 || format == kSampleF16x2 ? 1u : format == 1 ? 2u : 4u;
 }
 
 // A fragment program input: an interpolated value (and/or a texture sampled with an interpolated coordinate

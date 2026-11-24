@@ -748,6 +748,8 @@ void write_sample(const f32 rgba[4], u32 format, u32* regs) {
         regs[0] = w;
     } else if (format == kSampleF32x1) {
         regs[0] = std::bit_cast<u32>(rgba[0]);
+    } else if (format == kSampleF16x2) {
+        regs[0] = u32{to_half(rgba[0])} | u32{to_half(rgba[1])} << 16;
     } else if (format == 1) {
         regs[0] = u32{to_half(rgba[0])} | u32{to_half(rgba[1])} << 16;
         regs[1] = u32{to_half(rgba[2])} | u32{to_half(rgba[3])} << 16;
