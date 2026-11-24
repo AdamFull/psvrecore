@@ -2657,6 +2657,29 @@ u64 texture_contents(const TextureInfo& info, u32 size, u32 palette) {
     return h;
 }
 
+// (not the whole copy: it predates the scene's end, and its bytes of a surface written since, by the scene, a lazy
+// write-back or another thread's scene, are stale. Killzone: Mercenary binds a uniform buffer 17 MB long over its HDR,
+// reduction and atlas surfaces, and the program stores: written back whole, the stale bytes replaced the surfaces'
+// (materializing their deferred write-backs first, then marking them changed), and the next scenes read them back, a
+// pink haze. The pages nothing was stored to are not touched: a write-back deferred there stays deferred.)
+void store_changes(u32 address, const u8* before, const u8* after, usize bytes) {
+    const bool writable = memory().valid(address, static_cast<u32>(bytes), true);
+    usize i = 0;
+    while (i < bytes) {
+        for (u64 a, b; i + 8 <= bytes; i += 8) {
+            std::memcpy(&a, before + i, 8), std::memcpy(&b, after + i, 8);
+            if (a != b) break;
+        }
+        while (i < bytes && before[i] == after[i]) ++i;
+        if (i >= bytes) break;
+        usize j = i + 1;
+        while (j < bytes && before[j] != after[j]) ++j;
+        const u32 at = address + static_cast<u32>(i), n = static_cast<u32>(j - i);
+        if (writable || memory().valid(at, n, true)) std::memcpy(memory().host(at), after + i, n);
+        i = j;
+    }
+}
+
 namespace {
 
 // Where a texture starts inside a colour surface (at its address, or past it, smaller): laid out alike (rows of the surface's
@@ -5305,6 +5328,22 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     mem_words[0] = kMemoryBase;
     mem_words[1] = static_cast<u32>(mem.size() / 4);
     if (!mem.empty()) std::memcpy(mem_words.data() + 2, mem.data(), mem.size());
+    // (the regions of the buffers programs store to: what the programs changed there goes back after the scene, told
+    // from `mem`, the copies as they were made)
+    struct StoreBack {
+        u32 address, offset, bytes;
+    };
+    nx::vector<StoreBack> store_backs;
+    {
+        nx::vector<bool> taken(buffer_regions.size(), false);
+        for (const auto& [address, c] : buffer_copies) {
+            const BufferRegion& g = buffer_regions[c.region];
+            if (!c.written || !c.placed || !g.placed || g.end == g.start || taken[c.region]) continue;
+            taken[c.region] = true;
+            store_backs.push_back({g.start, g.offset, static_cast<u32>(g.end - g.start)});
+        }
+    }
+    nx::vector<u8> copied = store_backs.empty() ? nx::vector<u8>{} : std::move(mem);
     nx::vector<vk::Buffer> buffers;
     auto make = [&](const void* data, usize bytes, VkBufferUsageFlags usage) -> vk::Buffer* {
         (void)usage;
@@ -5945,7 +5984,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     const bool stores_depth = store_depth && depth.image;
     pending.finish = [&r, &d, stamps, color = color != nullptr, readback, mem_buf, depth_buf, buffers = std::move(buffers),
                       layout, data = cs.data, width, height, bytes = cf.guest_bytes(), image_bytes = cf.bytes, packing = cf.packing, target,
-                      buffer_copies = std::move(buffer_copies), queries, query_count, counters = std::move(counters), scale,
+                      store_backs = std::move(store_backs), copied = std::move(copied), queries, query_count, counters = std::move(counters), scale,
                       stores_depth, ds = ds_store, dl, unorm24, samples, depth_target,
                       kept_depth, kept_stores = !scene.store_elsewhere, depth, pool, sets,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
@@ -6023,12 +6062,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         }
         back_mark(0);
         if (!ok && kept_depth) kept_depth->written.clear();
-        // (the uniform buffers programs stored to)
-        bool invalidated = false;
-        for (const auto& [address, c] : buffer_copies) {
-            if (!ok || !c.written || !c.placed || !memory().valid(address, c.bytes, true)) continue;
-            if (!invalidated) vk::invalidate(d, *mem_buf), invalidated = true;
-            std::memcpy(memory().host(address), static_cast<const u8*>(mem_buf->mapped) + 8 + c.offset, c.bytes);
+        // (the uniform buffers programs stored to: what they stored, not the whole copy, see store_changes)
+        if (ok && !store_backs.empty()) {
+            vk::invalidate(d, *mem_buf);
+            const u8* after = static_cast<const u8*>(mem_buf->mapped) + 8;
+            for (const StoreBack& s : store_backs) store_changes(s.address, copied.data() + s.offset, after + s.offset, s.bytes);
         }
         if (ok && queries) {
             nx::vector<u64> counts(query_count, 0);

@@ -433,6 +433,9 @@ void frame_boundary();
 bool gpu_capture_in_progress();
 // (PSVRECORE_GXM_PROFILE: the time a scene's end waited for the display to let its buffer go)
 void profile_buffer_wait(u64 ns);
+// What a scene's programs stored into its copy of guest memory at `address`, written back: the bytes of `after`
+// (the copy as the scene left it) that differ from `before` (as it was copied), nothing else.
+void store_changes(u32 address, const u8* before, const u8* after, usize bytes);
 // At an internal resolution above 1: the frame buffer's pixels as drawn (tightly packed, at the internal
 // resolution), if a scene drew it and guest memory still holds what that scene wrote there.
 bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height);

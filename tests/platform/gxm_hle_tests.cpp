@@ -310,3 +310,49 @@ TEST_CASE("gxm: a scene that loads depth from one surface and stores it to anoth
     CHECK(call32(ctx, kSceGxm, 0x0B94C50A /*sceGxmDestroyRenderTarget*/, {target}) == 0);
     CHECK(call32(ctx, kSceGxm, 0xB627DE66 /*sceGxmTerminate*/, {}) == 0);
 }
+
+// A scene's programs stored into a copy of guest memory (a uniform buffer over surfaces, as Killzone: Mercenary's):
+// only the bytes they changed go back. The rest of the copy is as old as the scene's start, and guest memory there
+// may have been written since (a surface drawn, a lazy write-back): it is not replaced, and the pages nothing was
+// stored to are not written at all.
+TEST_CASE("gxm: a scene's stores into a buffer copy go back to guest memory, the rest of the copy does not") {
+    TestRuntime t;
+    REQUIRE(t.rt.ok());
+    GuestMemory& m = t.rt.memory();
+    constexpr u32 kBase = 0x90000000u, kSize = 0x40000;  // (whole host pages of 4 or 16 KiB)
+    REQUIRE(m.map_fixed(kBase, kSize, Access::ReadWrite, BlockKind::MemBlock, "buffer"));
+    u8* guest = static_cast<u8*>(m.host(kBase));
+    std::memset(guest, 0xAA, kSize);  // (written since the copy)
+    nx::vector<u8> before(kSize, 0x11), after(kSize, 0x11);
+    after[0] = 0x55;                                     // (the first byte)
+    after[0x1003] = 0x22;                                // (one byte)
+    std::memset(after.data() + 0x2000, 0x33, 16);        // (a run of them)
+    after[0x2009] = 0x11;                                // (stored as it was: not a change)
+    after[kSize - 1] = 0x44;                             // (the last byte)
+    REQUIRE(m.watch_writes(kBase, kSize));
+    const u64 quiet = m.writes(kBase + 0x20000, 0x10000), stored = m.writes(kBase, 0x4000);
+
+    gxm::hle::store_changes(kBase, before.data(), after.data(), kSize);
+    CHECK(guest[0] == 0x55);
+    CHECK(guest[1] == 0xAA);
+    CHECK(guest[0x1002] == 0xAA);
+    CHECK(guest[0x1003] == 0x22);
+    CHECK(guest[0x1004] == 0xAA);
+    for (u32 i = 0; i < 16; ++i) CHECK(guest[0x2000 + i] == (i == 9 ? 0xAA : 0x33));
+    CHECK(guest[0x1FFF] == 0xAA);
+    CHECK(guest[0x2010] == 0xAA);
+    CHECK(guest[kSize - 2] == 0xAA);
+    CHECK(guest[kSize - 1] == 0x44);
+    for (u32 i = 0x4000; i < kSize - 0x4000; ++i)
+        if (guest[i] != 0xAA) {
+            FAIL("a byte not stored to was written back");
+            break;
+        }
+    CHECK(m.writes(kBase + 0x20000, 0x10000) == quiet);  // (pages not stored to: not written)
+    CHECK(m.writes(kBase, 0x4000) != stored);
+
+    // (nothing changed: nothing written)
+    const u64 all = m.writes(kBase, kSize);
+    gxm::hle::store_changes(kBase, before.data(), before.data(), kSize);
+    CHECK(m.writes(kBase, kSize) == all);
+}
