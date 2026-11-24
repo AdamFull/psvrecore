@@ -346,8 +346,10 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         nx::logi(logs::gpu, "Vulkan device: local read left off: the validation layer ({}.{}.{}) predates it",
                  VK_API_VERSION_MAJOR(validation_version), VK_API_VERSION_MINOR(validation_version),
                  VK_API_VERSION_PATCH(validation_version));
+    // (and none with rasterization-order attachments: a pass that reads its colour then takes a render pass, where the
+    // order holds. The Adreno 830's driver doesn't keep it for local reads: reads see stale colour, Killzone's menus.)
     if (caps.dynamic_rendering && has_ext(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) &&
-        layer_knows_local_read && !(local_read_env && std::atoi(local_read_env) == 0)) {
+        layer_knows_local_read && !caps.raster_order_attachment && !(local_read_env && std::atoi(local_read_env) == 0)) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         query.pNext = &local_read;
         vkGetPhysicalDeviceFeatures2(gpu, &query);

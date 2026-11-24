@@ -81,12 +81,17 @@
   of Killzone: Mercenary's blurred level, but the sharp run had reused a shader cached without the read. The blur came
   from depth taps read as four bytes and from a depth store dropped by sceGxmBeginSceneEx.) `PSVRECORE_LOCAL_READ=0` uses render passes instead.
 - **No swapchain yet.** Presenting comes with the platform layer (SDL3).
-- **Rasterization-order attachment access** is enabled where a driver has it (`VK_EXT_` or `VK_ARM_`); neither GPU
-  tested here does, so draws that read the colour attachment are separated by barriers, which only holds between
+- **Rasterization-order attachment access** is enabled where a driver has it (`VK_EXT_` or `VK_ARM_`); the Adreno 830 has it,
+  the RTX 4060 doesn't, so there draws that read the colour attachment are separated by barriers, which only holds between
   draws, not between overlapping triangles of one draw (whose fragments then lose each other's writes: a light cone
   of layers drawn in one draw came out blotchy). Programs whose only read of the colour is a final blend of it with
   another register (sop2 or blend, factors Vulkan has: every such program P4D draws) leave that blend to the
   pipeline's fixed-function blending, which is ordered, and read no attachment; other colour reads still race.
+- **Rasterization-order access with local read.** On an Adreno 830 (Odin 3), draws that read the colour attachment
+  through `VK_KHR_dynamic_rendering_local_read` with rasterization-order access (no barriers between them) saw stale
+  colour: Killzone: Mercenary's menus kept earlier screens and piled up their glows. Render passes with the same order
+  access, or local read with barriers, were correct. A device with rasterization-order access leaves local read off,
+  so such passes take a render pass.
 
 ## Shader translator (USSE to SPIR-V)
 
