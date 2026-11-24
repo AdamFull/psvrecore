@@ -3962,8 +3962,9 @@ void trace_scene(u64 number, const Scene& scene) {
 namespace {
 
 // PSVRECORE_GXM_SKIP=<address>[,<address>...]: the draws whose vertex or fragment program is at one of these guest
-// addresses (as PSVRECORE_GXM_TRACE gives them) left out, for finding which draw makes what. ('+' separates them as
-// well: the Android launcher's argument list splits at commas.)
+// addresses, or whose program's GXP is (as PSVRECORE_GXM_TRACE gives them), left out, for finding which draw makes
+// what. The GXP addresses stay the same from run to run; the programs' addresses can change with the order the game
+// makes them in. ('+' separates them as well: the Android launcher's argument list splits at commas.)
 const nx::vector<u32>& skipped_programs() {
     static const nx::vector<u32> list = [] {
         nx::vector<u32> out;
@@ -4686,9 +4687,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     } copies{r, copies_recorded};
     if (traced(r.scenes, scene)) trace_scene(r.scenes, scene);
     if (const auto& skip = skipped_programs(); !skip.empty()) {
+        auto listed = [&](u32 address) { return address && std::find(skip.begin(), skip.end(), address) != skip.end(); };
         auto skipped = [&](const Draw& dr) {
-            return std::find(skip.begin(), skip.end(), dr.vertex ? dr.vertex->guest : 0) != skip.end() ||
-                   std::find(skip.begin(), skip.end(), dr.fragment ? dr.fragment->guest : 0) != skip.end();
+            return (dr.vertex && (listed(dr.vertex->guest) || (dr.vertex->program && listed(dr.vertex->program->gxp_address)))) ||
+                   (dr.fragment &&
+                    (listed(dr.fragment->guest) || (dr.fragment->program && listed(dr.fragment->program->gxp_address))));
         };
         // (the markers stay before the draws they were before)
         for (UserMarker& m : scene.markers) {
