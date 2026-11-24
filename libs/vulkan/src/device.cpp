@@ -217,9 +217,11 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
     VkPhysicalDevice gpu = d->physical_;
     vkGetPhysicalDeviceProperties(gpu, &d->properties_);
     const VkPhysicalDeviceProperties& props = d->properties_;
-    if (props.apiVersion < VK_API_VERSION_1_1) return failure(nx::format("{} does not support Vulkan 1.1", props.deviceName));
+    // (as a C string: libc++'s std::format prints a char array whole, its NULs too, which ends a log line there)
+    const char* const name = props.deviceName;
+    if (props.apiVersion < VK_API_VERSION_1_1) return failure(nx::format("{} does not support Vulkan 1.1", name));
     const i32 family = queue_family_of(gpu, d->surface_);
-    if (family < 0) return failure(nx::format("{} has no graphics and compute queue that presents", props.deviceName));
+    if (family < 0) return failure(nx::format("{} has no graphics and compute queue that presents", name));
     d->queue_family_ = static_cast<u32>(family);
     Capabilities& caps = d->caps_;
     caps.vendor_id = props.vendorID;
@@ -488,7 +490,7 @@ Result<nx::unique_ptr<Device>> Device::create(const DeviceOptions& options) {
         nx::logi(logs::gpu, "Vulkan memory: {} MiB reserved for textures, {} MiB for host buffers",
                  d->texture_pool_ ? kBlock * kTextureBlocks >> 20 : 0, d->host_pool_ ? kBlock * kHostBlocks >> 20 : 0);
     }
-    nx::logi(logs::gpu, "Vulkan device: {} (API {}.{}.{}, using {}.{}); {}{}{}{}{}", props.deviceName,
+    nx::logi(logs::gpu, "Vulkan device: {} (API {}.{}.{}, using {}.{}); {}{}{}{}{}", name,
              VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
              VK_API_VERSION_PATCH(props.apiVersion), VK_API_VERSION_MAJOR(caps.api_version),
              VK_API_VERSION_MINOR(caps.api_version), caps.dynamic_rendering ? "dynamic rendering" : "render passes",

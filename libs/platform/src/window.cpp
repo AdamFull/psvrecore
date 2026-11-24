@@ -784,7 +784,7 @@ Result<nx::unique_ptr<Window>> Window::open(const Options& options) {
         w->set_overlay_atlas(atlas.data(), aw, ah);
         w->update_overlay();
     }
-    nx::logi(logs::display, "display: window on {}", w->presenter_->device->properties().deviceName);
+    nx::logi(logs::display, "display: window on {}", static_cast<const char*>(w->presenter_->device->properties().deviceName));
     return w;
 }
 
