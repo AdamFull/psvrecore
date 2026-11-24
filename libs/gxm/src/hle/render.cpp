@@ -720,6 +720,10 @@ struct Renderer {
         nx::unique_ptr<vk::OneShot> shot;
         nx::vector<std::pair<u32, u32>> writes;  // (address, bytes)
         Target* target = nullptr;
+        // (its colour surface's, the first of `writes`: how its pixels lie in guest memory, and whether its write-back
+        // puts there the image's own bytes, unconverted: what memory_copy may take from the image instead)
+        SurfaceLayout color_layout;
+        bool color_as_image = false;
         nx::unique_function<void(bool ok)> finish;
     };
     nx::vector<Pending> pending;
@@ -2487,6 +2491,7 @@ struct SceneProfile {
                                                     "colour uploaded"};
     static constexpr u32 kOrder[kParts] = {8, 9, 10, 0, 1, 2, 3, 4, 6, 5, 7};
     u64 colour_uploads = 0;
+    u64 memory_fills = 0;  // (memory buffers' ranges filled from pending scenes' surfaces on the GPU: memory_copy)
     u64 began = 0, ns_before[kParts] = {}, misses_before = 0, miss_ns_before = 0;  // (this scene's start)
     u64 pipelines_made = 0, pipeline_ns = 0, pipelines_before = 0, pipeline_ns_before = 0;  // (made while drawing)
     u64 skipped = 0, skipped_before = 0;  // (draws left out: their pipelines being made asynchronously)
@@ -2584,6 +2589,9 @@ struct SceneProfile {
         for (u32 i : kOrder) profile_print(" %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
         profile_print(" %.2f colour surfaces uploaded a scene; %.2f ms waiting for the display to let the buffer go;",
                      static_cast<f64>(colour_uploads) / scenes, static_cast<f64>(buffer_wait_ns) / 1e6 / scenes);
+        if (memory_fills)
+            profile_print(" %.2f memory copies filled from pending surfaces on the GPU a scene;",
+                         static_cast<f64>(memory_fills) / scenes);
         if (finished)
             profile_print(" finishing a scene: %.2f ms waiting, %.2f ms the rest;",
                          static_cast<f64>(finish_wait_ns) / 1e6 / finished, static_cast<f64>(finish_work_ns) / 1e6 / finished);
@@ -2710,6 +2718,36 @@ void store_changes(u32 address, const u8* before, const u8* after, usize bytes) 
         if (writable || memory().valid(at, n, true)) std::memcpy(memory().host(at), after + i, n);
         i = j;
     }
+}
+
+// (a row's texels in the range: one copy, the whole rows one after another joined into one, the buffer's rows the
+// surface's stride apart as guest memory's are)
+bool surface_copies(const SurfaceLayout& l, u32 surface, u32 address, u32 bytes, u64 offset, nx::vector<TexelCopy>& copies,
+                    nx::vector<std::pair<u64, u64>>& filled) {
+    if (l.kind != SurfaceLayout::kLinear || !l.bytes || !l.width || !l.height || l.stride < l.width) return false;
+    const u64 a0 = address, a1 = a0 + bytes, s = surface, texel = l.bytes, pitch = u64{l.stride} * texel;
+    const u64 row = u64{l.width} * texel;
+    if (a1 <= s || s + l.span() <= a0) return true;
+    const usize first = copies.size();  // (copies before this call's are not joined)
+    for (u32 y = a0 > s ? static_cast<u32>((a0 - s) / pitch) : 0; y < l.height; ++y) {
+        const u64 r0 = s + y * pitch, r1 = r0 + row;
+        if (r0 >= a1) break;
+        const u64 lo = nx::max(r0, a0), hi = nx::min(r1, a1);
+        if (lo >= hi) continue;
+        if ((lo - r0) % texel || (hi - r0) % texel) return false;
+        const u64 at = offset + (lo - a0);
+        if (at % 4 || at % texel) return false;
+        const u32 x0 = static_cast<u32>((lo - r0) / texel), x1 = static_cast<u32>((hi - r0) / texel);
+        TexelCopy* last = copies.size() > first ? &copies.back() : nullptr;
+        if (x0 == 0 && x1 == l.width && last && last->x == 0 && last->width == l.width && last->y + last->height == y &&
+            last->row_length == l.stride && last->offset + u64{last->height} * pitch == at)
+            ++last->height;
+        else
+            copies.push_back({at, l.stride, x0, y, x1 - x0, 1});
+        if (!filled.empty() && filled.back().second == at) filled.back().second = at + (hi - lo);
+        else filled.push_back({at, at + (hi - lo)});
+    }
+    return true;
 }
 
 namespace {
@@ -3813,6 +3851,98 @@ void host_copy(nx::vector<u8>& out, u32 address, u32 bytes) {
     const usize at = out.size();
     out.resize(at + ((bytes + 15) & ~15u), 0);
     if (address && bytes && memory().valid(address, bytes)) std::memcpy(out.data() + at, memory().host(address), bytes);
+}
+
+// A scene's memory buffer copying bytes that a pending scene's colour surface writes (Killzone: Mercenary's depth
+// reconstruction binds uniform buffers over the 960 x 544 F16 surface the scene before drew) takes those bytes from
+// the surface's image on the GPU, at the start of its commands and so after that scene's on the queue, instead of
+// waiting for the GPU to finish that scene and write it back (about one 9.5 ms wait a frame on an Odin 3, the GPU
+// two thirds idle). Only where the write-back puts the image's own bytes (a linear surface, whole texels, nothing
+// converted); the rest of the range comes from guest memory as before. Anything else a pending scene writes there
+// (a converted, tiled or swizzled surface, a depth store, a buffer stored to, counters), or bytes the CPU reads from
+// the copy itself (a program's container, into secondary attributes): waited for, as before.
+// PSVRECORE_GXM_GPU_MEMORY_COPY=0: always waited for.
+bool gpu_memory_copies() {
+    static const bool on = [] {
+        const char* v = std::getenv("PSVRECORE_GXM_GPU_MEMORY_COPY");
+        return !(v && *v == '0');
+    }();
+    return on;
+}
+struct MemoryFill {
+    Target* from = nullptr;  // (never destroyed: r.targets keeps its surfaces' images)
+    TexelCopy copy;          // (into the memory, `offset` from its start, past the buffer's header)
+};
+// The bytes of [address, address + bytes), copied to `offset` in the memory, that the pending scenes write: copies
+// from their surfaces' images appended to `fills`, and the bytes they fill to `filled` (in order). False, nothing
+// appended: something else writes there, the copies cannot give exactly the bytes, or they fill some of `cpu`.
+bool fill_from_pending(Renderer& r, u32 address, u32 bytes, u64 offset, std::span<const GuestRange> cpu,
+                       nx::vector<MemoryFill>& fills, nx::vector<std::pair<u64, u64>>& filled) {
+    struct Source {
+        Target* t;
+        SurfaceLayout layout;
+        u32 address;
+    };
+    nx::vector<Source> sources;
+    for (const Renderer::Pending& p : r.pending)
+        for (usize k = 0; k < p.writes.size(); ++k) {
+            const auto [at, n] = p.writes[k];
+            if (!(address < u64{at} + n && at < u64{address} + bytes)) continue;
+            if (k != 0 || !p.target || !p.color_as_image) return false;  // (the first of a scene's writes: its colour)
+            auto same = std::find_if(sources.begin(), sources.end(), [&](const Source& s) { return s.t == p.target; });
+            if (same == sources.end()) sources.push_back({p.target, p.color_layout, at});
+            // (drawn again, laid out otherwise: the write-backs' bytes differ from the image's last)
+            else if (same->layout != p.color_layout || same->address != at) return false;
+        }
+    // (surfaces over the same memory: which write-back lands last is not the image's to say)
+    for (usize i = 0; i < sources.size(); ++i)
+        for (usize j = i + 1; j < sources.size(); ++j)
+            if (sources[i].address < u64{sources[j].address} + sources[j].layout.span() &&
+                sources[j].address < u64{sources[i].address} + sources[i].layout.span())
+                return false;
+    nx::vector<MemoryFill> got;
+    nx::vector<std::pair<u64, u64>> got_filled;
+    nx::vector<TexelCopy> copies;
+    for (const Source& s : sources) {
+        const vk::Image& image = s.t->image;
+        if (!image.image || image.desc.width != s.layout.width || image.desc.height != s.layout.height) return false;
+        // (the image's texels the surface's; and the buffer's copies 8 bytes past their offsets, after its two header
+        // words, so a texel must divide 8 for them to stay aligned as surface_copies checks)
+        if (vk::texel_size(image.desc.format) != s.layout.bytes || 8 % s.layout.bytes) return false;
+        copies.clear();
+        if (!surface_copies(s.layout, s.address, address, bytes, offset, copies, got_filled)) return false;
+        for (const TexelCopy& c : copies) got.push_back({s.t, c});
+    }
+    std::sort(got_filled.begin(), got_filled.end());
+    for (const GuestRange& g : cpu)
+        for (const auto& [lo, hi] : got_filled)
+            if (g.size && g.address < address + (hi - offset) && address + (lo - offset) < u64{g.address} + g.size) return false;
+    fills.insert(fills.end(), got.begin(), got.end());
+    filled.insert(filled.end(), got_filled.begin(), got_filled.end());
+    return true;
+}
+// host_copy, the bytes pending scenes' surfaces write filled on the GPU instead where fill_from_pending can (`fills`;
+// `filled`: their offsets in `out`, in order). The bytes it fills are left zero here.
+void memory_copy(Renderer& r, nx::vector<u8>& out, u32 address, u32 bytes, std::span<const GuestRange> cpu,
+                 nx::vector<MemoryFill>& fills, nx::vector<std::pair<u64, u64>>& filled) {
+    if (gpu_memory_copies() && address && bytes && !r.pending.empty() && memory().valid(address, bytes) &&
+        pending_writes(r, address, bytes)) {
+        const usize at = out.size();
+        const usize first = filled.size();
+        if (fill_from_pending(r, address, bytes, at, cpu, fills, filled)) {
+            out.resize(at + ((bytes + 15) & ~15u), 0);
+            const u8* from = static_cast<const u8*>(memory().host(address));
+            u64 next = at;  // (the next byte from guest memory)
+            for (usize k = first; k < filled.size(); ++k) {
+                if (filled[k].first > next) std::memcpy(out.data() + next, from + (next - at), static_cast<usize>(filled[k].first - next));
+                next = filled[k].second;
+            }
+            if (next < at + bytes) std::memcpy(out.data() + next, from + (next - at), static_cast<usize>(at + bytes - next));
+            if (g_profile.on) ++g_profile.memory_fills;
+            return;
+        }
+    }
+    host_copy(out, address, bytes);
 }
 
 // Depth and stencil samples (the depth words, then the stencil bytes) of a w x h surface at the internal
@@ -4971,6 +5101,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     struct BufferCopy {
         u32 address = 0, bytes = 0, offset = 0;  // (offset: in mem)
         u32 region = 0;
+        u32 cpu_bytes = 0;  // (read from the copy on the CPU: a program's container, into secondary attributes)
         bool placed = false, written = false;
     };
     nx::hash_map<u32, BufferCopy> buffer_copies;
@@ -4994,6 +5125,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 c.address = buffers[b];
                 c.bytes = nx::max(c.bytes, buffer_bytes(p.gxp, b));
                 c.written |= written;
+                for (const usse::Container& k : p.gxp.containers)
+                    if (k.index == b) c.cpu_bytes = nx::max<u32>(c.cpu_bytes, u32{k.size} * 4);
             }
         }
     }
@@ -5018,6 +5151,10 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             c->region = static_cast<u32>(buffer_regions.size() - 1);
         }
     }
+    // (the bytes of the copies that pending scenes' surfaces write, filled on the GPU: memory_copy)
+    nx::vector<MemoryFill> memory_fills;
+    nx::vector<std::pair<u64, u64>> memory_filled;  // (in mem)
+    nx::vector<GuestRange> cpu_ranges;
     auto place = [&](u32 address) {
         BufferCopy& c = buffer_copies[address];
         if (!c.placed) {
@@ -5025,7 +5162,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             if (!g.placed) {
                 g.placed = true;
                 g.offset = static_cast<u32>(mem.size());
-                host_copy(mem, g.start, static_cast<u32>(g.end - g.start));
+                cpu_ranges.clear();
+                if (!r.pending.empty())
+                    for (const auto& [at, x] : buffer_copies)
+                        if (x.region == c.region && x.cpu_bytes) cpu_ranges.push_back({x.address, nx::min(x.cpu_bytes, x.bytes)});
+                memory_copy(r, mem, g.start, static_cast<u32>(g.end - g.start), cpu_ranges, memory_fills, memory_filled);
             }
             c.placed = true;
             c.offset = g.offset + (c.address - g.start);
@@ -5419,7 +5560,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         buffers.push_back(*b);
         return &buffers.back();
     };
-    buffers.reserve(6);
+    buffers.reserve(7);  // (the pointers below into it stay valid: no more than this many are made)
     // The secondary programs, a dispatch for each program (and stage) the scene's draws run, a workgroup a draw: the
     // draws' indices in a table after their secondary attributes (a dispatch a draw took 3 ms of a phone's GPU a scene)
     struct SecondaryBatch {
@@ -5454,6 +5595,14 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                  u64{mem_words.size()} * 4 >> 20, d.properties().limits.maxStorageBufferRange >> 20);
     }
     vk::Buffer* mem_buf = make(mem_words.data(), mem_words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // (bytes filled on the GPU in a region programs store to: copied here too, what store_changes compares the
+    // programs' stores with there, as `copied` does not have them)
+    bool fills_stored = false;
+    for (const StoreBack& s : store_backs)
+        for (const auto& [lo, hi] : memory_filled) fills_stored |= lo < u64{s.offset} + s.bytes && s.offset < hi;
+    const u64 fill_from = fills_stored ? memory_filled.front().first & ~u64{15} : 0;
+    vk::Buffer* fill_buf =
+        fills_stored ? make(nullptr, static_cast<usize>(memory_filled.back().second - fill_from), VK_BUFFER_USAGE_TRANSFER_DST_BIT) : nullptr;
     vk::Buffer* vb = make(nullptr, static_cast<usize>(vertex_bytes), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     if (vb) {
         // (straight from guest memory into the buffer)
@@ -5504,7 +5653,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             free_depth_image(r, depth);  // (nothing submitted uses it)
         }
     };
-    if (!sa_buf || !mem_buf || !vb || !ib || !readback || ((load_depth || store_depth) && !depth_buf)) {
+    if (!sa_buf || !mem_buf || !vb || !ib || !readback || ((load_depth || store_depth) && !depth_buf) || (fills_stored && !fill_buf)) {
         cleanup();
         return false;
     }
@@ -5724,6 +5873,49 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     }
 #endif
     if (queries) vkCmdResetQueryPool(*cmd, queries, 0, query_count);
+    if (!memory_fills.empty()) {
+        // (the memory's bytes pending scenes' surfaces write, from their images (memory_copy): after those scenes'
+        // draws and blits into them, before anything of this scene reads the memory, its secondary programs first)
+        d.begin_label(*cmd, "memory from surfaces", kPassRgb);
+        auto barrier = [&](VkPipelineStageFlags from, VkAccessFlags from_access, VkPipelineStageFlags to, VkAccessFlags to_access) {
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = from_access;
+            mb.dstAccessMask = to_access;
+            vkCmdPipelineBarrier(*cmd, from, to, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        };
+        barrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT);
+        std::stable_sort(memory_fills.begin(), memory_fills.end(),
+                         [](const MemoryFill& a, const MemoryFill& b) { return a.from < b.from; });
+        nx::vector<VkBufferImageCopy> regions;
+        for (usize i = 0; i < memory_fills.size();) {
+            Target* t = memory_fills[i].from;
+            regions.clear();
+            for (; i < memory_fills.size() && memory_fills[i].from == t; ++i) {
+                const TexelCopy& c = memory_fills[i].copy;
+                VkBufferImageCopy copy{};
+                copy.bufferOffset = 8 + c.offset;  // (past the memory's two-word header)
+                copy.bufferRowLength = c.row_length;
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageOffset = {static_cast<i32>(c.x), static_cast<i32>(c.y), 0};
+                copy.imageExtent = {c.width, c.height, 1};
+                regions.push_back(copy);
+            }
+            vk::transition(*cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            vkCmdCopyImageToBuffer(*cmd, t->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mem_buf->buffer,
+                                   static_cast<u32>(regions.size()), regions.data());
+            if (fill_buf) {
+                for (VkBufferImageCopy& copy : regions) copy.bufferOffset -= 8 + fill_from;
+                vkCmdCopyImageToBuffer(*cmd, t->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fill_buf->buffer,
+                                       static_cast<u32>(regions.size()), regions.data());
+            }
+        }
+        barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        d.end_label(*cmd);
+    }
     const VkShaderStageFlags push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     bool computed = false;
     for (const SecondaryBatch& b : secondary_batches) {
@@ -6040,6 +6232,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         pending.writes.push_back({at, 4});
     }
     pending.target = color ? target : nullptr;
+    pending.color_layout = layout;
+    pending.color_as_image = color && cf.packing == Packing::None;
     pending.kept_depth = kept_depth;
     pending.stores_kept_depth = kept_depth && store_depth && !scene.store_elsewhere;
     pending.depth_sources[0] = aspect_from[0], pending.depth_sources[1] = aspect_from[1];
@@ -6054,7 +6248,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                       kept_depth, kept_stores = !scene.store_elsewhere, depth, pool, sets,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
                       uploads = std::move(r.texture_uploads), conversions = std::move(r.target_conversions), pack_work,
-                      pack_set, pack_verify](bool ok) mutable {
+                      pack_set, pack_verify, fill_buf, fill_from, memory_filled = fill_buf ? std::move(memory_filled)
+                      : nx::vector<std::pair<u64, u64>>{}](bool ok) mutable {
         if (ok && stamps) {
             u64 ts[4] = {};
             if (vkGetQueryPoolResults(d.device(), stamps, 0, 4, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -6131,7 +6326,25 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (ok && !store_backs.empty()) {
             vk::invalidate(d, *mem_buf);
             const u8* after = static_cast<const u8*>(mem_buf->mapped) + 8;
-            for (const StoreBack& s : store_backs) store_changes(s.address, copied.data() + s.offset, after + s.offset, s.bytes);
+            // (the bytes filled on the GPU compared with what they were filled with, the rest with `copied`)
+            if (fill_buf) vk::invalidate(d, *fill_buf);
+            const u8* filled_with = fill_buf ? static_cast<const u8*>(fill_buf->mapped) : nullptr;
+            for (const StoreBack& s : store_backs) {
+                const u64 end = u64{s.offset} + s.bytes;
+                u64 next = s.offset;
+                auto compare = [&](u64 from, u64 to, const u8* before) {
+                    if (to > from)
+                        store_changes(s.address + static_cast<u32>(from - s.offset), before, after + from, static_cast<usize>(to - from));
+                };
+                for (const auto& [lo, hi] : memory_filled) {
+                    if (hi <= next || lo >= end) continue;
+                    const u64 a = nx::max(lo, next), b = nx::min(hi, end);
+                    compare(next, a, copied.data() + next);
+                    compare(a, b, filled_with + (a - fill_from));
+                    next = b;
+                }
+                compare(next, end, copied.data() + next);
+            }
         }
         if (ok && queries) {
             nx::vector<u64> counts(query_count, 0);

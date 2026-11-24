@@ -9,6 +9,7 @@
 #include <atomic>
 
 #include "psvrecore/gxm/hle.hpp"
+#include "psvrecore/gxm/surface.hpp"
 #include "psvrecore/gxm/translate.hpp"
 #include "psvrecore/runtime/hle.hpp"
 #include "psvrecore/runtime/runtime.hpp"
@@ -436,6 +437,20 @@ void profile_buffer_wait(u64 ns);
 // What a scene's programs stored into its copy of guest memory at `address`, written back: the bytes of `after`
 // (the copy as the scene left it) that differ from `before` (as it was copied), nothing else.
 void store_changes(u32 address, const u8* before, const u8* after, usize bytes);
+// A copy of a colour surface's texels from its image into a buffer (as VkBufferImageCopy has it): the buffer's byte
+// offset of the first, the buffer's rows in texels, and the image's region.
+struct TexelCopy {
+    u64 offset = 0;
+    u32 row_length = 0;
+    u32 x = 0, y = 0, width = 0, height = 0;
+};
+// The texels of a linear surface at `surface` (laid out as `l`) with bytes in [address, address + bytes), as copies
+// into a buffer that holds that range from `offset`, and the buffer's bytes they fill ([from, to), in order, adjacent
+// ones joined). False: the texels are not exactly those bytes (a texel cut by the range's ends), the layout is not
+// linear, or a texel lands at an offset no copy takes (a multiple of 4 and of the texel's bytes). (render.cpp's
+// memory_copy: a scene's memory buffer filled from a pending scene's surface on the GPU)
+bool surface_copies(const SurfaceLayout& l, u32 surface, u32 address, u32 bytes, u64 offset, nx::vector<TexelCopy>& copies,
+                    nx::vector<std::pair<u64, u64>>& filled);
 // At an internal resolution above 1: the frame buffer's pixels as drawn (tightly packed, at the internal
 // resolution), if a scene drew it and guest memory still holds what that scene wrote there.
 bool scaled_frame(const DisplayFrameBuf& f, nx::vector<u8>& pixels, u32* width, u32* height);

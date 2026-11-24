@@ -356,3 +356,75 @@ TEST_CASE("gxm: a scene's stores into a buffer copy go back to guest memory, the
     gxm::hle::store_changes(kBase, before.data(), before.data(), kSize);
     CHECK(m.writes(kBase, kSize) == all);
 }
+
+// A scene's memory buffer copying bytes a pending scene's colour surface writes takes them from the surface's image on
+// the GPU: the copies of the texels in the range, the buffer's rows the surface's stride apart, and the bytes they fill
+// (the rest, between rows, from guest memory). None where they would not be exactly the range's bytes.
+TEST_CASE("gxm: a memory buffer's bytes a linear surface writes, as copies from its image") {
+    using gxm::hle::TexelCopy;
+    using gxm::SurfaceLayout;
+    auto layout = [](u32 kind, u32 stride, u32 width, u32 height) {
+        SurfaceLayout l;
+        l.kind = kind, l.stride = stride, l.bytes = 8, l.width = width, l.height = height;  // (F16 x 4)
+        return l;
+    };
+    nx::vector<TexelCopy> copies;
+    nx::vector<std::pair<u64, u64>> filled;
+    auto copy_is = [](const TexelCopy& c, u64 offset, u32 row_length, u32 x, u32 y, u32 width, u32 height) {
+        return c.offset == offset && c.row_length == row_length && c.x == x && c.y == y && c.width == width && c.height == height;
+    };
+
+    // (the whole surface, rows back to back: one copy)
+    const SurfaceLayout packed = layout(SurfaceLayout::kLinear, 4, 4, 3);
+    REQUIRE(gxm::hle::surface_copies(packed, 0x1000, 0x1000, 96, 16, copies, filled));
+    REQUIRE(copies.size() == 1);
+    CHECK(copy_is(copies[0], 16, 4, 0, 0, 4, 3));
+    REQUIRE(filled.size() == 1);
+    CHECK((filled[0] == std::pair<u64, u64>{16, 112}));
+
+    // (rows past the surface's width: one copy still, the bytes between them not filled; the range starting before
+    // the surface and ending past it)
+    copies.clear(), filled.clear();
+    const SurfaceLayout wide = layout(SurfaceLayout::kLinear, 6, 4, 3);
+    REQUIRE(gxm::hle::surface_copies(wide, 0x1010, 0x1000, 16 + 128 + 16, 0, copies, filled));
+    REQUIRE(copies.size() == 1);
+    CHECK(copy_is(copies[0], 16, 6, 0, 0, 4, 3));
+    REQUIRE(filled.size() == 3);
+    CHECK((filled[0] == std::pair<u64, u64>{16, 48}));
+    CHECK((filled[1] == std::pair<u64, u64>{64, 96}));
+    CHECK((filled[2] == std::pair<u64, u64>{112, 144}));
+
+    // (from the middle of the first row to the middle of the last: a copy a row, the bytes filled one run)
+    copies.clear(), filled.clear();
+    REQUIRE(gxm::hle::surface_copies(packed, 0x1000, 0x1010, 0x38, 8, copies, filled));
+    REQUIRE(copies.size() == 3);
+    CHECK(copy_is(copies[0], 8, 4, 2, 0, 2, 1));
+    CHECK(copy_is(copies[1], 24, 4, 0, 1, 4, 1));
+    CHECK(copy_is(copies[2], 56, 4, 0, 2, 1, 1));
+    REQUIRE(filled.size() == 1);
+    CHECK((filled[0] == std::pair<u64, u64>{8, 64}));
+
+    // (a whole row after another call's copy that would line up with it: not joined to it)
+    copies.assign(1, TexelCopy{0, 4, 0, 0, 4, 1});
+    filled.clear();
+    REQUIRE(gxm::hle::surface_copies(packed, 0x1000, 0x1020, 32, 32, copies, filled));
+    REQUIRE(copies.size() == 2);
+    CHECK(copy_is(copies[1], 32, 4, 0, 1, 4, 1));
+
+    // (no texel in the range: nothing)
+    copies.clear(), filled.clear();
+    REQUIRE(gxm::hle::surface_copies(packed, 0x1000, 0x1000 + 96, 64, 0, copies, filled));
+    REQUIRE(gxm::hle::surface_copies(wide, 0x1010, 0x1010 + 32, 16, 0, copies, filled));  // (between two rows)
+    CHECK(copies.empty());
+    CHECK(filled.empty());
+
+    // (not exactly the range's bytes: a texel cut by its start or its end, a copy at an offset that is not a whole
+    // texel's, a surface not laid out linearly)
+    nx::vector<TexelCopy> c;
+    nx::vector<std::pair<u64, u64>> f;
+    CHECK_FALSE(gxm::hle::surface_copies(packed, 0x1000, 0x1004, 60, 0, c, f));
+    CHECK_FALSE(gxm::hle::surface_copies(packed, 0x1000, 0x1000, 60, 0, c, f));
+    CHECK_FALSE(gxm::hle::surface_copies(packed, 0x1000, 0x1000, 96, 4, c, f));
+    CHECK_FALSE(gxm::hle::surface_copies(layout(SurfaceLayout::kTiled, 32, 32, 32), 0x1000, 0x1000, 64, 0, c, f));
+    CHECK_FALSE(gxm::hle::surface_copies(layout(SurfaceLayout::kSwizzled, 4, 4, 4), 0x1000, 0x1000, 64, 0, c, f));
+}
