@@ -3962,7 +3962,8 @@ void trace_scene(u64 number, const Scene& scene) {
 namespace {
 
 // PSVRECORE_GXM_SKIP=<address>[,<address>...]: the draws whose vertex or fragment program is at one of these guest
-// addresses (as PSVRECORE_GXM_TRACE gives them) left out, for finding which draw makes what.
+// addresses (as PSVRECORE_GXM_TRACE gives them) left out, for finding which draw makes what. ('+' separates them as
+// well: the Android launcher's argument list splits at commas.)
 const nx::vector<u32>& skipped_programs() {
     static const nx::vector<u32> list = [] {
         nx::vector<u32> out;
@@ -3972,7 +3973,7 @@ const nx::vector<u32>& skipped_programs() {
             const u32 v = static_cast<u32>(std::strtoul(p, &end, 0));
             if (end == p) break;
             out.push_back(v);
-            p = *end == ',' ? end + 1 : end;
+            p = *end == ',' || *end == '+' ? end + 1 : end;
         }
         return out;
     }();
