@@ -32,6 +32,7 @@
 #include <atomic>
 #include <mutex>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -3832,10 +3833,16 @@ struct DrawPlan {
 // PSVRECORE_GXM_TRACE=<first scene>[-<last scene>] (or 1: all): each scene logged before it is rendered (its surfaces
 // and draws: their programs, primitives, textures, depth and stencil state), for finding what a frame draws. Scene
 // numbers vary between runs: *<colour address>[:<count>] traces <count> scenes (default 16) from the first that draws
-// to that colour surface.
+// to that colour surface, and @<milliseconds>[:<count>] from the first rendered that long after the process started
+// (input scripts are timed so too: the same moment on a fast and a slow machine).
+const auto process_start = std::chrono::steady_clock::now();
+bool ms_passed(u64 ms) {
+    return std::chrono::steady_clock::now() - process_start >= std::chrono::milliseconds(ms);
+}
 struct Trace {
     u64 first = 0, last = 0;
     u32 surface = 0;
+    u64 time = 0;  // (@: milliseconds)
     bool on = false;
 };
 const Trace& trace() {
@@ -3850,6 +3857,11 @@ const Trace& trace() {
             t.last = *end == ':' ? std::strtoull(end + 1, nullptr, 0) : 16;  // (a count until the surface is seen)
             return t;
         }
+        if (*spec == '@') {
+            t.time = std::strtoull(spec + 1, &end, 0);
+            t.last = *end == ':' ? std::strtoull(end + 1, nullptr, 0) : 16;  // (a count from that moment)
+            return t;
+        }
         t.first = std::strtoull(spec, &end, 0);
         t.last = *end == '-' ? std::strtoull(end + 1, nullptr, 0) : t.first;
         if (t.first <= 1 && *end != '-') t.first = 0, t.last = ~u64{0};
@@ -3861,9 +3873,9 @@ const Trace& trace() {
 bool traced(u64 number, const Scene& scene) {
     const Trace& t = trace();
     if (!t.on) return false;
-    if (!t.surface) return number >= t.first && number <= t.last;
+    if (!t.surface && !t.time) return number >= t.first && number <= t.last;
     static u64 start = 0;
-    if (!start && scene.has_color && scene.color.data == t.surface) start = number + 1;
+    if (!start && (t.time ? ms_passed(t.time) : scene.has_color && scene.color.data == t.surface)) start = number + 1;
     return start && number + 1 - start < t.last;
 }
 
@@ -3989,12 +4001,14 @@ const nx::vector<u32>& skipped_programs() {
 }
 
 // PSVRECORE_GXM_CAPTURE=<scene>:<draw>:<folder>: that draw (by its index; or, an address, the first whose vertex
-// program is there, in that scene or a later one) written to the folder as a psvrender scene (scene.txt, its
+// program is there, in that scene or a later one; @<milliseconds> for the scene: the first rendered that long after
+// the process started, as PSVRECORE_GXM_TRACE takes it) written to the folder as a psvrender scene (scene.txt, its
 // programs' GXP files, its vertices decoded as the programs get them, its indices, uniforms and uniform buffers), for
 // comparing the translation's drawing with the reference renderer's (tools/psvrender). A triangle list, without its
 // textures or states.
 struct CaptureAt {
     u64 scene = 0;
+    u64 time = 0;  // (@<milliseconds> for the scene: the first rendered that long after the process started)
     u32 draw = 0;
     u32 surface = 0;  // (`*<address>`: every draw of the first scene drawing to the colour surface at that address)
     nx::string folder;
@@ -4008,14 +4022,21 @@ void capture_draw(u64 number, const Scene& scene) {
         const char* spec = std::getenv("PSVRECORE_GXM_CAPTURE");
         if (!spec || !*spec) return out;
         char* end = nullptr;
-        out.scene = std::strtoull(spec, &end, 0);
+        if (*spec == '@') out.time = std::strtoull(spec + 1, &end, 0), out.scene = 1;
+        else out.scene = std::strtoull(spec, &end, 0);
         if (*end == ':' && end[1] == '*') out.surface = static_cast<u32>(std::strtoul(end + 2, &end, 0));
         else if (*end == ':') out.draw = static_cast<u32>(std::strtoul(end + 1, &end, 0));
         if (*end == ':') out.folder = nx::string(end + 1);
         return out;
     }();
     static bool done = false;
-    if (done || !at.scene || number < at.scene || at.folder.empty()) return;
+    static u64 from = 0;  // (the scene: as given, or the first rendered after at.time)
+    if (done || !at.scene || at.folder.empty()) return;
+    if (!from) {
+        if (at.time && !ms_passed(at.time)) return;
+        from = at.time ? number : at.scene;
+    }
+    if (number < from) return;
     if (at.surface) {
         if (!scene.has_color || scene.color.data != at.surface) return;
         done = true;
@@ -4034,7 +4055,7 @@ void capture_draw(u64 number, const Scene& scene) {
                 which = i;
                 break;
             }
-    } else if (number != at.scene) {
+    } else if (number != from) {
         return;
     }
     if (which >= scene.draws.size()) return;
