@@ -34,6 +34,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2445,9 +2446,39 @@ DepthTarget* scaled_depth_texture(Renderer& r, const TextureInfo& info, const De
     return nullptr;
 }
 
+// PSVRECORE_GXM_PROFILE's lines, printf-style: to stderr, and on Android, where stderr goes nowhere, to the log (a
+// line at a time, the pieces up to each newline gathered first).
+void profile_print(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+#if defined(__ANDROID__)
+    static std::mutex lock;
+    static char line[8192];
+    static usize length = 0;
+    const std::lock_guard<std::mutex> hold(lock);
+    const int n = std::vsnprintf(line + length, sizeof line - length, format, args);
+    va_end(args);
+    if (n < 0) return;
+    length = nx::min<usize>(length + static_cast<usize>(n), sizeof line - 1);
+    usize from = 0;
+    for (usize i = 0; i < length; ++i)
+        if (line[i] == '\n') {
+            nx::logi(logs::gpu, "{}", nx::string_view(line + from, i - from));
+            from = i + 1;
+        }
+    // (a line longer than the buffer: what it holds, at once)
+    if (from == 0 && length == sizeof line - 1) nx::logi(logs::gpu, "{}", nx::string_view(line, length)), from = length;
+    std::memmove(line, line + from, length - from);
+    length -= from;
+#else
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+#endif
+}
+
 // A texture as the draw's control words describe it (cached), or none if it cannot be read.
 // PSVRECORE_GXM_PROFILE=1: every 200 scenes, the time the scenes spent in each part of render_scene and in the
-// textures (looked up, hashed, new ones decoded and uploaded), and every 50th new texture's description (to stderr).
+// textures (looked up, hashed, new ones decoded and uploaded), and every 50th new texture's description (profile_print).
 struct SceneProfile {
     static constexpr u32 kParts = 11;
     static constexpr const char* kNames[kParts] = {"depth in", "draws", "buffers", "descriptors and textures",
@@ -2548,55 +2579,55 @@ struct SceneProfile {
         u64 all = 0;
         for (u64 n : ns) all += n;
         static const u64 since = nx::os::ticks_ns();
-        std::fprintf(stderr, "gxm profile: %u scenes, %.1f ms each (%.1f s):", scenes, static_cast<f64>(all) / 1e6 / scenes,
+        profile_print("gxm profile: %u scenes, %.1f ms each (%.1f s):", scenes, static_cast<f64>(all) / 1e6 / scenes,
                      static_cast<f64>(nx::os::ticks_ns() - since) / 1e9);
-        for (u32 i : kOrder) std::fprintf(stderr, " %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
-        std::fprintf(stderr, " %.2f colour surfaces uploaded a scene; %.2f ms waiting for the display to let the buffer go;",
+        for (u32 i : kOrder) profile_print(" %s %.2f;", kNames[i], static_cast<f64>(ns[i]) / 1e6 / scenes);
+        profile_print(" %.2f colour surfaces uploaded a scene; %.2f ms waiting for the display to let the buffer go;",
                      static_cast<f64>(colour_uploads) / scenes, static_cast<f64>(buffer_wait_ns) / 1e6 / scenes);
         if (finished)
-            std::fprintf(stderr, " finishing a scene: %.2f ms waiting, %.2f ms the rest;",
+            profile_print(" finishing a scene: %.2f ms waiting, %.2f ms the rest;",
                          static_cast<f64>(finish_wait_ns) / 1e6 / finished, static_cast<f64>(finish_work_ns) / 1e6 / finished);
         if (finished) {
-            std::fprintf(stderr, " written back: colour %.2f, buffers and counters %.2f, depth %.2f, the rest %.2f ms a scene;",
+            profile_print(" written back: colour %.2f, buffers and counters %.2f, depth %.2f, the rest %.2f ms a scene;",
                          static_cast<f64>(back_ns[0] - back_printed[0]) / 1e6 / finished, static_cast<f64>(back_ns[1] - back_printed[1]) / 1e6 / finished,
                          static_cast<f64>(back_ns[2] - back_printed[2]) / 1e6 / finished, static_cast<f64>(back_ns[3] - back_printed[3]) / 1e6 / finished);
             std::memcpy(back_printed, back_ns, sizeof back_ns);
         }
         for (u32 i = 0; i < kWhys; ++i)
             if (why_count[i])
-                std::fprintf(stderr, " %s %.2f a scene (%.2f ms waiting);", kWhy[i], static_cast<f64>(why_count[i]) / scenes,
+                profile_print(" %s %.2f a scene (%.2f ms waiting);", kWhy[i], static_cast<f64>(why_count[i]) / scenes,
                              static_cast<f64>(why_wait_ns[i]) / 1e6 / scenes);
-        std::fprintf(stderr, " %.1f draws (%.1f reading the colour, %.1f barriers) a scene;",
+        profile_print(" %.1f draws (%.1f reading the colour, %.1f barriers) a scene;",
                      static_cast<f64>(draws) / scenes, static_cast<f64>(colour_reads) / scenes,
                      static_cast<f64>(barriers) / scenes);
         if (gpu_measured)
-            std::fprintf(stderr, " GPU: idle %.2f ms, busy %.2f ms a scene;", static_cast<f64>(gpu_idle_ns) / 1e6 / gpu_measured,
+            profile_print(" GPU: idle %.2f ms, busy %.2f ms a scene;", static_cast<f64>(gpu_idle_ns) / 1e6 / gpu_measured,
                          static_cast<f64>(gpu_span_ns) / 1e6 / gpu_measured);
         if (gpu_measured) {
-            std::fprintf(stderr, " GPU gaps between scenes:");
+            profile_print(" GPU gaps between scenes:");
             static constexpr const char* kGaps[4] = {"under 0.1 ms", "0.1-0.5", "0.5-2", "over 2"};
             for (u32 i = 0; i < 4; ++i)
-                std::fprintf(stderr, " %s %.2f (%.2f ms)%s", kGaps[i], static_cast<f64>(gap_count[i]) / gpu_measured,
+                profile_print(" %s %.2f (%.2f ms)%s", kGaps[i], static_cast<f64>(gap_count[i]) / gpu_measured,
                              static_cast<f64>(gap_ns[i]) / 1e6 / gpu_measured, i < 3 ? "," : " a scene;");
         }
         if (gpu_measured)
-            std::fprintf(stderr, " GPU: %.2f ms before the pass, %.2f the pass, %.2f after it a scene;",
+            profile_print(" GPU: %.2f ms before the pass, %.2f the pass, %.2f after it a scene;",
                          static_cast<f64>(gpu_before_ns) / 1e6 / gpu_measured, static_cast<f64>(gpu_pass_ns) / 1e6 / gpu_measured,
                          static_cast<f64>(gpu_after_ns) / 1e6 / gpu_measured);
-        std::fprintf(stderr, " surfaces written back found unchanged: %.2f by watching, %.2f compared a scene;",
+        profile_print(" surfaces written back found unchanged: %.2f by watching, %.2f compared a scene;",
                      static_cast<f64>(g_watch_seen.exchange(0)) / scenes, static_cast<f64>(g_watch_compared.exchange(0)) / scenes);
         if (const DisplayQueueTimes q = take_display_queue_times(); q.entries)
-            std::fprintf(stderr, " display queue: %llu frames, a frame: %.2f ms the game waited for room, %.2f its scenes "
+            profile_print(" display queue: %llu frames, a frame: %.2f ms the game waited for room, %.2f its scenes "
                          "finishing, %.2f the game's callback;", static_cast<unsigned long long>(q.entries),
                          static_cast<f64>(q.room_ns) / 1e6 / q.entries, static_cast<f64>(q.finish_ns) / 1e6 / q.entries,
                          static_cast<f64>(q.callback_ns) / 1e6 / q.entries);
-        std::fprintf(stderr, " write-backs deferred %.2f, written when touched %.2f a scene;",
+        profile_print(" write-backs deferred %.2f, written when touched %.2f a scene;",
                      static_cast<f64>(g_lazy_deferred.exchange(0)) / scenes, static_cast<f64>(g_lazy_written.exchange(0)) / scenes);
-        std::fprintf(stderr, " cached %u textures, %.0f MiB; %.2f made from surfaces a scene (%.2f converted, %.3f backgrounds);",
+        profile_print(" cached %u textures, %.0f MiB; %.2f made from surfaces a scene (%.2f converted, %.3f backgrounds);",
                      static_cast<u32>(renderer().textures.size()), static_cast<f64>(renderer().texture_bytes) / 1048576.0,
                      static_cast<f64>(from_targets + converted) / scenes, static_cast<f64>(converted) / scenes,
                      static_cast<f64>(converted_bg) / scenes);
-        std::fprintf(stderr,
+        profile_print(
                      " textures: %.1f lookups, %.1f unwritten, %.1f hashed (%.2f ms), %.1f writes to watched pages, %.2f "
                      "new (%.0f KiB, %.2f ms: decoded %.2f, made %.2f, uploaded %.2f) a scene\n",
                      static_cast<f64>(lookups) / scenes, static_cast<f64>(unchanged) / scenes, static_cast<f64>(hashed) / scenes,
@@ -2606,7 +2637,7 @@ struct SceneProfile {
                      static_cast<f64>(create_ns) / 1e6 / scenes, static_cast<f64>(upload_ns) / 1e6 / scenes);
         {
             const PrefetchStats ps = prefetch_stats();
-            std::fprintf(stderr, "gxm profile: textures decoded ahead: %llu, %llu taken (%llu in these scenes), %llu changed "
+            profile_print("gxm profile: textures decoded ahead: %llu, %llu taken (%llu in these scenes), %llu changed "
                          "while decoded, %llu dropped; %.0f MiB kept\n", static_cast<unsigned long long>(ps.decoded),
                          static_cast<unsigned long long>(ps.taken), static_cast<unsigned long long>(ahead),
                          static_cast<unsigned long long>(ps.changed), static_cast<unsigned long long>(ps.dropped),
@@ -3569,14 +3600,14 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
             ++g_profile.misses, g_profile.miss_bytes += bytes, g_profile.miss_ns += took;
             // (a texture that took a while: which)
             if (took >= 2'000'000)
-                std::fprintf(stderr, "gxm profile: a slow new texture, %.1f ms (%.1f decoding): format %08x type %u, %u x %u, "
+                profile_print("gxm profile: a slow new texture, %.1f ms (%.1f decoding): format %08x type %u, %u x %u, "
                              "%u levels, %u bytes\n", static_cast<f64>(took) / 1e6,
                              decoded ? static_cast<f64>(decoded - start) / 1e6 : 0.0, info.base_format, info.type, info.width,
                              info.height, info.levels, bytes);
         }
     } miss_time{miss_start, size, info};
     if (g_profile.on && g_profile.misses % 50 == 0)
-        std::fprintf(stderr, "gxm profile: new texture at %08x: format %08x type %u, %u x %u, %u levels, %u bytes\n",
+        profile_print("gxm profile: new texture at %08x: format %08x type %u, %u x %u, %u levels, %u bytes\n",
                      info.address, info.base_format, info.type, info.width, info.height, info.levels, size);
     auto read_guest = read_guest_memory;
     // (a movie's frame: its planes, for the GPU to convert; else the texels, decoded here)
@@ -5549,7 +5580,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 misses[k].texels = read_texels(info, read_guest_memory, bc, true, srgb);
                 // (one that took a while to decode: which)
                 if (const u64 took = g_profile.on ? nx::os::ticks_ns() - from : 0; took >= 1'000'000)
-                    std::fprintf(stderr, "gxm profile: a slow decode, %.1f ms: format %08x type %u gamma %u, %u x %u, %u levels, "
+                    profile_print("gxm profile: a slow decode, %.1f ms: format %08x type %u gamma %u, %u x %u, %u levels, "
                                  "%u bytes\n", static_cast<f64>(took) / 1e6, info.base_format, info.type, info.gamma,
                                  info.width, info.height, info.levels, misses[k].size);
             });
