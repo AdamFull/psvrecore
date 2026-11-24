@@ -322,12 +322,13 @@ void decode_bc8(u32 code, const u8* block, u8 out[16][4]) {
 // to 8 bits (PVRTC-II gives C1's alpha a low bit of 1, so it reaches 255).
 //
 // A texel's colours come from the four blocks around it (P, Q, R, S: their centres the corners of the square the
-// texel lies in, wrapping at the edges), at (s, t) from P's centre. What it is depends on its own block's H and M:
-// - 0, 0: C0 and C1 interpolated between the four blocks, mixed by the index's weight (0, 3/8, 5/8, 1);
-// - 0, 1: the same colours, the index 0 C0, 1 their mean, 2 their mean with alpha 0 (PVRTC-II: transparent black),
+// texel lies in, wrapping at the edges), at (s, t) from P's centre. What it is depends on M (its own block's) and
+// H (P's, the first of the four, as the Sony SDK decoder reads it):
+// - H 0, M 0: C0 and C1 interpolated between the four blocks, mixed by the index's weight (0, 3/8, 5/8, 1);
+// - H 0, M 1: the same colours, the index 0 C0, 1 their mean, 2 their mean with alpha 0 (PVRTC-II: transparent black),
 //   3 C1;
-// - 1, 0 (PVRTC-II): not interpolated: P's C0 and C1, mixed by the weight;
-// - 1, 1 (PVRTC-II): a local palette for each place in the square, from P, Q, R and S's colours.
+// - H 1, M 0 (PVRTC-II): not interpolated: the C0 and C1 of the block the texel lies in, mixed by the weight;
+// - H 1, M 1 (PVRTC-II): a local palette for each place in the square, from P, Q, R and S's colours.
 struct PvrtcColours {
     i32 c[2][4];  // C0, C1 as 8-bit RGBA
 };
@@ -358,10 +359,10 @@ PvrtcColours pvrtc_colours(u64 block, bool second) {
 // Mode 3's palette (PVRTC-II): for each index and place (t, s) in the square, the colour: P, Q, R or S (bits 0-1)
 // and C0 or C1 (bit 2), or P's 5/8 C0 + 3/8 C1 (8) or 3/8 C0 + 5/8 C1 (9).
 constexpr u8 kPvrtcPalette[4][4][4] = {
-    {{0, 0, 0, 0}, {0, 0, 0, 3}, {0, 0, 0, 3}, {0, 0, 3, 3}},
-    {{8, 4, 4, 4}, {4, 4, 4, 4}, {4, 4, 7, 7}, {4, 7, 7, 7}},
-    {{9, 1, 1, 1}, {2, 1, 1, 1}, {2, 2, 2, 1}, {2, 2, 2, 2}},
-    {{4, 5, 5, 5}, {6, 6, 5, 5}, {6, 6, 5, 5}, {6, 6, 6, 5}},
+    {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 3}, {0, 3, 3, 3}},
+    {{8, 4, 4, 4}, {4, 4, 4, 7}, {4, 4, 7, 7}, {4, 4, 7, 7}},
+    {{9, 1, 1, 1}, {2, 2, 1, 1}, {2, 2, 1, 1}, {2, 2, 2, 1}},
+    {{4, 5, 5, 5}, {6, 5, 5, 5}, {6, 6, 6, 5}, {6, 6, 6, 6}},
 };
 
 // A level's texels (8-bit RGBA, as integers in [0, 255]) from its blocks (bx x by, in rows).
@@ -376,7 +377,8 @@ void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
             const u32 px = ((x + 4 * bx - 2) / 4) % bx, qx = (px + 1) % bx, s = (x + 2) % 4;
             const u64 block = blocks[usize{y / 4} * bx + x / 4];
             const u32 index = static_cast<u32>(block >> (2 * ((y % 4) * 4 + x % 4))) & 3;
-            const bool m = (block >> 32) & 1, h = second && ((block >> 47) & 1);
+            // (M is the texel's own block's; H is P's, the first of the four blocks around it)
+            const bool m = (block >> 32) & 1, h = second && ((blocks[usize{py} * bx + px] >> 47) & 1);
             const PvrtcColours* corner[4] = {&colours[usize{py} * bx + px], &colours[usize{py} * bx + qx],
                                              &colours[usize{ry} * bx + px], &colours[usize{ry} * bx + qx]};
             i32 out[4];
@@ -394,7 +396,7 @@ void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
                           wr = static_cast<i32>((4 - s) * t), ws = static_cast<i32>(s * t);
                 for (u32 j = 0; j < 2; ++j)
                     for (u32 k = 0; k < 4; ++k)
-                        c[j][k] = h ? 16 * corner[0]->c[j][k]
+                        c[j][k] = h ? 16 * corner[(t >> 1) * 2 + (s >> 1)]->c[j][k]
                                     : wp * corner[0]->c[j][k] + wq * corner[1]->c[j][k] + wr * corner[2]->c[j][k] +
                                           ws * corner[3]->c[j][k];
                 if (m) {
@@ -423,8 +425,9 @@ void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
 // weights 0, 3/8, 5/8, 1; bit 0 (the first texel's low bit) set picks the neighbours: bit 20 (the centre texel's
 // low bit) set, the ones above and below, else the ones to the left and right; clear, all four. Those two texels'
 // low bits are then their high bits again (bit 1 and bit 21). The colours are interpolated over the 8x4 square as in
-// 4bpp; a PVRTC-II block with H set takes P's colours as they are (as its 4bpp blocks with H and not M). No texel is
-// punched through in 2bpp.
+// 4bpp; with H set (P's, as in 4bpp) a texel takes the colours of the block it lies in, as they are, picked from
+// the four by which quarter of the 8x4 square it is in (as 4bpp blocks with H and not M). No texel is punched
+// through in 2bpp.
 template <class Put>
 void decode_pvrtc2(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32 height, bool second, Put&& put) {
     nx::vector<PvrtcColours> colours(blocks.size());
@@ -481,7 +484,8 @@ void decode_pvrtc2(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
                     : m.mode == 3 ? (stored(x, u) + stored(x, d) + 1) / 2
                                   : (stored(l, y) + stored(r, y) + stored(x, u) + stored(x, d) + 2) / 4;
             }
-            const bool h = second && ((blocks[at] >> 47) & 1);
+            // (H is P's, the first of the four blocks around the texel, as in 4bpp)
+            const bool h = second && ((blocks[usize{py} * bx + px] >> 47) & 1);
             const PvrtcColours* corner[4] = {&colours[usize{py} * bx + px], &colours[usize{py} * bx + qx],
                                              &colours[usize{ry} * bx + px], &colours[usize{ry} * bx + qx]};
             // (C0 and C1 at this texel, times 32)
@@ -491,7 +495,7 @@ void decode_pvrtc2(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
             for (u32 k = 0; k < 4; ++k) {
                 i32 c[2];
                 for (u32 j = 0; j < 2; ++j)
-                    c[j] = h ? 32 * corner[0]->c[j][k]
+                    c[j] = h ? 32 * corner[(t >> 1) * 2 + (s >> 2)]->c[j][k]
                              : wp * corner[0]->c[j][k] + wq * corner[1]->c[j][k] + wr * corner[2]->c[j][k] +
                                    ws * corner[3]->c[j][k];
                 out[k] = nx::clamp(((8 - w) * c[0] + w * c[1] + 128) / 256, 0, 255);
