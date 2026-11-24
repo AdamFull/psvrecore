@@ -5730,8 +5730,9 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 // (one that took a while to decode: which)
                 if (const u64 took = g_profile.on ? nx::os::ticks_ns() - from : 0; took >= 1'000'000)
                     profile_print("gxm profile: a slow decode, %.1f ms: format %08x type %u gamma %u, %u x %u, %u levels, "
-                                 "%u bytes\n", static_cast<f64>(took) / 1e6, info.base_format, info.type, info.gamma,
-                                 info.width, info.height, info.levels, misses[k].size);
+                                 "%u bytes at %08x (stride %u)\n", static_cast<f64>(took) / 1e6, info.base_format,
+                                 info.type, info.gamma, info.width, info.height, info.levels, misses[k].size,
+                                 info.address, info.stride);
             });
             if (g_profile.on) g_profile.decode_ns += nx::os::ticks_ns() - decode_from;
             for (TextureMiss& m : misses) make_texture(r, m.info, m.size, m.key, m.words_key, &m.texels);

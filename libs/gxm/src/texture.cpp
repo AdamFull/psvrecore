@@ -1012,13 +1012,16 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     // frame): each output component a component's value or a constant, found by putting markers through the swizzle,
     // and written as the general path writes it (F32: the float's bits, F32M's without the mask bit; U2F10F10F10:
     // halves from tables of what the general path makes of each 10-bit float and 2-bit alpha), a texel at a time.
-    const bool floats32 = !reference && t.gamma == 0 && (code == kF32 || code == kF32M || code == kU2F10F10F10);
+    // X8U24 the same way (a D24 depth, or 8-bit colour a scene drew, read as one: Killzone's every scene; the only
+    // swizzle decoded, R = the low 24 bits, G = the top byte, B 0, A 1: halves of what the general path makes of them).
+    const bool x8u24 = !reference && t.gamma == 0 && code == kX8U24 && t.swizzle == 0;
+    const bool floats32 = x8u24 || (!reference && t.gamma == 0 && (code == kF32 || code == kF32M || code == kU2F10F10F10));
     i32 float_of[4] = {};
     f32 float_const[4] = {};
     nx::vector<u16> f10_halves;
     u16 alpha_halves[4] = {}, const_halves[4] = {};
     if (floats32) {
-        const u32 count = code == kU2F10F10F10 ? 4 : 1;
+        const u32 count = code == kU2F10F10F10 ? 4 : x8u24 ? 2 : 1;
         const f32 marks[4] = {10, 11, 12, 13};
         f32 m[4];
         swizzle(marks, count, t.swizzle, m);
@@ -1033,6 +1036,11 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
             f10_halves.resize(1024);
             for (u32 i = 0; i < 1024; ++i) f10_halves[i] = float_to_half(half_to_float(static_cast<u16>(i << 5)));
             for (u32 i = 0; i < 4; ++i) alpha_halves[i] = float_to_half(unorm(i, 2));
+        }
+        if (x8u24) {
+            // (the top byte's halves)
+            f10_halves.resize(256);
+            for (u32 i = 0; i < 256; ++i) f10_halves[i] = float_to_half(unorm(i, 8));
         }
     }
     usize total = 0;
@@ -1261,7 +1269,15 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                         }
                     }
                 };
-                if (code == kU2F10F10F10) {
+                if (x8u24) {
+                    const u16* top = f10_halves.data();
+                    each([&](u8* o, u32 v) {
+                        const u16 c[2] = {float_to_half(unorm(v & 0xFFFFFFu, 24)), top[v >> 24]};
+                        u16 h[4];
+                        for (u32 k = 0; k < 4; ++k) h[k] = float_of[k] >= 0 ? c[float_of[k]] : const_halves[k];
+                        std::memcpy(o, h, 8);
+                    });
+                } else if (code == kU2F10F10F10) {
                     const bool alpha_low = t.swizzle == 2 || t.swizzle == 3 || t.swizzle == 6 || t.swizzle == 7;
                     const u32 at = alpha_low ? 2 : 0;
                     const u16* f10 = f10_halves.data();

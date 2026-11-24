@@ -222,7 +222,7 @@ TEST_CASE("gxm textures: 8-bit components in every swizzle come out as their byt
     CHECK(texel(0x0C000000, 7) == 0xFF443322u);  // BGR1
 }
 
-TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted, blocks, PVRTC, 8-bit, 32-bit floats, each layout)") {
+TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted, blocks, PVRTC, 8-bit, 32-bit floats, X8U24, each layout)") {
     Memory m;
     m.bytes.resize(1u << 21);
     u32 seed = 12345;
@@ -233,7 +233,7 @@ TEST_CASE("gxm textures: the fast paths give the general path's texels (paletted
     };
     const Format formats[] = {{0x94000000, 4}, {0x95000000, 8}, {0x85000000, 4}, {0x86000000, 8}, {0x87000000, 8}, {0x0C000000, 32},
                               {0x00000000, 8}, {0x07000000, 16}, {0x98000000, 24}, {0x12000000, 32}, {0x13000000, 32},
-                              {0x9A000000, 32}, {0x81000000, 4}, {0x83000000, 4}};
+                              {0x9A000000, 32}, {0x81000000, 4}, {0x83000000, 4}, {0x15000000, 32}};
     const u32 types[] = {texture_type::kSwizzled, texture_type::kLinear, texture_type::kLinearStrided, texture_type::kTiled};
     const u32 sizes[][2] = {{37, 23}, {64, 64}, {128, 32}, {16, 256}, {1, 1}};
     u32 compared = 0;
