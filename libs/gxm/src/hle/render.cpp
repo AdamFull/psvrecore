@@ -3867,6 +3867,11 @@ bool traced(u64 number, const Scene& scene) {
     return start && number + 1 - start < t.last;
 }
 
+// A program as the trace and PSVRECORE_GXM_SKIP name it from run to run: the first four bytes of its GXP's SHA-256.
+u32 content_id(const Program* p) {
+    return p ? u32(p->content[0]) << 24 | u32(p->content[1]) << 16 | u32(p->content[2]) << 8 | p->content[3] : 0;
+}
+
 // (PSVRECORE_GXM_TRACE_PROGRAMS=<folder>: a traced program's GXP written there, for psvusse)
 void write_traced_program(const Program* p) {
     const char* folder = std::getenv("PSVRECORE_GXM_TRACE_PROGRAMS");
@@ -3904,10 +3909,11 @@ void trace_scene(u64 number, const Scene& scene) {
             if (t.levels > 1 || t.swizzle || t.gamma)
                 textures += nx::format("/levels {} swizzle {} gamma {}", t.levels, t.swizzle, t.gamma);
         }
-        nx::logi(logs::gxm, "trace:   draw {}: vertex 0x{:08x} fragment 0x{:08x} (blend {}, mask update {}), primitive {}, "
-                 "{} indices x {}{}", i, d.vertex ? d.vertex->guest : 0, d.fragment ? d.fragment->guest : 0,
-                 d.fragment && d.fragment->blend_enabled, d.fragment && d.fragment->mask_update, d.primitive,
-                 d.index_count, d.instances, textures);
+        nx::logi(logs::gxm, "trace:   draw {}: vertex 0x{:08x} fragment 0x{:08x} (contents 0x{:08x}/0x{:08x}; blend {}, mask "
+                 "update {}), primitive {}, {} indices x {}{}", i, d.vertex ? d.vertex->guest : 0,
+                 d.fragment ? d.fragment->guest : 0, d.vertex ? content_id(d.vertex->program) : 0,
+                 d.fragment ? content_id(d.fragment->program) : 0, d.fragment && d.fragment->blend_enabled,
+                 d.fragment && d.fragment->mask_update, d.primitive, d.index_count, d.instances, textures);
         {
             const DrawState& st = d.state;
             const StencilState& f = st.stencil[0];
@@ -3962,9 +3968,10 @@ void trace_scene(u64 number, const Scene& scene) {
 namespace {
 
 // PSVRECORE_GXM_SKIP=<address>[,<address>...]: the draws whose vertex or fragment program is at one of these guest
-// addresses, or whose program's GXP is (as PSVRECORE_GXM_TRACE gives them), left out, for finding which draw makes
-// what. The GXP addresses stay the same from run to run; the programs' addresses can change with the order the game
-// makes them in. ('+' separates them as well: the Android launcher's argument list splits at commas.)
+// addresses, or whose program's GXP is, or whose GXP's contents are (content_id; PSVRECORE_GXM_TRACE gives all three),
+// left out, for finding which draw makes what. Only the contents stay the same from run to run: the programs'
+// addresses change with the order the game makes them in, and a GXP's with where the game loaded it. ('+' separates
+// them as well: the Android launcher's argument list splits at commas.)
 const nx::vector<u32>& skipped_programs() {
     static const nx::vector<u32> list = [] {
         nx::vector<u32> out;
@@ -4689,9 +4696,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     if (const auto& skip = skipped_programs(); !skip.empty()) {
         auto listed = [&](u32 address) { return address && std::find(skip.begin(), skip.end(), address) != skip.end(); };
         auto skipped = [&](const Draw& dr) {
-            return (dr.vertex && (listed(dr.vertex->guest) || (dr.vertex->program && listed(dr.vertex->program->gxp_address)))) ||
-                   (dr.fragment &&
-                    (listed(dr.fragment->guest) || (dr.fragment->program && listed(dr.fragment->program->gxp_address))));
+            auto program = [&](u32 guest, const Program* p) {
+                return listed(guest) || (p && (listed(p->gxp_address) || listed(content_id(p))));
+            };
+            return (dr.vertex && program(dr.vertex->guest, dr.vertex->program)) ||
+                   (dr.fragment && program(dr.fragment->guest, dr.fragment->program));
         };
         // (the markers stay before the draws they were before)
         for (UserMarker& m : scene.markers) {
