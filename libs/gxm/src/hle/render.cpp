@@ -2127,10 +2127,20 @@ VkSampler texture_sampler(Renderer& r, const TextureInfo& info, VkFormat format,
     vkGetPhysicalDeviceFormatProperties(r.device->physical(), format, &fp);
     const bool filterable = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
     sd.mag = info.mag_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    sd.min = info.min_linear && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    sd.mip = info.mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    // (a linear strided texture's words hold its stride where the min and mip filters are: it has neither, its
+    // minification filtered as its magnification. Killzone: Mercenary's text shadows blur glyphs shrunk 4x: read
+    // nearest, the glyphs came out in stripes)
+    const bool strided = info.type == texture_type::kLinearStrided;
+    sd.min = (strided ? info.mag_linear : info.min_linear) && filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sd.mip = info.mip_linear && !strided ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sd.u = address_mode(info.u_address);
     sd.v = address_mode(info.v_address);
+    if (strided) {
+        // (a linear strided texture only has the clamp address mode: SDK texture.h, sceGxmTextureSetUAddrMode. A game
+        // that never sets one leaves the default REPEAT in the words, which the GPU ignores for this type. Killzone:
+        // Mercenary's text shadows sample glyph cells over -0.5..1.5, so repeating tiled the glyph 2x2 into the margins)
+        sd.u = sd.v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    }
     sd.w = sd.u;
     sd.lod_bias = (static_cast<f32>(info.lod_bias) - 31.0f) / 8.0f;  // (assumed: eighths of a level, 31 none)
     sd.max_lod = static_cast<f32>(levels - 1);
