@@ -583,7 +583,9 @@ u32 sceAvPlayerIsActive(PsvContext* ctx, u32 handle) {
         nx::scoped_lock<nx::mutex> held(p.lock);
         p.ctx = ctx;
         if (p.state == Player::State::Playing && ended(p, clock_ms(p))) source_ended(p);
-        active = p.state == Player::State::Ready || p.state == Player::State::Playing || p.state == Player::State::Paused;
+        // (a player just made, with no source added yet, is active too: Killzone: Mercenary asks between
+        // sceAvPlayerInit and sceAvPlayerAddSource, and takes 0 for its movie having ended)
+        active = p.state != Player::State::Stopped;
         events.swap(p.events);
     }
     deliver(ctx, p, events);
@@ -662,7 +664,13 @@ u64 sceAvPlayerCurrentTime(u32 handle) {
     auto pp = player_of(handle);
     if (!pp) return 0;
     nx::scoped_lock<nx::mutex> held(pp->lock);
-    return clock_ms(*pp);
+    // (the time of the picture last handed out, once there is one: Killzone: Mercenary keeps its movies in step
+    // with sound of its own by reading pictures while this lies behind the sound, and the clock alone, ahead of it
+    // from a hitch at the start, had it wait on the sound for good)
+    const Player& p = *pp;
+    if (p.video >= 0 && p.last_video_ms >= 0 && (p.state == Player::State::Playing || p.state == Player::State::Paused))
+        return static_cast<u64>(p.last_video_ms);
+    return clock_ms(p);
 }
 
 i32 sceAvPlayerJumpToTime(PsvContext* ctx, u32 handle, u64 ms) {
