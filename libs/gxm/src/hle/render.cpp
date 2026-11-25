@@ -2568,6 +2568,7 @@ struct SceneProfile {
                                                     "colour uploaded"};
     static constexpr u32 kOrder[kParts] = {8, 9, 10, 0, 1, 2, 3, 4, 6, 5, 7};
     u64 colour_uploads = 0;
+    u64 mem_copied = 0, vertex_copied = 0;  // (bytes of guest memory copied for scenes' memory and vertex buffers)
     u64 memory_fills = 0;  // (memory buffers' ranges filled from pending scenes' surfaces on the GPU: memory_copy)
     u64 began = 0, ns_before[kParts] = {}, misses_before = 0, miss_ns_before = 0;  // (this scene's start)
     u64 pipelines_made = 0, pipeline_ns = 0, pipelines_before = 0, pipeline_ns_before = 0;  // (made while drawing)
@@ -2723,11 +2724,15 @@ struct SceneProfile {
         {
             const PrefetchStats ps = prefetch_stats();
             profile_print("gxm profile: textures decoded ahead: %llu, %llu taken (%llu in these scenes), %llu changed "
-                         "while decoded, %llu dropped; %.0f MiB kept\n", static_cast<unsigned long long>(ps.decoded),
+                         "while decoded, %llu dropped; %.0f MiB kept; not found: %llu with other contents, %llu not kept, %llu "
+                         "never decoded\n", static_cast<unsigned long long>(ps.decoded),
                          static_cast<unsigned long long>(ps.taken), static_cast<unsigned long long>(ahead),
                          static_cast<unsigned long long>(ps.changed), static_cast<unsigned long long>(ps.dropped),
-                         static_cast<f64>(ps.bytes) / 1048576.0);
+                         static_cast<f64>(ps.bytes) / 1048576.0, static_cast<unsigned long long>(ps.missed_other),
+                         static_cast<unsigned long long>(ps.missed_gone), static_cast<unsigned long long>(ps.missed_never));
         }
+        profile_print("gxm profile: copied a scene: memory buffer %.0f KiB, vertices %.0f KiB\n",
+                     static_cast<f64>(mem_copied) / 1024.0 / scenes, static_cast<f64>(vertex_copied) / 1024.0 / scenes);
         const u64 last_end = gpu_last_end;
         *this = SceneProfile{};
         on = read = true;
@@ -5687,10 +5692,10 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
 
     g_profile.mark(1);
     // ---- Buffers ---------------------------------------------------------------------------------------------
-    nx::vector<u32> mem_words(2 + mem.size() / 4 + 2, 0);
-    mem_words[0] = kMemoryBase;
-    mem_words[1] = static_cast<u32>(mem.size() / 4);
-    if (!mem.empty()) std::memcpy(mem_words.data() + 2, mem.data(), mem.size());
+    // (the memory buffer: two words (its guest base, its length in words), the copies, two words of zeros; written
+    // straight into its host buffer below, not through a vector first: a copy and a clear of it fewer a scene)
+    const usize mem_bytes = (2 + mem.size() / 4 + 2) * 4;
+    if (g_profile.on) g_profile.mem_copied += mem.size(), g_profile.vertex_copied += vertex_bytes;
     // (the regions of the buffers programs store to: what the programs changed there goes back after the scene, told
     // from `mem`, the copies as they were made)
     struct StoreBack {
@@ -5746,12 +5751,23 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     vk::Buffer* sa_buf = make(sa.data(), sa.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     // (past the device's storage buffer range, what the programs read there is undefined: zeros on an Adreno)
     if (static bool told = false;
-        !told && u64{mem_words.size()} * 4 > d.properties().limits.maxStorageBufferRange) {
+        !told && u64{mem_bytes} > d.properties().limits.maxStorageBufferRange) {
         told = true;
         nx::logw(logs::gpu, "a scene's memory buffer of {} MiB is past the device's storage buffer range ({} MiB)",
-                 u64{mem_words.size()} * 4 >> 20, d.properties().limits.maxStorageBufferRange >> 20);
+                 u64{mem_bytes} >> 20, d.properties().limits.maxStorageBufferRange >> 20);
     }
-    vk::Buffer* mem_buf = make(mem_words.data(), mem_words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    vk::Buffer* mem_buf = nullptr;
+    if (auto b = take_host_buffer(r, nx::max<usize>(mem_bytes, 16))) {
+        const nx::vector<u8>& from = store_backs.empty() ? mem : copied;  // (moved to `copied` when kept)
+        u8* to = static_cast<u8*>(b->mapped);
+        const u32 head[2] = {kMemoryBase, static_cast<u32>(from.size() / 4)};
+        std::memcpy(to, head, sizeof head);
+        if (!from.empty()) std::memcpy(to + 8, from.data(), from.size());
+        std::memset(to + 8 + from.size(), 0, mem_bytes - 8 - from.size());
+        vk::flush(d, *b, nx::max<usize>(mem_bytes, 16));
+        buffers.push_back(*b);
+        mem_buf = &buffers.back();
+    }
     // (bytes filled on the GPU in a region programs store to: copied here too, what store_changes compares the
     // programs' stores with there, as `copied` does not have them)
     bool fills_stored = false;

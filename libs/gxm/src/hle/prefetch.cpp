@@ -185,6 +185,10 @@ std::optional<Texels> take_prefetched(const TextureInfo& info, u64 contents) {
         ++p.stats.taken;
         return t;
     }
+    if (texture_size(info) < 65536) return std::nullopt;  // (counted: the large ones only, slow to decode)
+    bool other = false;
+    for (const Decoded& d : p.decoded) other |= d.described == key;
+    ++(other ? p.stats.missed_other : p.times.contains(key) ? p.stats.missed_gone : p.stats.missed_never);
     return std::nullopt;
 }
 

@@ -27,6 +27,9 @@ std::optional<Texels> take_prefetched(const TextureInfo& info, u64 contents);
 
 struct PrefetchStats {
     u64 decoded = 0, taken = 0, changed = 0, dropped = 0, bytes = 0;  // (dropped: past the budget; bytes: kept now)
+    // (textures the renderer looked for and did not find: one of that description kept with other contents; one of
+    // it decoded once, not kept now; none of it decoded)
+    u64 missed_other = 0, missed_gone = 0, missed_never = 0;
 };
 PrefetchStats prefetch_stats();
 
