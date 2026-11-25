@@ -325,23 +325,31 @@ u32 depth_run(const DepthStencilSurface& s, u32 x, u32 width) {
 
 // 32-bit float depth, the image's words the surface's (but for a mask bit that is the background's): a run at a time.
 bool plain_depth(const DepthLayout& l, bool unorm24) { return l.depth_bytes == 4 && !l.packed && !unorm24 && !mask_in_stencil(l); }
+// (or no depth, a stencil surface say: the depth the background's, the stencil a run at a time. Killzone: Mercenary
+// loads a 960x544 stencil surface each frame that a program stored to, and stores one: a sample at a time, an Odin 3
+// took 0.55 ms more a scene, 22.2 frames a second in a level against 23.5)
+bool run_depth(const DepthLayout& l, bool unorm24) { return plain_depth(l, unorm24) || (!l.depth_bytes && !mask_in_stencil(l)); }
 
 void read_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32 width, u32 height, bool unorm24,
                         u32* depth, u8* stencil) {
-    if (plain_depth(l, unorm24)) {
-        const u8* d = memory().host(s.depth_data);
+    if (run_depth(l, unorm24)) {
+        const u8* d = l.depth_bytes ? memory().host(s.depth_data) : nullptr;
         const u8* st = l.stencil ? memory().host(s.stencil_data) : nullptr;
         const u8 background = static_cast<u8>(s.background_control & 0xFF);
+        const f32 bz = nx::clamp(std::isnan(s.background_depth) ? 0.0f : s.background_depth, 0.0f, 1.0f);
+        const u32 background_depth = unorm24 ? static_cast<u32>(std::lround(bz * 16777215.0f)) : std::bit_cast<u32>(bz);
         for (u32 y = 0; y < height; ++y)
             for (u32 x = 0; x < width;) {
                 const u32 n = depth_run(s, x, width), i = depth_sample(s, x, y), at = y * width + x;
-                for (u32 k = 0; k < n; ++k) {
-                    u32 w;
-                    std::memcpy(&w, d + (usize{i} + k) * 4, 4);
-                    f32 z = std::bit_cast<f32>(l.mask ? w & 0x7FFFFFFFu : w);
-                    z = nx::clamp(std::isnan(z) ? 0.0f : z, 0.0f, 1.0f);
-                    depth[at + k] = std::bit_cast<u32>(z);
-                }
+                if (!d) std::fill_n(depth + at, n, background_depth);
+                else
+                    for (u32 k = 0; k < n; ++k) {
+                        u32 w;
+                        std::memcpy(&w, d + (usize{i} + k) * 4, 4);
+                        f32 z = std::bit_cast<f32>(l.mask ? w & 0x7FFFFFFFu : w);
+                        z = nx::clamp(std::isnan(z) ? 0.0f : z, 0.0f, 1.0f);
+                        depth[at + k] = std::bit_cast<u32>(z);
+                    }
                 if (st) std::memcpy(stencil + at, st + i, n);
                 else std::memset(stencil + at, background, n);
                 x += n;
@@ -381,11 +389,12 @@ void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32
     const u32 mask = l.mask && (s.background_control & 0x100) ? 0x80000000u : 0;
     u8* const d = depth_out ? depth_out : l.depth_bytes ? memory().host(s.depth_data) : nullptr;
     u8* const st = !l.stencil ? nullptr : stencil_out ? stencil_out : memory().host(s.stencil_data);
-    if (plain_depth(l, unorm24) && !keep) {
+    if (run_depth(l, unorm24) && !keep) {
         for (u32 y = 0; y < height; ++y)
             for (u32 x = 0; x < width;) {
                 const u32 n = depth_run(s, x, width), i = depth_sample(s, x, y), at = y * width + x;
-                if (!mask) {
+                if (!l.depth_bytes) {
+                } else if (!mask) {
                     std::memcpy(d + usize{i} * 4, depth + at, usize{n} * 4);
                 } else {
                     for (u32 k = 0; k < n; ++k) {
