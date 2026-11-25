@@ -1212,7 +1212,6 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     }
     usize total = 0;
     for (const Level& l : levels) total += usize{l.width} * l.height * out_bytes;
-    out.data.resize(total * out.faces);
     auto put = [&](u8* dst, const f32 rgba[4]) {
         f32 v[4];
         for (u32 k = 0; k < 4; ++k) {
@@ -1253,6 +1252,10 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
         usize blocks_total = 0;
         for (const Level& l : levels) blocks_total += usize{(l.width + 3) / 4} * ((l.height + 3) / 4);
         out.data.assign(blocks_total * (code == kUBC1 ? 8 : 16) * out.faces, 0);
+    } else {
+        // (not for blocks kept: the texels' size zero-filled first was a millisecond or two a texture, 1.4-5.6 MB
+        // for Killzone's 512x512 and 1024x1024 BC1 chains)
+        out.data.resize(total * out.faces);
     }
     u32 palette8[256] = {};
     if (paletted)
