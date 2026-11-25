@@ -693,6 +693,9 @@ struct Renderer {
         Yuv420Constants yuv{};
         VkDescriptorSet bc_set = VK_NULL_HANDLE;
         nx::vector<BcDecodeConstants> bc;
+        // (`staging` a pending scene's memory buffer, lent: the texels it stores, copied once that scene's copies into
+        // it are done)
+        bool lent = false;
     };
     nx::vector<TextureUpload> texture_uploads;
     // A compute pipeline of one storage buffer and push constants, and its sets' pool: the YUV420 conversion's (none:
@@ -1968,6 +1971,7 @@ VkSamplerAddressMode address_mode(u32 m) {
 
 Result<vk::Buffer> take_host_buffer(Renderer& r, VkDeviceSize bytes);
 void give_host_buffer(Renderer& r, vk::Buffer& b);
+void release_host_buffer(Renderer& r, vk::Buffer& b);
 
 // Decoded texels into a staging buffer, to be uploaded into the texture `key` by the scene's commands (each face's
 // levels).
@@ -2071,7 +2075,8 @@ Result<bool> queue_bc_decode(Renderer& r, u64 key, const Texels& t) {
 
 // An upload's buffer (and set) given back.
 void give_upload(Renderer& r, Renderer::TextureUpload& u) {
-    give_host_buffer(r, u.staging);
+    if (u.lent) release_host_buffer(r, u.staging);
+    else give_host_buffer(r, u.staging);
     if (u.yuv_set) vkFreeDescriptorSets(r.device->device(), r.yuv.pool, 1, &u.yuv_set);
     u.yuv_set = VK_NULL_HANDLE;
     if (u.bc_set) vkFreeDescriptorSets(r.device->device(), r.bc.pool, 1, &u.bc_set);
@@ -3510,6 +3515,51 @@ CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words
     return nullptr;
 }
 
+// A texture over what a pending scene's programs store, from its memory buffer (stored_by_pending), copied into the
+// image by this scene's commands: RGBA8 texels as they are in memory (U8U8U8U8 of the identity swizzle, linear, one
+// level, as read_texels copies them; gamma mode 1 kept encoded, an sRGB image, where the device samples those).
+// Killzone: Mercenary samples a 128x240 one and a 64x120 sRGB one its scenes store, every frame of a level: waiting
+// for those scenes held up the frame.
+CachedTexture* texture_from_pending_stores(Renderer& r, const TextureInfo& info, u64 words_key, u64* key) {
+    const u32 code = ((info.base_format >> 24) & 0x1F) | ((info.base_format >> 31) << 7);
+    const bool srgb = info.gamma == 1 && srgb_textures(*r.device);
+    if (code != 0x0C || info.swizzle != 0 || (info.gamma && !srgb) || info.levels != 1 ||
+        info.type != texture_type::kLinearStrided || info.stride % 4 != 0 || info.stride < info.width * 4 || !info.width ||
+        !info.height)
+        return nullptr;
+    VkDeviceSize offset = 0;
+    const Renderer::Pending* p = stored_by_pending(r, info.address, texture_size(info), offset);
+    if (!p || offset % 4 != 0) return nullptr;
+    *key = (words_key * 0x9E3779B97F4A7C15ull) ^ (p->number * 0xC2B2AE3D27D4EB4Full) ^ 0x73746F7265733834ull;
+    if (auto it = r.textures.find(*key); it != r.textures.end()) {
+        it->second.used = r.scenes;
+        return &it->second;
+    }
+    vk::ImageDesc d;
+    d.format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    d.width = info.width, d.height = info.height;
+    auto image = vk::create_image(*r.device, d);
+    if (!image) return nullptr;
+    Renderer::TextureUpload u{*key, p->memory, {}};
+    u.lent = true;
+    VkBufferImageCopy c{};
+    c.bufferOffset = offset;
+    c.bufferRowLength = info.stride / 4;
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {info.width, info.height, 1};
+    u.regions.push_back(c);
+    lend_host_buffer(r, p->memory);
+    r.texture_uploads.push_back(std::move(u));
+    CachedTexture t;
+    t.image = *image;
+    t.sampler = texture_sampler(r, info, d.format, 1);
+    t.used = r.scenes;
+    t.bytes = u64{info.width} * info.height * 4;
+    r.texture_bytes += t.bytes;
+    auto [it, added] = r.textures.emplace(*key, t);
+    return &it->second;
+}
+
 // A texture over the surface a pending scene draws: made from its image (the GPU runs the scenes in order), keyed
 // by the surface's generation (guest memory does not hold that scene's pixels yet).
 CachedTexture* texture_from_pending_target(Renderer& r, const TextureInfo& info, u64 words_key, u64* key) {
@@ -3653,6 +3703,16 @@ void record_target_conversions(Renderer& r, VkCommandBuffer cmd) {
 
 // The copies texture_from_target asked for, and the new textures' uploads, recorded before the scene's draws.
 void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
+    bool lent = false;
+    for (const Renderer::TextureUpload& u : r.texture_uploads) lent |= u.lent;
+    if (lent) {
+        // (a pending scene's memory buffer, written by its commands before)
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+    }
     if (!r.target_copies.empty() || !r.target_conversions.empty()) {
         // (a surface a pending scene draws, read here: its drawing (and its write-back's copy) before these copies.
         // Its image may already be in TRANSFER_SRC, where a transition adds no barrier; the scenes are separate
@@ -3811,6 +3871,10 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         // (a depth surface's texture, made from its kept image that pending scenes store)
         if (u64 converted_key = 0; CachedTexture* c = converted_texture(r, info, wh.value(), &converted_key, nullptr, true)) {
             seen[wh.value()] = converted_key;
+            return c;
+        }
+        if (u64 stored_key = 0; CachedTexture* c = texture_from_pending_stores(r, info, wh.value(), &stored_key)) {
+            seen[wh.value()] = stored_key;
             return c;
         }
         g_finish_why = 7, finish_pending(r, true);
