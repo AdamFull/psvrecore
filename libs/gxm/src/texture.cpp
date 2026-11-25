@@ -372,10 +372,13 @@ void decode_pvrtc4(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
     nx::vector<PvrtcColours> colours(blocks.size());
     for (usize i = 0; i < blocks.size(); ++i) colours[i] = pvrtc_colours(blocks[i], second);
     static constexpr i32 kWeight[4] = {0, 3, 5, 8};  // (eighths)
+    // (each column's P and Q block columns, worked out once: two divisions a texel were half the decode)
+    nx::vector<u32> pxs(width), qxs(width);
+    for (u32 x = 0; x < width; ++x) pxs[x] = ((x + 4 * bx - 2) / 4) % bx, qxs[x] = (pxs[x] + 1) % bx;
     for (u32 y = 0; y < height; ++y) {
         const u32 py = ((y + 4 * by - 2) / 4) % by, ry = (py + 1) % by, t = (y + 2) % 4;
         for (u32 x = 0; x < width; ++x) {
-            const u32 px = ((x + 4 * bx - 2) / 4) % bx, qx = (px + 1) % bx, s = (x + 2) % 4;
+            const u32 px = pxs[x], qx = qxs[x], s = (x + 2) % 4;
             const u64 block = blocks[usize{y / 4} * bx + x / 4];
             const u32 index = static_cast<u32>(block >> (2 * ((y % 4) * 4 + x % 4))) & 3;
             // (M is the texel's own block's; H is P's, the first of the four blocks around it)
@@ -472,10 +475,12 @@ void decode_pvrtc2(const nx::vector<u64>& blocks, u32 bx, u32 by, u32 width, u32
         const i32 w = mods[usize{y / 4} * bx + x / 8].w[y % 4][x % 8];
         return w < 0 ? 0 : w;
     };
+    nx::vector<u32> pxs(width), qxs(width);  // (as in 4bpp)
+    for (u32 x = 0; x < width; ++x) pxs[x] = ((x + 8 * bx - 4) / 8) % bx, qxs[x] = (pxs[x] + 1) % bx;
     for (u32 y = 0; y < height; ++y) {
         const u32 py = ((y + 4 * by - 2) / 4) % by, ry = (py + 1) % by, t = (y + 2) % 4;
         for (u32 x = 0; x < width; ++x) {
-            const u32 px = ((x + 8 * bx - 4) / 8) % bx, qx = (px + 1) % bx, s = (x + 4) % 8;
+            const u32 px = pxs[x], qx = qxs[x], s = (x + 4) % 8;
             const usize at = usize{y / 4} * bx + x / 8;
             const Modulation& m = mods[at];
             i32 w = m.w[y % 4][x % 8];
