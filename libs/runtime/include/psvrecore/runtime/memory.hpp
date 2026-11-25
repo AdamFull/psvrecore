@@ -134,6 +134,16 @@ public:
     void materialize(u32 address, u32 size);
     // Whether a page of the range is deferred (what only might be read, such as a texture decoded ahead, is not).
     bool deferred(u32 address, u32 size) const { return any_deferred(address, u64{address} + size); }
+    // f() run while the range stays readable: no block of it unmapped or protected meanwhile, no page of it deferred
+    // (false, f not run: it is not readable now). For host threads that read guest memory the game may free at any
+    // time (the texture prefetcher): a fault there is no guest's to stop, and the process would end.
+    template <class F>
+    bool while_readable(u32 address, u32 size, F&& f) const {
+        const nx::scoped_lock<nx::mutex> guard(lock_);
+        if (!pages_ || !valid(address, size) || deferred(address, size)) return false;
+        f();
+        return true;
+    }
     u64 write_faults() const { return write_faults_.load(std::memory_order_relaxed); }
 
 private:

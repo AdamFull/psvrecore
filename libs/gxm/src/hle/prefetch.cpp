@@ -68,10 +68,26 @@ bool paletted(const TextureInfo& t) {
     return code == 0x94 || code == 0x95;
 }
 
+// Guest memory read here only while it stays readable (GuestMemory::while_readable): the game frees blocks whenever it
+// likes (entering a level), and a read of a freed one faulted on this thread with no guest thread to stop (the Odin 3,
+// Killzone: Mercenary, one run in two or three).
+bool read_guest(u32 address, void* out, u32 bytes) {
+    return memory().while_readable(address, bytes, [&] { std::memcpy(out, memory().host(address), bytes); });
+}
+
+std::optional<u64> contents_now(const TextureInfo& info, u32 size, u32 palette) {
+    std::optional<u64> h;
+    memory().while_readable(info.address, size, [&] {
+        // (the palette checked in the same hold: no block is unmapped meanwhile)
+        if (!palette || (memory().valid(palette, 1024) && !memory().deferred(palette, 1024)))
+            h = texture_contents(info, size, palette);
+    });
+    return h;
+}
+
 void decode(Prefetcher& p, u32 words_at) {
     u32 words[4];
-    if (!memory().valid(words_at, sizeof words)) return;
-    std::memcpy(words, memory().host(words_at), sizeof words);
+    if (!read_guest(words_at, words, sizeof words)) return;
     const TextureInfo info = decode_texture(words);
     if (!info.address || is_yuv420(info)) return;  // (movie frames: converted on the GPU)
     const u32 size = texture_size(info);
@@ -80,7 +96,9 @@ void decode(Prefetcher& p, u32 words_at) {
     const u32 palette = info.palette && memory().valid(info.palette, 1024) ? info.palette : 0;
     if (paletted(info) && !palette) return;
     const u64 key = described(info);
-    const u64 before = texture_contents(info, size, palette);
+    const std::optional<u64> first = contents_now(info, size, palette);
+    if (!first) return;
+    const u64 before = *first;
     {
         const nx::scoped_lock<nx::mutex> held(p.lock);
         for (const Decoded& d : p.decoded)
@@ -91,15 +109,10 @@ void decode(Prefetcher& p, u32 words_at) {
         if (++t.count > kChanging) return;
         if (p.times.size() > 65536) p.times.clear();
     }
-    auto read = [](u32 address, void* out, u32 bytes) {
-        if (!memory().valid(address, bytes)) return false;
-        std::memcpy(out, memory().host(address), bytes);
-        return true;
-    };
-    Result<Texels> texels = read_texels(info, read, p.native_bc, true, p.srgb);
+    Result<Texels> texels = read_texels(info, read_guest, p.native_bc, true, p.srgb);
     if (!texels || texels->data.empty()) return;
     // (written while it was decoded: not kept, the renderer decodes it)
-    if (texture_contents(info, size, palette) != before) {
+    if (contents_now(info, size, palette) != before) {
         const nx::scoped_lock<nx::mutex> held(p.lock);
         ++p.stats.changed;
         return;
