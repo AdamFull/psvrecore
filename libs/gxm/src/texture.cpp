@@ -3,6 +3,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 
 #include "core/foundation/strings/format.h"
@@ -935,17 +936,183 @@ nx::vector<u32> yuv420_shader() {
     return b.module();
 }
 
+usize bc_decoded_bytes(const Texels& t) {
+    usize bytes = 0;
+    for (u32 l = 0; l < t.levels; ++l) bytes += usize{nx::max(1u, t.width >> l)} * nx::max(1u, t.height >> l) * 4;
+    return bytes * t.faces;
+}
+
+usize bc_decode_buffer_bytes(const Texels& t) {
+    return sizeof(BcTables) + ((t.data.size() + 3) & ~usize{3}) + bc_decoded_bytes(t);
+}
+
+nx::vector<BcDecodeConstants> bc_decode_buffer(const Texels& t, u8* out) {
+    std::memcpy(out, &bc_tables(), sizeof(BcTables));
+    std::memcpy(out + sizeof(BcTables), t.data.data(), t.data.size());
+    nx::vector<BcDecodeConstants> levels;
+    u32 blocks = sizeof(BcTables) / 4, texels = blocks + static_cast<u32>((t.data.size() + 3) / 4);
+    for (u32 face = 0; face < t.faces; ++face) {
+        for (u32 l = 0; l < t.levels; ++l) {
+            const u32 w = nx::max(1u, t.width >> l), h = nx::max(1u, t.height >> l), bx = (w + 3) / 4, by = (h + 3) / 4;
+            levels.push_back({w, h, blocks, bx, texels, t.bc});
+            blocks += bx * by * (t.bc == 1 ? 2 : 4);
+            texels += w * h;
+        }
+    }
+    return levels;
+}
+
+Texels decode_bc_blocks(const Texels& t) {
+    Texels out;
+    out.width = t.width, out.height = t.height, out.levels = t.levels, out.faces = t.faces, out.srgb = t.srgb;
+    out.bytes = 4;
+    out.data.resize(bc_decoded_bytes(t));
+    const u32 code = t.bc == 1 ? kUBC1 : t.bc == 2 ? kUBC2 : kUBC3, block_bytes = t.bc == 1 ? 8 : 16;
+    const u8* from = t.data.data();
+    u8* dst = out.data.data();
+    for (u32 face = 0; face < t.faces; ++face) {
+        for (u32 l = 0; l < t.levels; ++l) {
+            const u32 w = nx::max(1u, t.width >> l), h = nx::max(1u, t.height >> l), bx = (w + 3) / 4, by = (h + 3) / 4;
+            for (u32 y = 0; y < by; ++y) {
+                for (u32 x = 0; x < bx; ++x) {
+                    u8 texels[16][4];
+                    decode_bc8(code, from + (usize{y} * bx + x) * block_bytes, texels);
+                    for (u32 i = 0; i < 16; ++i) {
+                        const u32 tx = x * 4 + (i & 3), ty = y * 4 + i / 4;
+                        if (tx < w && ty < h) std::memcpy(dst + (usize{ty} * w + tx) * 4, texels[i], 4);
+                    }
+                }
+            }
+            from += usize{bx} * by * block_bytes;
+            dst += usize{w} * h * 4;
+        }
+    }
+    return out;
+}
+
+nx::vector<u32> bc_decode_shader() {
+    using spirv::Builder;
+    using spirv::Id;
+    // (the tables' bytes at the buffer's start, as BcTables lays them out)
+    static_assert(offsetof(BcTables, c6) == 32 && offsetof(BcTables, third5) == 96 && offsetof(BcTables, third6) == 1120 &&
+                  offsetof(BcTables, half5) == 5216 && offsetof(BcTables, half6) == 6240 && sizeof(BcTables) == 10336);
+    Builder b;
+    b.capability(SpvCapabilityShader);
+    const Id tu = b.t_uint(), tb = b.t_bool(), tv3 = b.t_vector(tu, 3), tvoid = b.t_void();
+    const Id words = b.t_runtime_array(tu);
+    b.decorate(words, SpvDecorationArrayStride, {4});
+    const Id block = b.t_struct({words});
+    b.decorate(block, SpvDecorationBlock);
+    b.member_decorate(block, 0, SpvDecorationOffset, {0});
+    const Id buffer = b.variable(b.t_pointer(SpvStorageClassStorageBuffer, block), SpvStorageClassStorageBuffer);
+    b.decorate(buffer, SpvDecorationDescriptorSet, {0});
+    b.decorate(buffer, SpvDecorationBinding, {0});
+    const Id pc_block = b.t_struct({tu, tu, tu, tu, tu, tu});
+    b.decorate(pc_block, SpvDecorationBlock);
+    for (u32 i = 0; i < 6; ++i) b.member_decorate(pc_block, i, SpvDecorationOffset, {i * 4});
+    const Id pc = b.variable(b.t_pointer(SpvStorageClassPushConstant, pc_block), SpvStorageClassPushConstant);
+    const Id gid_var = b.variable(b.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+    b.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+
+    const Id fn = b.begin_function(tvoid, b.t_function(tvoid));
+    b.block(b.new_label());
+    const Id tp_pc = b.t_pointer(SpvStorageClassPushConstant, tu), tp_word = b.t_pointer(SpvStorageClassStorageBuffer, tu);
+    auto constant = [&](u32 i) { return b.op(SpvOpLoad, tu, {b.op(SpvOpAccessChain, tp_pc, {pc, b.c_int(static_cast<i32>(i))})}); };
+    auto u = [&](u32 v) { return b.c_uint(v); };
+    auto bin = [&](u32 op, Id type, Id a, Id c) { return b.op(op, type, {a, c}); };
+    auto add = [&](Id a, Id c) { return bin(SpvOpIAdd, tu, a, c); };
+    auto mul = [&](Id a, Id c) { return bin(SpvOpIMul, tu, a, c); };
+    auto band = [&](Id a, u32 m) { return bin(SpvOpBitwiseAnd, tu, a, u(m)); };
+    auto shr = [&](Id a, Id s) { return bin(SpvOpShiftRightLogical, tu, a, s); };
+    auto shl = [&](Id a, Id s) { return bin(SpvOpShiftLeftLogical, tu, a, s); };
+    auto eq = [&](Id a, u32 v) { return bin(SpvOpIEqual, tb, a, u(v)); };
+    auto sel = [&](Id c, Id a, Id e) { return b.op(SpvOpSelect, tu, {c, a, e}); };
+    auto word_ptr = [&](Id index) { return b.op(SpvOpAccessChain, tp_word, {buffer, b.c_int(0), index}); };
+    auto load_word = [&](Id index) { return b.op(SpvOpLoad, tu, {word_ptr(index)}); };
+    // (a byte of the tables)
+    auto byte = [&](Id at) { return band(shr(load_word(shr(at, u(2))), shl(band(at, 3), u(3))), 0xFF); };
+    const Id gid = b.op(SpvOpLoad, tv3, {gid_var});
+    const Id x = b.op(SpvOpCompositeExtract, tu, {gid, 0}), y = b.op(SpvOpCompositeExtract, tu, {gid, 1});
+    const Id width = constant(0), height = constant(1);
+    const Id inside = bin(SpvOpLogicalAnd, tb, bin(SpvOpULessThan, tb, x, width), bin(SpvOpULessThan, tb, y, height));
+    const Id body = b.new_label(), merge = b.new_label();
+    b.op0(SpvOpSelectionMerge, {merge, SpvSelectionControlMaskNone});
+    b.op0(SpvOpBranchConditional, {inside, body, merge});
+    b.block(body);
+    {
+        const Id kind = constant(5);
+        const Id bc1 = eq(kind, 1), bc2 = eq(kind, 2);
+        // (the texel's block: 2 words (BC1) or 4 (BC2 and BC3: the alpha's two first); its index in the block)
+        const Id at = add(constant(2), mul(add(mul(shr(y, u(2)), constant(3)), shr(x, u(2))), sel(bc1, u(2), u(4))));
+        const Id i = bin(SpvOpBitwiseOr, tu, shl(band(y, 3), u(2)), band(x, 3));
+        const Id colour = add(at, sel(bc1, u(0), u(2)));
+        const Id cw0 = load_word(colour), cw1 = load_word(add(colour, u(1)));
+        const Id c0 = band(cw0, 0xFFFF), c1 = shr(cw0, u(16));
+        const Id index = band(shr(cw1, shl(i, u(1))), 3);
+        // (decode_bc8's palette: endpoints from the tables, the pairs' (2a + b) / 3 or (a + b) / 2 too; index 3 of
+        // BC1's three colours 0)
+        const Id four = bin(SpvOpLogicalOr, tb, b.op(SpvOpLogicalNot, tb, {bc1}), bin(SpvOpUGreaterThan, tb, c0, c1));
+        const Id second = eq(index, 1), swapped = eq(index, 3);
+        const Id pair = bin(SpvOpUGreaterThanEqual, tb, index, u(2));
+        const Id none = bin(SpvOpLogicalAnd, tb, swapped, b.op(SpvOpLogicalNot, tb, {four}));
+        auto channel = [&](Id e0, Id e1, bool six) {
+            const Id single_at = add(u(six ? 32 : 0), sel(second, e1, e0));
+            const Id lo = sel(swapped, e1, e0), hi = sel(swapped, e0, e1);
+            const Id table = sel(four, u(six ? 1120 : 96), u(six ? 6240 : 5216));
+            const Id pair_at = add(table, add(mul(lo, u(six ? 64 : 32)), hi));
+            return sel(none, u(0), byte(sel(pair, pair_at, single_at)));
+        };
+        const Id red = channel(shr(c0, u(11)), shr(c1, u(11)), false);
+        const Id green = channel(band(shr(c0, u(5)), 63), band(shr(c1, u(5)), 63), true);
+        const Id blue = channel(band(c0, 31), band(c1, 31), false);
+        const Id colour_alpha = sel(none, u(0), u(255));
+        // (BC2: 4 bits a texel, n * 17)
+        const Id aw = load_word(add(at, shr(i, u(3))));
+        const Id alpha2 = mul(band(shr(aw, shl(band(i, 7), u(2))), 15), u(17));
+        // (BC3: two 8-bit endpoints and 3-bit indices from bit 16; the values between them rounded as to8 rounds
+        // decode_bc8's floats: n / 7 and n / 5 are never halfway between two integers, so to nearest exactly)
+        const Id w0 = load_word(at), w1 = load_word(add(at, u(1)));
+        const Id a0 = band(w0, 0xFF), a1 = band(shr(w0, u(8)), 0xFF);
+        const Id p = add(u(16), mul(i, u(3)));
+        const Id low = bin(SpvOpULessThan, tb, p, u(32));
+        const Id straddle = bin(SpvOpBitwiseOr, tu, shr(w0, band(p, 31)), shl(w1, band(bin(SpvOpISub, tu, u(32), p), 31)));
+        const Id k = band(sel(low, straddle, shr(w1, band(p, 31))), 7);
+        const Id km1 = bin(SpvOpISub, tu, k, u(1));
+        const Id n7 = add(mul(bin(SpvOpISub, tu, u(8), k), a0), mul(km1, a1));
+        const Id n5 = add(mul(bin(SpvOpISub, tu, u(6), k), a0), mul(km1, a1));
+        const Id by7 = bin(SpvOpUDiv, tu, add(shl(n7, u(1)), u(7)), u(14));
+        const Id by5 = bin(SpvOpUDiv, tu, add(shl(n5, u(1)), u(5)), u(10));
+        const Id six = sel(bin(SpvOpULessThan, tb, k, u(6)), by5, sel(eq(k, 6), u(0), u(255)));
+        const Id between = sel(bin(SpvOpUGreaterThan, tb, a0, a1), by7, six);
+        const Id alpha3 = sel(eq(k, 0), a0, sel(eq(k, 1), a1, between));
+        const Id alpha = sel(bc1, colour_alpha, sel(bc2, alpha2, alpha3));
+        Id rgba = bin(SpvOpBitwiseOr, tu, red, shl(green, u(8)));
+        rgba = bin(SpvOpBitwiseOr, tu, rgba, shl(blue, u(16)));
+        rgba = bin(SpvOpBitwiseOr, tu, rgba, shl(alpha, u(24)));
+        b.op0(SpvOpStore, {word_ptr(add(constant(4), add(mul(y, width), x))), rgba});
+        b.op0(SpvOpBranch, {merge});
+    }
+    b.block(merge);
+    b.op0(SpvOpReturn, {});
+    b.end_function();
+    const Id interface[] = {gid_var};  // (SPIR-V 1.3: the inputs and outputs only)
+    b.entry_point(SpvExecutionModelGLCompute, fn, "main", interface);
+    b.execution_mode(fn, SpvExecutionModeLocalSize, {8, 8, 1});
+    return b.module();
+}
+
 void set_yuv_profile(u32 csc, u32 profile) {
     if (csc < 2 && profile < 4) yuv_profiles[csc].store(profile);
 }
 
 Result<Texels> read_texels(const TextureInfo& t, ReadGuest read) { return detail::read_texels(t, read, false); }
-Result<Texels> read_texels(const TextureInfo& t, ReadGuest read, bool native_bc, bool single_float, bool srgb) {
-    return detail::read_texels(t, read, false, native_bc, single_float, srgb);
+Result<Texels> read_texels(const TextureInfo& t, ReadGuest read, bool native_bc, bool single_float, bool srgb,
+                           bool gpu_bc) {
+    return detail::read_texels(t, read, false, native_bc, single_float, srgb, gpu_bc);
 }
 
 Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool reference, bool native_bc, bool single_float,
-                                   bool srgb) {
+                                   bool srgb, bool gpu_bc) {
     const u32 code = code_of(t.base_format);
     const u32 bits = texel_bits(t.base_format);
     if (!bits || !t.width || !t.height || t.width > 4096 || t.height > 4096) return failure("texture: bad format or size");
@@ -1071,11 +1238,15 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
     // P4 and P8 to 8-bit components: each texel its palette entry's bytes, as put() writes them (not with `reference`,
     // which the tests compare with).
     const bool paletted = !reference && (code == kP4 || code == kP8) && out_bytes == 4;
-    // BC1-BC3 without gamma (or kept encoded: srgb8): the blocks as they are for a device that samples them, else 8-bit
-    // texels a block at a time
+    // BC1-BC3 without gamma (or kept encoded: srgb8): the blocks as they are for a device that samples them (or for the
+    // GPU to decode as decode_bc8 does: gpu_bc), else 8-bit texels a block at a time
     const bool bc_plain = (code == kUBC1 || code == kUBC2 || code == kUBC3) && plain && out_bytes == 4;
-    const bool keep_blocks = native_bc && bc_plain;
+    const bool for_gpu = !native_bc && gpu_bc && !reference && bc_plain;
+    const bool keep_blocks = (native_bc && bc_plain) || for_gpu;
     const bool bc_bytes = !reference && bc_plain && !keep_blocks;
+    // (a block outside the data: its texels left 0 when decoded here. For the GPU to decode, a block that decodes to 0
+    // there: BC1's three-colour mode, every index 3; BC2's and BC3's zero blocks decode to 0 already)
+    constexpr u8 kTransparentBc1[8] = {0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF};
     if (keep_blocks) {
         out.bc = code == kUBC1 ? 1 : code == kUBC2 ? 2 : 3;
         out.bytes = 0;
@@ -1135,7 +1306,11 @@ Result<Texels> detail::read_texels(const TextureInfo& t, ReadGuest read, bool re
                     for (u32 x = 0; x < bx; ++x) {
                         const u64 index = is_swizzled(t.type) ? sw.xs[x] + sw.ys[y] : u64{y} * bx + x;
                         const u8* block = base + index * block_bytes;
-                        if (block + block_bytes > raw.data() + raw.size()) continue;
+                        if (block + block_bytes > raw.data() + raw.size()) {
+                            if (for_gpu && code == kUBC1)
+                                std::memcpy(out.data.data() + at + (usize{y} * bx + x) * 8, kTransparentBc1, 8);
+                            continue;
+                        }
                         if (keep_blocks) {
                             std::memcpy(out.data.data() + at + (usize{y} * bx + x) * block_bytes, block, block_bytes);
                             continue;

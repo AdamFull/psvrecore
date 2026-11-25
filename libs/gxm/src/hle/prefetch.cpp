@@ -43,7 +43,7 @@ struct Prefetcher {
     nx::hash_map<u64, Times> times;
     nx::vector<Decoded> decoded;     // (oldest first)
     PrefetchStats stats;
-    bool off = false, native_bc = false, srgb = false;
+    bool off = false, native_bc = false, gpu_bc = false, srgb = false;
     std::atomic<bool> started{false};
 };
 
@@ -109,7 +109,7 @@ void decode(Prefetcher& p, u32 words_at) {
         if (++t.count > kChanging) return;
         if (p.times.size() > 65536) p.times.clear();
     }
-    Result<Texels> texels = read_texels(info, read_guest, p.native_bc, true, p.srgb);
+    Result<Texels> texels = read_texels(info, read_guest, p.native_bc, true, p.srgb, p.gpu_bc);
     if (!texels || texels->data.empty()) return;
     // (written while it was decoded: not kept, the renderer decodes it)
     if (contents_now(info, size, palette) != before) {
@@ -154,7 +154,7 @@ void prefetch_texture(u32 words) {
     p.waiting[words] = nx::os::ticks_ns() + kSettle;
 }
 
-void prefetch_start(bool native_bc, bool srgb) {
+void prefetch_start(bool native_bc, bool gpu_bc, bool srgb) {
     Prefetcher& p = prefetcher();
     if (p.started.exchange(true)) return;
     if (const char* v = std::getenv("PSVRECORE_TEXTURE_PREFETCH"); v && std::atoi(v) == 0) {
@@ -165,6 +165,7 @@ void prefetch_start(bool native_bc, bool srgb) {
         return;
     }
     p.native_bc = native_bc;
+    p.gpu_bc = gpu_bc;
     p.srgb = srgb;
     nx::thread_options options;
     options.name = "texture prefetch";

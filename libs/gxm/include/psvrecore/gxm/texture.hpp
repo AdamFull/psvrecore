@@ -57,7 +57,8 @@ u32 texel_bits(u32 base_format);
 // The decoded texels: faces of mip levels, each level's texels as 16-bit floats or 8-bit unorm RGBA.
 struct Texels {
     u32 bytes = 4;  // per texel: 4 (RGBA8), 8 (RGBA16F) or 16 (RGBA32F: formats with 32-bit float components)
-    // 1-3: BC1-BC3 blocks as they are (native_bc), each level's 4x4 blocks in rows (8 or 16 bytes each); 0: texels
+    // 1-3: BC1-BC3 blocks as they are (native_bc, or gpu_bc: for the GPU to decode), each level's 4x4 blocks in rows (8
+    // or 16 bytes each); 0: texels
     u32 bc = 0;
     u32 width = 0, height = 0, levels = 1, faces = 1;
     // F32 and F32M without gamma, read with `single_float`: one float a texel (bytes 4, as R32F), RGBA from it as
@@ -81,13 +82,34 @@ Result<Texels> read_texels(const TextureInfo& info, ReadGuest read);
 // to linear half floats. Gamma mode 1 decodes the RGBA's R, G and B (the SDK's _R for one component, _BGR for more:
 // the swizzle's constant 0 and 1 are their own decode), never alpha, as sRGB images do; the others (mode 3, _GR) and
 // wider formats are decoded here still.
+// With `gpu_bc` and not `native_bc` (a device that does not sample BC1-BC3, for the GPU to decode them: bc_decode_shader):
+// the BC1-BC3 blocks that would be decoded to 8-bit RGBA here kept as they are too (Texels::bc), blocks outside the
+// data as blocks that decode to the 0 this leaves there (BC1's: transparent black), for the same texels.
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool native_bc, bool single_float = false,
-                           bool srgb = false);
+                           bool srgb = false, bool gpu_bc = false);
 namespace detail {
 // (`reference`: without the fast paths that give the same texels, for the tests to compare them with)
 Result<Texels> read_texels(const TextureInfo& info, ReadGuest read, bool reference, bool native_bc = false,
-                           bool single_float = false, bool srgb = false);
+                           bool single_float = false, bool srgb = false, bool gpu_bc = false);
 }  // namespace detail
+
+// BC1-BC3 blocks (Texels::bc, read with `gpu_bc`) decoded by a GPU to the bytes read_texels decodes them to (8-bit
+// RGBA): bc_decode_shader, a compute shader of 8 x 8 invocations, one a texel of a level, dispatched once for each
+// level of each face with these push constants. One storage buffer (binding 0 of set 0): the palettes' tables, the
+// blocks and then the texels it writes, laid out as read_texels lays decoded texels out (bc_decode_buffer fills it
+// but for those). `blocks` and `out`: word offsets of the level's first block and texel; `row`: blocks a row; `kind`
+// 1-3 (BC1-BC3).
+struct BcDecodeConstants {
+    u32 width, height, blocks, row, out, kind;
+};
+nx::vector<u32> bc_decode_shader();
+// The buffer's bytes, and the decoded texels' (where they start: the first level's `out`, times 4).
+usize bc_decode_buffer_bytes(const Texels& blocks);
+usize bc_decoded_bytes(const Texels& blocks);
+// The buffer filled but for the texels; the constants of each face's levels, in read_texels' order.
+nx::vector<BcDecodeConstants> bc_decode_buffer(const Texels& blocks, u8* out);
+// The same texels decoded on the CPU (decode_bc8, as read_texels decodes them): RGBA8 texels of the same description.
+Texels decode_bc_blocks(const Texels& blocks);
 
 // YUV420 textures (two planes or three), for a GPU to convert as read_texels does, to the same bytes: the planes as
 // they are in guest memory (the luma plane's rows y_pitch bytes each; the chroma planes' c_pitch texels, two bytes

@@ -447,6 +447,65 @@ TEST_CASE("gxm textures: BC blocks kept for the device are the texture's blocks 
     }
 }
 
+TEST_CASE("gxm textures: BC blocks kept for the GPU to decode give the CPU's texels decoded, and only where it decodes them") {
+    Memory m;
+    m.bytes.resize(1u << 20);
+    u32 seed = 4242;
+    for (u8& b : m.bytes) b = static_cast<u8>((seed = seed * 1103515245u + 12345u) >> 16);
+    auto read = [&](u32 address, void* out, u32 size) { return m.read(address, out, size); };
+    struct Case {
+        u32 type, width, height, clamp, gamma;
+        bool srgb;
+    };
+    // (sizes not of whole blocks, mips, cube faces; 64 x 1 and 37 x 3 linear: rows of blocks past the data, left 0)
+    const Case cases[] = {
+        {texture_type::kSwizzled, 64, 32, 15, 0, false}, {texture_type::kSwizzled, 128, 64, 6, 0, false},
+        {texture_type::kSwizzledArbitrary, 37, 21, 5, 0, false}, {texture_type::kLinear, 37, 21, 15, 0, false},
+        {texture_type::kLinear, 64, 1, 15, 0, false}, {texture_type::kLinear, 37, 3, 15, 0, false},
+        {texture_type::kTiled, 50, 40, 15, 0, false}, {texture_type::kCube, 32, 32, 5, 0, false},
+        {texture_type::kSwizzled, 64, 64, 6, 1, true},
+    };
+    u32 compared = 0;
+    for (u32 format : {0x85000000u, 0x86000000u, 0x87000000u}) {
+        for (const Case& c : cases) {
+            TextureInfo t;
+            t.base_format = format, t.type = c.type, t.width = c.width, t.height = c.height, t.gamma = c.gamma;
+            t.mipmapped = c.clamp != 15;
+            t.levels = t.mipmapped ? c.clamp + 1 : 1;
+            t.stride = ((c.width + 7) & ~7u) * (format == 0x85000000u ? 4 : 8) / 8;
+            t.address = 0x1000;
+            auto cpu = read_texels(t, read, false, true, c.srgb);
+            auto kept = read_texels(t, read, false, true, c.srgb, true);
+            REQUIRE(cpu);
+            REQUIRE(kept);
+            CHECK(cpu->bc == 0);
+            REQUIRE(kept->bc == (format == 0x85000000u ? 1u : format == 0x86000000u ? 2u : 3u));
+            CHECK(bc_decoded_bytes(*kept) == cpu->data.size());
+            const Texels decoded = decode_bc_blocks(*kept);
+            CHECK(decoded.bytes == 4);
+            CHECK(decoded.srgb == cpu->srgb);
+            CHECK(decoded.levels == cpu->levels);
+            CHECK(decoded.faces == cpu->faces);
+            CHECK(decoded.data == cpu->data);
+            // (a device that samples them: its blocks, as without gpu_bc)
+            auto native = read_texels(t, read, true, true, c.srgb, true);
+            auto native_only = read_texels(t, read, true, true, c.srgb);
+            REQUIRE(native);
+            REQUIRE(native_only);
+            CHECK(native->data == native_only->data);
+            ++compared;
+        }
+        // (gamma decoded here, not kept encoded: decoded here still, not kept)
+        TextureInfo t;
+        t.base_format = format, t.type = texture_type::kSwizzled, t.width = t.height = 16, t.gamma = 1, t.address = 0x1000;
+        auto linear = read_texels(t, read, false, true, false, true);
+        REQUIRE(linear);
+        CHECK(linear->bc == 0);
+        CHECK(linear->bytes == 8);
+    }
+    CHECK(compared == 27);
+}
+
 TEST_CASE("gxm textures: BC4 and BC5 (unsigned and signed) decode their endpoints and indices through the swizzle") {
     auto decode = [](u32 base_format, u32 swizzle, std::initializer_list<u8> blocks) {
         Memory m;

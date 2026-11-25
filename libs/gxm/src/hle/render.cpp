@@ -679,22 +679,27 @@ struct Renderer {
     // New textures' texels (texture_for), uploaded by the scene's commands before its draws: not waited for, as a
     // copy submitted alone would be (behind the scenes the GPU still has). Their buffers go when the scene is done.
     // A YUV420 texture (a movie's frame) is converted by the commands too (yuv_set: the staging buffer holds the
-    // planes and the conversion's tables, and the pixels it writes, copied from there).
+    // planes and the conversion's tables, and the pixels it writes, copied from there); BC1-BC3 blocks on a device
+    // that does not sample them decoded so (bc_set: the tables, the blocks and the texels; a dispatch a level).
     struct TextureUpload {
         u64 key;  // (the texture's in `textures`)
         vk::Buffer staging;
         nx::vector<VkBufferImageCopy> regions;
         VkDescriptorSet yuv_set = VK_NULL_HANDLE;
         Yuv420Constants yuv{};
+        VkDescriptorSet bc_set = VK_NULL_HANDLE;
+        nx::vector<BcDecodeConstants> bc;
     };
     nx::vector<TextureUpload> texture_uploads;
-    // The YUV420 conversion's pipeline (none: converted on the CPU, by read_texels), and its sets' pool.
-    struct YuvPipeline {
+    // A compute pipeline of one storage buffer and push constants, and its sets' pool: the YUV420 conversion's (none:
+    // converted on the CPU, by read_texels), and BC1-BC3 decoding's (none: the device samples them, or they are
+    // decoded on the CPU).
+    struct BufferPipeline {
         VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
-    } yuv;
+    } yuv, bc;
     // Depth/stencil images a scene drew with and no longer needs, for the next scene of their size: destroying one
     // (its memory freed, its framebuffers forgotten) took 3-25 ms on a desktop's driver, scene after scene.
     nx::vector<vk::Image> free_depths;
@@ -1014,30 +1019,28 @@ bool defer_write_back(Renderer& r, u32 address, u32 size, const WrittenWatch* ex
     return true;
 }
 
-// The YUV420 conversion's pipeline (yuv420_shader): unless PSVRECORE_YUV_CPU is set, or the device has none.
-void make_yuv_pipeline(Renderer& r) {
-    if (const char* v = std::getenv("PSVRECORE_YUV_CPU"); v && *v && *v != '0') return;
+// A compute pipeline of one storage buffer (binding 0 of set 0) and `push` bytes of constants, with a pool of `sets`
+// sets (none made: left empty).
+bool make_buffer_pipeline(Renderer& r, Renderer::BufferPipeline& y, const nx::vector<u32>& code, u32 push_bytes, u32 sets) {
     const VkDevice dev = r.device->device();
-    Renderer::YuvPipeline& y = r.yuv;
     VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     si.bindingCount = 1;
     si.pBindings = &binding;
-    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Yuv420Constants)};
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     li.setLayoutCount = 1;
     li.pSetLayouts = &y.set_layout;
     li.pushConstantRangeCount = 1;
     li.pPushConstantRanges = &push;
-    const nx::vector<u32> code = yuv420_shader();
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = code.size() * 4;
     mi.pCode = code.data();
     VkShaderModule module = VK_NULL_HANDLE;
-    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64};
+    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pi.maxSets = 64;
+    pi.maxSets = sets;
     pi.poolSizeCount = 1;
     pi.pPoolSizes = &size;
     bool ok = vkCreateDescriptorSetLayout(dev, &si, nullptr, &y.set_layout) == VK_SUCCESS &&
@@ -1055,14 +1058,38 @@ void make_yuv_pipeline(Renderer& r) {
     }
     if (module) vkDestroyShaderModule(dev, module, nullptr);
     if (!ok) {
-        nx::logw(logs::gpu, "gxm: no YUV conversion on the GPU: movies' frames converted on the CPU");
         if (y.pipeline) vkDestroyPipeline(dev, y.pipeline, nullptr);
         if (y.pool) vkDestroyDescriptorPool(dev, y.pool, nullptr);
         if (y.layout) vkDestroyPipelineLayout(dev, y.layout, nullptr);
         if (y.set_layout) vkDestroyDescriptorSetLayout(dev, y.set_layout, nullptr);
         y = {};
     }
+    return ok;
 }
+
+// The YUV420 conversion's pipeline (yuv420_shader): unless PSVRECORE_YUV_CPU is set, or the device has none.
+void make_yuv_pipeline(Renderer& r) {
+    if (const char* v = std::getenv("PSVRECORE_YUV_CPU"); v && *v && *v != '0') return;
+    if (!make_buffer_pipeline(r, r.yuv, yuv420_shader(), sizeof(Yuv420Constants), 64))
+        nx::logw(logs::gpu, "gxm: no YUV conversion on the GPU: movies' frames converted on the CPU");
+}
+
+// BC1-BC3 decoding's pipeline (bc_decode_shader), for a device that does not sample them (Killzone: Mercenary
+// streams such textures as it plays, 25-30 a second on the Odin 3, whose Adreno has no BC: 1-1.8 ms each to decode
+// on the CPU, up to 35 ms of a scene): unless PSVRECORE_BC_CPU is set, or the device has none. (Sets: a scene's new
+// textures each have one until the scene is done, a level's start some hundreds; past them, decoded on the CPU)
+void make_bc_pipeline(Renderer& r) {
+    if (r.device->caps().texture_bc) return;
+    if (const char* v = std::getenv("PSVRECORE_BC_CPU"); v && *v && *v != '0') {
+        nx::logi(logs::gpu, "gxm: BC1-BC3 textures decoded on the CPU (PSVRECORE_BC_CPU)");
+        return;
+    }
+    if (!make_buffer_pipeline(r, r.bc, bc_decode_shader(), sizeof(BcDecodeConstants), 512))
+        nx::logw(logs::gpu, "gxm: no BC1-BC3 decoding on the GPU: decoded on the CPU");
+}
+
+// Whether BC1-BC3 textures the device does not sample are decoded on the GPU (read_texels' `gpu_bc`).
+bool gpu_bc(const Renderer& r) { return r.bc.pipeline != VK_NULL_HANDLE; }
 
 Renderer& renderer() {
     // (never destroyed: the flusher thread may look at it until the process ends)
@@ -1400,7 +1427,8 @@ bool ensure(Renderer& r) {
 #if PSVRECORE_TRACY
     make_gpu_zones(r);
 #endif
-    prefetch_start(d.caps().texture_bc, srgb_textures(d));
+    make_bc_pipeline(r);  // (before decoding ahead begins: it keeps the blocks for it)
+    prefetch_start(d.caps().texture_bc, gpu_bc(r), srgb_textures(d));
     if (!r.flusher) {
         // (the scenes the GPU is done with finished when nothing else has a while after: their notifications written
         // for a game that polls them. Not at once: the game's next scene or frame finishes them, and this, finishing
@@ -1997,11 +2025,53 @@ Result<bool> queue_yuv420(Renderer& r, u64 key, const Yuv420& y) {
     return true;
 }
 
+// BC1-BC3 blocks (read with gpu_bc) into a staging buffer, to be decoded into the texture `key` by the scene's
+// commands (false: no set for it now, or too large a buffer for one: decoded on the CPU then).
+Result<bool> queue_bc_decode(Renderer& r, u64 key, const Texels& t) {
+    const usize bytes = bc_decode_buffer_bytes(t);
+    if (bytes > r.device->properties().limits.maxStorageBufferRange) return false;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = r.bc.pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &r.bc.set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(r.device->device(), &ai, &set) != VK_SUCCESS) return false;
+    auto staging = take_host_buffer(r, bytes);
+    if (!staging) {
+        vkFreeDescriptorSets(r.device->device(), r.bc.pool, 1, &set);
+        return nx::err(staging.error());
+    }
+    Renderer::TextureUpload u{key, *staging, {}};
+    u.bc = bc_decode_buffer(t, static_cast<u8*>(staging->mapped));
+    vk::flush(*r.device, *staging, bytes - bc_decoded_bytes(t));
+    u.bc_set = set;
+    VkDescriptorBufferInfo bi{staging->buffer, 0, bytes};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &bi;
+    vkUpdateDescriptorSets(r.device->device(), 1, &w, 0, nullptr);
+    // (each face's levels, as the texels are laid out: the face the level's index over the levels)
+    for (usize k = 0; k < u.bc.size(); ++k) {
+        const BcDecodeConstants& c = u.bc[k];
+        VkBufferImageCopy region{};
+        region.bufferOffset = VkDeviceSize{c.out} * 4;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, static_cast<u32>(k % t.levels), static_cast<u32>(k / t.levels), 1};
+        region.imageExtent = {c.width, c.height, 1};
+        u.regions.push_back(region);
+    }
+    r.texture_uploads.push_back(std::move(u));
+    return true;
+}
+
 // An upload's buffer (and set) given back.
 void give_upload(Renderer& r, Renderer::TextureUpload& u) {
     give_host_buffer(r, u.staging);
     if (u.yuv_set) vkFreeDescriptorSets(r.device->device(), r.yuv.pool, 1, &u.yuv_set);
     u.yuv_set = VK_NULL_HANDLE;
+    if (u.bc_set) vkFreeDescriptorSets(r.device->device(), r.bc.pool, 1, &u.bc_set);
+    u.bc_set = VK_NULL_HANDLE;
 }
 
 // Uploads decoded texels and waits: each face's levels.
@@ -3573,6 +3643,17 @@ void record_target_copies(Renderer& r, VkCommandBuffer cmd) {
         vkCmdPushConstants(cmd, r.yuv.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof u.yuv, &u.yuv);
         vkCmdDispatch(cmd, (u.yuv.width + 7) / 8, (u.yuv.height + 7) / 8, 1);
     }
+    bool decoded = false;
+    for (Renderer::TextureUpload& u : r.texture_uploads) {
+        if (!u.bc_set || r.textures.find(u.key) == r.textures.end()) continue;
+        if (!decoded) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bc.pipeline);
+        decoded = converted = true;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bc.layout, 0, 1, &u.bc_set, 0, nullptr);
+        for (const BcDecodeConstants& c : u.bc) {
+            vkCmdPushConstants(cmd, r.bc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof c, &c);
+            vkCmdDispatch(cmd, (c.width + 7) / 8, (c.height + 7) / 8, 1);
+        }
+    }
     if (converted) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -3809,7 +3890,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     } else if (yuv) {
         texels->width = yuv->width, texels->height = yuv->height;
     } else {
-        texels = read_texels(info, read_guest, r.device->caps().texture_bc, true, srgb_textures(*r.device));
+        texels = read_texels(info, read_guest, r.device->caps().texture_bc, true, srgb_textures(*r.device), gpu_bc(r));
     }
     if (!texels) {
         nx::logw(logs::gxm, "{} (format 0x{:08x}, type {})", texels.error().message, info.base_format, info.type);
@@ -3819,7 +3900,10 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     vk::ImageDesc d;
     // (texels of a gamma mode kept encoded, Texels::srgb: the sRGB formats, which decode R, G and B as they are sampled)
     const bool srgb = texels->srgb;
-    d.format = texels->bc == 1   ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+    // (BC1-BC3 blocks the device does not sample, kept for the GPU to decode: RGBA8 texels, as the CPU decodes them)
+    const bool bc_decode = texels->bc && !r.device->caps().texture_bc;
+    d.format = bc_decode         ? (srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM)
+               : texels->bc == 1 ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
                : texels->bc == 2 ? (srgb ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK)
                : texels->bc == 3 ? (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK)
                : texels->single      ? VK_FORMAT_R32_SFLOAT
@@ -3849,9 +3933,16 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
             if (!decoded) return nx::err(decoded.error());
             *texels = std::move(*decoded);
         }
+        if (bc_decode) {
+            auto queued = queue_bc_decode(r, key, *texels);
+            if (!queued) return nx::err(queued.error());
+            if (*queued) return {};
+            *texels = decode_bc_blocks(*texels);
+        }
         return queue_texels(r, key, *texels);
     };
-    const u64 texel_bytes = u64{d.width} * d.height * 4;  // (both forms: RGBA8, one level)
+    // (the image's bytes, for the cache's budget: a movie's frame RGBA8, one level; decoded blocks RGBA8)
+    const u64 image_bytes = yuv ? u64{d.width} * d.height * 4 : bc_decode ? bc_decoded_bytes(*texels) : texels->data.size();
     // (the image these words showed before, when no draw of this scene samples it and it has this size and format)
     if (auto was = r.by_words.find(words_key); was != r.by_words.end()) {
         auto old = r.textures.find(was->second);
@@ -3889,7 +3980,7 @@ CachedTexture* make_texture(Renderer& r, const TextureInfo& info, u32 size, u64 
     c.image = *image;
     c.sampler = texture_sampler(r, info, d.format, texels->levels);
     c.used = r.scenes;
-    c.bytes = yuv ? texel_bytes : texels->data.size();
+    c.bytes = image_bytes;
     r.texture_bytes += c.bytes;
     r.by_words[words_key] = key;
     auto [it, added] = r.textures.emplace(key, c);
@@ -5893,7 +5984,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             }
         }
         if (!misses.empty()) {
-            const bool bc = r.device->caps().texture_bc, srgb = srgb_textures(*r.device);
+            const bool bc = r.device->caps().texture_bc, srgb = srgb_textures(*r.device), gpu = gpu_bc(r);
             const u64 decode_from = g_profile.on ? nx::os::ticks_ns() : 0;
             // (those decoded ahead, as they were set up, taken; the rest decoded here)
             nx::vector<usize> order;
@@ -5912,7 +6003,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 const usize k = order[i];
                 const u64 from = g_profile.on ? nx::os::ticks_ns() : 0;
                 const TextureInfo& info = misses[k].info;
-                misses[k].texels = read_texels(info, read_guest_memory, bc, true, srgb);
+                misses[k].texels = read_texels(info, read_guest_memory, bc, true, srgb, gpu);
                 // (one that took a while to decode: which)
                 if (const u64 took = g_profile.on ? nx::os::ticks_ns() - from : 0; took >= 1'000'000)
                     profile_print("gxm profile: a slow decode, %.1f ms: format %08x type %u gamma %u, %u x %u, %u levels, "

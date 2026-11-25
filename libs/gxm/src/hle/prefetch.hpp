@@ -16,10 +16,10 @@ u64 texture_contents(const TextureInfo& info, u32 size, u32 palette);
 // little later, once the game is done setting it up (its palette and gamma are set after its init).
 void prefetch_texture(u32 words);
 
-// Decoding begins (the renderer, its device made): BC1-BC3 blocks kept as they are when the device samples them,
-// gamma-mode textures kept encoded with `srgb` (read_texels' arguments, as the renderer's own decodes give them).
-// PSVRECORE_TEXTURE_PREFETCH=0 turns it off.
-void prefetch_start(bool native_bc, bool srgb);
+// Decoding begins (the renderer, its device made): BC1-BC3 blocks kept as they are when the device samples them or
+// the GPU decodes them (`gpu_bc`), gamma-mode textures kept encoded with `srgb` (read_texels' arguments, as the
+// renderer's own decodes give them). PSVRECORE_TEXTURE_PREFETCH=0 turns it off.
+void prefetch_start(bool native_bc, bool gpu_bc, bool srgb);
 
 // The texels decoded ahead for a texture with this description and contents, taken (none: not decoded, or its
 // contents changed after).

@@ -886,6 +886,144 @@ TEST_CASE("vulkan gpu: YUV420 textures converted by a compute shader as on the C
     check_no_validation_errors(*g);
 }
 
+TEST_CASE("vulkan gpu: BC1-BC3 blocks decoded by a compute shader to the CPU decoder's bytes") {
+    auto g = open(false);
+    Device& d = *g->device;
+    const VkShaderModule module = value_or_throw(create_shader(d, gxm::bc_decode_shader()));
+    VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    si.bindingCount = 1;
+    si.pBindings = &binding;
+    VkDescriptorSetLayout set_layout;
+    REQUIRE(vkCreateDescriptorSetLayout(d.device(), &si, nullptr, &set_layout) == VK_SUCCESS);
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gxm::BcDecodeConstants)};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.setLayoutCount = 1;
+    li.pSetLayouts = &set_layout;
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &push;
+    VkPipelineLayout layout;
+    REQUIRE(vkCreatePipelineLayout(d.device(), &li, nullptr, &layout) == VK_SUCCESS);
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = module;
+    ci.stage.pName = "main";
+    ci.layout = layout;
+    VkPipeline pipeline;
+    REQUIRE(vkCreateComputePipelines(d.device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) == VK_SUCCESS);
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pi.maxSets = 1;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &size;
+    VkDescriptorPool pool;
+    REQUIRE(vkCreateDescriptorPool(d.device(), &pi, nullptr, &pool) == VK_SUCCESS);
+
+    // (blocks of noise: BC1's endpoints in either order, a fifth of them equal (three colours, c0 <= c1); the last
+    // texture's BC3 blocks every pair of alpha endpoints, each block every index twice)
+    constexpr u32 kExhaustive = 0x200000;
+    nx::vector<u8> guest(kExhaustive + 65536 * 16 + 4096);
+    u32 seed = 2468;
+    for (u8& v : guest) seed = seed * 1103515245u + 12345u, v = static_cast<u8>(seed >> 16);
+    for (usize at = 0; at + 8 <= kExhaustive; at += 40) guest[at + 2] = guest[at], guest[at + 3] = guest[at + 1];
+    for (u32 j = 0; j < 65536; ++j) {
+        u8* block = guest.data() + kExhaustive + usize{j} * 16;
+        block[0] = static_cast<u8>(j), block[1] = static_cast<u8>(j >> 8);
+        u64 bits = 0;
+        for (u32 i = 0; i < 16; ++i) bits |= u64{(i + j) & 7} << (3 * i);
+        for (u32 k = 0; k < 6; ++k) block[2 + k] = static_cast<u8>(bits >> (8 * k));
+    }
+    auto read = [&](u32 address, void* out, u32 bytes) {
+        if (address + u64{bytes} > guest.size()) return false;
+        std::memcpy(out, guest.data() + address, bytes);
+        return true;
+    };
+    struct Case {
+        u32 format, type, width, height, clamp, gamma;
+        bool srgb;
+        u32 address;
+    };
+    const Case cases[] = {
+        {0x85000000u, gxm::texture_type::kSwizzled, 512, 512, 9, 0, false, 4096},
+        {0x86000000u, gxm::texture_type::kSwizzled, 256, 128, 8, 0, false, 4096},
+        {0x87000000u, gxm::texture_type::kSwizzled, 512, 512, 9, 0, false, 4096},
+        {0x85000000u, gxm::texture_type::kSwizzledArbitrary, 37, 21, 5, 0, false, 4096},
+        {0x86000000u, gxm::texture_type::kLinear, 35, 19, 15, 0, false, 4096},
+        {0x87000000u, gxm::texture_type::kLinear, 50, 30, 15, 0, false, 4096},
+        {0x85000000u, gxm::texture_type::kLinear, 64, 1, 15, 0, false, 4096},  // (blocks past the data)
+        {0x87000000u, gxm::texture_type::kLinear, 37, 3, 15, 0, false, 4096},
+        {0x85000000u, gxm::texture_type::kCube, 64, 64, 6, 0, false, 4096},
+        {0x87000000u, gxm::texture_type::kCube, 32, 32, 5, 1, true, 4096},
+        {0x85000000u, gxm::texture_type::kSwizzled, 128, 128, 7, 1, true, 4096},
+        {0x87000000u, gxm::texture_type::kLinear, 1024, 1024, 15, 0, false, kExhaustive},
+    };
+    for (const Case& c : cases) {
+        gxm::TextureInfo t;
+        t.base_format = c.format, t.type = c.type, t.width = c.width, t.height = c.height, t.gamma = c.gamma;
+        t.mipmapped = c.clamp != 15;
+        t.levels = t.mipmapped ? c.clamp + 1 : 1;
+        t.stride = ((c.width + 7) & ~7u) * (c.format == 0x85000000u ? 4 : 8) / 8;
+        t.address = c.address;
+        const auto cpu = value_or_throw(gxm::read_texels(t, read, false, true, c.srgb));
+        const auto kept = value_or_throw(gxm::read_texels(t, read, false, true, c.srgb, true));
+        REQUIRE(cpu.bc == 0);
+        REQUIRE(kept.bc != 0);
+        const usize bytes = gxm::bc_decode_buffer_bytes(kept);
+        Buffer buf = value_or_throw(create_host_buffer(d, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+        const nx::vector<gxm::BcDecodeConstants> levels = gxm::bc_decode_buffer(kept, static_cast<u8*>(buf.mapped));
+        flush(d, buf);
+        REQUIRE(levels.size() == usize{kept.levels} * kept.faces);
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &set_layout;
+        VkDescriptorSet set;
+        REQUIRE(vkAllocateDescriptorSets(d.device(), &ai, &set) == VK_SUCCESS);
+        VkDescriptorBufferInfo bi{buf.buffer, 0, bytes};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = set;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bi;
+        vkUpdateDescriptorSets(d.device(), 1, &w, 0, nullptr);
+        OneShot shot(d);
+        VkCommandBuffer cmd = value_or_throw(shot.begin());
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        for (const gxm::BcDecodeConstants& k : levels) {
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof k, &k);
+            vkCmdDispatch(cmd, (k.width + 7) / 8, (k.height + 7) / 8, 1);
+        }
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+        REQUIRE(shot.submit_and_wait());
+        invalidate(d, buf);
+        REQUIRE(cpu.data.size() == gxm::bc_decoded_bytes(kept));
+        REQUIRE(bytes == usize{levels[0].out} * 4 + cpu.data.size());
+        const u8* gpu = static_cast<const u8*>(buf.mapped) + usize{levels[0].out} * 4;
+        usize differ = 0, first = 0;
+        for (usize i = 0; i < cpu.data.size(); ++i)
+            if (gpu[i] != cpu.data[i] && differ++ == 0) first = i;
+        if (differ)
+            std::fprintf(stderr, "BC case format %08x type %u, %u x %u, %u levels: %zu bytes differ, the first at %zu (%u, not %u)\n",
+                         c.format, c.type, c.width, c.height, t.levels, differ, first, gpu[first], cpu.data[first]);
+        CHECK(differ == 0);
+        vkFreeDescriptorSets(d.device(), pool, 1, &set);
+        destroy_buffer(d, buf);
+    }
+    vkDestroyDescriptorPool(d.device(), pool, nullptr);
+    vkDestroyPipeline(d.device(), pipeline, nullptr);
+    vkDestroyPipelineLayout(d.device(), layout, nullptr);
+    vkDestroyDescriptorSetLayout(d.device(), set_layout, nullptr);
+    vkDestroyShaderModule(d.device(), module, nullptr);
+    check_no_validation_errors(*g);
+}
+
 TEST_CASE("vulkan gpu: the device's conversion to half precision checked against the interpreter's") {
     auto g = open(false);
     const gxm::HalfCheck c = gxm::check_half_conversion(*g->device);
