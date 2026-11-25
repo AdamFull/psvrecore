@@ -90,6 +90,7 @@ TextureInfo probe_info(const TextureInfo& like, u32 width, u32 height, u32 bytes
 }
 
 void create_image_converter(vulkan::Device& device, TargetConverter& c);
+void create_depth_converter(vulkan::Device& device, TargetConverter& c);
 
 u16 half_at(const Texels& t, usize texel, u32 k) {
     u16 h;
@@ -245,7 +246,7 @@ std::optional<TargetDecode> target_decode(const TextureInfo& info, TargetSource 
         }
         return d;
     }
-    if (source == TargetSource::Depth24S8) {
+    if (source == TargetSource::Depth24S8 || source == TargetSource::Words) {
         if (code != kX8U24 || !g_x8u24_tables) return std::nullopt;
         d.kind = 3;
         // (the low 24 bits' half: the last of the steps at or below them)
@@ -415,7 +416,7 @@ nx::vector<u32> target_texture_shader() {
             const Id a2 = sel(bin(SpvOpINotEqual, tb, band(h3, u(0x8000)), u(0)), u(0),
                               add(add(at_least(h3, kAlpha1), at_least(h3, kAlpha2)), at_least(h3, kAlpha3)));
             const Id packed = bor(bor(f10(h0), shl(f10(h1), u(10))), bor(shl(f10(h2), u(20)), shl(a2, u(30))));
-            const Id v = sel(eq(source, u(0)), w0, sel(eq(source, u(1)), d16, sel(is24, d24, packed)));
+            const Id v = sel(eq(source, u(0)), w0, sel(eq(source, u(4)), w0, sel(eq(source, u(1)), d16, sel(is24, d24, packed))));
             b.op0(SpvOpStore, {v_var, v});
             b.op0(SpvOpBranch, {have});
         }
@@ -608,6 +609,75 @@ nx::vector<u32> target_image_shader() {
     return b.module();
 }
 
+Depth24Constants depth24_constants(u32 count, bool unorm24) {
+    const u32 padded = (count + 3) & ~3u;
+    return {count, unorm24 ? 1u : 0u, padded, padded + padded / 4};
+}
+
+static_assert(sizeof(Depth24Constants) == 4 * 4);
+
+nx::vector<u32> depth24_shader() {
+    using spirv::Builder;
+    using spirv::Id;
+    Builder b;
+    b.capability(SpvCapabilityShader);
+    const Id tu = b.t_uint(), tb = b.t_bool(), tv3 = b.t_vector(tu, 3), tvoid = b.t_void();
+    const Id words = b.t_runtime_array(tu);
+    b.decorate(words, SpvDecorationArrayStride, {4});
+    const Id block = b.t_struct({words});
+    b.decorate(block, SpvDecorationBlock);
+    b.member_decorate(block, 0, SpvDecorationOffset, {0});
+    const Id buf = b.variable(b.t_pointer(SpvStorageClassStorageBuffer, block), SpvStorageClassStorageBuffer);
+    b.decorate(buf, SpvDecorationDescriptorSet, {0});
+    b.decorate(buf, SpvDecorationBinding, {0});
+    const Id pc_block = b.t_struct({tu, tu, tu, tu});
+    b.decorate(pc_block, SpvDecorationBlock);
+    for (u32 i = 0; i < 4; ++i) b.member_decorate(pc_block, i, SpvDecorationOffset, {i * 4});
+    const Id pc = b.variable(b.t_pointer(SpvStorageClassPushConstant, pc_block), SpvStorageClassPushConstant);
+    const Id gid_var = b.variable(b.t_pointer(SpvStorageClassInput, tv3), SpvStorageClassInput);
+    b.decorate(gid_var, SpvDecorationBuiltIn, {SpvBuiltInGlobalInvocationId});
+
+    const Id fn = b.begin_function(tvoid, b.t_function(tvoid));
+    b.block(b.new_label());
+    const Id tp_pc = b.t_pointer(SpvStorageClassPushConstant, tu), tp_word = b.t_pointer(SpvStorageClassStorageBuffer, tu);
+    auto u = [&](u32 v) { return b.c_uint(v); };
+    auto bin = [&](u32 op, Id x, Id y) { return b.op(op, tu, {x, y}); };
+    auto k = [&](u32 i) { return b.op(SpvOpLoad, tu, {b.op(SpvOpAccessChain, tp_pc, {pc, b.c_int(static_cast<i32>(i))})}); };
+    auto word = [&](Id i) { return b.op(SpvOpAccessChain, tp_word, {buf, b.c_int(0), i}); };
+    const Id count = k(0), unorm24 = b.op(SpvOpINotEqual, tb, {k(1), u(0)}), stencil = k(2), raw = k(3);
+    const Id g = b.op(SpvOpCompositeExtract, tu, {b.op(SpvOpLoad, tv3, {gid_var}), 0});
+    const Id inside = b.op(SpvOpULessThan, tb, {bin(SpvOpShiftLeftLogical, g, u(2)), count});
+    const Id body = b.new_label(), merge = b.new_label();
+    b.op0(SpvOpSelectionMerge, {merge, SpvSelectionControlMaskNone});
+    b.op0(SpvOpBranchConditional, {inside, body, merge});
+    b.block(body);
+    {
+        const Id last = bin(SpvOpISub, count, u(1));
+        Id packed = u(0);
+        for (u32 j = 0; j < 4; ++j) {
+            const Id i = bin(SpvOpIAdd, bin(SpvOpShiftLeftLogical, g, u(2)), u(j));
+            const Id w = b.op(SpvOpLoad, tu, {word(bin(SpvOpIAdd, raw, b.ext(tu, GLSLstd450UMin, {i, last})))});
+            const Id n = bin(SpvOpBitwiseAnd, w, u(0xFFFFFF));
+            const Id top = b.ext(tu, GLSLstd450FindUMsb, {n});
+            const Id exponent = bin(SpvOpShiftLeftLogical, bin(SpvOpIAdd, top, u(103)), u(23));
+            const Id mantissa = bin(SpvOpBitwiseAnd, bin(SpvOpShiftLeftLogical, n, bin(SpvOpISub, u(23), top)), u(0x7FFFFF));
+            const Id bits = bin(SpvOpIAdd, bin(SpvOpBitwiseOr, exponent, mantissa), u(1));
+            const Id f = b.op(SpvOpSelect, tu, {b.op(SpvOpIEqual, tb, {n, u(0)}), u(0), bits});
+            b.op0(SpvOpStore, {word(i), b.op(SpvOpSelect, tu, {unorm24, n, f})});
+            packed = bin(SpvOpBitwiseOr, packed, bin(SpvOpShiftLeftLogical, bin(SpvOpShiftRightLogical, w, u(24)), u(8 * j)));
+        }
+        b.op0(SpvOpStore, {word(bin(SpvOpIAdd, stencil, g)), packed});
+        b.op0(SpvOpBranch, {merge});
+    }
+    b.block(merge);
+    b.op0(SpvOpReturn, {});
+    b.end_function();
+    const Id interface[] = {gid_var};
+    b.entry_point(SpvExecutionModelGLCompute, fn, "main", interface);
+    b.execution_mode(fn, SpvExecutionModeLocalSize, {64, 1, 1});
+    return b.module();
+}
+
 // ---- On a device ---------------------------------------------------------------------------------------------
 
 Result<void> create_target_converter(vulkan::Device& device, TargetConverter& c) {
@@ -685,6 +755,7 @@ Result<void> create_target_converter(vulkan::Device& device, TargetConverter& c)
         return failure("target textures: the conversion's pipeline could not be made");
     }
     create_image_converter(device, c);
+    create_depth_converter(device, c);
     return {};
 }
 
@@ -751,10 +822,134 @@ void create_image_converter(vulkan::Device& device, TargetConverter& c) {
     if (!ok) destroy_target_image_converter(device, c);
 }
 
+void destroy_depth_converter(vulkan::Device& device, TargetConverter& c) {
+    const VkDevice dev = device.device();
+    if (c.depth_pipeline) vkDestroyPipeline(dev, c.depth_pipeline, nullptr);
+    if (c.depth_pool) vkDestroyDescriptorPool(dev, c.depth_pool, nullptr);
+    if (c.depth_layout) vkDestroyPipelineLayout(dev, c.depth_layout, nullptr);
+    if (c.depth_set_layout) vkDestroyDescriptorSetLayout(dev, c.depth_set_layout, nullptr);
+    c.depth_pipeline = VK_NULL_HANDLE, c.depth_pool = VK_NULL_HANDLE;
+    c.depth_layout = VK_NULL_HANDLE, c.depth_set_layout = VK_NULL_HANDLE;
+}
+
+// depth24_shader's pipeline (none if it cannot be made: the depth is then loaded through guest memory).
+void create_depth_converter(vulkan::Device& device, TargetConverter& c) {
+    const VkDevice dev = device.device();
+    const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    si.bindingCount = 1;
+    si.pBindings = &binding;
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Depth24Constants)};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.setLayoutCount = 1;
+    li.pSetLayouts = &c.depth_set_layout;
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &push;
+    const nx::vector<u32> code = depth24_shader();
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = code.size() * 4;
+    mi.pCode = code.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    constexpr u32 kSets = 32;
+    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pi.maxSets = kSets;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &size;
+    bool ok = vkCreateDescriptorSetLayout(dev, &si, nullptr, &c.depth_set_layout) == VK_SUCCESS &&
+              vkCreatePipelineLayout(dev, &li, nullptr, &c.depth_layout) == VK_SUCCESS &&
+              vkCreateShaderModule(dev, &mi, nullptr, &module) == VK_SUCCESS &&
+              vkCreateDescriptorPool(dev, &pi, nullptr, &c.depth_pool) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module;
+        ci.stage.pName = "main";
+        ci.layout = c.depth_layout;
+        ok = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &c.depth_pipeline) == VK_SUCCESS;
+    }
+    if (module) vkDestroyShaderModule(dev, module, nullptr);
+    if (!ok) destroy_depth_converter(device, c);
+}
+
 }  // namespace
+
+VkDescriptorSet target_depth_set(vulkan::Device& device, TargetConverter& c, VkBuffer words, VkDeviceSize bytes) {
+    if (!c.depth_pool) return VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = c.depth_pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &c.depth_set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device.device(), &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const VkDescriptorBufferInfo bi{words, 0, bytes};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set;
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &bi;
+    vkUpdateDescriptorSets(device.device(), 1, &w, 0, nullptr);
+    return set;
+}
+
+void free_target_depth_set(vulkan::Device& device, TargetConverter& c, VkDescriptorSet set) {
+    if (set) vkFreeDescriptorSets(device.device(), c.depth_pool, 1, &set);
+}
+
+void record_depth24_conversion(VkCommandBuffer cmd, const TargetConverter& c, VkDescriptorSet set, const Depth24Constants& k) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.depth_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.depth_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cmd, c.depth_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof k, &k);
+    vkCmdDispatch(cmd, ((k.count + 3) / 4 + 63) / 64, 1, 1);
+}
+
+Result<std::pair<nx::vector<u32>, nx::vector<u8>>> run_depth24_conversion(vulkan::Device& device, TargetConverter& c,
+                                                                          std::span<const u32> words, bool unorm24) {
+    const Depth24Constants k = depth24_constants(static_cast<u32>(words.size()), unorm24);
+    const VkDeviceSize bytes = (VkDeviceSize{k.raw} + words.size()) * 4 + 4;
+    auto work = vulkan::create_host_buffer(device, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (!work) return nx::err(work.error());
+    std::memset(work->mapped, 0, bytes);
+    if (!words.empty()) std::memcpy(static_cast<u32*>(work->mapped) + k.raw, words.data(), words.size() * 4);
+    vulkan::flush(device, *work);
+    Result<std::pair<nx::vector<u32>, nx::vector<u8>>> result = failure("depth conversion: no descriptor set");
+    if (const VkDescriptorSet set = target_depth_set(device, c, work->buffer, bytes)) {
+        vulkan::OneShot shot(device);
+        auto cmd = shot.begin();
+        if (!cmd) {
+            result = nx::err(cmd.error());
+        } else {
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(*cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr,
+                                 0, nullptr);
+            record_depth24_conversion(*cmd, c, set, k);
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(*cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+            if (auto done = shot.submit_and_wait(); !done) {
+                result = nx::err(done.error());
+            } else {
+                vulkan::invalidate(device, *work);
+                const u32* p = static_cast<const u32*>(work->mapped);
+                const u8* st = reinterpret_cast<const u8*>(p + k.stencil);
+                result = std::pair{nx::vector<u32>(p, p + words.size()), nx::vector<u8>(st, st + words.size())};
+            }
+        }
+        free_target_depth_set(device, c, set);
+    }
+    vulkan::destroy_buffer(device, *work);
+    return result;
+}
 
 void destroy_target_converter(vulkan::Device& device, TargetConverter& c) {
     destroy_target_image_converter(device, c);
+    destroy_depth_converter(device, c);
     const VkDevice dev = device.device();
     if (c.pipeline) vkDestroyPipeline(dev, c.pipeline, nullptr);
     if (c.pool) vkDestroyDescriptorPool(dev, c.pool, nullptr);
@@ -916,6 +1111,8 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
         {TargetSource::Depth24S8, 0x15000000u, 0, texture_type::kLinearStrided, 40, 24, 20, 12, 1},
         {TargetSource::Depth24S8, 0x15000000u, 0, texture_type::kLinearStrided, 33, 17, 33, 17, 2},
         {TargetSource::Depth24S8, 0x15000000u, 0, texture_type::kTiled, 64, 64, 64, 40, 1},
+        {TargetSource::Words, 0x15000000u, 0, texture_type::kLinearStrided, 40, 24, 40, 24, 1},
+        {TargetSource::Words, 0x15000000u, 0, texture_type::kLinearStrided, 33, 17, 20, 12, 1},
     };
     check.ran = true;
     check.ok = true;
@@ -926,7 +1123,7 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
         const u32 bytes = cs.source == TargetSource::Depth16 ? 2 : 4;
         info.stride = cs.type == texture_type::kTiled ? 0 : (cs.width + 3) * bytes;  // (a stride past the width)
         const auto d = target_decode(info, cs.source);
-        if (!d && cs.source == TargetSource::Depth24S8) continue;  // (none made: the decoder's X8U24 not as expected)
+        if (!d && (cs.source == TargetSource::Depth24S8 || cs.source == TargetSource::Words)) continue;  // (none made: the decoder's X8U24 not as expected)
         if (!d) {
             check.ok = false;
             check.what = nx::format("format {:08x} swizzle {}: no decode", cs.format, cs.swizzle);
@@ -961,6 +1158,8 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
                 else if (kinds < 5) h = static_cast<u16>((r >> 16) & 0x3FFF);                       // (0-2)
                 const u32 other = next();
                 image[i] = h | (other & 0x3FFF0000u);
+            } else if (cs.source == TargetSource::Words) {
+                image[i] = r;
             } else {
                 f32 z = static_cast<f32>(r >> 8) / 16777216.0f;
                 if ((r & 3) == 0 && !d24) z = std::nextafter((static_cast<f32>(r >> 16) + 0.5f) / 65535.0f, (r & 4) ? 2.0f : -1.0f);
@@ -985,7 +1184,7 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
                 if (cs.source == TargetSource::Depth16) {
                     const u16 v = depth16_of(std::bit_cast<f32>(t[0]));
                     std::memcpy(guest.data() + index * 2, &v, 2);
-                } else if (cs.source == TargetSource::Depth32) {
+                } else if (cs.source == TargetSource::Depth32 || cs.source == TargetSource::Words) {
                     std::memcpy(guest.data() + index * 4, t, 4);
                 } else if (d24) {
                     const u32 v = depth24_of(std::bit_cast<f32>(t[0]),

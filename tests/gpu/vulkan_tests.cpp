@@ -1352,6 +1352,35 @@ TEST_CASE("vulkan gpu: X8U24 textures of an S8D24 surface made by the compute sh
     check_no_validation_errors(*g);
 }
 
+TEST_CASE("vulkan gpu: S8D24 words made a depth image's aspects by the compute shader as the CPU makes them") {
+    auto g = open(false);
+    Device& d = *g->device;
+    gxm::TargetConverter c;
+    REQUIRE(gxm::create_target_converter(d, c));
+    REQUIRE(c.depth_ready());
+    // (every 24-bit depth, a stencil byte above each)
+    constexpr u32 kCount = 1u << 24;
+    nx::vector<u32> words(kCount);
+    for (u32 i = 0; i < kCount; ++i) words[i] = i | ((i * 2654435761u) & 0xFF000000u);
+    for (const bool unorm24 : {false, true}) {
+        // (an odd count: the last group of four part outside)
+        const std::span<const u32> some(words.data(), unorm24 ? 1001 : words.size());
+        const auto [depth, stencil] = value_or_throw(gxm::run_depth24_conversion(d, c, some, unorm24));
+        REQUIRE(depth.size() == some.size());
+        REQUIRE(stencil.size() == some.size());
+        usize differ = 0, first = 0;
+        for (u32 i = 0; i < some.size(); ++i) {
+            const u32 want = unorm24 ? i : std::bit_cast<u32>(static_cast<f32>(i) / 16777215.0f);
+            if ((depth[i] != want || stencil[i] != static_cast<u8>(some[i] >> 24)) && differ++ == 0) first = i;
+        }
+        if (differ) std::fprintf(stderr, "depth24 (unorm %d): %zu words differ, the first %zu (%08x, %02x)\n", unorm24, differ, first,
+                                 depth[first], stencil[first]);
+        CHECK(differ == 0);
+    }
+    gxm::destroy_target_converter(d, c);
+    check_no_validation_errors(*g);
+}
+
 TEST_CASE("vulkan gpu: an HDR surface's write-back packed by the compute shader as pack_u2f10f10f10 packs it") {
     auto g = open(false);
     Device& d = *g->device;

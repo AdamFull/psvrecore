@@ -30,6 +30,9 @@ enum class TargetSource : u32 {
     // A D32 float depth aspect's words and the stencil aspect's bytes (at word `stencil`, rows of stencil_pitch bytes),
     // written back as S8D24's packed words: depth24_of
     Depth24S8 = 3,
+    // A surface's words as guest memory will hold them (a pending scene's stores, from its memory buffer), passed
+    // through: X8U24 decoded as Depth24S8's
+    Words = 4,
 };
 
 // The write-back's conversions (the renderer's, shared with the shader's checks).
@@ -109,6 +112,18 @@ struct TargetImageConstants {
 };
 nx::vector<u32> target_image_shader();
 
+// An S8D24 surface's words (set 0 binding 0, a storage buffer: `count` of them from word `raw`) made a depth image's
+// aspects as read_depth_surface makes them: the depth words from word 0 (D32_SFLOAT: (w & 0xFFFFFF) / 16777215.0f,
+// rounded as the CPU rounds it, in integers: that quotient's bits repeat the 24 bits, so it is the bits from the top
+// one up, rounded up; a D24_UNORM_S8_UINT image's: the low 24 bits), the stencil bytes (their top bytes) from word
+// `stencil`. Four words an invocation: from word 0 up to `count` rounded up to four, the depth written.
+struct Depth24Constants {
+    u32 count = 0, unorm24 = 0, stencil = 0, raw = 0;
+};
+// (the words: count rounded up to four, a quarter of that, then the surface's words)
+Depth24Constants depth24_constants(u32 count, bool unorm24);
+nx::vector<u32> depth24_shader();
+
 // The shaders' pipelines on a device, the tables in a device buffer, and pools of their descriptor sets.
 struct TargetConverter {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
@@ -121,7 +136,13 @@ struct TargetConverter {
     VkPipelineLayout image_layout = VK_NULL_HANDLE;
     VkPipeline image_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool image_pool = VK_NULL_HANDLE;
+    // (depth24_shader's)
+    VkDescriptorSetLayout depth_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout depth_layout = VK_NULL_HANDLE;
+    VkPipeline depth_pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool depth_pool = VK_NULL_HANDLE;
     bool ready() const { return pipeline != VK_NULL_HANDLE; }
+    bool depth_ready() const { return depth_pipeline != VK_NULL_HANDLE; }
     bool images_ready() const { return image_pipeline != VK_NULL_HANDLE; }
 };
 Result<void> create_target_converter(vulkan::Device& device, TargetConverter& out);
@@ -143,6 +164,13 @@ void write_target_image_set(vulkan::Device& device, const TargetConverter& c, Vk
 void free_target_image_set(vulkan::Device& device, TargetConverter& c, VkDescriptorSet set);
 void record_target_image_conversion(VkCommandBuffer cmd, const TargetConverter& c, VkDescriptorSet set,
                                     const TargetImageConstants& k);
+// depth24_shader's: a set for the work buffer (null: none free now), given back; the conversion recorded.
+VkDescriptorSet target_depth_set(vulkan::Device& device, TargetConverter& c, VkBuffer words, VkDeviceSize bytes);
+void free_target_depth_set(vulkan::Device& device, TargetConverter& c, VkDescriptorSet set);
+void record_depth24_conversion(VkCommandBuffer cmd, const TargetConverter& c, VkDescriptorSet set, const Depth24Constants& k);
+// (the tests': the words converted on the device and waited for: the depth words, then the stencil bytes)
+Result<std::pair<nx::vector<u32>, nx::vector<u8>>> run_depth24_conversion(vulkan::Device& device, TargetConverter& c,
+                                                                          std::span<const u32> words, bool unorm24);
 
 // One conversion run on the device and waited for (the tests' and the start-up check's): the image's texels as the
 // work buffer holds them at `src`, the background's bytes; the texels made (width * height * out words).
