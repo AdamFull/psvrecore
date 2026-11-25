@@ -397,8 +397,11 @@ struct Streamer : Module {
     f64 frac = 0;
     bool began = false, ended = true;
     i64 lead_in = 0;
-    // (the counters: samples generated, and the bytes of the frames played through)
+    // (the counters: samples generated, and the bytes of the frames played through; `generated` is in frames, the
+    // states count a sample in each of the voice's channels: Killzone: Mercenary halves the count of its stereo
+    // voices to keep its streams' buffers, in frames, in step, and with frames its rings of buffers filled up)
     i64 generated = 0;
+    u32 out_channels = 2;
     i32 samples_total = 0, bytes_total = 0, bytes_since_key_on = 0;
     i32 played_buffer = 0;
     u32 played_end = 0;
@@ -422,8 +425,8 @@ struct Streamer : Module {
     }
     bool state(void* out, u32 size) const override {
         if (size < sizeof(PlayerStates)) return false;
-        PlayerStates s{static_cast<i32>(played_end), played_buffer, static_cast<i32>(generated), bytes_since_key_on,
-                       samples_total, bytes_total};
+        PlayerStates s{static_cast<i32>(played_end), played_buffer, static_cast<i32>(generated * out_channels),
+                       bytes_since_key_on, static_cast<i32>(static_cast<u32>(samples_total) * out_channels), bytes_total};
         std::memcpy(out, &s, sizeof s);
         return true;
     }
@@ -484,6 +487,7 @@ struct Streamer : Module {
 
     void render(const Context& c, Packet& out, bool* end) {
         const u32 g = c.granularity;
+        out_channels = c.channels;
         out.clear(g);
         if (ended) {
             *end = true;

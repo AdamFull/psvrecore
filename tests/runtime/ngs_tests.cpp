@@ -206,7 +206,7 @@ TEST_CASE("ngs: PCM played through the master buss comes out sample for sample; 
             REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
             CHECK(psv_ld32(st) == 1024);       // position in the buffer
             CHECK(psv_ld32(st + 4) == 0);      // buffer
-            CHECK(psv_ld32(st + 8) == 256);    // samples since key on
+            CHECK(psv_ld32(st + 8) == 512);    // samples since key on (256 frames, two channels)
             CHECK(psv_ld32(st + 12) == 1024);  // bytes since key on
             CHECK(calls.empty());
         }
@@ -222,7 +222,7 @@ TEST_CASE("ngs: PCM played through the master buss comes out sample for sample; 
     CHECK(calls[1].user == 0x222);
     const u32 st = scratch(24);
     REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
-    CHECK(psv_ld32(st + 8) == 1000);
+    CHECK(psv_ld32(st + 8) == 2000);  // (1000 frames of two channels)
     CHECK(psv_ld32(st + 12) == 4000);
 }
 
@@ -656,7 +656,7 @@ TEST_CASE("ngs: stereo VAG takes a block of each channel in turn, the left first
     CHECK(out[2 * 56 + 1] == 0);
     const u32 st = scratch(24);
     REQUIRE(call32(ctx, kSceNgs, kStateData, {voice, 0, st, 24}) == 0);
-    CHECK(psv_ld32(st + 8) == 56);
+    CHECK(psv_ld32(st + 8) == 112);  // (56 frames of two channels)
     CHECK(psv_ld32(st + 12) == 64);
 }
 
