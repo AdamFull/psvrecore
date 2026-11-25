@@ -6541,17 +6541,24 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             if (last.compare[face] != compare) vkCmdSetStencilCompareMask(*cmd, f, compare), last.compare[face] = compare;
             if (last.write[face] != write) vkCmdSetStencilWriteMask(*cmd, f, write), last.write[face] = write;
         };
+        bool last_reads = false;
         for (usize i = 0; i < plans.size(); ++i) {
             const DrawPlan& p = plans[i];
             const DrawState& st = p.draw->state;
             if (!scene.markers.empty()) markers.upto(static_cast<u32>(p.draw - scene.draws.data()));
             const bool reads = reads_attachment(*p.draw, cf, color != nullptr);
             if (g_profile.on) ++g_profile.draws, g_profile.colour_reads += reads;
-            if (reads && i > 0 && !d.caps().raster_order_attachment) {
+            // (what the draws before wrote, for this one to read: the render pass's self-dependency. With rasterization-
+            // order access only the pipelines that read the colour have it (GraphicsPipelineDesc::unordered), and the
+            // Adreno 830 does not order them with the others' fragments: Killzone: Mercenary's dust in its light shafts
+            // came out as solid cards. So there is a barrier wherever the draws go from those that read to those that do not,
+            // or back)
+            const bool ordered = d.caps().raster_order_attachment;
+            if (i > 0 && (ordered ? reads_color && reads != last_reads : reads)) {
                 if (g_profile.on) ++g_profile.barriers;
-                // (what the draws before wrote, for this one to read: the render pass's self-dependency)
                 vk::color_read_barrier(*cmd);
             }
+            last_reads = reads;
             if (last.pipeline != p.pipeline) vkCmdBindPipeline(*cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline), last.pipeline = p.pipeline;
             if (d.caps().dynamic_state) vk::set_dynamic_state(*cmd, p.state);
             if (std::memcmp(&last.scissor, &p.scissor, sizeof p.scissor) != 0)
