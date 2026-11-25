@@ -2,9 +2,9 @@
 
 // Textures made on the GPU from a render target's image: a surface a scene drew and wrote back to guest memory,
 // which a later draw samples as a texture (a depth surface read as F32M, an HDR colour surface as U2F10F10F10, a
-// D16 shadow map as U16). Instead of the texels being read back from guest memory, decoded on the CPU and uploaded
-// again, a compute shader makes them from the image: each texel's word as the write-back puts it in guest memory
-// (the same packing: pack_u2f10f10f10, depth16_of), then decoded as read_texels decodes it (its tables and the
+// D16 shadow map as U16, an S8D24 one as X8U24). Instead of the texels being read back from guest memory, decoded on
+// the CPU and uploaded again, a compute shader makes them from the image: each texel's word as the write-back puts it
+// in guest memory (the same packing: pack_u2f10f10f10, depth16_of, depth24_of), then decoded as read_texels decodes it (its tables and the
 // swizzle's choices are the decoder's own, found by decoding probes), to the same bytes. Texels the image does not
 // hold (a texture larger than what the scene stored) come from a copy of guest memory, the background.
 //
@@ -27,6 +27,9 @@ enum class TargetSource : u32 {
     Depth32 = 0,      // a D32 float depth aspect's words, written back as they are (DF32, DF32M but for the mask bit)
     Depth16 = 1,      // the same, written back as 16-bit unorm (D16): depth16_of
     U2F10F10F10 = 2,  // R16G16B16A16_SFLOAT halves (two words a texel), packed: pack_u2f10f10f10
+    // A D32 float depth aspect's words and the stencil aspect's bytes (at word `stencil`, rows of stencil_pitch bytes),
+    // written back as S8D24's packed words: depth24_of
+    Depth24S8 = 3,
 };
 
 // The write-back's conversions (the renderer's, shared with the shader's checks).
@@ -39,13 +42,17 @@ u32 pack_u2f10f10f10(const u16 h[4]);
 void pack_u2f10f10f10(const u16* halves, u32* words, usize count);
 // A depth value as a D16 surface's sample: rounded to nearest (halves away from zero), the low 16 bits kept.
 u16 depth16_of(f32 z);
+// A depth value and stencil byte as an S8D24 surface's word: the depth rounded to 24-bit unorm (to nearest, halves
+// away from zero), the stencil the top byte.
+u32 depth24_of(f32 z, u8 stencil);
 
 // What read_texels makes of a texel's word, for the shader to make the same.
 struct TargetDecode {
     bool single = false;  // one 32-bit float a texel (an R32F image whose view's components are rgba_of), else four
                           // halves (RGBA16F)
     u8 rgba_of[4] = {};   // (single: as Texels::rgba_of)
-    u32 kind = 0;         // 0: the word, masked; 1: a U16's half from the table; 2: U2F10F10F10's fields from the tables
+    u32 kind = 0;         // 0: the word, masked; 1: a U16's half from the table; 2: U2F10F10F10's fields from the tables;
+                          // 3: X8U24's: the low 24 bits' half (found among the table's steps), the top byte's
     u32 mask = ~0u;
     u32 select = 0;       // (kinds 1-2: four fields of 4 bits, an output half's source: 0-3 a component, 4 zero, 5 one)
     bool alpha_low = false;  // (U2F10F10F10: the alpha in the low two bits, by the swizzle)
@@ -69,6 +76,9 @@ struct TargetTextureConstants {
     // The background: texel j at word bg of buffer 2 (16-bit texels: half words), j = y * bg_pitch + x in rows, or
     // in 32 x 32 tiles of bg_pitch tiles a row.
     u32 bg = 0, bg_tiled = 0, bg_pitch = 0, bg_bits = 32;
+    // (Depth24S8: the stencil's bytes from word `stencil` of the work buffer, rows of stencil_pitch bytes; texel x of a
+    // row at src_first + x * src_step, as the depth's)
+    u32 stencil = 0, stencil_pitch = 0;
 };
 // The constants' packing fields (alpha1-3) for a source.
 void target_packing(TargetTextureConstants& k);
@@ -81,7 +91,9 @@ inline u32 target_source_words(TargetSource s) { return s == TargetSource::U2F10
 inline u32 target_out_words(const TargetDecode& d) { return d.single ? 1 : 2; }
 
 nx::vector<u32> target_texture_shader();
-// The decoder's tables (buffer 1): the U16 values' halves (65536), the 10-bit floats' (1024), the 2-bit alphas' (4).
+// The decoder's tables (buffer 1): the U16 values' halves (65536), the 10-bit floats' (1024), the 2-bit alphas' (4);
+// X8U24's: the least 24-bit value whose half is at least h, for each h (16384, past 1.0 none), and the top byte's
+// halves (256).
 const nx::vector<u32>& target_texture_tables();
 
 // An HDR surface's texture made from its image directly (target_image_shader, 8 x 8 invocations, one a texel): the

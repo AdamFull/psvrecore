@@ -941,6 +941,55 @@ nx::vector<u32> through_image(Device& d, VkFormat format, VkImageAspectFlags asp
     return got;
 }
 
+// A depth/stencil image's depths (f32) and stencil bytes put in, and taken out as the renderer copies an S8D24
+// surface's for a conversion: the depth rows (`step` apart from `first`, w texels each), then the stencil's in rows of
+// `pitch` bytes.
+nx::vector<u32> through_depth_stencil(Device& d, VkFormat format, u32 width, u32 height, std::span<const u32> depths,
+                                      std::span<const u8> stencil, u32 w, u32 h, u32 step, u32 first, u32 pitch) {
+    ImageDesc desc;
+    desc.format = format;
+    desc.width = width, desc.height = height;
+    desc.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    Image image = value_or_throw(create_image(d, desc));
+    const VkDeviceSize st_in = (depths.size_bytes() + 3) & ~VkDeviceSize{3};
+    Buffer in = value_or_throw(create_host_buffer(d, st_in + stencil.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT));
+    std::memcpy(in.mapped, depths.data(), depths.size_bytes());
+    std::memcpy(static_cast<u8*>(in.mapped) + st_in, stencil.data(), stencil.size());
+    flush(d, in);
+    const usize depth_words = usize{w} * h, out_words = depth_words + usize{pitch} * h / 4;
+    Buffer out = value_or_throw(create_host_buffer(d, out_words * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT));
+    std::memset(out.mapped, 0, out_words * 4);
+    flush(d, out);
+    OneShot shot(d);
+    VkCommandBuffer cmd = value_or_throw(shot.begin());
+    transition(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkBufferImageCopy up[2] = {{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}},
+                                     {st_in, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}}};
+    vkCmdCopyBufferToImage(cmd, in.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, up);
+    transition(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    nx::vector<VkBufferImageCopy> rows;
+    for (u32 r = 0; r < h; ++r) {
+        const i32 at = static_cast<i32>(r * step + first);
+        rows.push_back({VkDeviceSize{r} * w * 4, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, at, 0}, {w, 1, 1}});
+        rows.push_back({depth_words * 4 + VkDeviceSize{r} * pitch, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, at, 0},
+                        {w, 1, 1}});
+    }
+    vkCmdCopyImageToBuffer(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, static_cast<u32>(rows.size()),
+                           rows.data());
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    REQUIRE(shot.submit_and_wait());
+    invalidate(d, out);
+    const u32* p = static_cast<const u32*>(out.mapped);
+    nx::vector<u32> got(p, p + out_words);
+    destroy_buffer(d, in);
+    destroy_buffer(d, out);
+    destroy_image(d, image);
+    return got;
+}
+
 }  // namespace
 
 TEST_CASE("vulkan gpu: render targets' textures made by a compute shader as the decoder makes them from guest memory") {
@@ -1039,6 +1088,127 @@ TEST_CASE("vulkan gpu: render targets' textures made by a compute shader as the 
             std::fprintf(stderr, "target texture format %08x at scale %u: %zu bytes differ, the first at texel %zu\n",
                          cs.format, s, differ, first / cpu.bytes);
         CHECK(differ == 0);
+    }
+    gxm::destroy_target_converter(d, c);
+    check_no_validation_errors(*g);
+}
+
+TEST_CASE("vulkan gpu: X8U24 textures of an S8D24 surface made by the compute shader as the decoder makes them") {
+    auto g = open(false);
+    Device& d = *g->device;
+    const VkFormat depth_format = d.caps().depth_stencil_format;
+    if (depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;  // (the renderer makes none from other images)
+    gxm::TargetConverter c;
+    REQUIRE(gxm::create_target_converter(d, c));
+    gxm::TextureInfo x24;
+    x24.base_format = 0x15000000u, x24.type = gxm::texture_type::kLinearStrided, x24.levels = 1;
+    x24.width = 240, x24.height = 136, x24.stride = 1024;
+    const auto dec = gxm::target_decode(x24, gxm::TargetSource::Depth24S8);
+    REQUIRE(dec.has_value());
+    u32 seed = 2401;
+    auto next = [&] { return seed = seed * 1103515245u + 12345u; };
+    auto decode = [](const gxm::TextureInfo& info, const nx::vector<u8>& guest) {
+        return value_or_throw(gxm::read_texels(info, [&](u32 address, void* out, u32 n) {
+            if (u64{address} + n > guest.size()) return false;
+            std::memcpy(out, guest.data() + address, n);
+            return true;
+        }, false, true));
+    };
+    auto compare = [](const gxm::Texels& cpu, const nx::vector<u32>& gpu, const char* what) {
+        REQUIRE(cpu.data.size() == gpu.size() * 4);
+        usize differ = 0, first = 0;
+        const u8* gb = reinterpret_cast<const u8*>(gpu.data());
+        for (usize i = 0; i < cpu.data.size(); ++i)
+            if (gb[i] != cpu.data[i] && differ++ == 0) first = i;
+        if (differ) {
+            u64 gv = 0, cv = 0;
+            std::memcpy(&gv, gb + first / 8 * 8, 8);
+            std::memcpy(&cv, cpu.data.data() + first / 8 * 8, 8);
+            std::fprintf(stderr, "X8U24 %s: %zu bytes differ, the first at texel %zu (%016llx, the decoder's %016llx)\n", what,
+                         differ, first / cpu.bytes, static_cast<unsigned long long>(gv), static_cast<unsigned long long>(cv));
+        }
+        CHECK(differ == 0);
+    };
+
+    // Killzone: Mercenary's: a 240 x 136 S8D24 surface (256 samples a row) read as 240 x 136 X8U24 of the same stride,
+    // at the internal resolution s (its middle samples); and one past it, 256 x 160, the rest from guest memory.
+    // Depths 0, 1, each side of D24's rounding steps (z * 16777215 at n + 0.5, below 2^23 and above), any; stencil
+    // bytes 0, 255, any.
+    const u32 kEdges[] = {0, 1, 2, 3, 0x7FFF, 0x8000, 0x3FFFFF, 0x400000, 0x7FFFFE, 0x7FFFFF, 0x800000, 0x800001, 0xFFFFFE};
+    for (const u32 s : {1u, 2u}) {
+        for (const bool past : {false, true}) {
+            constexpr u32 sw = 240, sh = 136, stride = 256;
+            const u32 iw = sw * s, ih = sh * s;
+            nx::vector<u32> depths(usize{iw} * ih);
+            nx::vector<u8> stencil(depths.size());
+            for (usize i = 0; i < depths.size(); ++i) {
+                const u32 r = next(), kind = r % 8;
+                f32 z = static_cast<f32>(r >> 8) / 16777216.0f;
+                if (kind == 0) z = (r & 8) ? 1.0f : 0.0f;
+                else if (kind <= 2) {
+                    const u32 n = kind == 1 ? kEdges[(r >> 4) % std::size(kEdges)] : r >> 8;
+                    z = static_cast<f32>((static_cast<f64>(n) + 0.5) / 16777215.0);
+                    if (r & 0x10000) z = std::nextafter(z, (r & 0x20000) ? 2.0f : -1.0f);
+                } else if (kind == 3) {
+                    z = static_cast<f32>(static_cast<f64>(kEdges[(r >> 4) % std::size(kEdges)]) / 16777215.0);
+                }
+                depths[i] = std::bit_cast<u32>(z);
+                const u32 q = next() >> 24;
+                stencil[i] = static_cast<u8>(q < 16 ? 0 : q < 32 ? 255 : q);
+            }
+            gxm::TextureInfo info = x24;
+            if (past) info.width = 256, info.height = 160;
+            const u32 aw = nx::min(info.width, sw), ah = nx::min(info.height, sh);
+            gxm::TargetTextureConstants k;
+            k.width = info.width, k.height = info.height, k.a_width = aw, k.a_height = ah;
+            k.src_pitch = aw * s, k.src_step = s, k.src_first = s / 2;
+            k.source = static_cast<u32>(gxm::TargetSource::Depth24S8);
+            k.kind = dec->kind, k.mask = dec->mask, k.select = dec->select, k.alpha_low = dec->alpha_low;
+            gxm::target_packing(k);
+            k.bg_tiled = 0, k.bg_pitch = stride, k.bg_bits = 32;
+            k.stencil = k.src_pitch * ah, k.stencil_pitch = (k.src_pitch + 3) & ~3u;
+            // (the image's rows the renderer copies, through the device)
+            const nx::vector<u32> image =
+                through_depth_stencil(d, depth_format, iw, ih, depths, stencil, aw * s, ah, s, s / 2, k.stencil_pitch);
+            // (guest memory as the write-back leaves it: noise, the surface's middle samples over it)
+            const u32 size = gxm::texture_size(info);
+            nx::vector<u8> guest(size + 8);
+            for (u8& v : guest) v = static_cast<u8>(next() >> 24);
+            for (u32 y = 0; y < sh; ++y)
+                for (u32 x = 0; x < sw; ++x) {
+                    const usize i = usize{y * s + s / 2} * iw + x * s + s / 2;
+                    const u32 v = gxm::depth24_of(std::bit_cast<f32>(depths[i]), stencil[i]);
+                    std::memcpy(guest.data() + (usize{y} * stride + x) * 4, &v, 4);
+                }
+            const gxm::Texels cpu = decode(info, guest);
+            k.out = static_cast<u32>((image.size() + 3) & ~usize{3});
+            const auto gpu = value_or_throw(gxm::run_target_conversion(d, c, k, image, std::span<const u8>(guest.data(), size)));
+            compare(cpu, gpu, s == 1 ? (past ? "past the surface" : "a surface") : (past ? "past a scaled surface" : "a scaled surface"));
+        }
+    }
+
+    // Every low 24-bit value (the decode's half of each, found among the table's steps), with top bytes of every
+    // value, from guest memory: 4096 x 1024 texels at a time.
+    {
+        gxm::TextureInfo info = x24;
+        info.width = 4096, info.height = 1024, info.stride = 4096 * 4;
+        gxm::TargetTextureConstants k;
+        k.width = info.width, k.height = info.height, k.a_width = 0, k.a_height = 0;
+        k.source = static_cast<u32>(gxm::TargetSource::Depth24S8);
+        k.kind = dec->kind, k.mask = dec->mask, k.select = dec->select, k.alpha_low = dec->alpha_low;
+        gxm::target_packing(k);
+        k.bg_pitch = info.stride / 4, k.bg_bits = 32, k.out = 0;
+        for (u32 part = 0; part < 4; ++part) {
+            const usize n = usize{info.width} * info.height;
+            nx::vector<u8> guest(n * 4 + 8);
+            for (usize i = 0; i < n; ++i) {
+                const u32 v = static_cast<u32>(part * n + i) | static_cast<u32>((i * 7 + part) & 0xFF) << 24;
+                std::memcpy(guest.data() + i * 4, &v, 4);
+            }
+            const gxm::Texels cpu = decode(info, guest);
+            const auto gpu = value_or_throw(gxm::run_target_conversion(d, c, k, {}, std::span<const u8>(guest.data(), n * 4)));
+            compare(cpu, gpu, "of every value");
+        }
     }
     gxm::destroy_target_converter(d, c);
     check_no_validation_errors(*g);

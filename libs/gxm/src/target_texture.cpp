@@ -32,10 +32,13 @@ f32 half_value(u16 h) {
 }
 
 u32 code_of(u32 base_format) { return ((base_format >> 24) & 0x1F) | ((base_format >> 31) << 7); }
-constexpr u32 kU16 = 0x09, kF32 = 0x12, kF32M = 0x13, kU2F10F10F10 = 0x9A;
+constexpr u32 kU16 = 0x09, kF32 = 0x12, kF32M = 0x13, kX8U24 = 0x15, kU2F10F10F10 = 0x9A;
 
 // Where the tables are in buffer 1 (words).
-constexpr u32 kTableU16 = 0, kTableF10 = 32768, kTableAlpha = 32768 + 512, kTableWords = 32768 + 512 + 2;
+constexpr u32 kTableU16 = 0, kTableF10 = 32768, kTableAlpha = 32768 + 512, kTableD24 = 32768 + 512 + 2;
+constexpr u32 kTableTop = kTableD24 + 16384, kTableWords = kTableTop + 128;
+constexpr u32 kD24Halves = 0x3C01;  // (X8U24's low 24 bits decode to the halves 0 to 1.0)
+bool g_x8u24_tables = false;        // (the tables' X8U24 part made: target_texture_tables)
 
 // The least half bits whose packed alpha is 1, 2 and 3 (positive halves: the packing is monotonic in their bits;
 // negative ones pack to 0). Found from pack_u2f10f10f10 itself; all zero if it is not monotonic.
@@ -118,6 +121,7 @@ void pack_u2f10f10f10(const u16* halves, u32* words, usize count) {
 }
 
 u16 depth16_of(f32 z) { return static_cast<u16>(std::lround(z * 65535.0f)); }
+u32 depth24_of(f32 z, u8 stencil) { return static_cast<u32>(std::lround(z * 16777215.0f)) | u32{stencil} << 24; }
 
 const nx::vector<u32>& target_texture_tables() {
     static const nx::vector<u32> tables = [] {
@@ -146,6 +150,45 @@ const nx::vector<u32>& target_texture_tables() {
             out[kTableF10 + i / 2] |= u32{h} << ((i & 1) * 16);
         }
         for (u32 i = 0; i < 4; ++i) out[kTableAlpha + i / 2] |= u32{half_at(*b, i, 3)} << ((i & 1) * 16);
+        // (X8U24, decoded in the identity swizzle: R the low 24 bits' half, G the top byte's. The R half is monotonic
+        // in the value: the least value of each half 1 to 1.0 found by bisection, a round a decode of a probe for
+        // each. Halves past 1.0 none: their least values past every value)
+        g_x8u24_tables = [&] {
+            TextureInfo x24;
+            x24.base_format = kX8U24 << 24;
+            constexpr u32 pw = 128, ph = (kD24Halves - 1 + pw - 1) / pw;
+            nx::vector<u32> lo(kD24Halves, 0), hi(kD24Halves, 1u << 24);
+            nx::vector<u8> probe(usize{pw} * ph * 4, 0);
+            for (u32 round = 0; round < 24; ++round) {
+                for (u32 h = 1; h < kD24Halves; ++h) {
+                    const u32 mid = (lo[h] + hi[h]) / 2;
+                    std::memcpy(probe.data() + usize{h - 1} * 4, &mid, 4);
+                }
+                auto t = decode_bytes(probe_info(x24, pw, ph, 4), probe);
+                if (!t || t->bytes != 8 || t->single) return false;
+                for (u32 h = 1; h < kD24Halves; ++h) {
+                    const u32 mid = (lo[h] + hi[h]) / 2;
+                    (half_at(*t, h - 1, 0) >= h ? hi[h] : lo[h]) = mid;
+                }
+            }
+            // (0 to 0 and the largest value to 1.0, as the bisection took them; the top bytes' halves in G)
+            nx::vector<u8> ends(256 * 4);
+            for (u32 i = 0; i < 256; ++i) {
+                const u32 w = i << 24 | (i == 1 ? 0xFFFFFFu : 0);
+                std::memcpy(ends.data() + i * 4, &w, 4);
+            }
+            auto e = decode_bytes(probe_info(x24, 256, 1, 4), ends);
+            if (!e || e->bytes != 8 || e->single || half_at(*e, 0, 0) != 0 || half_at(*e, 1, 0) != kD24Halves - 1)
+                return false;
+            for (u32 i = 0; i < 256; ++i) out[kTableTop + i / 2] |= u32{half_at(*e, i, 1)} << ((i & 1) * 16);
+            out[kTableD24] = 0;
+            for (u32 h = 1; h < 16384; ++h) {
+                if (h < kD24Halves && (hi[h] >= (1u << 24) || hi[h] - lo[h] != 1 || hi[h] < out[kTableD24 + h - 1]))
+                    return false;
+                out[kTableD24 + h] = h < kD24Halves ? hi[h] : ~0u;
+            }
+            return true;
+        }();
         return out;
     }();
     return tables;
@@ -202,6 +245,28 @@ std::optional<TargetDecode> target_decode(const TextureInfo& info, TargetSource 
         }
         return d;
     }
+    if (source == TargetSource::Depth24S8) {
+        if (code != kX8U24 || !g_x8u24_tables) return std::nullopt;
+        d.kind = 3;
+        // (the low 24 bits' half: the last of the steps at or below them)
+        auto low_half = [&](u32 v) {
+            u32 h = 0;
+            for (u32 step = 8192; step; step >>= 1)
+                if (tables[kTableD24 + h + step] <= v) h += step;
+            return static_cast<u16>(h);
+        };
+        u32 first = ~0u;
+        for (const u32 w : {0x40345678u, 0xC0A98765u}) {
+            u8 bytes[4];
+            std::memcpy(bytes, &w, 4);
+            auto t = decode_bytes(probe_info(info, 1, 1, 4), bytes);
+            if (!t || t->bytes != 8 || t->single) return std::nullopt;
+            const u16 c[4] = {low_half(w & 0xFFFFFF), table_half(kTableTop, w >> 24), 0, 0};
+            if (!fields(*t, c, 2, d.select) || (first != ~0u && d.select != first)) return std::nullopt;
+            first = d.select;
+        }
+        return d;
+    }
     if (code != kU2F10F10F10) return std::nullopt;
     d.kind = 2;
     d.alpha_low = info.swizzle == 2 || info.swizzle == 3 || info.swizzle == 6 || info.swizzle == 7;
@@ -227,7 +292,7 @@ void target_packing(TargetTextureConstants& k) {
     k.alpha1 = s.at[0], k.alpha2 = s.at[1], k.alpha3 = s.at[2];
 }
 
-static_assert(sizeof(TargetTextureConstants) == 21 * 4);
+static_assert(sizeof(TargetTextureConstants) == 23 * 4);
 
 TargetTextureConstants target_pack_constants(u32 width, u32 height) {
     TargetTextureConstants k;
@@ -259,7 +324,7 @@ nx::vector<u32> target_texture_shader() {
         b.decorate(buf[i], SpvDecorationBinding, {i});
     }
     constexpr u32 kConstants = sizeof(TargetTextureConstants) / 4;
-    const Id pc_block = b.t_struct({tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu});
+    const Id pc_block = b.t_struct({tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu, tu});
     b.decorate(pc_block, SpvDecorationBlock);
     for (u32 i = 0; i < kConstants; ++i) b.member_decorate(pc_block, i, SpvDecorationOffset, {i * 4});
     const Id pc = b.variable(b.t_pointer(SpvStorageClassPushConstant, pc_block), SpvStorageClassPushConstant);
@@ -268,13 +333,13 @@ nx::vector<u32> target_texture_shader() {
 
     const Id fn = b.begin_function(tvoid, b.t_function(tvoid));
     const Id tp_local = b.t_pointer(SpvStorageClassFunction, tu);
-    const Id v_var = b.local(tp_local);
+    const Id v_var = b.local(tp_local), low_var = b.local(tp_local);
     b.block(b.new_label());
     const Id tp_pc = b.t_pointer(SpvStorageClassPushConstant, tu), tp_word = b.t_pointer(SpvStorageClassStorageBuffer, tu);
     // (the constants by their place in TargetTextureConstants)
     enum : u32 {
         kWidth, kHeight, kAWidth, kAHeight, kSrc, kSrcPitch, kSrcStep, kSrcFirst, kOut, kSource, kKind, kMask, kSelect,
-        kAlphaLow, kAlpha1, kAlpha2, kAlpha3, kBg, kBgTiled, kBgPitch, kBgBits
+        kAlphaLow, kAlpha1, kAlpha2, kAlpha3, kBg, kBgTiled, kBgPitch, kBgBits, kStencil, kStencilPitch
     };
     auto k = [&](u32 i) { return b.op(SpvOpLoad, tu, {b.op(SpvOpAccessChain, tp_pc, {pc, b.c_int(static_cast<i32>(i))})}); };
     auto u = [&](u32 v) { return b.c_uint(v); };
@@ -324,6 +389,19 @@ nx::vector<u32> target_texture_shader() {
             b.decorate(q, SpvDecorationNoContraction);
             const Id fl = b.ext(tf, GLSLstd450FMax, {b.ext(tf, GLSLstd450Floor, {q}), b.c_float(0.0f)});
             const Id d16 = band(b.op(SpvOpConvertFToU, tu, {fl}), u(0xFFFF));
+            // (S8D24: lround(z * 16777215), z not negative: the product's floor and its fraction, exact, not z * c + 0.5,
+            // which rounds above 2^23; the stencil's byte above)
+            const Id p24 = bin(SpvOpFMul, tf, z, b.c_float(16777215.0f));
+            b.decorate(p24, SpvDecorationNoContraction);
+            const Id fl24 = b.ext(tf, GLSLstd450FMax, {b.ext(tf, GLSLstd450Floor, {p24}), b.c_float(0.0f)});
+            const Id frac24 = bin(SpvOpFSub, tf, p24, fl24);
+            b.decorate(frac24, SpvDecorationNoContraction);
+            const Id up = sel(bin(SpvOpFOrdGreaterThanEqual, tb, frac24, b.c_float(0.5f)), u(1), u(0));
+            const Id is24 = eq(source, u(3));
+            const Id sb = add(mul(y, k(kStencilPitch)), add(k(kSrcFirst), mul(x, k(kSrcStep))));
+            const Id sw = load(0, sel(is24, add(k(kStencil), shr(sb, u(2))), u(0)));
+            const Id st = band(shr(sw, shl(band(sb, u(3)), u(3))), u(0xFF));
+            const Id d24 = bor(band(add(b.op(SpvOpConvertFToU, tu, {fl24}), up), u(0xFFFFFF)), shl(st, u(24)));
             // (U2F10F10F10: the halves packed as pack_u2f10f10f10 packs them)
             auto f10 = [&](Id h) {
                 const Id neg = bin(SpvOpINotEqual, tb, band(h, u(0x8000)), u(0));
@@ -337,7 +415,7 @@ nx::vector<u32> target_texture_shader() {
             const Id a2 = sel(bin(SpvOpINotEqual, tb, band(h3, u(0x8000)), u(0)), u(0),
                               add(add(at_least(h3, kAlpha1), at_least(h3, kAlpha2)), at_least(h3, kAlpha3)));
             const Id packed = bor(bor(f10(h0), shl(f10(h1), u(10))), bor(shl(f10(h2), u(20)), shl(a2, u(30))));
-            const Id v = sel(eq(source, u(0)), w0, sel(eq(source, u(1)), d16, packed));
+            const Id v = sel(eq(source, u(0)), w0, sel(eq(source, u(1)), d16, sel(is24, d24, packed)));
             b.op0(SpvOpStore, {v_var, v});
             b.op0(SpvOpBranch, {have});
         }
@@ -362,7 +440,27 @@ nx::vector<u32> target_texture_shader() {
         const Id at = sel(alpha_low, u(2), u(0));
         auto field = [&](u32 n) { return table(kTableF10, band(shr(v, add(at, u(10 * n))), u(0x3FF))); };
         const Id c16 = table(kTableU16, band(v, u(0xFFFF)));
-        const Id c[4] = {sel(eq(kind, u(1)), c16, field(0)), field(1), field(2),
+        // (X8U24: the low 24 bits' half, the last of the table's steps at or below them, by bisection)
+        const Id x24 = eq(kind, u(3));
+        b.op0(SpvOpStore, {low_var, u(0)});
+        {
+            const Id search = b.new_label(), searched = b.new_label();
+            b.op0(SpvOpSelectionMerge, {searched, SpvSelectionControlMaskNone});
+            b.op0(SpvOpBranchConditional, {x24, search, searched});
+            b.block(search);
+            const Id v24 = band(v, u(0xFFFFFF));
+            Id h = u(0);
+            for (u32 step = 8192; step; step >>= 1) {
+                const Id next = add(h, u(step));
+                h = sel(bin(SpvOpULessThanEqual, tb, load(1, add(u(kTableD24), next)), v24), next, h);
+            }
+            b.op0(SpvOpStore, {low_var, h});
+            b.op0(SpvOpBranch, {searched});
+            b.block(searched);
+        }
+        const Id low = b.op(SpvOpLoad, tu, {low_var});
+        const Id top = table(kTableTop, shr(v, u(24)));
+        const Id c[4] = {sel(x24, low, sel(eq(kind, u(1)), c16, field(0))), sel(x24, top, field(1)), field(2),
                          table(kTableAlpha, sel(alpha_low, band(v, u(3)), shr(v, u(30))))};
         const Id select = k(kSelect);
         Id h[4];
@@ -815,6 +913,9 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
         {TargetSource::U2F10F10F10, 0x9A000000u, 5, texture_type::kLinearStrided, 16, 16, 16, 16, 1},
         {TargetSource::U2F10F10F10, 0x9A000000u, 6, texture_type::kLinearStrided, 16, 16, 16, 16, 1},
         {TargetSource::U2F10F10F10, 0x9A000000u, 7, texture_type::kTiled, 32, 32, 32, 32, 1},
+        {TargetSource::Depth24S8, 0x15000000u, 0, texture_type::kLinearStrided, 40, 24, 20, 12, 1},
+        {TargetSource::Depth24S8, 0x15000000u, 0, texture_type::kLinearStrided, 33, 17, 33, 17, 2},
+        {TargetSource::Depth24S8, 0x15000000u, 0, texture_type::kTiled, 64, 64, 64, 40, 1},
     };
     check.ran = true;
     check.ok = true;
@@ -825,6 +926,7 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
         const u32 bytes = cs.source == TargetSource::Depth16 ? 2 : 4;
         info.stride = cs.type == texture_type::kTiled ? 0 : (cs.width + 3) * bytes;  // (a stride past the width)
         const auto d = target_decode(info, cs.source);
+        if (!d && cs.source == TargetSource::Depth24S8) continue;  // (none made: the decoder's X8U24 not as expected)
         if (!d) {
             check.ok = false;
             check.what = nx::format("format {:08x} swizzle {}: no decode", cs.format, cs.swizzle);
@@ -841,9 +943,15 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
         k.bg_pitch = k.bg_tiled ? (cs.width + 31) / 32 : info.stride / bytes;
         k.bg_bits = bytes * 8;
         const u32 tw = target_source_words(cs.source);
-        // (the image's texels: depths in 0-1 with D16's rounding boundaries, halves of every kind)
-        nx::vector<u32> image(usize{k.src_pitch} * cs.a_height * tw);
-        for (usize i = 0; i < image.size(); ++i) {
+        // (the image's texels: depths in 0-1 with D16's and D24's rounding boundaries, halves of every kind; D24S8's
+        // stencil bytes after the depths)
+        const bool d24 = cs.source == TargetSource::Depth24S8;
+        const usize depth_words = usize{k.src_pitch} * cs.a_height * tw;
+        k.stencil = d24 ? k.src + static_cast<u32>(depth_words) : 0;
+        k.stencil_pitch = d24 ? (k.src_pitch + 3) & ~3u : 0;
+        nx::vector<u32> image(depth_words + usize{k.stencil_pitch} * cs.a_height / 4);
+        for (usize i = depth_words; i < image.size(); ++i) image[i] = next();
+        for (usize i = 0; i < depth_words; ++i) {
             const u32 r = next();
             if (cs.source == TargetSource::U2F10F10F10) {
                 const u32 kinds = r & 7;
@@ -855,11 +963,16 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
                 image[i] = h | (other & 0x3FFF0000u);
             } else {
                 f32 z = static_cast<f32>(r >> 8) / 16777216.0f;
-                if ((r & 3) == 0) z = std::nextafter((static_cast<f32>(r >> 16) + 0.5f) / 65535.0f, (r & 4) ? 2.0f : -1.0f);
+                if ((r & 3) == 0 && !d24) z = std::nextafter((static_cast<f32>(r >> 16) + 0.5f) / 65535.0f, (r & 4) ? 2.0f : -1.0f);
+                if ((r & 3) == 0 && d24) {
+                    z = static_cast<f32>((static_cast<f64>(r >> 9) + 0.5) / 16777215.0);
+                    if (r & 0x80) z = std::nextafter(z, (r & 4) ? 2.0f : -1.0f);
+                }
                 if ((r & 15) == 1) z = (r & 16) ? 1.0f : 0.0f;
                 image[i] = std::bit_cast<u32>(z);
             }
         }
+        const u8* stencil = reinterpret_cast<const u8*>(image.data() + depth_words);
         // (guest memory as the write-back leaves it: noise, the image's part written over it)
         const u32 size = texture_size(info);
         nx::vector<u8> guest(size + 8);
@@ -874,6 +987,10 @@ TargetCheck check_target_conversion(vulkan::Device& device, TargetConverter& c) 
                     std::memcpy(guest.data() + index * 2, &v, 2);
                 } else if (cs.source == TargetSource::Depth32) {
                     std::memcpy(guest.data() + index * 4, t, 4);
+                } else if (d24) {
+                    const u32 v = depth24_of(std::bit_cast<f32>(t[0]),
+                                             stencil[usize{y} * k.stencil_pitch + k.src_first + usize{x} * k.src_step]);
+                    std::memcpy(guest.data() + index * 4, &v, 4);
                 } else {
                     const u16 h[4] = {static_cast<u16>(t[0]), static_cast<u16>(t[0] >> 16), static_cast<u16>(t[1]),
                                       static_cast<u16>(t[1] >> 16)};

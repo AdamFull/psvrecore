@@ -413,7 +413,7 @@ void write_depth_surface(const DepthStencilSurface& s, const DepthLayout& l, u32
             if (keep && !keep(i)) continue;
             const f32 z = unorm24 ? static_cast<f32>(depth[at] & 0xFFFFFF) / 16777215.0f : std::bit_cast<f32>(depth[at]);
             if (l.depth_bytes == 4) {
-                const u32 w = l.packed ? static_cast<u32>(std::lround(z * 16777215.0f)) | u32{stencil[at]} << 24
+                const u32 w = l.packed ? depth24_of(z, stencil[at])
                                        : std::bit_cast<u32>(z) | (mask_in_stencil(l) ? u32{stencil[at] & 1u} << 31 : mask);
                 std::memcpy(d + usize{i} * 4, &w, 4);
             } else if (l.depth_bytes == 2) {
@@ -561,6 +561,7 @@ struct DepthTarget {
     u32 stencil_address = 0;  // (a kept one's: its key has the stencil's address too)
     u64 used = 0;             // (a kept one's: the scene it was last used in)
     u64 generation = 0;       // (a kept one's: +1 each time a scene's store of it is written back)
+    u64 drawn = 0;            // (a kept one's: +1 for each scene drawing with it, as they are rendered)
     WrittenWatch watch[2];    // (its depth's bytes and its stencil's, once stored: `written`)
     WrittenWatch background_watch;  // (background_bytes' range, once compared or taken)
     // (a kept one's, for textures made on the GPU from it that read past what the scenes store (converted_texture):
@@ -656,6 +657,9 @@ struct Renderer {
         vk::DeviceBuffer work{};
         VkDescriptorSet set = VK_NULL_HANDLE;
         bool from_image = false;
+        // (a depth surface a pending scene stores: the depths and stencil it copies for its write-back, its buffer
+        // lent to this conversion, copied to the work buffer: rows of w (h of them), the stencil's bytes after)
+        vk::Buffer stored{};
         vk::Buffer background_staging{};
         vk::DeviceBuffer retired_background{};  // (a smaller one this replaced: earlier scenes may read it)
         // (PSVRECORE_TARGET_TEXTURES=verify: the decoder's texels from guest memory, and the GPU's read back)
@@ -728,6 +732,13 @@ struct Renderer {
         DepthTarget* kept_depth = nullptr;  // (the kept depth image it drew with, and whether it stores it)
         bool stores_kept_depth = false;
         DepthTarget* depth_sources[2] = {};  // (the kept images it copies its depth and stencil from)
+        // (the depth surface it stores, at its size and scale, and the buffer its image's depths and stencil are copied
+        // to for the write-back: rows of width * scale samples, `height` of them, then the stencil's bytes)
+        struct DepthStore {
+            vk::Buffer buffer{};
+            DepthStencilSurface ds{};
+            u32 width = 0, height = 0, scale = 1;
+        } depth_store;
         nx::vector<DepthTarget*> converted_from;  // (kept images its textures were made from)
         nx::unique_ptr<vk::OneShot> shot;
         nx::vector<std::pair<u32, u32>> writes;  // (address, bytes)
@@ -2252,8 +2263,9 @@ void give_descriptor_pool(Renderer& r, VkDescriptorPool pool, u32 sets) {
 }
 
 // And back, once the GPU is done with it.
+void release_host_buffer(Renderer& r, vk::Buffer& b);
 void Snapshot::clear() {
-    if (buffer.buffer) give_host_buffer(renderer(), buffer);
+    if (buffer.buffer) release_host_buffer(renderer(), buffer);  // (a scene's buffer it adopted: kept while lent)
     buffer_bytes = 0;
     bytes.clear();
 }
@@ -2999,6 +3011,7 @@ void release_conversion(Renderer& r, Renderer::TargetConversion& c) {
     if (c.from_image) free_target_image_set(*r.device, r.converter, c.set);
     else free_target_converter_set(*r.device, r.converter, c.set);
     c.set = VK_NULL_HANDLE;
+    release_host_buffer(r, c.stored);
     give_host_buffer(r, c.background_staging);
     give_host_buffer(r, c.verify);
     if (c.retired_background.buffer) vk::destroy_buffer(*r.device, c.retired_background);
@@ -3075,6 +3088,7 @@ void verify_packing(vk::Device& d, vk::Buffer& texels, const u8* words, u32 widt
 CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u64 words_key, const TargetDecode& dec,
                                 Renderer::TargetConversion conv) {
     TargetTextureConstants& k = conv.k;
+    const vk::Buffer stored = std::exchange(conv.stored, vk::Buffer{});  // (lent once the conversion is queued)
     k.kind = dec.kind, k.mask = dec.mask, k.select = dec.select, k.alpha_low = dec.alpha_low ? 1 : 0;
     target_packing(k);
     vk::ImageDesc d;
@@ -3093,8 +3107,14 @@ CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u
         if (!conv.set) conv.from_image = false, d.usage = vk::ImageDesc{}.usage;
     }
     // (else the work buffer: the image's texels, then the texels made, 16-byte aligned)
-    const u32 src_words = conv.w * conv.h * target_source_words(static_cast<TargetSource>(k.source));
+    u32 src_words = conv.w * conv.h * target_source_words(static_cast<TargetSource>(k.source));
     k.src = 0;
+    if (k.source == static_cast<u32>(TargetSource::Depth24S8)) {
+        // (the stencil's bytes after the depths, rows of whole words: copies of a stencil aspect start at a word. A
+        // pending scene's: as its buffer has them, rows of w)
+        k.stencil = src_words, k.stencil_pitch = stored.buffer ? conv.w : (conv.w + 3) & ~3u;
+        src_words += (k.stencil_pitch * conv.h + 3) / 4;
+    }
     k.out = (src_words + 3) & ~3u;
     const VkDeviceSize work_bytes = (VkDeviceSize{k.out} + VkDeviceSize{k.width} * k.height * target_out_words(dec)) * 4;
     if (!conv.from_image) {
@@ -3160,7 +3180,7 @@ CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u
         return nullptr;
     }
     if (upload) bg->background_uploaded = true;
-    if (verify_conversions() && (conv.depth || conv.color->scale <= 1 || !conv.color->scaled.image)) {
+    if (verify_conversions() && (conv.depth || stored.buffer || conv.color->scale <= 1 || !conv.color->scaled.image)) {
         auto texels = read_texels(info, read_guest_memory, false, true);
         auto readback = texels ? take_host_buffer(r, texels->data.size()) : Result<vk::Buffer>(failure("verify"));
         if (texels && readback && texels->data.size() == usize{k.width} * k.height * target_out_words(dec) * 4) {
@@ -3173,6 +3193,7 @@ CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u
         }
     }
     conv.key = key;
+    if (stored.buffer) conv.stored = stored, lend_host_buffer(r, stored);
     r.target_conversions.push_back(conv);
     c.used = r.scenes;
     r.by_words[words_key] = key;
@@ -3182,22 +3203,24 @@ CachedTexture* queue_conversion(Renderer& r, const TextureInfo& info, u64 key, u
 
 // A texture that reads a surface the GPU drew, in a format whose texels the shader makes from its image
 // (target_texture.hpp): an HDR colour surface (U2F10F10F10, read as such), a depth surface a scene stores (DF32,
-// DF32M read as F32 or F32M; D16 as U16). Made from the image while guest memory still holds what was written back
-// from it (and, for a texture that reads past what the scenes store, what it held when it was taken as the
-// background): keyed by the surface's generation, not hashed, decoded and uploaded.
+// DF32M read as F32 or F32M; D16 as U16; S8D24 as X8U24, from the depth and the stencil). Made from the image while
+// guest memory still holds what was written back from it (and, for a texture that reads past what the scenes store,
+// what it held when it was taken as the background): keyed by the surface's generation, not hashed, decoded and
+// uploaded.
 //
 // A colour surface: the texture inside it (its address in it, the same layout: rows of the same stride, or tiles of
 // as many a row from a tile row), at the internal resolution when it is drawn at one. A depth surface: at its
 // address, in its layout, its kept image's samples (at a scale, the middle samples guest memory gets) and the
 // background past them; also while pending scenes store that image (the GPU runs them first: keyed by the generation
-// their write-backs make). `only`: that colour surface, which a pending scene draws (not compared). `depth_only`:
-// depth surfaces alone (a texture over memory pending scenes write: a colour surface's is `only`'s).
+// their write-backs make), else from what the latest pending scene to write there copied for its store. `only`:
+// that colour surface, which a pending scene draws (not compared). `depth_only`: depth surfaces alone (a texture
+// over memory pending scenes write: a colour surface's is `only`'s).
 CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words_key, u64* key, Target* only = nullptr,
                                  bool depth_only = false) {
     if (!r.converter.ready() || info.levels != 1 || !info.address || info.gamma) return nullptr;
     const u32 code = ((info.base_format >> 24) & 0x1F) | ((info.base_format >> 31) << 7);
-    const bool hdr = code == 0x9A, d16 = code == 0x09, d32 = code == 0x12 || code == 0x13;
-    if (!hdr && !d16 && !d32) return nullptr;
+    const bool hdr = code == 0x9A, d16 = code == 0x09, d32 = code == 0x12 || code == 0x13, x24 = code == 0x15;
+    if (!hdr && !d16 && !d32 && !x24) return nullptr;
     if (hdr && depth_only) return nullptr;
     const bool linear = info.type == texture_type::kLinear || info.type == texture_type::kLinearStrided;
     const bool tiled = info.type == texture_type::kTiled;
@@ -3255,14 +3278,16 @@ CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words
         return nullptr;
     }
     if (only) return nullptr;
-    // (a D32 float image: a D24 one's values are converted on storing)
+    // (a D32 float image: a D24 one's values are converted on storing. S8D24's: with its stencil)
     const VkFormat depth_format = r.device->caps().depth_stencil_format;
     if (depth_format != VK_FORMAT_D32_SFLOAT && depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return nullptr;
+    if (x24 && depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return nullptr;
+    const TargetSource source = x24 ? TargetSource::Depth24S8 : d16 ? TargetSource::Depth16 : TargetSource::Depth32;
     for (auto& kt : r.kept_depths) {
         DepthTarget* t = kt.get();
         if (t->address != info.address || t->image.layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
         DepthLayout l;
-        if (!depth_layout(t->control & 0x03FFF000u, l) || l.packed) continue;
+        if (!depth_layout(t->control & 0x03FFF000u, l) || l.packed != x24) continue;
         if (d16 ? l.depth_bytes != 2 : (l.depth_bytes != 4 || (code == 0x12 && l.mask))) continue;
         const u32 bytes = l.depth_bytes;
         if (((t->control & kDsTiled) != 0) != tiled) continue;
@@ -3295,7 +3320,7 @@ CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words
                 others |= !(p.kept_depth == t && p.stores_kept_depth && within);
             }
         if (others) continue;
-        const auto& dec = decode_for(r, info, d16 ? TargetSource::Depth16 : TargetSource::Depth32);
+        const auto& dec = decode_for(r, info, source);
         if (!dec) return nullptr;
         if (past) {
             // (guest memory past what the scenes store, row by row: as it was taken, else taken again)
@@ -3336,7 +3361,47 @@ CachedTexture* converted_texture(Renderer& r, const TextureInfo& info, u64 words
         TargetTextureConstants& k = conv.k;
         k.width = tw, k.height = th, k.a_width = aw, k.a_height = ah;
         k.src_pitch = aw * sc, k.src_step = sc, k.src_first = sc / 2;
-        k.source = static_cast<u32>(d16 ? TargetSource::Depth16 : TargetSource::Depth32);
+        k.source = static_cast<u32>(source);
+        k.bg_tiled = 0, k.bg_pitch = linear ? info.stride / bytes : 0, k.bg_bits = bytes * 8;
+        return queue_conversion(r, info, *key, words_key, *dec, conv);
+    }
+    // A depth surface a pending scene stores but not from the image kept for it (it drew over the image after, or
+    // stores elsewhere): from the depths and stencil that scene copied for its write-back. The latest pending scene
+    // to write the texture's memory, only by that store; the texture within the surface, at its start. (X8U24 only
+    // for now: the only kind a game was seen to need, Killzone: Mercenary; D32 and D16 wait and decode as before.)
+    for (usize i = x24 ? r.pending.size() : 0; i-- > 0;) {
+        const Renderer::Pending& p = r.pending[i];
+        const Renderer::Pending::DepthStore& s = p.depth_store;
+        DepthLayout l;
+        const bool stores = s.buffer.buffer && depth_layout(s.ds.control & 0x03FFF000u, l);
+        const DepthRanges g = stores ? depth_ranges(s.ds, l, s.width, s.height) : DepthRanges{};
+        const u32 tsize = texture_size(info);
+        bool writes = false, others = false;
+        for (const auto& [at, n] : p.writes) {
+            if (!(info.address < at + n && at < info.address + tsize)) continue;
+            writes = true;
+            others |= !((g.depth_bytes && at >= g.depth && u64{at} + n <= u64{g.depth} + g.depth_bytes) ||
+                        (g.stencil_bytes && at >= g.stencil && u64{at} + n <= u64{g.stencil} + g.stencil_bytes));
+        }
+        if (!writes) continue;
+        if (others || s.ds.depth_data != info.address || l.packed != x24) break;
+        if (d16 ? l.depth_bytes != 2 : (l.depth_bytes != 4 || (code == 0x12 && l.mask))) break;
+        const u32 bytes = l.depth_bytes, stride = s.ds.background_control >> 16;
+        if (((s.ds.control & kDsTiled) != 0) != tiled) break;
+        if (linear ? info.stride != stride * 32 * bytes : (tw + 31) / 32 != stride) break;
+        if (tw > s.width || th > s.height) break;
+        const auto& dec = decode_for(r, info, source);
+        if (!dec) return nullptr;
+        *key = mix(nullptr, p.number, 0x73746F726564ull);
+        if (CachedTexture* c = cached()) return c;
+        Renderer::TargetConversion conv;
+        conv.stored = s.buffer;
+        conv.pending = true;
+        conv.w = s.width * s.scale, conv.h = s.height;
+        TargetTextureConstants& k = conv.k;
+        k.width = k.a_width = tw, k.height = k.a_height = th;
+        k.src_pitch = conv.w, k.src_step = s.scale, k.src_first = s.scale / 2;
+        k.source = static_cast<u32>(source);
         k.bg_tiled = 0, k.bg_pitch = linear ? info.stride / bytes : 0, k.bg_bits = bytes * 8;
         return queue_conversion(r, info, *key, words_key, *dec, conv);
     }
@@ -3376,7 +3441,7 @@ void record_target_conversions(Renderer& r, VkCommandBuffer cmd) {
     };
     // (a kept depth image pending scenes store: their writes before its copy, whatever layout they left it in)
     bool from_pending = false;
-    for (Renderer::TargetConversion* c : live) from_pending |= c->depth && c->pending;
+    for (Renderer::TargetConversion* c : live) from_pending |= (c->depth || c->stored.buffer) && c->pending;
     if (from_pending)
         barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT);
@@ -3390,18 +3455,33 @@ void record_target_conversions(Renderer& r, VkCommandBuffer cmd) {
             const VkBufferCopy region{0, 0, bytes};
             vkCmdCopyBuffer(cmd, c->background_staging.buffer, c->depth->background.buffer, 1, &region);
         }
-        if (c->depth) {
+        if (c->stored.buffer) {
+            // (the pending scene's depths, and S8D24's stencil after them, as its buffer has them)
+            const bool stencil = c->k.source == static_cast<u32>(TargetSource::Depth24S8);
+            const VkBufferCopy region{0, 0, VkDeviceSize{c->w} * c->h * (stencil ? 5 : 4)};
+            vkCmdCopyBuffer(cmd, c->stored.buffer, c->work.buffer, 1, &region);
+        } else if (c->depth) {
             vk::Image& from = c->depth->image;
             const VkImageLayout was = from.layout;
             vk::transition(cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             nx::vector<VkBufferImageCopy> rows;
+            // (S8D24's stencil too, its bytes at word k.stencil in rows of k.stencil_pitch)
+            const bool stencil = c->k.source == static_cast<u32>(TargetSource::Depth24S8);
+            const VkDeviceSize st = VkDeviceSize{c->k.stencil} * 4;
             if (c->step == 1) {
                 rows.push_back({0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {c->w, c->h, 1}});
+                if (stencil)
+                    rows.push_back({st, c->k.stencil_pitch, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {c->w, c->h, 1}});
             } else {
                 // (the rows of middle samples, as the write-back takes them)
-                for (u32 y = 0; y < c->h; ++y)
-                    rows.push_back({VkDeviceSize{y} * c->w * 4, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
-                                    {0, static_cast<i32>(y * c->step + c->first), 0}, {c->w, 1, 1}});
+                for (u32 y = 0; y < c->h; ++y) {
+                    const i32 at = static_cast<i32>(y * c->step + c->first);
+                    rows.push_back({VkDeviceSize{y} * c->w * 4, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, at, 0},
+                                    {c->w, 1, 1}});
+                    if (stencil)
+                        rows.push_back({st + VkDeviceSize{y} * c->k.stencil_pitch, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                                        {0, at, 0}, {c->w, 1, 1}});
+                }
             }
             vkCmdCopyImageToBuffer(cmd, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->work.buffer,
                                    static_cast<u32>(rows.size()), rows.data());
@@ -6345,7 +6425,9 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     pending.color_as_image = color && cf.packing == Packing::None;
     pending.kept_depth = kept_depth;
     pending.stores_kept_depth = kept_depth && store_depth && !scene.store_elsewhere;
+    const u64 kept_drawn = kept_depth ? ++kept_depth->drawn : 0;
     pending.depth_sources[0] = aspect_from[0], pending.depth_sources[1] = aspect_from[1];
+    if (store_depth && depth.image && depth_buf) pending.depth_store = {*depth_buf, ds_store, width, height, scale};
     for (const Renderer::TargetConversion& c : r.target_conversions)
         if (c.depth && std::find(pending.converted_from.begin(), pending.converted_from.end(), c.depth) == pending.converted_from.end())
             pending.converted_from.push_back(c.depth);
@@ -6354,7 +6436,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                       layout, data = cs.data, width, height, bytes = cf.guest_bytes(), image_bytes = cf.bytes, packing = cf.packing, target,
                       store_backs = std::move(store_backs), copied = std::move(copied), queries, query_count, counters = std::move(counters), scale,
                       stores_depth, ds = ds_store, dl, unorm24, samples, depth_target,
-                      kept_depth, kept_stores = !scene.store_elsewhere, depth, pool, sets, stencil_buf,
+                      kept_depth, kept_stores = !scene.store_elsewhere, kept_drawn, depth, pool, sets, stencil_buf,
                       notifications = std::move(notifications), copies = std::move(r.target_copies),
                       uploads = std::move(r.texture_uploads), conversions = std::move(r.target_conversions), pack_work,
                       pack_set, pack_verify, fill_buf, fill_from, memory_filled = fill_buf ? std::move(memory_filled)
@@ -6524,8 +6606,13 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 if (keep_stored_bytes({&depth_target->watch[0]})) w.bytes.assign(now.begin(), now.end());
                 else w.bytes.clear();
             }
-            // (a scene that stores elsewhere drew over its kept image: not the surface it stored)
-            if (kept_depth && kept_stores) {
+            // (a scene that stores elsewhere drew over its kept image: not the surface it stored. Nor is it once a later
+            // scene has drawn with the image (Killzone: Mercenary's scene after the one storing its 240 x 136 S8D24
+            // surface loads it, draws and stores elsewhere): `written` cleared, as that scene cleared it)
+            if (kept_depth && kept_stores && kept_depth->drawn != kept_drawn) {
+                kept_depth->written.clear();
+                ++kept_depth->generation;
+            } else if (kept_depth && kept_stores) {
                 watch_range(kept_depth->watch[0], g.depth, g.depth_bytes);
                 watch_range(kept_depth->watch[1], g.stencil, g.stencil_bytes);
                 StoredDepth& w = kept_depth->written;
