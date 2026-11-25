@@ -5819,6 +5819,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         pass_formats.color_input = reads_color;
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
+        desc.unordered = reads_color && !reads_attachment(dr, cf, color != nullptr) ? 1 : 0;
         if (d.caps().dynamic_state) plan.state = desc;
         plan.topology = desc.topology;
         // (one not made yet: made with the scene's others after its draws are planned, on several threads)

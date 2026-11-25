@@ -184,7 +184,7 @@ Result<VkPipeline> Pipelines::graphics(const GraphicsPipelineDesc& d) {
     const bool has_color = d.formats.color != VK_FORMAT_UNDEFINED;
     blend.attachmentCount = has_color ? 1 : 0;
     blend.pAttachments = &attachment;
-    if (d.formats.color_input && device_.caps().raster_order_attachment)
+    if (d.formats.color_input && !d.unordered && device_.caps().raster_order_attachment)
         blend.flags |= VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     // (with dynamic_state, the rasterization, depth and stencil state too, as the libraries have them: the draws set
     // them for whichever is bound, set_dynamic_state)
@@ -278,7 +278,7 @@ GraphicsPipelineDesc part_of(u32 part, const GraphicsPipelineDesc& d, bool dynam
             p.formats = d.formats;
             break;
         default:
-            p.blend = d.blend, p.formats = d.formats;
+            p.blend = d.blend, p.formats = d.formats, p.unordered = d.unordered;
             break;
     }
     return p;
@@ -382,7 +382,7 @@ Result<VkPipeline> Pipelines::library(u32 part, const GraphicsPipelineDesc& full
     blend.logicOpEnable = d.blend.logic_enable && device_.caps().logic_op;
     blend.logicOp = d.blend.logic_op;
     blend.attachmentCount = has_color ? 1 : 0, blend.pAttachments = &attachment;
-    if (d.formats.color_input && device_.caps().raster_order_attachment)
+    if (d.formats.color_input && !d.unordered && device_.caps().raster_order_attachment)
         blend.flags |= VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     // (each part's dynamic state, as graphics() makes them dynamic)
     // (with dynamic_state, the rasterization, depth and stencil state too: the draws set them, set_dynamic_state)

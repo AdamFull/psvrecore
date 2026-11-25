@@ -62,7 +62,10 @@ struct GraphicsPipelineDesc {
     // Specialization constants 0 to count - 1, for both stages.
     u32 specialization[kMaxSpecialization];
     u32 specialization_count;
-    u32 reserved;  // (zero: no padding at the end)
+    // In a pass that reads its colour (formats.color_input), a pipeline whose fragments don't read it: made without
+    // rasterization-order access, which the Adreno 830 keeps for every fragment of such a pipeline, at a cost
+    // (also no padding at the end)
+    u32 unordered;
 
     // Every byte zero, then: triangles, filled, no culling, counter-clockwise front faces, no depth or stencil test,
     // no blending, all colour components written.
