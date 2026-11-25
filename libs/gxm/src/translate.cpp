@@ -340,7 +340,10 @@ private:
     Id raw(const Operand& o, u32 lane, Type t);
     Id fval(const Operand& o, u32 lane, Type t);
     void put(const Operand& d, u32 lane, Type t, Id value);
-    void putf(const Operand& d, u32 lane, Type t, Id v) { put(d, lane, t, t == Type::F16 ? to_half(cast(tu_, v)) : cast(tu_, v)); }
+    void putf(const Operand& d, u32 lane, Type t, Id v) {
+        if (t == Type::F16 && d.bank == Bank::Internal) t = Type::F32;  // (see fval)
+        put(d, lane, t, t == Type::F16 ? to_half(cast(tu_, v)) : cast(tu_, v));
+    }
     void commit();
     // A store now (index registers, predicates), under the instruction's predicate.
     void store_now(Id type, Id ptr, Id v) {
@@ -560,6 +563,9 @@ Id Translator::raw(const Operand& o, u32 lane, Type t) {
 }
 
 Id Translator::fval(const Operand& o, u32 lane, Type t) {
+    // (an f16 operation on an internal register keeps its f32 value, read and written: Killzone Mercenary's
+    // occlusion boxes put world positions through one, and at half precision a door's box fell behind its wall)
+    if (t == Type::F16 && o.bank == Bank::Internal) t = Type::F32;
     const Id r = raw(o, lane, t);
     Id v = t == Type::F16 ? from_half(r) : cast(tf_, r);
     if (o.absolute) v = ext(tf_, GLSLstd450FAbs, {v});

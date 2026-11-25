@@ -677,6 +677,9 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
 - **Shader interpreter** (`usse/interp.hpp`, test and tool use only). It runs decoded programs on one instance.
   - Lanes are read by data type: words, halves or bytes of the 32-bit registers.
   - The internal registers hold four 32-bit lanes. f16 values are held there as f32, narrower integers zero-extended.
+    An f16 float operation reads and writes them at f32 precision, unrounded (Killzone Mercenary's occlusion boxes
+    put world positions through one; rounded to half precision, a door's box fell behind its wall and the door
+    flickered). The translation does the same.
   - Before a draw, the secondary attributes are filled as the driver fills them: the default uniform buffer, uniform
     buffer addresses with their bias, and literals (`load_secondary`). Then the secondary program runs, then the
     primary one.

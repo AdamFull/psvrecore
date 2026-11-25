@@ -191,7 +191,7 @@ public:
                 return comp < 4 ? (w >> (8 * comp)) & 0xFF : 0;
             }
             case Bank::Internal:
-                // (an internal register holds f32 values: an f16 read narrows; checked, see put)
+                // (an internal register holds f32 values: an f16 read narrows, not a float operation's: see fval)
                 if (t == Type::F16) {
                     const Slot s = slot(o, comp, 32);
                     return s.word ? to_half(std::bit_cast<f32>(*s.word)) : 0;
@@ -207,6 +207,9 @@ public:
     }
 
     f32 fval(const Operand& o, u32 lane, Type t) {
+        // (an f16 operation on an internal register keeps its f32 value, read and written: Killzone Mercenary's
+        // occlusion boxes put world positions through one, and at half precision a door's box fell behind its wall)
+        if (t == Type::F16 && o.bank == Bank::Internal) t = Type::F32;
         const u32 r = raw(o, lane, t);
         f32 v = t == Type::F16 ? from_half(static_cast<u16>(r)) : std::bit_cast<f32>(r);
         if (o.absolute) v = std::fabs(v);
@@ -232,6 +235,7 @@ public:
     }
 
     void putf(const Operand& d, u32 lane, Type t, f32 v) {
+        if (t == Type::F16 && d.bank == Bank::Internal) t = Type::F32;  // (see fval)
         put(d, lane, t, t == Type::F16 ? to_half(v) : std::bit_cast<u32>(v));
     }
 
