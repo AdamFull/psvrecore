@@ -91,7 +91,12 @@ struct ColorFormat {
     // The surface is drawn through its image's sRGB view (`gamma` is 0 then: the hardware encodes what is written,
     // and blends and reads the colour in linear light), set where the scene's surface is known.
     bool srgb = false;
-    VkFormat attachment_format() const { return srgb ? vk::srgb_format_of(format) : format; }
+    // The surface is drawn through its image's raw view (FragmentShader::raw: 16 or 32, the component size; 0: not),
+    // set where the scene's surface is known (raw_view_of).
+    u8 raw = 0;
+    VkFormat attachment_format() const {
+        return raw ? vk::raw_format_of(format) : srgb ? vk::srgb_format_of(format) : format;
+    }
     u32 guest_bytes() const {  // per pixel in guest memory
         return packing == Packing::None       ? bytes
                : packing == Packing::U8U8U8   ? 3
@@ -1771,7 +1776,7 @@ ShaderKey fragment_key(const Program& p, const FragmentShader& fs, bool inline_s
     v.insert(v.end(), reinterpret_cast<const u8*>(&fs.output_format), reinterpret_cast<const u8*>(&fs.output_format) + 4);
     v.insert(v.end(), fs.swizzle, fs.swizzle + 4);
     v.push_back(fs.color_output), v.push_back(fs.fragment_program_enabled), v.push_back(inline_secondary);
-    v.push_back(fs.blend_read), v.push_back(fs.gamma);
+    v.push_back(fs.blend_read), v.push_back(fs.gamma), v.push_back(fs.raw);
     return shader_key({p.content, v});
 }
 
@@ -1828,6 +1833,8 @@ Result<vk::Image> target_image(Renderer& r, VkFormat format, u32 width, u32 heig
     vk::ImageDesc d;
     d.format = format;
     d.srgb_view = srgb_view;
+    // (a float surface: also its raw view, for scenes that write it bit patterns, raw_view_of)
+    d.raw_view = vk::raw_format_of(format) != VK_FORMAT_UNDEFINED;
     d.width = width;
     d.height = height;
     d.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1879,6 +1886,7 @@ bool ensure_scaled(Renderer& r, Target& t, u32 scale) {
     if (t.scaled.image) {
         r.passes->forget(t.scaled.view);
         if (t.scaled.srgb_view) r.passes->forget(t.scaled.srgb_view);
+        if (t.scaled.raw_view) r.passes->forget(t.scaled.raw_view);
         vk::destroy_image(*r.device, t.scaled);
         t.scaled = {};
     }
@@ -4821,6 +4829,31 @@ std::optional<ColorReadBlend> blend_read_of(const Draw& dr, const ColorFormat& c
     return p.blend_read == 1 ? std::optional<ColorReadBlend>(p.blend_read_found) : std::nullopt;
 }
 
+// Whether a scene draws its colour surface through the image's raw view (ColorFormat::raw: the component size, or 0):
+// a float surface some draw's program writes 32-bit words of the surface's bits to (output type U32 or S32), which a
+// float attachment would not keep as they are (it may quiet or canonicalize NaN patterns: Call of Duty: Black Ops
+// Declassified packs a G-buffer's normal and albedo bytes in an F16x4 surface, and a byte of 0xFF next to another
+// is a NaN's half). Not where a draw blends or reads the colour, which bit patterns cannot do (they are then written
+// as floats). PSVRECORE_RAW_VIEW=0: never.
+u8 raw_view_of(const Scene& scene, const ColorFormat& cf) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PSVRECORE_RAW_VIEW");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    const VkFormat raw = vk::raw_format_of(cf.format);
+    if (!enabled || raw == VK_FORMAT_UNDEFINED || cf.srgb || cf.packing != Packing::None) return 0;
+    bool words = false;
+    for (const Draw& dr : scene.draws) {
+        if (!dr.fragment || !dr.fragment->program) continue;
+        const usse::Gxp& g = dr.fragment->program->gxp;
+        if (dr.fragment->blend_enabled || (g.native_color && g.frag_color)) return 0;
+        words = words || g.output_type == usse::ParameterType::U32 || g.output_type == usse::ParameterType::S32;
+    }
+    if (!words) return 0;
+    const bool halves = raw == VK_FORMAT_R16_UINT || raw == VK_FORMAT_R16G16_UINT || raw == VK_FORMAT_R16G16B16A16_UINT;
+    return halves ? 16 : 32;
+}
+
 // A draw's fragment shader variant, for a colour surface of that format (or none).
 FragmentShader fragment_shader_of(const Draw& dr, const ColorFormat& cf, bool color) {
     FragmentShader fs;
@@ -4829,6 +4862,7 @@ FragmentShader fragment_shader_of(const Draw& dr, const ColorFormat& cf, bool co
     fs.color_output = color;
     fs.blend_read = blend_read_of(dr, cf, color).has_value();
     fs.gamma = color ? cf.gamma : 0;
+    fs.raw = color ? cf.raw : 0;
     return fs;
 }
 
@@ -4842,7 +4876,7 @@ u64 fragment_quick(const Program& fp, const FragmentShader& fs, bool inline_seco
     nx::fnv1a64 q;
     q.combine_bytes(reinterpret_cast<const char*>(fp.content.data()), fp.content.size()).combine('f');
     q.combine_all(fs.output_format, fs.swizzle[0], fs.swizzle[1], fs.swizzle[2], fs.swizzle[3], fs.color_output,
-                  fs.fragment_program_enabled, inline_secondary, fs.blend_read, fs.gamma);
+                  fs.fragment_program_enabled, inline_secondary, fs.blend_read, fs.gamma, fs.raw);
     return q.value();
 }
 
@@ -5333,6 +5367,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         cf.gamma = surface_gamma(cs, cf);
         if (gamma_view(r, cf, cs.data, cs.format, cs.size & 0xFFFF, cs.size >> 16)) cf.srgb = true, cf.gamma = 0;
         ahead_color(cf);
+        cf.raw = raw_view_of(scene, cf);  // (after ahead_color: the warm-up's shaders are the surface's own format's)
         ahead_start(r);  // (once: warm_up, when there is one, is done by now)
         layout.kind = cs.modes & 3;
         if (layout.kind > SurfaceLayout::kSwizzled) {
@@ -5863,6 +5898,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         vk::Pass pass_formats;
         pass_formats.color.image = color;
         pass_formats.color.srgb = cf.srgb;
+        pass_formats.color.raw = cf.raw != 0;
         pass_formats.color_input = reads_color;
         if (has_depth && depth.image) pass_formats.depth.image = &depth;
         desc.formats = pass_formats.formats();
@@ -6222,7 +6258,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         VkDescriptorImageInfo ii[kDrawBindings];
         for (u32 b = kDrawBindingFragmentTextures; b < kDrawBindings; ++b)
             ii[b] = {r.sampler, r.white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        if (color) ii[kDrawBindingColor] = {VK_NULL_HANDLE, cf.srgb ? color->srgb_view : color->view, input_layout};
+        if (color)
+            ii[kDrawBindingColor] = {VK_NULL_HANDLE, cf.raw ? color->raw_view : cf.srgb ? color->srgb_view : color->view, input_layout};
         for (u32 stage = 0; stage < 2; ++stage) {
             const Draw& dr = *plans[i].draw;
             const Program& p = stage ? *dr.fragment->program : *dr.vertex->program;
@@ -6539,7 +6576,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         vkCmdCopyBufferToImage(*cmd, color_buf.buffer, target->image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
     vk::Pass pass;
-    if (color) pass.color = {color, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {}, nullptr, cf.srgb};
+    if (color) pass.color = {color, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {}, nullptr, cf.srgb, cf.raw != 0};
     pass.color_input = reads_color;
     if (has_depth && depth.image) {
         pass.depth.image = &depth;

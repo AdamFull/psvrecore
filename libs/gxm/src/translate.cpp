@@ -1930,6 +1930,10 @@ void Translator::fragment_epilogue() {
             case usse::ParameterType::S8: format = gxp_.native_color ? 1 : 2; break;
             case usse::ParameterType::U16: format = 3; break;
             case usse::ParameterType::S16: format = 4; break;
+            // (32-bit words, the surface's bits as they are, e.g. two words of packed bytes for a 64-bit surface:
+            // one word a 32-bit surface's four bytes, two an F16x4 surface's four halves)
+            case usse::ParameterType::U32:
+            case usse::ParameterType::S32: format = gxp_.output_components <= 1 ? 1 : 5; break;
             default: format = gxp_.output_components <= 2 ? 6 : 5; break;  // F16
         }
     }
@@ -1978,7 +1982,37 @@ void Translator::fragment_epilogue() {
             break;
         default: fail(nx::format("output register format {} not implemented", format)); break;
     }
-    if (fragment_shader->color_output) {
+    if (fragment_shader->color_output && fragment_shader->raw) {
+        // (a raw view: the components' bits. Words as they are, halves or floats; lanes converted, gamma-corrected first)
+        const bool r16 = fragment_shader->raw == 16;
+        const Id tuv4 = b_.t_vector(tu_, 4);
+        const Id color = b_.variable(b_.t_pointer(SpvStorageClassOutput, tuv4), SpvStorageClassOutput);
+        b_.decorate(color, SpvDecorationLocation, {0});
+        interface_.push_back(color);
+        const bool words = gxp_.output_type == usse::ParameterType::U32 || gxp_.output_type == usse::ParameterType::S32;
+        const u8* z = fragment_shader->swizzle;
+        Id bits[6];
+        if (words) {
+            const u32 n = nx::max<u32>(gxp_.output_components, 1);
+            for (u32 k = 0; k < 4; ++k) {
+                const u32 w = r16 ? k / 2 : k;
+                bits[k] = w >= n ? u(0) : r16 ? mask((k & 1) ? shr(p(w), u(16)) : p(w), 16) : p(w);
+            }
+        }
+        bits[4] = u(0), bits[5] = u(r16 ? 0x3C00u : 0x3F800000u);
+        Id out[4];
+        for (u32 k = 0; k < 4; ++k) {
+            const u8 l = nx::min<u8>(z[k], 5);
+            if (words || l >= 4) {
+                out[k] = bits[l];
+                continue;
+            }
+            Id v = lane[l];
+            if (l < 3 && (fragment_shader->gamma >> l & 1)) v = srgb_encode(v);
+            out[k] = r16 ? to_half(cast(tu_, v)) : cast(tu_, v);
+        }
+        store(color, b_.op(SpvOpCompositeConstruct, tuv4, {out[0], out[1], out[2], out[3]}));
+    } else if (fragment_shader->color_output) {
         const Id color = b_.variable(b_.t_pointer(SpvStorageClassOutput, tv4_), SpvStorageClassOutput);
         b_.decorate(color, SpvDecorationLocation, {0});
         interface_.push_back(color);

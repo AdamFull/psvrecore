@@ -143,6 +143,10 @@ struct FragmentShader {
     // swizzle takes them there. (Fixed-function blending, which runs on the encoded values, is not the surface's: it
     // blends in encoded space.)
     u8 gamma = 0;
+    // The colour attachment is a float surface's raw view (vk::raw_format_of: 16 for half components, 32 for float
+    // ones; 0: the surface's own format): the colour is written as bit patterns, which a float attachment would not
+    // keep (NaNs). A program whose output type is U32 or S32 writes its words' bits, the others their lanes converted.
+    u8 raw = 0;
 };
 
 // A program's read of the colour that fixed-function blending can do: the program reads it (FRAGCOLOR, with

@@ -19,8 +19,12 @@ struct ColorAttachment {
     // Drawn through the image's sRGB view (Image::srgb_view): the pipelines' colour format is the sRGB one, the
     // hardware encodes what is written and blends and reads back in linear light.
     bool srgb = false;
-    VkImageView view() const { return srgb ? image->srgb_view : image->view; }
-    VkFormat format() const { return srgb ? srgb_format_of(image->desc.format) : image->desc.format; }
+    // Drawn through the image's raw view (Image::raw_view): the shaders write bit patterns, which reach it as they are.
+    bool raw = false;
+    VkImageView view() const { return raw ? image->raw_view : srgb ? image->srgb_view : image->view; }
+    VkFormat format() const {
+        return raw ? raw_format_of(image->desc.format) : srgb ? srgb_format_of(image->desc.format) : image->desc.format;
+    }
 };
 
 struct DepthAttachment {

@@ -11,7 +11,8 @@
 //   uniform vertex|fragment <name> <f32>... a default uniform buffer parameter (f32 or f16, by its type)
 //   buffer vertex|fragment <n> <f32>...     uniform buffer BUFFER[n]'s words
 //   words vertex|fragment uniforms|<n> <hex>...  the default uniform buffer's or BUFFER[n]'s words as they are
-//   texture <unit> <width> <height> nearest|linear checker|gradient|noise
+//   texture <unit> <width> <height> nearest|linear checker|gradient|noise|<file.bin>
+//                                           (<file.bin>: a captured texture, 4 bytes a texel)
 //   depth, blend                            a LESS_EQUAL depth test with writes; source-alpha blending
 //   tolerance <n>                           the largest difference of a channel that matches (default 1)
 //   draw                                    the draw: attributes, indices, uniforms, buffers, textures and states
@@ -22,6 +23,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "gpu.hpp"
 #include "psvrecore/io/png.hpp"
@@ -200,6 +202,12 @@ Result<Scene> load_scene(const nx::string& path) {
             if (unit >= 16 || !w || !h || w > 1024 || h > 1024) return bad("bad texture");
             if (current.textures.size() <= unit) current.textures.resize(unit + 1);
             current.textures[unit] = make_texture(w, h, f[5], f[4] == "linear");
+            if (f[5].ends_with(".bin")) {
+                // (a captured texture: its texels as PSVRECORE_GXM_CAPTURE writes them, 4 bytes each, red first)
+                const auto data = io::read_file(dir + nx::string(f[5]));
+                if (!data || data->size() < usize{w} * h * 4) return bad("texture file missing or too small");
+                std::memcpy(current.textures[unit].texels.data(), data->data(), usize{w} * h * 4);
+            }
         } else if (op == "tolerance" && f.size() == 2) {
             s.tolerance = static_cast<i64>(parse_u64(f[1]).value_or(1));
         } else if (op == "depth" && f.size() == 1) {

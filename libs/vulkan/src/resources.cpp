@@ -27,6 +27,18 @@ VkFormat srgb_format_of(VkFormat format) {
     }
 }
 
+VkFormat raw_format_of(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R16_SFLOAT: return VK_FORMAT_R16_UINT;
+        case VK_FORMAT_R16G16_SFLOAT: return VK_FORMAT_R16G16_UINT;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return VK_FORMAT_R16G16B16A16_UINT;
+        case VK_FORMAT_R32_SFLOAT: return VK_FORMAT_R32_UINT;
+        case VK_FORMAT_R32G32_SFLOAT: return VK_FORMAT_R32G32_UINT;
+        case VK_FORMAT_R32G32B32A32_SFLOAT: return VK_FORMAT_R32G32B32A32_UINT;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 u32 texel_size(VkFormat format) {
     switch (format) {
         case VK_FORMAT_R8_UNORM:
@@ -70,13 +82,18 @@ u32 texel_size(VkFormat format) {
 Result<Image> create_image(Device& device, const ImageDesc& desc) {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = desc.cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-    // (a view of the sRGB format: the image's format and it, as a list where the device takes one, which lets a driver
-    // that would drop compression for a mutable-format image keep it)
+    // (a view of the sRGB or the raw format: the image's format and it, as a list where the device takes one, which
+    // lets a driver that would drop compression for a mutable-format image keep it)
     const VkFormat srgb = desc.srgb_view ? srgb_format_of(desc.format) : VK_FORMAT_UNDEFINED;
-    const VkFormat both[2] = {desc.format, srgb};
+    const VkFormat raw = desc.raw_view ? raw_format_of(desc.format) : VK_FORMAT_UNDEFINED;
+    const VkFormat formats[3] = {desc.format, srgb, raw};
+    VkFormat listed[3];
+    u32 count = 0;
+    for (VkFormat f : formats)
+        if (f != VK_FORMAT_UNDEFINED) listed[count++] = f;
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
-    format_list.viewFormatCount = 2, format_list.pViewFormats = both;
-    if (srgb != VK_FORMAT_UNDEFINED) {
+    format_list.viewFormatCount = count, format_list.pViewFormats = listed;
+    if (count > 1) {
         info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         if (device.caps().api_version >= VK_API_VERSION_1_2) info.pNext = &format_list;
     }
@@ -133,11 +150,25 @@ Result<Image> create_image(Device& device, const ImageDesc& desc) {
             return nx::err(vk_error("vkCreateImageView (sRGB)", r));
         }
     }
+    if (raw != VK_FORMAT_UNDEFINED) {
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = desc.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        view.pNext = &usage;
+        view.format = raw;
+        if (r = vkCreateImageView(device.device(), &view, nullptr, &im.raw_view); r != VK_SUCCESS) {
+            if (im.srgb_view) vkDestroyImageView(device.device(), im.srgb_view, nullptr);
+            vkDestroyImageView(device.device(), im.view, nullptr);
+            vmaDestroyImage(device.allocator(), im.image, im.allocation);
+            return nx::err(vk_error("vkCreateImageView (raw)", r));
+        }
+    }
     return im;
 }
 
 void destroy_image(Device& device, Image& image) {
     if (image.srgb_view) vkDestroyImageView(device.device(), image.srgb_view, nullptr);
+    if (image.raw_view) vkDestroyImageView(device.device(), image.raw_view, nullptr);
     if (image.view) vkDestroyImageView(device.device(), image.view, nullptr);
     if (image.image) vmaDestroyImage(device.allocator(), image.image, image.allocation);
     image = Image{};

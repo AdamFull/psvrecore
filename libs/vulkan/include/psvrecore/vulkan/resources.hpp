@@ -20,6 +20,9 @@ struct ImageDesc {
     // A second view of the image in the sRGB format with the same layout (R8G8B8A8 or B8G8R8A8 only), for a colour
     // attachment the hardware gamma-encodes on write and blends in linear light (Image::srgb_view).
     bool srgb_view = false;
+    // A second view of the image in the unsigned integer format of its float format's size (Image::raw_view), for a
+    // colour attachment written with bit patterns: a float attachment may quiet or canonicalize NaN patterns.
+    bool raw_view = false;
 };
 
 struct Image {
@@ -29,6 +32,7 @@ struct Image {
     // (ImageDesc::srgb_view: the same image as the sRGB format, as a colour attachment, an input attachment or a
     // texture: writes encode, blending and reads decode, in linear light)
     VkImageView srgb_view = VK_NULL_HANDLE;
+    VkImageView raw_view = VK_NULL_HANDLE;  // (ImageDesc::raw_view: the same image as raw_format_of its format)
     ImageDesc desc;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;  // as recorded so far
@@ -39,6 +43,8 @@ void destroy_image(Device& device, Image& image);
 VkImageAspectFlags aspect_of(VkFormat format);
 // The sRGB format of an 8888 format (R8G8B8A8_UNORM, B8G8R8A8_UNORM), or UNDEFINED.
 VkFormat srgb_format_of(VkFormat format);
+// The unsigned integer format of a float format's components (R16G16B16A16_SFLOAT: R16G16B16A16_UINT), or UNDEFINED.
+VkFormat raw_format_of(VkFormat format);
 // Bytes per texel of an uncompressed format (0 for a format this layer does not size).
 u32 texel_size(VkFormat format);
 

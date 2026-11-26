@@ -150,6 +150,13 @@ void output_color(const usse::Gxp& g, const Machine& m, f32 rgba[4]) {
             lane[0] = std::bit_cast<f32>(bank[0]);
             if (g.output_components > 1) lane[1] = std::bit_cast<f32>(bank[1]);
             break;
+        case usse::ParameterType::U32:
+        case usse::ParameterType::S32:  // (32-bit words as they are: a 32-bit surface's bytes, an F16x4 one's halves)
+            if (g.output_components > 1) {
+                lane[0] = half(bank[0], 0), lane[1] = half(bank[0], 1), lane[2] = half(bank[1], 0), lane[3] = half(bank[1], 1);
+                break;
+            }
+            [[fallthrough]];
         case usse::ParameterType::U8:
             for (u32 k = 0; k < 4; ++k) lane[k] = static_cast<f32>((bank[0] >> (8 * k)) & 0xFF) / 255.0f;
             break;
