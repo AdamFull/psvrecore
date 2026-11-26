@@ -7,6 +7,7 @@
 //   target <width> <height> [<clear RGBA8 hex, red in the low byte>]
 //   vertex <gxp>, fragment <gxp>            the programs of the draws that follow
 //   attribute <name> <components> <f32>...  a vertex attribute (per vertex, components values)
+//   untyped <name> <words> <hex>...         an untyped attribute (32-bit words as they are, <words> per vertex)
 //   indices <index>...                      a triangle list
 //   uniform vertex|fragment <name> <f32>... a default uniform buffer parameter (f32 or f16, by its type)
 //   buffer vertex|fragment <n> <f32>...     uniform buffer BUFFER[n]'s words
@@ -159,6 +160,24 @@ Result<Scene> load_scene(const nx::string& path) {
             a.components = static_cast<u32>(parse_u64(f[2]).value_or(0));
             if (!a.components || a.components > 4 || !floats(f, 3, a.values) || a.values.size() % a.components)
                 return bad("bad attribute values");
+            current.attributes.push_back(std::move(a));
+        } else if (op == "untyped" && f.size() >= 4) {
+            // (untyped <name> <words> <hex>...: an SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED attribute, 32-bit words as they
+            // are, per vertex <words> of them; a draw captured from a game: PSVRECORE_GXM_CAPTURE)
+            if (!vertex) return bad("an attribute before the vertex program");
+            const auto index = vertex->gxp.find(f[1]);
+            if (!index) return bad(nx::format("no attribute '{}'", f[1]));
+            gxm::reference::Attribute a;
+            a.reg = vertex->gxp.parameters[*index].resource;
+            a.components = static_cast<u32>(parse_u64(f[2]).value_or(0));
+            a.untyped = true;
+            if (!a.components || a.components > 4) return bad("bad attribute values");
+            for (usize i = 3; i < f.size(); ++i) {
+                const auto w = parse_u64(f[i], 16);
+                if (!w) return bad("bad word");
+                a.values.push_back(std::bit_cast<f32>(static_cast<u32>(*w)));
+            }
+            if (a.values.size() % a.components) return bad("bad attribute values");
             current.attributes.push_back(std::move(a));
         } else if (op == "indices") {
             for (usize i = 1; i < f.size(); ++i) current.indices.push_back(static_cast<u32>(parse_u64(f[i]).value_or(0)));

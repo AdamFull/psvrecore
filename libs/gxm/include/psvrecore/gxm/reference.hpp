@@ -33,8 +33,9 @@ struct Texture {
 
 struct Attribute {
     u32 reg = 0;         // the attribute's primary register (its parameter's resource index)
-    u32 components = 4;  // per vertex, f32
+    u32 components = 4;  // per vertex, f32 (untyped: 32-bit words)
     nx::vector<f32> values;
+    bool untyped = false;  // SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED: values holds the words' bits, stored in the registers as they are
 };
 
 struct Draw {

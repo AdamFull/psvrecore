@@ -107,6 +107,11 @@ Result<void> run_vertex(const Draw& d, const Machine& setup, u32 index, Vertex& 
         for (const usse::Parameter& q : g.parameters)
             if (q.category == usse::ParameterCategory::Attribute && q.resource == a.reg) p = &q;
         if (!p) continue;
+        if (a.untyped) {
+            for (u32 k = 0; k < a.components && k < 4; ++k)
+                m.primary[a.reg + k] = std::bit_cast<u32>(a.values[usize{index} * a.components + k]);
+            continue;
+        }
         f32 v[4] = {0, 0, 0, 1};
         for (u32 k = 0; k < a.components && k < 4; ++k) v[k] = a.values[usize{index} * a.components + k];
         const u32 n = nx::max<u32>(p->components, 1);

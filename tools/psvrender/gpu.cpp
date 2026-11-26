@@ -236,7 +236,7 @@ Result<void> render_on_gpu(const GpuOptions& options, std::span<const Draw> draw
                 gxm::VertexInput in;
                 in.location = static_cast<u32>(a);
                 in.reg = attr.reg;
-                in.format = 9;  // SCE_GXM_ATTRIBUTE_FORMAT_F32
+                in.format = attr.untyped ? 10 : 9;  // SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED, F32
                 in.components = static_cast<u8>(attr.components);
                 for (const usse::Parameter& q : dr.vertex.gxp->parameters)
                     if (q.category == usse::ParameterCategory::Attribute && q.resource == attr.reg) in.raw = q.reg_format;
@@ -244,7 +244,10 @@ Result<void> render_on_gpu(const GpuOptions& options, std::span<const Draw> draw
                 static constexpr VkFormat kF32[] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT,
                                                     VK_FORMAT_R32G32B32A32_SFLOAT};
                 desc.bindings[a] = {attr.components * 4, 0};
-                desc.attributes[a] = {static_cast<u32>(a), static_cast<u32>(a), kF32[nx::clamp<u32>(attr.components, 1, 4) - 1], 0};
+                static constexpr VkFormat kU32[] = {VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32_UINT,
+                                                    VK_FORMAT_R32G32B32A32_UINT};
+                desc.attributes[a] = {static_cast<u32>(a), static_cast<u32>(a),
+                                      (attr.untyped ? kU32 : kF32)[nx::clamp<u32>(attr.components, 1, 4) - 1], 0};
                 auto b = buffer(attr.values.data(), attr.values.size() * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
                 if (!b) return nx::err(b.error());
                 p.streams.push_back(*b);

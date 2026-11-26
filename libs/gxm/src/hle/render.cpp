@@ -625,7 +625,7 @@ struct Renderer {
     // drawn over in more than one scene of a frame): never sampled as textures, unlike depth_targets.
     nx::vector<nx::unique_ptr<DepthTarget>> kept_depths;
     nx::hash_map<u32, bool> scalable;  // (by VkFormat: blits to and from it, and it is drawn into)
-    vk::Image white, white_cube;
+    vk::Image white, white_cube, black_cube;
     VkSampler sampler = VK_NULL_HANDLE;
     nx::hash_map<u64, CachedTexture> textures;
     u64 texture_bytes = 0;  // (the cached textures' texels)
@@ -1528,6 +1528,11 @@ bool ensure(Renderer& r) {
         r.white_cube = *img;
         const u8 texel[4] = {255, 255, 255, 255};
         for (u32 f = 0; f < 6; ++f) (void)vk::upload_image(d, r.white_cube, texel, f);
+    }
+    if (auto img = vk::create_image(d, cd)) {
+        r.black_cube = *img;
+        const u8 texel[4] = {0, 0, 0, 255};
+        for (u32 f = 0; f < 6; ++f) (void)vk::upload_image(d, r.black_cube, texel, f);
     }
     vk::SamplerDesc sd;
     if (auto s = r.samplers->get(sd)) r.sampler = *s;
@@ -4653,6 +4658,15 @@ void capture_one(u64 number, const Scene& scene, usize which, const nx::string& 
                            d.fragment->blend_enabled, b.color_mask, b.color_func(), b.color_src(), b.color_dst(),
                            b.alpha_func(), b.alpha_src(), b.alpha_dst());
     }
+    // (every draw of the scene: what raw_view_of decides the surface's raw view by)
+    for (usize i = 0; i < scene.draws.size(); ++i) {
+        const Draw& o = scene.draws[i];
+        if (!o.vertex || !o.fragment || !o.fragment->program) continue;
+        const usse::Gxp& g = o.fragment->program->gxp;
+        text += nx::format("# scene draw {}: vertex 0x{:08x} fragment 0x{:08x} blend {} native_color {} frag_color {} output type {} x{}\n",
+                           i, o.vertex->guest, o.fragment->guest, o.fragment->blend_enabled, g.native_color, g.frag_color,
+                           static_cast<u32>(g.output_type), g.output_components);
+    }
     for (const VertexAttribute& a : d.vertex->attributes) {
         nx::string name;
         for (const usse::Parameter& p : d.vertex->program->gxp.parameters)
@@ -4661,10 +4675,17 @@ void capture_one(u64 number, const Scene& scene, usize which, const nx::string& 
         const u32 stride = d.vertex->streams[a.stream].stride, n = nx::clamp<u32>(a.components, 1, 4);
         static constexpr u32 kBytes[10] = {1, 1, 2, 2, 1, 1, 2, 2, 2, 4};
         const u32 size = a.format < 10 ? kBytes[a.format] : 4;
-        text += nx::format("attribute {} {}", name, n);
+        const bool untyped = a.format >= 10;  // (32-bit words the shader unpacks itself: written as hex, bit for bit)
+        text += nx::format("{} {} {}", untyped ? "untyped" : "attribute", name, n);
         for (u32 v = 0; v < count; ++v)
             for (u32 c = 0; c < n; ++c) {
                 const u32 addr = d.streams[a.stream] + v * stride + a.offset + c * size;
+                if (untyped) {
+                    u32 w = 0;
+                    if (memory().valid(addr, 4)) std::memcpy(&w, memory().host(addr), 4);
+                    text += nx::format(" {:x}", w);
+                    continue;
+                }
                 f32 x = 0;
                 if (memory().valid(addr, size)) {
                     const u8* p = memory().host(addr);
@@ -6293,6 +6314,11 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
                 if (CachedTexture* t = texture_for(r, words, seen_textures); t && t->image.desc.cube == q.sampler_cube) {
                     ii[binding].imageView = t->image.view;
                     ii[binding].sampler = t->sampler ? t->sampler : r.sampler;
+                } else if (t && q.sampler_cube) {
+                    // A 2D texture left bound to a cube sampler (CoD Declassified's weapon composite samples its
+                    // g_CompositeEnvmap with the level's 128x128 noise texture still at that unit): no reflection,
+                    // not the white cube, which lit every glossy texel of the weapon full white.
+                    ii[binding].imageView = r.black_cube.view;
                 }
             }
         }
@@ -7193,7 +7219,74 @@ void wait_rendered(Renderer& r, u64 limit) {
 
 }  // namespace
 
+// The draws after the first of a scene without depth that sample its own colour surface (0: none). The console's GPU
+// draws a scene tile by tile and stores each tile when it is done, so a draw reading another part of the surface it
+// draws into reads what the scene's earlier draws stored there. Here a scene's textures are made before its draws:
+// they read what the scene starts from. Call of Duty: Black Ops Declassified's bloom downsamples the frame into one
+// part of a 1024x256 surface and blurs each part into the next, five draws in one scene: read so, each blur was a
+// frame older than the one before and the glows trailed behind the lights. Such a scene is rendered as several, one
+// begun at each of those draws (the parts after the first load the colour the one before stored, and its textures
+// read it), only for post-processing scenes (no depth): a draw reading the pixels it draws over, which the console
+// reads as the scene began, stays one scene with its draws. PSVRECORE_GXM_SPLIT_SELF_READS=0 leaves them whole.
+static nx::vector<usize> self_read_splits(const Scene& scene) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PSVRECORE_GXM_SPLIT_SELF_READS");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    nx::vector<usize> out;
+    if (!enabled || !scene.has_color || scene.has_depth || scene.draws.size() < 2) return out;
+    const ColorSurface& cs = scene.color;
+    ColorFormat cf;
+    if (!color_format(cs.format, cf) || (cs.modes & 3) > SurfaceLayout::kSwizzled) return out;
+    SurfaceLayout layout;
+    layout.kind = cs.modes & 3, layout.stride = cs.stride, layout.bytes = cf.guest_bytes();
+    layout.width = cs.size & 0xFFFF, layout.height = cs.size >> 16;
+    if (!layout.width || !layout.height || !layout.bytes) return out;
+    const u64 first = cs.data, last = first + layout.span();
+    auto reads_own = [&](const TextureWords* units, usize n) {
+        for (usize u = 0; u < n; ++u) {
+            const TextureWords& t = units[u];
+            if (!(t.words[0] | t.words[1] | t.words[2] | t.words[3])) continue;
+            const u64 at = decode_texture(t.words).address;
+            if (at >= first && at < last) return true;
+        }
+        return false;
+    };
+    for (usize i = 1; i < scene.draws.size(); ++i) {
+        const Draw& dr = scene.draws[i];
+        if (reads_own(dr.fragment_textures, 16) ||
+            reads_own(dr.vertex_textures, 4))
+            out.push_back(i);
+    }
+    return out;
+}
+
 void end_scene(Scene&& scene, nx::vector<Notification> notifications) {
+    if (const nx::vector<usize> splits = self_read_splits(scene); !splits.empty()) {
+        // (the parts in order, each with the scene's surfaces and states: the first waits for the scene's sync
+        // object, the last gives its notifications)
+        nx::vector<Draw> draws = std::move(scene.draws);
+        nx::vector<UserMarker> markers = std::move(scene.markers);
+        usize from = 0;
+        for (usize k = 0; k <= splits.size(); ++k) {
+            const usize to = k < splits.size() ? splits[k] : draws.size();
+            Scene part;
+            part.target = scene.target, part.color = scene.color, part.has_color = scene.has_color;
+            part.depth = scene.depth, part.has_depth = scene.has_depth, part.store_elsewhere = scene.store_elsewhere;
+            part.store_depth_data = scene.store_depth_data, part.store_stencil_data = scene.store_stencil_data;
+            part.region = scene.region, part.flags = scene.flags, part.visibility_buffer = scene.visibility_buffer;
+            if (k == 0) part.fragment_sync = scene.fragment_sync, part.fragment_holds = scene.fragment_holds;
+            for (usize i = from; i < to; ++i) part.draws.push_back(std::move(draws[i]));
+            for (const UserMarker& m : markers)
+                if ((m.at >= from && m.at < to) || (k == splits.size() && m.at >= to)) {
+                    part.markers.push_back(m);
+                    part.markers.back().at = static_cast<u32>(m.at - from);
+                }
+            end_scene(std::move(part), k == splits.size() ? std::move(notifications) : nx::vector<Notification>{});
+            from = to;
+        }
+        return;
+    }
     Renderer& r = renderer();
     // (on the renderer's own thread only with PSVRECORE_GXM_SCENE_THREAD=1: there, a scene's copies run on a thread
     // that sleeps between scenes, with cold caches; a song on a Pixel 8a ran at 27.3 frames a second so, 28.1 on the
