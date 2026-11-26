@@ -5365,8 +5365,15 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         ds_store.control |= kDsForceStore;
     }
     ColorFormat cf;
-    // (without a colour surface, a depth-only scene: the render target's size)
-    u32 width = scene.target->width, height = scene.target->height, stride = 0;
+    // A render target with 4x multisampling (SCE_GXM_MULTISAMPLE_4X) whose surfaces keep the samples (the colour
+    // surface not downscaled): they are twice its size each way, a pixel's samples a 2x2 block, and the scene is drawn
+    // at that size (`ms`: samples per pixel each way), its viewport and clips in the render target's pixels. Call of
+    // Duty: Black Ops Declassified's shadow resolve draws a 360x204 target into a 720x408 surface and its shadow map
+    // a 512x512 one into a 1024x1024 depth: drawn at the target's size, a quarter of each was filled, and the lit
+    // layer of a room stopped at the top-left quarter of the screen. (Without a colour surface, a depth-only scene:
+    // the render target's size, in samples.)
+    const bool samples4 = scene.target->multisample == 2;
+    u32 width = scene.target->width << samples4, height = scene.target->height << samples4, stride = 0;
     SurfaceLayout layout;  // (where the colour surface's pixels are in guest memory)
     vk::Image* color = nullptr;
     // The internal resolution: drawn into `color` at `scale` times the surface's size (the target's scaled image),
@@ -5445,7 +5452,9 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         }
         g_profile.mark(10);
     }
-    const u32 target_w = nx::min(width, scene.target->width), target_h = nx::min(height, scene.target->height);
+    const u32 ms = samples4 && width >= scene.target->width * 2 && height >= scene.target->height * 2 ? 2 : 1;
+    const u32 target_w = nx::min(width / ms, scene.target->width), target_h = nx::min(height / ms, scene.target->height);
+    const u32 draw_scale = scale * ms;  // (pixels of `color` and the depth drawn per pixel of the render target)
     // A depth-only scene whose depth is stored (a shadow map): at the internal resolution too, in a depth image kept
     // for the surface, which the textures reading that surface then sample.
     DepthLayout kl;
@@ -5942,12 +5951,14 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         c.target[1] = static_cast<f32>(target_h);
         std::memcpy(c.viewport, st.viewport, sizeof c.viewport);
         c.w_clamp = st.w_clamp_enabled ? st.w_clamp : 0.0f;
-        c.scale = static_cast<f32>(scale);
-        // Region clip (tile-aligned, as the hardware applies it) and the surface's clip, as a scissor.
-        i32 x0 = 0, y0 = 0, x1 = static_cast<i32>(width) - 1, y1 = static_cast<i32>(height) - 1;
+        c.scale = static_cast<f32>(draw_scale);
+        // Region clip (tile-aligned, as the hardware applies it) and the surface's clip, as a scissor (in the render
+        // target's pixels: the surface's clip is in its samples)
+        const i32 mi = static_cast<i32>(ms);
+        i32 x0 = 0, y0 = 0, x1 = static_cast<i32>(width / ms) - 1, y1 = static_cast<i32>(height / ms) - 1;
         if (color) {
-            x0 = static_cast<i32>(cs.clip_min & 0xFFFF), y0 = static_cast<i32>(cs.clip_min >> 16);
-            x1 = static_cast<i32>(cs.clip_max & 0xFFFF), y1 = static_cast<i32>(cs.clip_max >> 16);
+            x0 = static_cast<i32>(cs.clip_min & 0xFFFF) / mi, y0 = static_cast<i32>(cs.clip_min >> 16) / mi;
+            x1 = (static_cast<i32>(cs.clip_max & 0xFFFF) + 1) / mi - 1, y1 = (static_cast<i32>(cs.clip_max >> 16) + 1) / mi - 1;
         }
         if (st.region_clip_mode == 0x80000000u) {
             x0 = nx::max<i32>(x0, static_cast<i32>(st.region_min[0] & ~31u));
@@ -5958,8 +5969,8 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         x1 = nx::min<i32>(x1, static_cast<i32>(target_w) - 1);
         y1 = nx::min<i32>(y1, static_cast<i32>(target_h) - 1);
         if (x1 < x0 || y1 < y0) continue;
-        const i32 si = static_cast<i32>(scale);
-        plan.scissor = {{x0 * si, y0 * si}, {static_cast<u32>(x1 - x0 + 1) * scale, static_cast<u32>(y1 - y0 + 1) * scale}};
+        const i32 si = static_cast<i32>(draw_scale);
+        plan.scissor = {{x0 * si, y0 * si}, {static_cast<u32>(x1 - x0 + 1) * draw_scale, static_cast<u32>(y1 - y0 + 1) * draw_scale}};
         plans.push_back(std::move(plan));
     }
     // (a phone's driver: up to a tenth of a second for each pipeline whose shaders are new; a scene of a song's start
@@ -6611,7 +6622,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
         if (load_depth) pass.depth.load = pass.depth.stencil_load = VK_ATTACHMENT_LOAD_OP_LOAD;
         if (store_depth) pass.depth.store = pass.depth.stencil_store = VK_ATTACHMENT_STORE_OP_STORE;
     }
-    pass.area = {{0, 0}, {target_w * scale, target_h * scale}};
+    pass.area = {{0, 0}, {target_w * draw_scale, target_h * draw_scale}};
     if (stamps) vkCmdWriteTimestamp(*cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 1);
     d.begin_label(*cmd, "draws", kPassRgb);
     MarkerReplay markers{d, *cmd, scene.markers};
@@ -6619,7 +6630,7 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
     markers.zones_ctx = r.gpu_zones;
 #endif
     if (auto begun = r.passes->begin(*cmd, pass); begun) {
-        const VkViewport viewport{0, 0, static_cast<f32>(target_w * scale), static_cast<f32>(target_h * scale), 0, 1};
+        const VkViewport viewport{0, 0, static_cast<f32>(target_w * draw_scale), static_cast<f32>(target_h * draw_scale), 0, 1};
         vkCmdSetViewport(*cmd, 0, 1, &viewport);
         const f32 blend[4] = {0, 0, 0, 0};
         vkCmdSetBlendConstants(*cmd, blend);

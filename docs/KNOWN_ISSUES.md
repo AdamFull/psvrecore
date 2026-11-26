@@ -166,7 +166,9 @@
   the entry that lets it go, would wait for ever; GXM's display buffering does not do that.
 - **Scenes render synchronously** when they end (one submission and wait each): simple and ordered with transfers and
   the CPU, but slow (multithreaded_rendering: about 40 ms a frame).
-- **Not implemented:** multisampling, the DF32M_S8
+- **Not implemented:** multisampling as such (a 4x render target whose surfaces keep the samples, twice its size each
+  way, is drawn at the surfaces' size, each sample shaded; 2x targets, and 4x ones with a downscaled colour surface,
+  are drawn at the target's size, their depth at the target's too), the DF32M_S8
   mask bit (DF32M's is the depth image's stencil aspect), YUV transfers, the VDM buffer and region clip checks of
   command lists.
 - **Uniform data is copied when a draw is made** (the hardware reads it when the scene runs). A game that writes a
