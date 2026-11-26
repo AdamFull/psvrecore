@@ -121,18 +121,19 @@ void emit(const Word& w, u64 raw, u32 index, u8 repetition, ProgramKind kind, nx
     }
 }
 
-// Family 3 repeats ignore the increment state: bits 47-48 choose what steps (source 0 on by a vec4 of two register
-// pairs, not at all, or back by a vec4; and/or the internal-register sources by one). A dot product writes the next
-// destination lane; a multiply-add's destination, as the reference prints it, is two registers on (an internal
-// register: one).
-void repeat_fam3(u64 word, u32 index, ProgramKind kind, nx::vector<Decoded>& out) {
+// Family 3 repeats: bits 47-48 choose what steps (source 0 on by a vec4 of two register pairs, not at all, or by
+// the increment state's source-1 increment, as the other families' source 1; and/or the internal-register sources by
+// one). A dot product writes the next destination lane; a multiply-add's destination, as the reference prints it, is
+// two registers on (an internal register: one).
+void repeat_fam3(u64 word, u32 index, ProgramKind kind, const DecodeState& state, nx::vector<Decoded>& out) {
     const Word base_word(word);
     const i32 count = base_word.field(44, 2) + 1;
     const u32 mode = base_word.bit(47) | (base_word.bit(48) << 1);
-    // (3: back, as the reference prints it, a game's skinning dot products of rows the compiler put in o8, o4 and o0)
-    static constexpr i32 s0_steps[4] = {2, 0, 2, -2};
-    const i32 s0_step = s0_steps[mode];
+    // (3: read back from the reference for increments 9, 3, -2 and -4 and the swizzle mode: Killzone Mercenary's
+    // rows r0 and r18 with an increment of 9, a game's skinning rows o8, o4 and o0 with one of -2)
+    static constexpr i32 s0_steps[4] = {2, 0, 2, 0};
     const bool gpi_step = mode == 1 || mode == 2;
+    const bool s0_swizzle = (state.increment_swizzle >> (3 - kSrc1)) & 1;
     for (i32 k = 0; k < count; ++k) {
         Word w(word & ~(u64{3} << 44));
         if (base_word.bit(53)) {
@@ -143,7 +144,10 @@ void repeat_fam3(u64 word, u32 index, ProgramKind kind, nx::vector<Decoded>& out
             w.offset(39, 4, (1 << k) - base_word.field(39, 4));
             if (gpi_step && k) w.offset(28, 2, k);
         }
-        if (s0_step && k) w.offset(0, 6, s0_step * k);
+        const i32 s0_step = mode != 3 ? s0_steps[mode] * k
+                            : s0_swizzle ? (static_cast<u8>(state.increment[kSrc1]) >> (2 * (k % 4))) & 3
+                                         : k * state.increment[kSrc1];
+        if (s0_step) w.offset(0, 6, s0_step);
         emit(w, word, index, static_cast<u8>(k), kind, out);
     }
 }
@@ -154,7 +158,7 @@ void decode_word(u64 word, u32 index, ProgramKind kind, DecodeState& state, nx::
     const u32 family = static_cast<u32>(word >> 59);
     const Word w(word);
     if (family == 3 && w.field(44, 2)) {
-        repeat_fam3(word, index, kind, out);
+        repeat_fam3(word, index, kind, state, out);
         return;
     }
     RepeatSpec spec;

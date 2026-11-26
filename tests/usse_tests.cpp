@@ -147,6 +147,17 @@ TEST_CASE("usse: repeats follow the increments") {
     const auto p = decode_program(dot, ProgramKind::Primary);
     REQUIRE(p.size() == 4);
     CHECK(squeeze(format(p[3].in, ProgramKind::Primary)) == "dot.f32 o0.---w, sa12.xyzw, i0.xyz1");
+    // Bits 47-48 = 3: source 0 steps by the increments' source 1 (9 here, Killzone Mercenary's rows r0 and r18;
+    // -2 back, a step of -4 registers), as the reference prints it.
+    const u64 rows[] = {0xFA14000001010909ull, 0x188190810151A200ull};
+    const auto q = decode_program(rows, ProgramKind::Primary);
+    REQUIRE(q.size() == 3);
+    CHECK(squeeze(format(q[1].in, ProgramKind::Primary)) == "dot.f32 o10.x, r0.xyz, i0.xyz");
+    CHECK(squeeze(format(q[2].in, ProgramKind::Primary)) == "dot.f32 o10.-y, r18.xyz, i0.xyz");
+    const u64 back[] = {0xFA1400000101FEFEull, 0x188190810151A200ull | 4};
+    const auto r = decode_program(back, ProgramKind::Primary);
+    REQUIRE(r.size() == 3);
+    CHECK(squeeze(format(r[2].in, ProgramKind::Primary)) == "dot.f32 o10.-y, r4.xyz, i0.xyz");
 }
 
 TEST_CASE("usse: listing numbers and branch targets") {
