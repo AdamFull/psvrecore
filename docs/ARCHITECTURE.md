@@ -709,7 +709,9 @@ static libraries. See [BUILDING.md](BUILDING.md#the-shared-runtime-library).
     input attachment and a self-dependency.
   - A pipeline description is a padding-free struct, hashed and compared as bytes. Pipelines are made once and
     kept, and the driver's pipeline cache can be saved and loaded. Viewport, scissor, stencil values, depth bias
-    and blend constants are dynamic state.
+    and blend constants are dynamic state. A draw with a depth test enables depth bias when its front faces' bias
+    (sceGxmSetFrontDepthBias) is not zero; GXM's units are the float depth's epsilon, as Vulkan's are for D32F
+    (Killzone Mercenary's decals flickered against their walls without it).
   - Frames in flight each have a command buffer, a fence, a stream of host-visible memory for their draws' data
     and a list of objects to release once the GPU is done with them.
   - Every use of the queue holds one lock, since the GXM layer and the display may use it from different

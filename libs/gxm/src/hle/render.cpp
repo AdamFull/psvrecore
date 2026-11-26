@@ -5769,6 +5769,9 @@ bool render_scene(Scene& scene, nx::vector<Notification> notifications, u64 numb
             desc.depth_test = 1;
             desc.depth_compare = static_cast<VkCompareOp>((st.depth_func[0] >> 22) & 7);
             desc.depth_write = st.depth_write[0] ? 1 : 0;
+            // (the front faces' depth bias, set as the draw is recorded: Killzone Mercenary draws its decals with one, and
+            // without it they fought with their walls; GXM's epsilon is the float depth's, as Vulkan's for D32F)
+            desc.depth_bias = st.depth_bias_factor[0] != 0 || st.depth_bias_units[0] != 0 ? 1 : 0;
             auto stencil_state = [](const StencilState& s) {
                 VkStencilOpState o{};
                 o.compareOp = static_cast<VkCompareOp>((s.func >> 25) & 7);
