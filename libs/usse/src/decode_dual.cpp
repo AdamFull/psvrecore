@@ -132,8 +132,9 @@ bool decode_dual(const Word& w, ProgramKind, nx::vector<Instruction>& out) {
         if (op.vector || op.op == Op::Dot) {
             o.lanes = op.vector ? dest.lanes : width;
             o.mask = op.vector ? dest.mask : static_cast<u8>((1 << width) - 1);
+            // (G3, which has no swizzle code, reads its own fourth lane on vec3 too: an f16 vector operation's
+            // four-lane destination shows it, read back from the reference for every routing)
             for (int i = 0; i < 4; ++i) o.swizzle[i] = comp_of(text[i]);
-            if (code < 0 && width == 3) o.swizzle[3] = Comp::X;
         } else {
             const Comp sc = scalar_comp(comp_of(text[0]));
             const u8 lane = static_cast<u8>(sc);

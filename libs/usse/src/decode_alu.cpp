@@ -297,10 +297,14 @@ bool decode_fam8(const Word& w, nx::vector<Instruction>& out) {
             if (dt == st) sel[2] = sel[0], sel[3] = sel[1];
         }
         Lanes lanes = lanes_identity(4, on);
-        if (dt == Type::F32 || dt == Type::F16 || st == Type::F16) {
+        const bool f16_to_byte = st == Type::F16 && (dt == Type::U8 || dt == Type::S8 || dt == Type::O8);
+        if (dt == Type::F32 || dt == Type::F16 || (st == Type::F16 && dt == Type::Fx10) || (f16_to_byte && w.bit(18))) {
             for (int i = 0; i < 4; ++i) lanes.comp[i] = static_cast<Comp>(sel[i]);
         } else {
-            // (the selects go to the used lanes in order)
+            // (the selects go to the used lanes in order; f16 to all four bytes without scaling takes the first two
+            // twice, with scaling each lane its own select: read back from the reference for every mask, Killzone
+            // Mercenary's packs of f16 to u8)
+            if (f16_to_byte && on == 15) sel[2] = sel[0], sel[3] = sel[1];
             int k = 0;
             for (int i = 0; i < 4; ++i) lanes.comp[i] = ((on >> i) & 1) ? static_cast<Comp>(sel[k++]) : Comp::X;
         }

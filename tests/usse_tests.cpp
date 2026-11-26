@@ -69,6 +69,10 @@ TEST_CASE("usse: moves, packs and tests") {
     // packing f32 to integers: the lane selects go to the written lanes in order
     CHECK(one(0x40810C7120033C80ull) == "pack.s8.f32 o0.--zw, i0.--zw");
     CHECK(one(0x40810C3120010000ull) == "pack.u8.f32 o0.--zw, r0.--xy");
+    // f16 to bytes: unscaled, all four lanes take the first two selects twice; scaled, each lane its own
+    CHECK(one(0x40810A3EA0410001ull) == "pack.u8.f16 pa2.xyzw, pa0.yyyy");
+    CHECK(one(0x40810A3EA0450001ull) == "pack.u8.f16.scl pa2.xyzw, pa0.yyxx");
+    CHECK(one(0x40810A3AA05D8000ull) == "pack.u8.f16.scl pa2.-yzw, pa0.-yzw");
     CHECK(one(0x4809C91110038080ull) == "cmp.ge.f32 p0, r2.y, {0}");
     CHECK(one(0x488C0A81000A2240ull) == "cmp.gt.u8 p0, r4.x, r0.x");
     CHECK(one(0x78408A80C0338080ull) == "cmp.gt.f32 r2.x, sa2.xyzw, r0.xyzw");
@@ -101,6 +105,11 @@ TEST_CASE("usse: two operations in one word") {
     REQUIRE(v4.size() == 2);
     CHECK(v4[0] == "mad.f32 i0.x--w, i0.x--w, i0.x--w, i1.x--w");
     CHECK(v4[1] == "+mov.f32 i1.xyzw, pa0.xyzw");
+    // vec3 f16 into four lanes: the swizzled sources' fourth lane is x, G3's (no swizzle) its own w
+    const auto g3 = lines(0x20A1050280388786ull);
+    REQUIRE(g3.size() == 2);
+    CHECK(g3[0] == "mad.f16 pa2.xyzw, pa12.yyyx, i0.xxxx, i2.xyzw");
+    CHECK(g3[1] == "+rsq.f16 i0.xyz, i1.x");
     const auto sop = lines(0x88809106F810264Eull);
     REQUIRE(sop.size() == 2);
     CHECK(sop[0] == "add.fx10 pa0.xyz, pa0.xyz * sa12.xyz, sa14.xyz");
