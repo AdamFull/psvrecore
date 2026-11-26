@@ -2156,7 +2156,13 @@ VkSampler texture_sampler(Renderer& r, const TextureInfo& info, VkFormat format,
 // gives as the bytes are (an F16x4 surface read as an F16x4 texture). With `srgb` (srgb_textures), an 8-bit texture of
 // gamma mode 1 too, whose texels are the image's bytes still encoded (Texels::srgb): sampled through the sRGB format
 // of the image's (texture_format), which decodes them.
-bool texels_as_image(const TextureInfo& info, VkFormat format, bool srgb) {
+//
+// With `mapping`, half-float texels that are the bytes' four halves in another order (a swizzle other than the
+// surface's: ARGB swaps red and blue) are taken too, sampled through a view whose components put them back in order:
+// `mapping` is that view's (identity, {}, for texels in the bytes' own order). Only for a texture copied into an image
+// of its own (texture_from_target); a surface's own image sampled as it is (scaled_texture) passes none.
+bool texels_as_image(const TextureInfo& info, VkFormat format, bool srgb, VkComponentMapping* mapping = nullptr) {
+    if (mapping) *mapping = {};
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) {
         if (texel_bits(info.base_format) != 64 || info.gamma || info.palette) return false;
         TextureInfo one = info;
@@ -2164,14 +2170,33 @@ bool texels_as_image(const TextureInfo& info, VkFormat format, bool srgb) {
         one.levels = 1;
         one.stride = 8;
         one.type = texture_type::kLinear;
-        const u8 probe[8] = {0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44};  // (halves 1, 2, 3, 4)
+        const u16 halves[4] = {0x3C00, 0x4000, 0x4200, 0x4400};  // (1, 2, 3, 4)
+        u8 probe[8];
+        std::memcpy(probe, halves, 8);
         auto texels = read_texels(one, [&](u32, void* out, u32 bytes) {
             if (bytes > 8) return false;
             std::memcpy(out, probe, bytes);
             return true;
         });
-        return texels && texels->bytes == 8 && !texels->single && texels->data.size() >= 8 &&
-               std::memcmp(texels->data.data(), probe, 8) == 0;
+        if (!texels || texels->bytes != 8 || texels->single || texels->data.size() < 8) return false;
+        if (std::memcmp(texels->data.data(), probe, 8) == 0) return true;
+        if (!mapping) return false;
+        // (each of the texel's components one of the bytes' halves, each half once: the view picks it)
+        constexpr VkComponentSwizzle pick[4] = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B,
+                                                VK_COMPONENT_SWIZZLE_A};
+        VkComponentSwizzle of[4];
+        u32 used = 0;
+        for (u32 k = 0; k < 4; ++k) {
+            u16 got;
+            std::memcpy(&got, texels->data.data() + k * 2, 2);
+            u32 j = 0;
+            while (j < 4 && halves[j] != got) ++j;
+            if (j == 4 || (used & (1u << j))) return false;
+            used |= 1u << j;
+            of[k] = pick[j];
+        }
+        *mapping = {of[0], of[1], of[2], of[3]};
+        return true;
     }
     u32 order[4];
     if (format == VK_FORMAT_R8G8B8A8_UNORM) order[0] = 0, order[1] = 1, order[2] = 2, order[3] = 3;
@@ -2195,6 +2220,8 @@ bool texels_as_image(const TextureInfo& info, VkFormat format, bool srgb) {
         if (texels->data[k] != probe[order[k]]) return false;
     return true;
 }
+
+constexpr VkComponentMapping kIdentityMapping{};
 
 // The format a texture that texels_as_image takes from an image of this format is sampled as: the image's, or its
 // sRGB format for a texture with a gamma mode.
@@ -2970,7 +2997,12 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         const bool whole = t->address == info.address && info.height == t->height && info.width >= t->width &&
                            (info.width == t->width || t->layout.kind == SurfaceLayout::kLinear);
         if (!whole && !texture_in_surface(info, *t, ox, oy)) continue;
-        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format, srgb)) continue;
+        VkComponentMapping mapping;
+        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format, srgb, &mapping)) continue;
+        // (the columns past a linear surface come from guest memory as decoded, in the texture's order: not under a view
+        // that reorders them)
+        const bool reordered = std::memcmp(&mapping, &kIdentityMapping, sizeof mapping) != 0;
+        if (reordered && info.width > t->width) continue;
         if (!only) {
             const Changes changes = surface_changes(*t);
             if (changes.all || changes.pixels) continue;
@@ -2983,6 +3015,7 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
         d.format = texture_format(info, t->image.desc.format);
         d.width = info.width * s;
         d.height = info.height * s;
+        d.components = mapping;
         CachedTexture c;
         bool reused = false;
         if (auto was = r.by_words.find(words_key); was != r.by_words.end()) {
@@ -2990,7 +3023,7 @@ CachedTexture* texture_from_target(Renderer& r, const TextureInfo& info, u64 key
             if (old != r.textures.end() && old->second.used != r.scenes) {
                 const vk::ImageDesc& od = old->second.image.desc;
                 if (od.format == d.format && od.width == d.width && od.height == d.height && od.mips == 1 &&
-                    od.layers == 1 && !od.cube) {
+                    od.layers == 1 && !od.cube && std::memcmp(&od.components, &d.components, sizeof d.components) == 0) {
                     c = old->second;
                     r.textures.erase(old);
                     reused = true;
@@ -3900,7 +3933,8 @@ CachedTexture* texture_for(Renderer& r, const TextureWords& words, nx::hash_map<
         u32 ox = 0, oy = 0;
         if (t->written.empty() || info.levels != 1) continue;
         if (!texture_in_surface(info, *t, ox, oy)) continue;
-        if (!texture_reads_layout(info, t->layout) || !texels_as_image(info, t->image.desc.format, srgb_textures(*r.device)))
+        if (VkComponentMapping mapping; !texture_reads_layout(info, t->layout) ||
+                                        !texels_as_image(info, t->image.desc.format, srgb_textures(*r.device), &mapping))
             break;
         const Changes changes = surface_changes(*t);
         if (changes.all || changes.pixels) break;
